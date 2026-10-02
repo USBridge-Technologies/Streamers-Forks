@@ -41,6 +41,7 @@
 #include "process.h"
 #include "system_tray.h"
 #include "upnp.h"
+#include "usbridge.h"
 #include "video.h"
 
 using namespace std::literals;
@@ -176,6 +177,12 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
  * @return Process or platform callback exit code.
  */
 int main(int argc, char *argv[]) {
+  // usbridge: the USBridge agent asks whether this build hands devices to its USB broker.
+  if (argc > 1 && std::string_view {argv[1]} == "--usbridge-bridge") {
+    std::cout << usbridge::PROBE_LINE << std::endl;
+    return 0;
+  }
+
 #ifdef __linux__
   const bool privileged_execution = getauxval(AT_SECURE) != 0 || platf::has_elevated_privileges(true);
   if (privileged_execution && !platf::sanitize_process_environment()) {
