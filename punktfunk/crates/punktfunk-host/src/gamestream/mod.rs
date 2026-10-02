@@ -148,6 +148,9 @@ pub const SCM_HEVC: u32 = 0x0000_0100;
 pub const SCM_HEVC_MAIN10: u32 = 0x0000_0200;
 pub const SCM_AV1_MAIN8: u32 = 0x0001_0000;
 pub const SCM_AV1_MAIN10: u32 = 0x0002_0000;
+/// USBridge extension, outside the bits Moonlight reads: this host encodes PyroWave. The
+/// USBridge agent offers the codec from it; the client negotiates on the DESCRIBE line.
+pub const SCM_USBRIDGE_PYROWAVE: u32 = 0x0100_0000;
 /// SDR baseline: H.264 + HEVC Main + AV1 Main 8-bit. HEVC Main10 is layered at runtime by
 /// `serverinfo::codec_mode_support` only when [`host_hdr_capable`] is true — a non-HDR host
 /// must not advertise a mode it cannot produce. 4:4:4 stays off; stock Moonlight is 4:2:0.

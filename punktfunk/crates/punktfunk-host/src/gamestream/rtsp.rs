@@ -590,6 +590,15 @@ fn read_sealed_message(
     Ok(Some(req))
 }
 
+/// DESCRIBE line that offers PyroWave to a USBridge client (payload type 99 is unused by
+/// GameStream).
+const PYROWAVE_RTPMAP: &str = "a=rtpmap:99 PYROWAVE/90000";
+
+/// Whether this host can encode PyroWave: the same capability bit the native plane advertises.
+pub(super) fn pyrowave_offered() -> bool {
+    crate::encode::host_wire_caps() & punktfunk_core::quic::CODEC_PYROWAVE != 0
+}
+
 /// DESCRIBE SDP: the HEVC/AV1 lines `codecs` (`ServerCodecModeSupport`) backs, surround
 /// configs, and the encryption offer. moonlight-common-c picks HEVC or AV1 from those two lines
 /// alone. Shipping modes advertise encryption as SUPPORTED, never REQUESTED.
@@ -617,6 +626,11 @@ fn describe_sdp(codecs: u32) -> String {
     }
     if codecs & super::SCM_AV1_MAIN8 != 0 {
         lines.push("a=rtpmap:98 AV1/90000".into());
+    }
+    // USBridge extension: a client that decodes PyroWave reads this line and answers with
+    // `bitStreamFormat:3`. Stock Moonlight ignores a payload type it does not know.
+    if codecs & super::SCM_USBRIDGE_PYROWAVE != 0 {
+        lines.push(PYROWAVE_RTPMAP.into());
     }
     // Client takes the first `surround-params=<channelCount>` as normal and
     // a second as HQ, so normal must precede HQ. Stereo lines are Sunshine
@@ -684,6 +698,8 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     let codec = match map.get("x-nv-vqos[0].bitStreamFormat").map(|s| s.trim()) {
         Some("1") => Codec::H265,
         Some("2") => Codec::Av1,
+        // USBridge extension, sent only after our `PYROWAVE/90000` line in DESCRIBE.
+        Some("3") if pyrowave_offered() => Codec::PyroWave,
         _ => Codec::H264,
     };
     // Moonlight sets `dynamicRangeMode != 0` when it saw Main10 and the user
@@ -1313,6 +1329,9 @@ mod tests {
     fn describe_advertises_codecs_and_surround() {
         let h264_only = describe_sdp(super::super::SCM_H264);
         assert!(!h264_only.contains("AAAAAU") && !h264_only.contains("AV1/90000"));
+        assert!(!h264_only.contains("PYROWAVE/90000"), "PyroWave only when the bit is set");
+        let pyrowave = describe_sdp(super::super::SCM_H264 | super::super::SCM_USBRIDGE_PYROWAVE);
+        assert!(pyrowave.contains("a=rtpmap:99 PYROWAVE/90000"), "PyroWave indicator");
         let sdp = describe_sdp(
             super::super::SCM_H264 | super::super::SCM_HEVC | super::super::SCM_AV1_MAIN8,
         );

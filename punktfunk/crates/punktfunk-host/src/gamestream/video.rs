@@ -52,6 +52,10 @@ pub struct VideoPacketizer {
     min_fec: usize,
     frame_index: u32,
     seq: u32,
+    /// NV `streamPacketIndex`: data shards only. moonlight-common-c's depacketizer sees
+    /// parity-stripped blocks and treats a gap between one block's last data shard and
+    /// the next block's first as a corrupt frame, so parity must not advance this.
+    packet_index: u32,
     /// `(k, m)` Cauchy-matrix cache lives across frames; block shape only moves with frame size.
     coder: Gf8Coder,
     /// `/launch` rikey when `SS_ENC_VIDEO` is on; `None` is the plaintext wire.
@@ -88,6 +92,7 @@ impl VideoPacketizer {
             min_fec: min_fec as usize,
             frame_index: 0,
             seq: 0,
+            packet_index: 0,
             coder: Gf8Coder::default(),
             enc_key: None,
             pool: Vec::new(),
@@ -206,6 +211,7 @@ impl VideoPacketizer {
             }
             let k = last - first;
             let block_seq_base = self.seq;
+            let block_index_base = self.packet_index;
             let multi_fec_blocks = ((b as u8) << 4) | (((n_blocks - 1) as u8) << 6);
 
             // NV fields RS must reproduce (`streamPacketIndex`, `frameIndex`, `flags`,
@@ -223,7 +229,8 @@ impl VideoPacketizer {
                 if global == total_data - 1 {
                     flags |= FLAG_EOF;
                 }
-                shard[16..20].copy_from_slice(&(seq << 8).to_le_bytes()); // streamPacketIndex
+                let index = block_index_base.wrapping_add(i as u32);
+                shard[16..20].copy_from_slice(&(index << 8).to_le_bytes()); // streamPacketIndex
                 shard[20..24].copy_from_slice(&frame_index.to_le_bytes()); // frameIndex
                 shard[24] = flags;
                 shard[26] = MULTI_FEC_FLAGS;
@@ -274,6 +281,7 @@ impl VideoPacketizer {
             // Stamp RTP + `fecInfo` only. Leave `flags`/`streamPacketIndex` so a recovered
             // shard's RS-reconstructed NV header stays valid.
             self.seq = block_seq_base + k as u32;
+            self.packet_index = block_index_base.wrapping_add(k as u32);
             let key = self.enc_key;
             for (i, mut buf) in self.data_scratch.drain(..).enumerate() {
                 let seq = block_seq_base + i as u32;
@@ -485,6 +493,28 @@ mod tests {
         let n_blocks = total.div_ceil(255).clamp(1, 4);
         let last_block = ((pkts.last().unwrap()[27]) >> 6) & 0x3;
         assert_eq!(last_block as usize, n_blocks - 1);
+    }
+
+    /// The client strips parity before the depacketizer, which requires each block's
+    /// first data shard to follow the previous block's last one.
+    #[test]
+    fn stream_packet_index_skips_parity_across_blocks() {
+        let mut pk = VideoPacketizer::new(1024, 20, 2);
+        let au = vec![7u8; 400_000];
+        let pkts = pk.packetize(&au, FrameType::Idr, 0, None);
+        let blocks = |p: &Vec<u8>| (p[27] >> 4) & 0x3;
+        assert!(pkts.iter().any(|p| blocks(p) > 0), "frame must span several FEC blocks");
+        let fec_index = |p: &Vec<u8>| (u32::from_le_bytes(p[28..32].try_into().unwrap()) >> 12) & 0x3ff;
+        let data_shards = |p: &Vec<u8>| (u32::from_le_bytes(p[28..32].try_into().unwrap()) >> 22) & 0x3ff;
+        let indices: Vec<u32> = pkts
+            .iter()
+            .filter(|p| fec_index(p) < data_shards(p))
+            .map(|p| u32::from_le_bytes(p[16..20].try_into().unwrap()) >> 8)
+            .collect();
+        assert!(indices.windows(2).all(|w| w[1] == w[0] + 1), "data shards must be numbered without gaps");
+        // The next frame continues the same sequence.
+        let next = pk.packetize(&au[..1000], FrameType::Idr, 0, None);
+        assert_eq!(u32::from_le_bytes(next[0][16..20].try_into().unwrap()) >> 8, indices.last().unwrap() + 1);
     }
 
     #[test]
