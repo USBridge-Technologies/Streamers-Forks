@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unom <packages@unom.io>
+Subject: [PATCH] pipewire: repaint the capture on the Steam overlay's commits
+
+paint_pipewire() pushes a frame only when the focus or override window
+commits. The Steam overlay is painted into that frame but never triggers
+one, so a game that stops presenting once the overlay takes input leaves
+the node showing the game: the menu sound plays and nothing appears.
+
+The stream also has no held base. The scanout paints a focus window with
+no finished commit from the held base commit; the stream painted nothing,
+so the overlay landed on black. Read the held base without BasePlane,
+which would rewrite the scanout's cached plane, and refit it to the
+capture size.
+
+Stamp pfhdr11 so a box upgrades to it. No new capability.
+---
+ src/meson.build      |  3 ++-
+ src/steamcompmgr.cpp | 33 +++++++++++++++++++++++++++++----
+ 2 files changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -190,7 +190,8 @@
+ #   +pfhdr8 — …and the seat's keyboard carries the XKB_DEFAULT_* keymap (honours the box layout)
+ #   +pfhdr9 — …and the headless connector supports adaptive sync (paint on game commit)
+ #   +pfhdr10 — …and the CLI framerate limit persists across paints without switching refresh
+-version_tag = vcs_tag + '+pfhdr10' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr11 — …and the Steam overlay repaints the capture on its own commits (no new capability)
++version_tag = vcs_tag + '+pfhdr11' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -2462,9 +2462,17 @@
+ 	// WHILE the picture behind them is static, which is the case the test would otherwise skip.
+ 	const uint64_t ulExternalOverlayCommitId = window_last_done_commit_id( pExternalOverlay );
+ 
++	// The Steam overlay's commits join the test too. A game that stops presenting while the
++	// overlay holds input would otherwise never push it: the menu sound plays, the stream stays put.
++	static uint64_t s_ulLastOverlayCommitId = 0;
++	steamcompmgr_win_t *pOverlay = ( !ulFocusAppId && pFocus->overlayWindow && pFocus->overlayWindow->opacity )
++		? pFocus->overlayWindow : nullptr;
++	const uint64_t ulOverlayCommitId = window_last_done_commit_id( pOverlay );
++
+ 	if ( ulFocusCommitId == s_ulLastFocusCommitId &&
+ 	     ulOverrideCommitId == s_ulLastOverrideCommitId &&
+ 	     ulExternalOverlayCommitId == s_ulLastExternalOverlayCommitId &&
++	     ulOverlayCommitId == s_ulLastOverlayCommitId &&
+ 	     bDrawCursor == s_bLastCursorDrawn &&
+ 	     nCursorX == s_nLastCursorX && nCursorY == s_nLastCursorY )
+ 		return;
+@@ -2472,6 +2480,7 @@
+ 	s_ulLastFocusCommitId = ulFocusCommitId;
+ 	s_ulLastOverrideCommitId = ulOverrideCommitId;
+ 	s_ulLastExternalOverlayCommitId = ulExternalOverlayCommitId;
++	s_ulLastOverlayCommitId = ulOverlayCommitId;
+ 	s_bLastCursorDrawn = bDrawCursor;
+ 	s_nLastCursorX = nCursorX;
+ 	s_nLastCursorY = nCursorY;
+@@ -2487,15 +2496,32 @@
+ 	currentOutputWidth = uWidth;
+ 	currentOutputHeight = uHeight;
+ 
+-	// Paint the windows we have onto the Pipewire stream.
+-	paint_window( pFocus->focusWindow, pFocus->focusWindow, &frameInfo, nullptr, 0, 1.0f, pFocus->overrideWindow );
++	// Paint the windows we have onto the Pipewire stream. A focus window with no finished commit
++	// shows the scanout's held base, as `paint_all` does; without it the overlay lands on black.
++	// Read-only: `BasePlane` would rewrite the scanout's cached plane from this stream's scale.
++	gamescope::Rc<commit_t> focusCommit;
++	get_window_last_done_commit( pFocus->focusWindow, focusCommit );
++	if ( focusCommit == nullptr && g_HeldCommits[ HELD_COMMIT_BASE ] != nullptr )
++	{
++		// The cached plane is fitted to the scanout; a consumer may ask for a smaller capture.
++		BaseLayerInfo_t base = g_CachedPlanes[ HELD_COMMIT_BASE ];
++		const float flRatioX = (float)uBackupWidth / uWidth;
++		const float flRatioY = (float)uBackupHeight / uHeight;
++		base.scale[0] *= flRatioX;
++		base.scale[1] *= flRatioY;
++		base.offset[0] /= flRatioX;
++		base.offset[1] /= flRatioY;
++		paint_cached_base_layer( g_HeldCommits[ HELD_COMMIT_BASE ], base, &frameInfo, 1.0f, true );
++	}
++	else
++		paint_window( pFocus->focusWindow, pFocus->focusWindow, &frameInfo, nullptr, 0, 1.0f, pFocus->overrideWindow );
+ 
+ 	if ( pFocus->overrideWindow && !pFocus->focusWindow->isSteamStreamingClient )
+ 		paint_window( pFocus->overrideWindow, pFocus->focusWindow, &frameInfo, nullptr, PaintWindowFlag::NoFilter, 1.0f, pFocus->overrideWindow );
+ 
+-	if ( !ulFocusAppId && pFocus->overlayWindow && pFocus->overlayWindow->opacity )
++	if ( pOverlay )
+ 	{
+-		paint_window( pFocus->overlayWindow, pFocus->overlayWindow, &frameInfo, nullptr, PaintWindowFlag::DrawBorders | PaintWindowFlag::NoFilter |
++		paint_window( pOverlay, pOverlay, &frameInfo, nullptr, PaintWindowFlag::DrawBorders | PaintWindowFlag::NoFilter |
+ 				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 )  );
+ 	}
+ 

@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- macOS-ONLY entitlements. App Sandbox is a macOS concept (iOS/tvOS are always
+	     sandboxed and REJECT this key at upload), so the macOS target points here while
+	     iOS/tvOS keep the shared Config/Punktfunk.entitlements. The single macOS app is
+	     sandboxed for BOTH channels — the Developer ID DMG is codesigned with this same
+	     file (App Sandbox is allowed, not just required, for Developer ID), so what we
+	     test locally (⌘R / DMG) is exactly what Mac App Store / TestFlight users get. -->
+
+	<!-- Required for Mac App Store / TestFlight distribution. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<!-- Outbound QUIC control plane + raw-UDP data plane to the host, and NWBrowser mDNS
+	     discovery / NWConnection resolve. Every outbound socket (incl. the linked Rust
+	     core's UDP binds) needs this under the sandbox. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+
+	<!-- NOT optional, despite the client being "outbound only": the App Sandbox gates the
+	     bind() syscall itself as a network-bind ("server") operation. quinn binds its QUIC
+	     endpoint socket (quic.rs Endpoint::client 0.0.0.0:0) and the raw-UDP data plane
+	     binds a local socket to receive host→client datagrams (transport/udp.rs); both fail
+	     with deny(1) network-bind / EPERM without this, so NO video/audio/rumble ever
+	     arrives. (The classic QUIC-on-quinn-under-sandbox trap.) -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+
+	<!-- Microphone uplink: SessionAudio installs an AVAudioEngine input tap → Opus → host
+	     virtual mic. TCC blocks AVAudioEngine input under the sandbox without this even with
+	     NSMicrophoneUsageDescription present. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+
+	<!-- Game controllers over Bluetooth via the GameController framework
+	     (GCController.startWirelessControllerDiscovery — Xbox/DualSense), AND the Steam
+	     Controller 2 as-is passthrough's CoreBluetooth client (Sc2BleLink reads the SC2's
+	     custom Valve GATT service), whose NSBluetoothAlwaysUsageDescription lives in the
+	     shared Config/Info.plist. The sandbox gates both on this key. -->
+	<key>com.apple.security.device.bluetooth</key>
+	<true/>
+
+	<!-- Game controllers over USB + USB HID mouse/keyboard via the GameController framework.
+	     device.usb gates the IOHIDLibUserClient path the framework uses for wired devices
+	     (per Apple DTS); without it, plugged-in controllers deliver no input. Justify in App
+	     Review notes ("reads input from USB game controllers").
+
+	     ALSO gates the Steam Controller 2 as-is passthrough's raw-HID USB transport
+	     (Sc2UsbLink), which opens a wired SC2 or a Steam Controller Puck dongle directly.
+	     That open additionally sits behind the Input Monitoring (kTCCServiceListenEvent)
+	     user grant: on-glass (macOS 27, 2026-08-31) each controller interface is one HID
+	     device that carries the lizard-mode keyboard collection beside the vendor controller
+	     collection, so the keyboard surface cannot be matched away. Sc2UsbLink raises the
+	     prompt via IOHIDRequestAccess before its first open. Same App Review justification
+	     line covers it: it reads controller input from a USB game controller. -->
+	<key>com.apple.security.device.usb</key>
+	<true/>
+
+	<!-- NO mach-lookup temporary exception here — and none is needed. Build 0.4.2 (3384) shipped a
+	     `com.apple.security.temporary-exception.mach-lookup.global-name` = com.apple.audioanalyticsd
+	     exception on the THEORY that CoreHaptics controller rumble (CHHapticEngine — the session
+	     RumbleRenderer + MenuHaptics) hard-crashes under the App Sandbox without it, because the
+	     framework reaches the audio-analytics daemon over Mach and the sandbox denies that lookup.
+	     App Review REJECTED the exception under guideline 2.4.5(i) (review 2026-07-04). We then
+	     tested the premise directly on macOS: a CHHapticEngine start + full-intensity rumble on a
+	     real Xbox pad, in a genuinely ENFORCED sandbox (NSHomeDirectory redirected into the app
+	     container) with NO exception on the codesigned binary — and it ran WITHOUT crashing, rumble
+	     and all, even with a live AVAudioEngine stream running concurrently. CoreHaptics simply
+	     tolerates the denied audioanalyticsd lookup (it's telemetry, not a hard precondition). So
+	     controller rumble works fully sandboxed with none of these exceptions. Do NOT re-add one —
+	     it will be rejected again AND it buys nothing. (DualSense rumble separately goes over raw
+	     HID via device.usb/device.bluetooth — CoreHaptics genuinely doesn't drive Sony motors on
+	     macOS — but that path needs no exception either; see DualSenseHID.) -->
+
+	<!-- Keychain Sharing (unchanged from the shared file): a team-scoped access group so the
+	     punktfunk/1 client identity in the data-protection keychain is gated by the app's
+	     entitlement (team + bundle id), persisting across rebuilds with NO prompt — see
+	     ClientIdentityStore. $(AppIdentifierPrefix) expands to the team prefix at signing
+	     time (the Developer ID codesign step in release.yml resolves it via sed). -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)io.unom.punktfunk</string>
+	</array>
+
+	<!-- App Group: same shared UserDefaults suite as iOS (Config/Punktfunk.entitlements). Shared
+	     here so a single HostStore code path (UserDefaults(suiteName:)) works on every platform;
+	     macOS widgets that read it arrive with M5. macOS App Groups use the plain group id under
+	     the App Store profile; a Developer-ID-signed build wants the team-prefixed form — the
+	     Dev-ID codesign step in release.yml must verify this value against the Dev-ID profile. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.io.unom.punktfunk</string>
+	</array>
+</dict>
+</plist>

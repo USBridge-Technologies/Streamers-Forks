@@ -1,0 +1,86 @@
+# udev rules for the punktfunk streaming host (mirrors Sunshine's 60-sunshine.rules).
+#
+# Grants the `input` group access to /dev/uinput (virtual X-Box-360 gamepads) and /dev/uhid
+# (virtual DualSense via the kernel hid-playstation driver — LED, adaptive triggers, touchpad,
+# gyro). `static_node` makes the nodes exist before their modules load.
+#
+# Install:
+#   sudo cp scripts/60-punktfunk.rules /etc/udev/rules.d/
+#   sudo usermod -aG input $USER       # then re-login (or reboot)
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="uhid", SUBSYSTEM=="misc", OPTIONS+="static_node=uhid", GROUP="input", MODE="0660", TAG+="uaccess"
+
+# usbip vhci attach/detach for the virtual Steam Deck controller. Steam Input only
+# adopts the virtual Deck when it arrives as a USB device (usbip/vhci or raw_gadget);
+# the UHID fallback has no USB interface and Steam ignores it. The sysfs attach files
+# are root-only by default while the host runs as a user service — grant the dedicated
+# `punktfunk` group write when vhci_hcd appears (module autoload: modules-load.d/punktfunk.conf).
+#
+# ⚠ This is deliberately NOT the `input` group (2026-08-05 review M-4). Writing `attach` hands the
+# kernel a caller-supplied socket fd and materialises an arbitrary, fully userspace-emulated USB
+# device — a root-only kernel primitive. Every packaging scriptlet tells the user to
+# `usermod -aG input $USER` as step 1, so putting it on `input` handed that primitive to a group
+# people are routinely told to join: a member could present a HID keyboard and inject keystrokes
+# into a root TTY or the lock screen, or drive any of hundreds of in-tree USB drivers from
+# userspace, all without CAP_SYS_ADMIN. The uinput/uhid grants above are already systemwide input
+# injection, but neither reaches kernel USB enumeration — this one does, so it gets its own group
+# that nothing else asks users to join.
+ACTION=="add", SUBSYSTEM=="platform", KERNEL=="vhci_hcd.*", RUN+="/bin/sh -c 'chgrp punktfunk /sys%p/attach /sys%p/detach && chmod 0660 /sys%p/attach /sys%p/detach'"
+
+# hidraw access for the VIRTUAL pads this host creates. Steam/SDL drive a DualSense's rich
+# feedback (adaptive triggers, lightbar, player LEDs) exclusively over hidraw — the kernel has no
+# evdev API for any of it — and Steam without hidraw demotes a PlayStation pad to a generic evdev
+# device, losing its rumble handling too. hidraw nodes are root-only by default; the distro's
+# steam-devices rules + logind's uaccess ACL cover only the active seat session, so a game
+# launched outside it (a headless/dedicated streaming session) is silently feedback-dead.
+# GROUP="input" makes access follow the same group the host itself already requires.
+# KERNELS matches the HID device name (works for UHID devices, which have no USB parent);
+# the ATTRS pair covers the usbip/gadget Deck, which IS a (virtual) USB device.
+# DualSense (054C:0CE6) / DualSense Edge (054C:0DF2) / DualShock 4 (054C:09CC)
+KERNEL=="hidraw*", KERNELS=="*054C:0CE6*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*054C:0DF2*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*054C:09CC*", GROUP="input", MODE="0660", TAG+="uaccess"
+# Switch Pro Controller (057E:2009) — SDL's hidapi driver wants hidraw for rumble/LEDs too
+KERNEL=="hidraw*", KERNELS=="*057E:2009*", GROUP="input", MODE="0660", TAG+="uaccess"
+# Joy-Con (L) / (R) (057E:2006 / 2007), the halves of a virtual pair
+KERNEL=="hidraw*", KERNELS=="*057E:200[67]*", GROUP="input", MODE="0660", TAG+="uaccess"
+# Switch 2 Pro / GameCube (057E:2069 / 2073): SDL and Steam open the whole USB device via libusb
+SUBSYSTEM=="usb", ATTR{idVendor}=="057e", ATTR{idProduct}=="2069|2073", GROUP="input", MODE="0660", TAG+="uaccess"
+# 8BitDo Ultimate 2 (2DC8:6012) / Pro 2 (2DC8:6003) / Pro 3 (2DC8:6009) and HORIPAD for Steam
+# (0F0D:01AB): hid-generic binds them, so hidraw is the only way their paddles and gyro reach SDL
+KERNEL=="hidraw*", KERNELS=="*2DC8:6012*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*2DC8:6003*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*2DC8:6009*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*0F0D:01AB*", GROUP="input", MODE="0660", TAG+="uaccess"
+# Steam Deck (28DE:1205) / classic Steam Controller (28DE:1102), UHID and usbip/gadget forms
+KERNEL=="hidraw*", KERNELS=="*28DE:1205*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*28DE:1102*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1205", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1102", GROUP="input", MODE="0660", TAG+="uaccess"
+# The usbip DualSense's SOUND card (haptics + speaker land on /dev/snd/pcmC*D0p as channels
+# ch0/ch1 = speaker, ch2/ch3 = the voice coils). Same story as the hidraw nodes above, but worse:
+# the card is minted mid-session-bringup while no seat session is active, so logind's uaccess ACL
+# never materialises, WirePlumber's probe fails EACCES (the card then never appears in PipeWire at
+# all — no pad sink for a game to route to), and GE-Proton's direct ALSA leg
+# (`find_dualsense_haptic_alsa_path`) cannot open the PCM either. The distro's own rules don't
+# cover it because a real pad on a desktop is always uaccess'd via the seat. Field-diagnosed
+# 2026-08-18 on Bazzite: `spa.alsa: can't open control for card hw:2: Permission denied`.
+# DualSense (054C:0CE6) / DualSense Edge (054C:0DF2); matches real pads too, which is desirable —
+# a headless streaming session with a physically plugged pad has the identical gap.
+SUBSYSTEM=="sound", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ce6", GROUP="input", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="sound", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0df2", GROUP="input", MODE="0660", TAG+="uaccess"
+
+# Steam Controller 2 (Triton): wired 28DE:1302 and the Puck dongle 28DE:1304 — the two identities
+# `steam_backend_product` mints. Steam is the ONLY consumer of this pad: no kernel driver claims
+# the PID (mainline hid-steam stops at the Deck), so its state reports ride a vendor collection
+# that yields no evdev node at all. A hidraw node Steam cannot open is therefore not a degraded
+# controller, it is no controller — the pad enumerates, the kernel reads its report descriptor,
+# and Steam's own device list stays empty (field report 2026-08-15: usbip attached cleanly, the
+# log showed every kernel control transfer and not one SET_REPORT from Steam).
+# Relying on the distro's steam-devices rules is not enough for a pad that shipped in 2026: those
+# lists are per-PID and a host whose copy predates the SC2 leaves the node root-only.
+KERNEL=="hidraw*", KERNELS=="*28DE:1302*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*28DE:1304*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1302", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1304", GROUP="input", MODE="0660", TAG+="uaccess"

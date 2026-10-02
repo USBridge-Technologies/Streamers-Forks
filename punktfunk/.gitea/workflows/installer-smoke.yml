@@ -1,0 +1,276 @@
+# Smoke test for the guided installer. Runs it unattended inside a clean container per package
+# family against the REAL package registry — the one path a textual gate can't cover: does the
+# repo line, the key import and the install actually work today on a fresh box. `--no-start`
+# because a container has no user systemd; it degrades to printing the enable command, which is
+# also under test.
+#
+# It drives the SHIPPED path end to end: scripts/install.sh, the stub, with
+# PUNKTFUNK_SETUP_BIN pointed at a punktfunk-setup built FROM THIS TREE. So the stub's argument
+# passing is under test alongside the installer, and the published binary is never involved —
+# only the probe job touches that (design/installer-v2.md WP4.3).
+#
+# Path-filtered on purpose: it pulls ~100 MB of packages per family, so it runs when the
+# installer or its fact source changes, not on every push. The cheap halves run in ci.yml on
+# every push: the plan goldens, and check-installer-behavior.sh's detection and channel gates.
+name: installer-smoke
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/install.sh
+      - data/platforms.json
+      - crates/punktfunk-setup/**
+      - crates/pf-host-config/**
+      - crates/pf-paths/**
+      - ci/omarchy/**
+      - packaging/linux/omarchy/punktfunk-omarchy
+      - packaging/linux/omarchy/selftest.sh
+      - .gitea/workflows/installer-smoke.yml
+  pull_request:
+    paths:
+      - scripts/install.sh
+      - data/platforms.json
+      - crates/punktfunk-setup/**
+      - crates/pf-host-config/**
+      - crates/pf-paths/**
+      - ci/omarchy/**
+      - packaging/linux/omarchy/punktfunk-omarchy
+      - packaging/linux/omarchy/selftest.sh
+      - .gitea/workflows/installer-smoke.yml
+
+jobs:
+  # One static binary the family containers can all run, built from the PR's tree. musl needs no
+  # C cross-toolchain here: the crate is pure Rust, so rust-lld plus the target's self-contained
+  # crt objects link it (measured: 984 KB static-pie, seconds to build).
+  setup-binary:
+    name: build punktfunk-setup (musl)
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -C linker=rust-lld -C link-self-contained=yes
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the static installer from this tree
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked -p punktfunk-setup \
+            --target x86_64-unknown-linux-musl
+      - name: It is actually static
+        # readelf, not file(1): the rust-ci image ships binutils but no file. Static-pie
+        # is exactly ET_DYN with no PT_INTERP.
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/punktfunk-setup
+          readelf -h "$bin" | grep -q 'Type:.*DYN'
+          if readelf -l "$bin" | grep -q 'INTERP'; then
+            echo "::error::punktfunk-setup has PT_INTERP — dynamically linked, not static-pie"
+            exit 1
+          fi
+      # v3: Gitea's API rejects upload-artifact@v4 (see apple.yml). Download is a zip.
+      - uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
+        with:
+          name: punktfunk-setup-musl
+          path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
+      # The consuming jobs read it from the run-scoped cache, not the artifact: the artifact
+      # download client re-encodes the storage redirect's presigned URL (%2F -> %252F), which
+      # breaks its signature and the storage answers 400. The upload stays for humans.
+      #
+      # actions/cache versions an entry by compression tool, so every job in this hand-off
+      # must agree on zstd or the restore misses (arch images ship it; debian/fedora preps
+      # install it).
+      - name: zstd for the cache archive
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends zstd
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
+          key: punktfunk-setup-musl-${{ github.run_id }}
+
+  omarchy:
+    name: omarchy integration self-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # `punktfunk-omarchy` only ever runs on an Omarchy box, so nothing else can exercise the
+      # parts of it that edit a file the user owns — or that simply have to REACH the end under
+      # `set -euo pipefail`. It needs no container: bash and python3 are all the checks use.
+      - name: Run the Omarchy integration self-check
+        run: bash packaging/linux/omarchy/selftest.sh
+
+  # No Omarchy image exists and none is needed — the trap is a file. This wears Omarchy's
+  # os-release and its real libalpm update guard, proves the guard is ARMED before asserting
+  # anything else, and then requires the install to succeed anyway. See ci/omarchy/row.sh.
+  omarchy-install:
+    name: omarchy (armed update guard)
+    runs-on: ubuntu-24.04
+    needs: setup-binary
+    timeout-minutes: 25
+    container:
+      image: archlinux:base
+    env:
+      PF: sh scripts/install.sh
+      PUNKTFUNK_SETUP_BIN: /usr/local/bin/punktfunk-setup
+    steps:
+      - name: Prepare the container
+        run: pacman -Sy --noconfirm --needed curl git nodejs && (pacman-key --init >/dev/null 2>&1 || true)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
+          key: punktfunk-setup-musl-${{ github.run_id }}
+          fail-on-cache-miss: true
+      - name: Install the built binary
+        run: install -m 755 target/x86_64-unknown-linux-musl/release/punktfunk-setup /usr/local/bin/punktfunk-setup
+      - name: Install under Omarchy's update guard
+        run: bash ci/omarchy/row.sh
+
+  smoke:
+    name: smoke (${{ matrix.family }})
+    runs-on: ubuntu-24.04
+    needs: setup-binary
+    timeout-minutes: 25
+    env:
+      # The stub is the entry point users get, so it is the entry point under test. It execs
+      # whatever PUNKTFUNK_SETUP_BIN names, which is this pull request's own build.
+      PF: sh scripts/install.sh
+      PUNKTFUNK_SETUP_BIN: /usr/local/bin/punktfunk-setup
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # actions/checkout needs git + node + CA certs in the container; curl is the
+          # script's own prerequisite (it says so and stops without it).
+          - family: debian-13
+            image: debian:trixie
+            prep: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git nodejs zstd
+            rmweb: apt-get purge -y punktfunk-web
+            oncanary: grep -q ' canary main' /etc/apt/sources.list.d/punktfunk.list
+            onstable: grep -q ' stable main' /etc/apt/sources.list.d/punktfunk.list
+          # openh264 lives in fedora-cisco-openh264, hosted by Cisco rather than on the Fedora
+          # mirrors, and the runners cannot reach it — one unreachable package failed the whole
+          # transaction while the other 251 pulled at 15 MiB/s. It arrives as a weak dep of
+          # other packages, and punktfunk vendors its own openh264, so dropping the repo costs the
+          # smoke nothing. This is the debian row's --no-install-recommends, aimed at one repo.
+          - family: fedora-44
+            image: fedora:44
+            prep: rm -f /etc/yum.repos.d/fedora-cisco-openh264*.repo && dnf install -y -q curl git nodejs zstd
+            rmweb: dnf remove -y punktfunk-web
+            haveclient: rpm -q punktfunk-client
+            oncanary: grep -q 'fedora-44-canary' /etc/yum.repos.d/punktfunk.repo
+            onstable: grep -q 'rpm/fedora-44$' /etc/yum.repos.d/punktfunk.repo
+          - family: arch
+            image: archlinux:base
+            prep: pacman -Sy --noconfirm --needed curl git nodejs && (pacman-key --init >/dev/null 2>&1 || true)
+            rmweb: pacman -Rns --noconfirm punktfunk-web
+            haveclient: pacman -Q punktfunk-client
+            # The published STABLE host and client each ship /usr/share/icons/.../
+            # io.unom.Punktfunk.svg and pacman refuses the co-install (rpm tolerates identical
+            # duplicate files, so fedora keeps the default channel). Canary splits the file
+            # into punktfunk-icons. Drop the pin when stable splits it too — same trap as
+            # ci/omarchy/row.sh.
+            clientchannel: --channel canary
+            oncanary: grep -q '^\[punktfunk-canary\]' /etc/pacman.conf && ! grep -q '^\[punktfunk\]' /etc/pacman.conf
+            onstable: grep -q '^\[punktfunk\]' /etc/pacman.conf && ! grep -q '^\[punktfunk-canary\]' /etc/pacman.conf
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Prepare the container (${{ matrix.family }})
+        run: ${{ matrix.prep }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch the installer binary built from this tree
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
+          key: punktfunk-setup-musl-${{ github.run_id }}
+          fail-on-cache-miss: true
+      - name: Install the built binary
+        run: install -m 755 target/x86_64-unknown-linux-musl/release/punktfunk-setup /usr/local/bin/punktfunk-setup
+      # No tty → the installer runs as --yes; --no-start because there is no user systemd here.
+      # Root without sudo → the sudo shim, another path under test.
+      - name: Run the installer unattended
+        run: $PF --yes --no-start
+      - name: The host is installed and conflict-free
+        run: |
+          punktfunk-host --version
+          punktfunk-host detect-conflicts
+      # The console is the whole management surface — pairing, approving a device, every setting.
+      # A host without it can be installed and still be useless, so assert it by name: the binary
+      # the package puts on PATH and the user unit step 6 enables.
+      - name: The web console is installed too
+        run: |
+          command -v punktfunk-web-server
+          test -f /usr/lib/systemd/user/punktfunk-web.service
+      - name: Re-running is a no-op install
+        run: $PF --yes --no-start | grep -q 'already installed'
+      # The reported Fedora failure, as a test: a box that has the host but lost (or never got)
+      # the console must get one back from a re-run. Before the per-package check, the installer
+      # saw punktfunk-host on PATH, declared itself done, and left the box without a console
+      # while still printing the console's URL.
+      - name: A host without a console gets one back on re-run
+        run: |
+          ${{ matrix.rmweb }}
+          ! command -v punktfunk-web-server
+          $PF --yes --no-start
+          command -v punktfunk-web-server
+      # The channel switch, both ways, against the real registries — the half no textual gate can
+      # reach. Two things are actually at risk here and nowhere else: that the canary repo resolves
+      # at all, and that the walk back DOWN to stable happens instead of silently no-opping (canary
+      # is always a minor ahead, so every package manager refuses that step without being told).
+      # The version moving and then coming back is the proof; the repo-config greps localise a
+      # failure to the rewrite half. A red here can also mean the family's canary channel is empty
+      # — check https://git.unom.io/unom/-/packages before hunting in the script.
+      - name: Switch to canary and back to stable
+        run: |
+          set -eu
+          stable_v=$(punktfunk-host --version | head -1)
+          $PF --yes --no-start --channel canary
+          ${{ matrix.oncanary }}
+          canary_v=$(punktfunk-host --version | head -1)
+          test "$canary_v" != "$stable_v" \
+            || { echo "switch to canary left the version at $stable_v"; exit 1; }
+          command -v punktfunk-web-server
+          $PF --yes --no-start --channel stable
+          ${{ matrix.onstable }}
+          back_v=$(punktfunk-host --version | head -1)
+          test "$back_v" = "$stable_v" \
+            || { echo "walk back to stable gave $back_v, not $stable_v (a downgrade that did not happen?)"; exit 1; }
+      # A re-run with no --channel must follow the box, not the flag's stable default.
+      - name: A bare re-run does not drag a canary box back to stable
+        run: |
+          set -eu
+          $PF --yes --no-start --channel canary
+          canary_v=$(punktfunk-host --version | head -1)
+          $PF --yes --no-start
+          ${{ matrix.oncanary }}
+          test "$(punktfunk-host --version | head -1)" = "$canary_v" \
+            || { echo "a bare re-run moved a canary box off $canary_v"; exit 1; }
+          $PF --yes --no-start --channel stable
+      # M3: the client comes from the same family repo, so this is one more package from a
+      # repo the steps above already proved works. The flatpak fallback — the sysext boxes and
+      # any distro without a repo — is deliberately NOT installed here: flatpak in a container
+      # needs a session bus and buys nothing, so the crate's goldens assert its line instead.
+      #
+      # Debian has no leg on purpose. punktfunk-client is published there, but its deb depends
+      # on libc6 >= 2.43 and Debian 13 ships 2.41, so `--client` cannot resolve on the very
+      # release the host supports. That is a packaging floor to fix, not an installer bug; add
+      # the leg back the day the deb builds against trixie.
+      # Two runs where a channel pin applies: `--client --channel X` makes the installer take
+      # the channel-switch flow and drop --client, so the switch happens first and the client
+      # follows the box's channel on a bare re-run (the re-run steps above prove it does).
+      - name: The client installs from the same repo
+        if: matrix.haveclient != ''
+        run: |
+          test -z "${{ matrix.clientchannel }}" || $PF --yes --no-start ${{ matrix.clientchannel }}
+          $PF --yes --no-start --client
+          ${{ matrix.haveclient }}
+      - name: --uninstall takes the packages and the repo off again
+        run: |
+          $PF --yes --uninstall
+          ! command -v punktfunk-host
+          ! test -e /etc/apt/sources.list.d/punktfunk.list -o -e /etc/yum.repos.d/punktfunk.repo
+          ! grep -q '^\[punktfunk\]' /etc/pacman.conf 2>/dev/null

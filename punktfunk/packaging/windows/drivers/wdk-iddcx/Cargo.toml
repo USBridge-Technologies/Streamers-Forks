@@ -1,0 +1,17 @@
+# Safe-ish typed wrappers over the wdk-sys IddCx DDIs (table dispatch), plus the compile-time asserts
+# that keep the iddcx bindgen surface honest. The pf-vdisplay driver depends on it.
+# A plain lib (rlib) — no build.rs; it rides on wdk-sys's iddcx bindgen.
+[package]
+name = "wdk-iddcx"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+
+[dependencies]
+wdk-sys = { workspace = true, features = ["iddcx"] }
+
+[lints]
+workspace = true

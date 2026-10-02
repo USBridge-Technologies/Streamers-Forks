@@ -1,0 +1,527 @@
+# Build the punktfunk-host / punktfunk-client / punktfunk-web / punktfunk-scripting pacman packages from
+# packaging/arch/PKGBUILD and publish them to Gitea's Arch package registry, so Arch boxes
+# get new builds via `pacman -Syu`. Counterpart to deb.yml (apt) and rpm.yml (dnf/rpm-ostree).
+# Arch is rolling, so the packages build against whatever the archlinux:base-devel container
+# resolves today — the same sonames an up-to-date Arch box runs.
+#
+# Registry (public, unom org) — box setup (once), see packaging/arch/README.md. The registry
+# SIGNS the DB + packages, so the box imports the registry key first (pacman-key --add +
+# --lsign-key), then no SigLevel line is needed (pacman's default Required verifies):
+#   [punktfunk]                         # or [punktfunk-canary] for main-push builds
+#   Server = https://git.unom.io/api/packages/unom/arch/$repo/$arch
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (shared with docker.yml).
+# NOTE: this token + the registry-held private key are the trust root — a token holder can
+# publish a validly-signed package (the signature attests "via the registry", not "built by CI").
+name: arch
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    branches: [main]
+    # Scope canary builds to what this artifact is built FROM — a docs-only or
+    # web-only push should not light up the whole fleet. Applies to branch pushes;
+    # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
+    paths:
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-capture/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-clipboard/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-dmabuf/**'
+      - 'crates/pf-driver-proto/**'
+      - 'crates/pf-encode/**'
+      - 'crates/pf-encode-core/**'
+      - 'crates/pf-frame/**'
+      - 'crates/pf-gpu/**'
+      - 'crates/pf-host-config/**'
+      - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
+      - 'crates/pf-libva/**'
+      - 'crates/pf-paths/**'
+      - 'crates/pf-paths-win/**'
+      - 'crates/pf-portal/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-update/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pf-vaapi/**'
+      - 'crates/pf-v4l2dec/**'
+      - 'crates/pf-v4l2/**'
+      - 'crates/pf-vdisplay/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-win-display/**'
+      - 'crates/pf-zerocopy/**'
+      - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
+      - 'crates/punktfunk-encode-worker/**'
+      - 'crates/punktfunk-host/**'
+      - 'crates/punktfunk-tray/**'
+      - 'crates/pyrowave-sys/**'
+      - 'clients/linux/**'
+      - 'clients/session/**'
+      - 'clients/shared/**'
+      - 'clients/cli/**'
+      - 'web/**'
+      - 'sdk/**'
+      - 'api/openapi.json'
+      - 'packaging/arch/**'
+      - 'packaging/gamescope/**'
+      - 'packaging/linux/**'
+      - 'packaging/bazzite/host.env'
+      - 'packaging/bazzite/gamescope-headless-session'
+      - 'packaging/kde/host.env'
+      - 'LICENSE-MIT'
+      - 'LICENSE-APACHE'
+      - 'README.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/60-punktfunk.rules'
+      - 'scripts/60-punktfunk-dualsense.conf'
+      - 'scripts/70-punktfunk-client.rules'
+      - 'scripts/99-punktfunk-net.conf'
+      - 'scripts/99-punktfunk-client-net.conf'
+      - 'scripts/headless/**'
+      - 'scripts/host.env.example'
+      - 'scripts/io.unom.punktfunk.dm-helper.policy'
+      - 'scripts/pf-dm-helper'
+      - 'scripts/punktfunk-host-desktop-session.conf'
+      - 'scripts/punktfunk-host.service'
+      - 'scripts/punktfunk-kde-session.service'
+      - 'scripts/punktfunk-modules.conf'
+      - 'scripts/punktfunk-scripting.service'
+      - 'scripts/punktfunk-web-init.service'
+      - 'scripts/punktfunk-web.service'
+      - 'scripts/web-init.sh'
+      - 'scripts/alsa-ucm2/**'
+      - 'scripts/ci/assert-cap-matrix.sh'
+      - 'scripts/ci/gitea-release.sh'
+      - 'scripts/ci/pf-version.sh'
+      - 'scripts/ci/retry.sh'
+      - 'ci/bun.env'
+      - 'ci/install-bun.sh'
+      - '.gitea/workflows/arch.yml'
+    # Single project version: a `vX.Y.Z` tag is THE release. main publishes to the
+    # `punktfunk-canary` pacman repo as X.Y.Z-0.<run#> (sorts below the eventual X.Y.Z-1),
+    # tags to `punktfunk` — separate repos, so neither channel can shadow the other.
+    tags: ['v*']
+  # REBUILDING A PUBLISHED RELEASE, because on a rolling distro the ground moves under one.
+  # Arch went FFmpeg 8 -> 9 (every libav soname +1) four minutes before v0.25.0 was tagged, and
+  # the release's punktfunk-host — which linked libav* back then — shipped a bound no up-to-date
+  # box could satisfy. pacman prepares the whole transaction at once, so it did not merely block
+  # our package, it blocked those users' entire `pacman -Syu`. The host links no libav* now, but
+  # any shared library can do this again. The repair is a rebuild of the SAME version at a HIGHER
+  # pkgrel; nothing else reaches a box that already has the broken build recorded in its db.
+  # The workflow file at the tag can never carry inputs added after it was tagged, so dispatch
+  # this from `main`: it checks the tag's SOURCE out, publishes to the STABLE repo, and
+  # replaces the release-page assets. Same lever for any future "the distro moved" rebuild.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Rebuild this published release (e.g. v0.25.0) into the stable `punktfunk` repo. Empty = ordinary canary build of the dispatched ref.'
+        required: false
+        default: ''
+      pkgrel:
+        description: 'pkgrel for that rebuild — MUST be above the published one (2, 3, …); a same-pkgrel republish is invisible to pacman. Ignored without release_tag.'
+        required: false
+        default: '2'
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  # Shared compile cache: sccache -> RustFS S3 (storage.unom.io). NOTE: makepkg runs
+  # behind `sudo -u builder env ...`, which strips ambient env — the makepkg step
+  # re-exports these explicitly.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # The C/C++ half of the cache (aws-lc-sys, vendored libopus, openh264's C++). Safe at workflow
+  # level — no cross-compiling job here (see ci.yml's `rust` job for that trap). NOTE these ALSO
+  # have to be named in the makepkg step's `sudo -u builder env …` list: sudo's env_reset drops
+  # everything not listed, which is why the sccache vars are already spelled out there.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  CC_x86_64_unknown_linux_gnu: sccache cc
+  CXX_x86_64_unknown_linux_gnu: sccache c++
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    container:
+      # Everything the two pacman steps below used to download (~1 GB/run) is baked in,
+      # plus bun, sccache and node (ci/arch-ci.Dockerfile). The steps stay as --needed
+      # no-op guards for the one push where :latest lags an image-content change.
+      image: 192.168.1.58:5010/punktfunk-arch-ci:latest
+    timeout-minutes: 90
+    env:
+      CARGO_HOME: /usr/local/cargo
+    steps:
+      # git + nodejs must exist before actions/checkout — base-devel ships neither, and
+      # act_runner runs the action's JS with the CONTAINER's node, it does not inject one.
+      - name: Build + runtime-dev deps (no-op guard — baked into arch-ci)
+        # No -Syu: the image's snapshot IS the build environment (see the Dockerfile's
+        # rolling-release note); with everything installed this resolves locally and
+        # does nothing. It only matters on the push that adds a dep before the image
+        # rebuild lands — same bootstrap note as ci.yml's GTK4 step.
+        run: |
+          pacman -S --noconfirm --needed \
+            git nodejs rust clang cmake ninja nasm pkgconf python vulkan-headers \
+            gtk4 libadwaita sdl3 pipewire wayland libxkbcommon opus libei \
+            mesa libglvnd unzip libarchive || echo "::warning::pacman guard failed (stale image db?) — proceeding with baked packages"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A dispatched release rebuild takes its WORKFLOW from the ref you dispatch (the only
+          # way it can carry inputs the tag predates) and its SOURCE from the tag. Empty string
+          # = checkout's own default, i.e. the triggering ref, for every other trigger.
+          ref: ${{ github.event.inputs.release_tag }}
+
+      # The PKGBUILD vendors this bun, so it is the pin in ci/bun.env, never [extra]'s rolling bun.
+      # Baked into arch-ci; the script heals an image that lags the pin. A rebuilt tag older than
+      # the script runs on the image's bun.
+      - name: Pinned bun (no-op once the image bakes it)
+        run: |
+          if [ -f ci/install-bun.sh ]; then sh ci/install-bun.sh; else bun --version; fi
+
+      # Cache cargo's git dir too, not just the registry: the workspace includes
+      # clients/windows, whose windows-reactor/windows deps are git-pinned — cargo must CLONE
+      # them (windows-rs is huge) merely to resolve the workspace, even though nothing Windows
+      # is ever compiled here. Cached, that cost is paid once per runner.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-arch-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-arch-
+
+      - name: Version + channel
+        # vX.Y.Z tag -> X.Y.Z-1 in the `punktfunk` repo; main push -> <next-minor>-0.<run#> in
+        # `punktfunk-canary`. scripts/ci/pf-version.sh owns the rule, including why the run number
+        # is zero-padded; the leading `0.` sorts a canary BELOW the eventual `X.Y.Z-1` release.
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+          REBUILD_PKGREL: ${{ github.event.inputs.pkgrel }}
+        run: |
+          eval "$(bash scripts/ci/pf-version.sh --format arch)"   # -> PF_VERSION, PF_RELEASE, PF_CHANNEL
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            # Dispatched rebuild of a published release (see the workflow_dispatch note at the
+            # top): same upstream version, higher pkgrel, straight into the stable repo.
+            # ⚠ Keep that pkgrel SINGLE-DIGIT. Gitea's Arch registry picks the version its .db
+            # advertises by STRING order (the trap pf-version.sh zero-pads the canary run for),
+            # so "0.25.0-10" sorts BELOW "0.25.0-2" and the rebuild would never be advertised.
+            V="${RELEASE_TAG#v}"
+            R="${REBUILD_PKGREL:-2}"
+            REPO=punktfunk
+            case "$R" in
+              ''|*[!0-9.]*) echo "::error::pkgrel '$R' is not digits+dots"; exit 1 ;;
+              1) echo "::error::pkgrel 1 is the published build — a rebuild MUST go up (2, 3, …)"; exit 1 ;;
+            esac
+          else
+            V="$PF_VERSION"
+            R="$PF_RELEASE"
+            case "$PF_CHANNEL" in
+              stable) REPO=punktfunk ;;
+              *)      REPO=punktfunk-canary ;;
+            esac
+          fi
+          echo "PF_PKGVER=$V" >> "$GITHUB_ENV"
+          echo "PF_PKGREL=$R" >> "$GITHUB_ENV"
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
+          echo "pacman $V-$R -> repo '$REPO'"
+
+      # ── The web console, built once per (web+sdk content, bun) instead of once per job ─────────
+      # Shares deb.yml's key family — see the fuller note there. Unlike the RPM leg this needs no
+      # hand-off macro: makepkg builds with PF_SRCDIR pointing at this workspace, so a restored
+      # web/.output is already exactly where PKGBUILD's build-if-missing guard looks for it.
+      #
+      # Built here as root, BEFORE the makepkg step's `chown -R builder:` sweeps the tree, so the
+      # bundle ends up owned like everything else the builder user is handed.
+      - name: Web console cache key
+        run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
+      - name: Cache the built web console
+        id: webconsole
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: web/.output
+          key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
+
+      - name: Build the web console (cache miss only)
+        if: steps.webconsole.outputs.cache-hit != 'true'
+        run: |
+          cd web
+          # Retried: bun's download-and-extract is single-shot, and a truncated tarball reads as
+          # `Fail extracting tarball` (ci.yml's web job has the measurement).
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+          bun run build
+
+      - name: The console must exist (cache hit or fresh build)
+        run: |
+          if [ ! -f web/.output/server/index.mjs ]; then
+            echo "::error::web/.output is missing — neither the cache restore nor the build produced it"
+            exit 1
+          fi
+          grep -q 'Bun\.serve' web/.output/server/index.mjs || {
+            echo "::error::web/.output is not a bun bundle (wrong nitro preset)"; exit 1; }
+          echo "web console present: $(du -sh web/.output | cut -f1)"
+
+      - name: Build packages (makepkg)
+        run: |
+          git config --global --add safe.directory "$PWD"
+          # libcuda link stub — same trick as packaging/rpm/build-rpm.sh: the zerocopy FFI
+          # links -lcuda but the builder has no GPU; synthesize every cu* symbol the source
+          # references so a newly-added call can't silently break the link.
+          CU_SYMS="$(grep -rhoE '\bcu[A-Z][A-Za-z0-9_]*' crates/punktfunk-host/src/ | sort -u || true)"
+          if [ -n "$CU_SYMS" ] && [ ! -e /usr/lib/libcuda.so ]; then
+            STUB_C="$(mktemp --suffix=.c)"
+            for s in $CU_SYMS; do printf 'int %s(void){return 0;}\n' "$s" >> "$STUB_C"; done
+            gcc -shared -fPIC -Wl,-soname,libcuda.so.1 -o /usr/lib/libcuda.so.1 "$STUB_C"
+            ln -sf libcuda.so.1 /usr/lib/libcuda.so
+            rm -f "$STUB_C"; ldconfig
+            echo "== libcuda stub: $(printf '%s\n' "$CU_SYMS" | wc -l) symbols =="
+          fi
+          # makepkg refuses to run as root; deps are already installed above (-d skips the
+          # RPM-level check that can't see the script-installed bun anyway).
+          useradd -m builder
+          mkdir -p "$CARGO_HOME"   # actions/cache doesn't create it on a cache miss
+          chown -R builder: "$PWD" "$CARGO_HOME"
+          sudo -u builder git config --global --add safe.directory "$PWD"
+          mkdir -p dist && chown builder: dist
+          cd packaging/arch
+          # sudo env_reset strips the ambient env, so the sccache wiring must cross the
+          # boundary explicitly (same values as the workflow env block).
+          sudo -u builder env PF_SRCDIR="$GITHUB_WORKSPACE" PF_WITH_WEB=1 PF_WITH_SCRIPTING=1 \
+            PF_PKGVER="$PF_PKGVER" PF_PKGREL="$PF_PKGREL" \
+            CARGO_HOME="$CARGO_HOME" PKGDEST="$GITHUB_WORKSPACE/dist" \
+            RUSTC_WRAPPER="$RUSTC_WRAPPER" CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
+            SCCACHE_BUCKET="$SCCACHE_BUCKET" SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
+            SCCACHE_REGION="$SCCACHE_REGION" \
+            AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            CMAKE_C_COMPILER_LAUNCHER="$CMAKE_C_COMPILER_LAUNCHER" \
+            CMAKE_CXX_COMPILER_LAUNCHER="$CMAKE_CXX_COMPILER_LAUNCHER" \
+            CC_x86_64_unknown_linux_gnu="$CC_x86_64_unknown_linux_gnu" \
+            CXX_x86_64_unknown_linux_gnu="$CXX_x86_64_unknown_linux_gnu" \
+            makepkg -f -d --holdver
+          ls -lh "$GITHUB_WORKSPACE/dist"
+          # Visibility only. The stats have to be read as the SAME user that ran the compiles —
+          # sccache keeps its stats in a per-user server process, so a root `--show-stats` here
+          # would report an idle server and zero everything.
+          sudo -u builder env SCCACHE_BUCKET="$SCCACHE_BUCKET" SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
+            SCCACHE_REGION="$SCCACHE_REGION" \
+            AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            sccache --show-stats || true
+
+      # 0.26.0-1 setcap'd `cap_sys_nice=ep` on the host from this package's .INSTALL scriptlet and
+      # killed desktop streaming on every KDE box — with a green board, because nothing here ever
+      # looked at what the built package would DO. The lesson recorded then was "verify the
+      # PACKAGE, never the board"; this is that, and pacman is the channel where it matters most,
+      # since capabilities live in the scriptlet rather than in package metadata.
+      #
+      # Host must carry NOTHING, the worker exactly cap_sys_nice=ep. `--self-test` runs first so a
+      # guard that has quietly lost the ability to fail takes the job down rather than approving a
+      # release. (Only the host package is checked: the client/web/scripting packages ship neither
+      # binary and the script skips them by itself.)
+      - name: Assert the capability matrix (Arch package)
+        run: |
+          bash scripts/ci/assert-cap-matrix.sh --self-test
+          bash scripts/ci/assert-cap-matrix.sh "$GITHUB_WORKSPACE"/dist/punktfunk-host-*.pkg.tar.zst
+
+      # The optional HDR gamescope companion (packaging/gamescope) — a separate pkgbase with a
+      # completely different dependency set, published into the same repo so `pacman -S
+      # punktfunk-gamescope` is all an Arch/SteamOS box needs for 10-bit BT.2020 PQ.
+      #
+      # CACHED on `packaging/gamescope/**`: it depends on nothing else in this repo, so a normal
+      # push restores the built package instead of spending ~10 minutes on someone else's C++ tree.
+      # Arch is rolling, so the cache is invalidated by our own patch changes only — a stale binary
+      # against newer system libs is the same risk the distro's own package carries between rebuilds.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: gamescope
+        with:
+          path: dist-gamescope
+          key: punktfunk-gamescope-arch-${{ hashFiles('packaging/gamescope/**') }}
+
+      - name: Build punktfunk-gamescope (makepkg)
+        if: steps.gamescope.outputs.cache-hit != 'true'
+        # Best-effort: punktfunk-host works without it (SDR on the gamescope backend), and a
+        # failure building gamescope must not cost the packages this workflow exists to publish.
+        run: |
+          set -x
+          # Baked into arch-ci — a no-op guard, like the dep step above.
+          pacman -S --noconfirm --needed \
+            glslang libcap libdrm libinput libx11 libxcomposite libxdamage libxext \
+            libxkbcommon libxmu libxrender libxres libxtst libxxf86vm libavif libdecor \
+            hwdata luajit pipewire seatd sdl2-compat vulkan-icd-loader wayland \
+            xcb-util-errors xcb-util-wm xorg-xwayland \
+            meson cmake glm wayland-protocols benchmark libxcursor || true
+          mkdir -p dist-gamescope && chown builder: dist-gamescope
+          chown -R builder: packaging/gamescope
+          if sudo -u builder env PKGDEST="$GITHUB_WORKSPACE/dist-gamescope" \
+               bash -c 'cd packaging/gamescope && makepkg -f -d --holdver'; then
+            ls -lh dist-gamescope
+          else
+            echo "::warning::punktfunk-gamescope failed to build — Arch boxes stay SDR on the gamescope backend this run"
+            rm -rf dist-gamescope   # never cache a failed build (an empty path is not saved)
+          fi
+
+      # THE GATE THIS PIPELINE WAS MISSING. v0.25.0 shipped a soname bound the world had already
+      # moved past — every affected user got "unable to satisfy dependency … required by
+      # punktfunk-host", and because pacman prepares one transaction, their whole system upgrade
+      # stopped there. So ask the only question that matters before publishing: would a real,
+      # up-to-date Arch box install this?
+      #
+      # An empty --dbpath is what makes the answer honest. It means "nothing is installed", so
+      # pacman must satisfy every dependency FROM THE REPOS exactly as a user's box does. Checking
+      # against the builder's own installed set instead would let a stale package satisfy a stale
+      # bound and hide the break completely — the very illusion that shipped v0.25.0. `--print`
+      # resolves and prints; it downloads nothing and installs nothing.
+      - name: Assert every package installs on an up-to-date Arch box
+        run: |
+          export LC_ALL=C
+          mkdir -p /tmp/pf-instcheck
+          if ! pacman -Sy --dbpath /tmp/pf-instcheck --logfile /dev/null >/dev/null 2>&1; then
+            echo "::error::could not sync the Arch db — cannot prove these packages install"
+            exit 1
+          fi
+          check() {   # check FILES... -> 0 installable together, 1 not (reason on stdout)
+            pacman -U --print --noconfirm --dbpath /tmp/pf-instcheck --logfile /dev/null "$@" 2>&1
+          }
+          ls dist/*.pkg.tar.zst >/dev/null 2>&1 || { echo "::error::nothing in dist/ to check"; exit 1; }
+          rc=0
+          # ONE transaction for the whole built set — the shape reality takes (the published repo
+          # carries the siblings, so `pacman -S punktfunk-host` resolves punktfunk-icons from it)
+          # and the only shape -U --print can verify: file targets resolve against the sync db
+          # PLUS each other, and a split-package dependency exists only as a sibling file here.
+          # Checking one file at a time turned exactly that into a false "cannot be installed"
+          # (punktfunk-icons, run 16446). pacman's own error text names the offending package.
+          if out="$(check dist/*.pkg.tar.zst)"; then
+            echo "OK  the built set resolves together ($(echo "$out" | wc -l) targets)"
+          else
+            rc=1
+            echo "::error::the built set CANNOT be installed on an up-to-date Arch box:"
+            echo "$out" | sed 's/^/    /'
+          fi
+          # gamescope stays best-effort, exactly as its build step is: a companion that cannot
+          # install is dropped from the upload with a warning, never a reason to withhold the
+          # packages this workflow exists to publish. (It is also the one package that can be
+          # restored from a cache older than the current Arch snapshot.)
+          # The dist set rides along: gamescope may depend on punktfunk packages, and after the
+          # set proved itself above, a failure here is attributable to gamescope alone.
+          for pkg in dist-gamescope/*.pkg.tar.zst; do
+            [ -e "$pkg" ] || continue
+            if out="$(check "$pkg" dist/*.pkg.tar.zst)"; then
+              echo "OK  $(basename "$pkg")  ($(echo "$out" | wc -l) targets resolve)"
+            else
+              echo "::warning::$(basename "$pkg") is not installable on current Arch — NOT publishing it"
+              echo "$out" | sed 's/^/    /'
+              rm -f "$pkg"
+            fi
+          done
+          if [ "$rc" != 0 ]; then
+            echo "::error::refusing to publish: pacman would reject this on a current box, and a"
+            echo "::error::rejected dependency blocks the user's ENTIRE upgrade, not just punktfunk."
+            echo "::error::Usual cause: the arch-ci builder image lags Arch across a soname bump —"
+            echo "::error::bump 'refreshed:' in ci/arch-ci.Dockerfile, let docker.yml republish it, re-run."
+            exit 1
+          fi
+
+      # The dry-resolve above stops BEFORE pacman's file-conflict phase (`-U --print` only
+      # resolves), so two packages shipping the same path sail through it and then refuse to
+      # coexist on a real box — found live when host and client both shipped the brand SVG and
+      # installing the second died with "exists in filesystem". File lists are in the packages
+      # we just built; compare them directly.
+      - name: Assert no two packages ship the same file
+        run: |
+          dup=$(for p in dist/*.pkg.tar.zst dist-gamescope/*.pkg.tar.zst; do
+                  [ -e "$p" ] || continue
+                  bsdtar -tf "$p" | grep -v '/$' | grep -v '^\.'
+                done | sort | uniq -d)
+          if [ -n "$dup" ]; then
+            echo "::error::shipped by more than one package (pacman will refuse to install them together):"
+            printf '%s\n' "$dup" | sed 's/^/    /'
+            exit 1
+          fi
+          echo "OK  no path is claimed twice across the built packages"
+
+      # NOTE deliberately NO sysext image is built or published here: a prebuilt HOST binary on
+      # SteamOS breaks on the next A/B soname bump (and /var — where sysexts live — is
+      # per-partition-set), which is the standing packaging verdict behind the on-device
+      # distrobox build (scripts/steamdeck/, see scripts/steamdeck/README.md). That flow builds
+      # its own HDR gamescope too. packaging/arch/build-sysext.sh remains a by-hand tool for the
+      # Deck CLIENT image and for operators who accept the prebuilt-host trade-off.
+
+      - name: Publish to the Gitea Arch registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          # The gamescope companion rides the same loop (same repo, same channel).
+          cp -f dist-gamescope/*.pkg.tar.zst dist/ 2>/dev/null || true
+          for pkg in dist/*.pkg.tar.zst; do
+            echo "uploading $pkg"
+            NAME=$(bsdtar -xOf "$pkg" .PKGINFO | sed -n 's/^pkgname = //p')
+            VER=$(bsdtar -xOf "$pkg" .PKGINFO | sed -n 's/^pkgver = //p')
+            ARCH=$(bsdtar -xOf "$pkg" .PKGINFO | sed -n 's/^arch = //p')
+            # A re-tagged release re-fires this workflow and the registry 409s on duplicate
+            # package versions — delete any prior copy first (404 on the first publish is fine).
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/arch/$REPO/$NAME/$VER/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$pkg" \
+              "https://$REGISTRY/api/packages/$OWNER/arch/$REPO"
+          done
+          echo "published to $OWNER/arch/$REPO"
+
+      # On a real release, also attach the packages to the unified Gitea Release. A dispatched
+      # rebuild attaches to that SAME release object: the release page is a distribution surface
+      # too, and leaving the superseded .pkg.tar.zst sitting on it is one click away from handing
+      # someone the exact break the rebuild exists to fix.
+      - name: Attach packages to the Gitea release (stable tags + release rebuilds)
+        if: startsWith(gitea.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          TAG="${RELEASE_TAG:-$GITHUB_REF_NAME}"
+          RID=$(ensure_release "$TAG" "$TAG" auto)
+          for pkg in dist/*.pkg.tar.zst; do
+            upsert_asset "$RID" "$pkg"
+          done
+          # A rebuild bumps pkgrel, so its FILENAMES differ from the ones already attached, and
+          # upsert_asset only replaces by name — the superseded set would survive untouched.
+          # Drop every pacman asset (and .sha256 sidecar) this upload did not just write.
+          #
+          # ⚠⚠ THIS MUST LIVE IN THE WORKFLOW, NOT IN scripts/ci/gitea-release.sh. The sourced
+          # script comes from the CHECKED-OUT TREE, which on a release rebuild is the OLD TAG —
+          # so it can only ever offer the helpers that existed when that tag was cut. A helper
+          # added for this feature is therefore guaranteed ABSENT in the one code path that
+          # calls it: the first attempt failed with `prune_release_assets: command not found`
+          # after publishing perfectly. Only the workflow file itself is taken from the ref you
+          # dispatch. Same reason a packaging fix made after a tag does NOT reach a rebuild of
+          # that tag — the PKGBUILD is the tag's too.
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            KEEP="$(cd dist && printf '%s ' *.pkg.tar.zst)"
+            # An UNMATCHED glob would come through literally and match nothing in the keep set —
+            # i.e. "delete every pacman asset on the release". Skip entirely instead.
+            case "$KEEP" in *'*'*) KEEP="" ;; esac
+            API="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+            if [ -n "$KEEP" ]; then
+              curl -fsS "$API/releases/$RID/assets" -H "Authorization: token $GITEA_TOKEN" \
+                | python3 -c "import json,sys;k=set(sys.argv[1].split());k|={n+'.sha256' for n in k};print('\n'.join('%s %s'%(a['id'],a['name']) for a in json.load(sys.stdin) if a.get('name','').endswith(('.pkg.tar.zst','.pkg.tar.zst.sha256')) and a['name'] not in k))" "$KEEP" \
+                | while read -r id name; do
+                    [ -n "$id" ] || continue
+                    echo "dropping superseded release asset: $name"
+                    curl -fsS -o /dev/null -X DELETE "$API/releases/$RID/assets/$id" \
+                      -H "Authorization: token $GITEA_TOKEN" || true
+                  done
+            fi
+          fi

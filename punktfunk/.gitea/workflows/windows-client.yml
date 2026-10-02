@@ -1,0 +1,475 @@
+# Windows CLIENT — build, lint, test and package, on a self-hosted windows-amd64 runner (host mode;
+# the generic runner + MSVC/WinUI toolchain come from unom/infra's windows-runner/, punktfunk's own
+# extras — the WDK and the ARM64 rustup target — self-provision via the "Ensure Windows
+# toolchain" step, a fast no-op once present, so any runner with that label works).
+#
+# Covers BOTH client binaries: the WinUI 3 shell (windows-reactor + WASAPI + SDL3) and the
+# punktfunk-session Vulkan client (pf-presenter/pf-client-core/pf-console-ui — every stream runs in
+# it, spawned by the shell), plus punktfunk-cli, whose `punktfunk.exe` alias the MSIX manifest
+# references.
+#
+# ⚠ ONE FILE, ONE RELEASE BUILD PER ARCH. Build, clippy and fmt share it. Tests build under the
+# `ci-test` profile (release without LTO), the only second tree. Every extra tree costs disk, and
+# `cabac_decoder.cpp: fatal error C1069` in openh264-sys2's vendored C++ means the disk ran out,
+# not a source error. Do not add a debug leg.
+#
+# Renamed from windows-msix.yml deliberately, and safely: `github.run_number` is REPO-WIDE in Gitea
+# (consecutive runs of DIFFERENT workflows get consecutive numbers), so the canary MSIX version
+# `<minor>.<run>.0` keeps climbing across the rename — on GitHub, where run_number is per-workflow,
+# this same rename would have reset it to 1 and made every canary sort below the published ones.
+#
+# Two architectures from ONE x64 runner: x86_64-pc-windows-msvc natively and aarch64-pc-windows-msvc
+# by cross-compiling. The x64 MSVC toolset ships an ARM64 cross compiler
+# (VC\Tools\MSVC\<ver>\bin\Hostx64\arm64\cl.exe) and aarch64-pc-windows-msvc is a tier-2 Rust target
+# with host tools, so no ARM64 runner is needed — the cc/cmake crates pick the ARM64 compiler from
+# the target triple (SDL3 + libopus build-from-source cross-compile fine). The one thing the aarch64
+# build can't do is *run* on the x64 host, so fmt + test run only for x64.
+#
+# ARM64 note: rust-skia publishes no aarch64-pc-windows-msvc prebuilt binaries, so the session builds
+# --no-default-features there (no Skia console UI; streaming is unaffected) — flip when
+# skia-binaries adds the target.
+#
+# NO FFmpeg here since M10 (design/client-native-decode.md §6): the client decodes with
+# pf-vkdecode / pf-dxvadec / openh264+rav1d and links no libav* at all, so this workflow sets
+# no FFMPEG_DIR, no PF_FFVK_VULKAN_INCLUDE and prepends nothing to PATH. Nor does the host
+# any more, so nothing provisions an FFmpeg tree.
+#
+# The MSVC/WinUI toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, CARGO_HOME,
+# CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. Per-checkout / per-arch
+# vars are set in a step:
+#   - CARGO_TARGET_DIR=C:\t…  the runner's host workdir is buried deep under
+#                          C:\Windows\System32\config\systemprofile\.cache\act\<hash>\hostexecutor\,
+#                          so the default target\ path blows past Windows' MAX_PATH (260) inside the
+#                          CMake-from-source builds (audiopus_sys / SDL3) — MSBuild's tracker then
+#                          can't create its .tlog (DirectoryNotFoundException -> MSB6003). A short
+#                          root keeps every nested path well under the limit (per-arch so the two
+#                          matrix legs don't share a target dir).
+#
+# Steps use `shell: pwsh` (PowerShell 7) deliberately: Windows PowerShell 5.1's
+# `Out-File -Encoding utf8` prepends a UTF-8 BOM that corrupts the first GITHUB_ENV line (that
+# var silently never gets set). pwsh writes no BOM.
+# The runner's daemon wrapper puts C:\Program Files\PowerShell\7 on PATH so the job finds pwsh.
+#
+# ── Packaging (the `Pack + sign MSIX` step onward; skipped on pull requests) ──────────────────────
+#
+# Publishes THREE artifacts per arch (x64 + ARM64) to Gitea's generic package registry, all packed
+# from one assembled layout:
+#   punktfunk-client-setup_<arch>.exe   — per-user installer exe, the DEFAULT download
+#                                         (stable path Steam can launch: overlay + Big Picture work)
+#   punktfunk-client-windows_<arch>-portable.zip — the same file set, no installer
+#   punktfunk-client-windows_<arch>.msix — kept for Microsoft Store compatibility
+#
+# Registry (public, unom org): https://git.unom.io/unom/-/packages  (generic group)
+# Packaging internals: clients/windows/packaging/README.md.
+#
+# Versioning — single project version; MSIX requires a strictly 4-part numeric version, so:
+#   vX.Y.Z tag -> X.Y.Z.0  (THE release; any -rc/+meta pre-release suffix is dropped for MSIX).
+#                Published to the generic registry + the stable `latest/` alias + attached to the
+#                unified Gitea Release alongside every other platform's artifact.
+#   main push / dispatch -> <next-minor>.<run_number>.0  (canary; base is one minor ahead of the
+#                latest stable tag via scripts/ci/pf-version.ps1, run number climbs monotonically).
+# Both arches share the version; artifacts are arch-suffixed (..._x64.msix / ..._arm64.msix).
+#
+# Signing (clients/windows/packaging/pack-msix.ps1), first match wins:
+#   1. Azure Artifact Signing — what this workflow always takes, since the AZURE_CODESIGNING_*
+#      endpoint/account/profile are literals below and only the AZURE_TENANT_ID / AZURE_CLIENT_ID /
+#      AZURE_CLIENT_SECRET secrets are needed. Publicly trusted, so NO .cer is emitted or published
+#      and users import nothing. NOTE the Publisher DN is the Azure profile's verified subject, and
+#      MSIX identity is name + publisher: moving to it changed the package identity, so installs
+#      predating it need an uninstall, not an upgrade.
+#   2. MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD — the older self-signed .pfx, kept as a fallback.
+#   3. an ephemeral self-signed cert. Modes 2 and 3 DO emit a .cer next to the .msix, which users
+#      would have to import into Trusted People before Windows will install the package.
+#
+# Modes 2 and 3 are for canary/CI ONLY. On a v* tag the pack script FAILS CLOSED — a missing secret
+# aborts the build instead of quietly shipping a release signed by a per-build throwaway cert that
+# no one can pin. Nothing to opt into here: the script reads GITHUB_REF itself.
+name: windows-client
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    branches: [main]
+    # The crate lines are the Windows client build closure. scripts/ci/check-workflow-paths.py
+    # fails CI when one is missing, in either leg.
+    paths:
+      - 'clients/windows/**'
+      - 'clients/session/**'
+      - 'clients/cli/**'
+      - 'crates/punktfunk-core/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-dxvadec/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pyrowave-sys/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'scripts/ci/pf-version.ps1'
+      - 'scripts/ci/pf-version.vectors'
+      - '.gitea/workflows/windows-client.yml'
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'clients/windows/**'
+      - 'clients/session/**'
+      - 'clients/cli/**'
+      - 'crates/punktfunk-core/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-dxvadec/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pyrowave-sys/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'scripts/ci/pf-version.ps1'
+      - 'scripts/ci/pf-version.vectors'
+      - '.gitea/workflows/windows-client.yml'
+  workflow_dispatch:
+
+# Shared compile cache: sccache -> RustFS S3 (storage.unom.io, LAN-pinned via ci-core's
+# unbound). Keys include compiler hash + target + flags, so cross-OS/arch entries can
+# never collide; every Rust job on every host feeds and reads one warm cache.
+#
+# NOTE the C/C++ launcher wiring the Linux workflows carry (CMAKE_*_COMPILER_LAUNCHER, CC_*) is
+# deliberately NOT set here. This runner's failure mode under extra compiler processes is the
+# C1069 disk/temp exhaustion documented in windows-host.yml, so sccache-for-MSVC is its own
+# change, to be made with a measurement rather than folded into a reorganisation.
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  PKG: punktfunk-client-windows
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # The Windows client build is opt-in on a pull request: add the `ci:windows-client` label, or `ci:all`. Only someone with
+  # write access can label, so this is also the trust boundary. Pushes and tags are unaffected.
+  #
+  # Shell rather than a label expression on the job's `if`, because the event payload is a
+  # snapshot: a label added after the last push is not in it, and a re-run replays the old one.
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      heavy: ${{ steps.gate.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Decide whether this pull request runs Windows client build
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          sh scripts/ci/pr-gate.sh --self-test
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "heavy=true" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          API="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls/$PR"
+          curl -fsS "$API" -H "Authorization: token $GITEA_TOKEN" > /tmp/pr.json || true
+          [ -s /tmp/pr.json ] || curl -fsS "$API" > /tmp/pr.json || true
+          sh scripts/ci/pr-gate.sh --label ci:windows-client < /tmp/pr.json | tee -a "$GITHUB_OUTPUT"
+
+  # SECURITY: this job builds PULL-REQUEST code (attacker-controllable build.rs / cargo build) on the
+  # host-mode, persistent `windows-amd64` runner that the release-SIGNING steps below and
+  # windows-host.yml (which decrypt MSIX_CERT_PFX_B64 + REGISTRY_TOKEN to disk) also run on. Untrusted
+  # PR code could therefore persist on that machine or harvest signing material a later job exposes.
+  # The DEFINITIVE fix is operational and lives outside this file: enable Gitea's "require approval to
+  # run workflows for PRs from outside collaborators/forks", and/or route PR CI to isolated ephemeral
+  # runners. The `if:` below is only a backstop, and it fails closed: only a PR whose head repo IS
+  # this repo runs. A fork, or a Gitea that leaves the field empty, does not.
+  client:
+    runs-on: windows-amd64
+    needs: gate
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository
+      && needs.gate.outputs.heavy == 'true')
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            td: C:\t
+            session_flags: ''
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            td: C:\t-a64
+            # No skia-binaries prebuilt for aarch64-pc-windows-msvc: the session ships
+            # without the Skia console UI on ARM64 (streaming unaffected) — flip when
+            # rust-skia adds the target.
+            session_flags: '--no-default-features'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Ensure Windows toolchain (WDK, ARM64 target)
+        shell: pwsh
+        run: ./scripts/ci/ensure-windows-toolchain.ps1
+
+      # The version rule's pwsh twin must agree with pf-version.sh (ci.yml checks that side).
+      - name: pf-version vectors
+        shell: pwsh
+        run: ./scripts/ci/pf-version.ps1 -SelfTest
+
+      - name: Configure + version
+        shell: pwsh
+        run: |
+          # CARGO_TARGET_DIR (per-arch, short) dodges the MAX_PATH wall in the CMake-from-source
+          # crates (see this file's header). No FFMPEG_DIR: nothing in this package links libav*
+          # (M10), and pack-msix.ps1 no longer copies runtime DLLs from one.
+          "CARGO_TARGET_DIR=${{ matrix.td }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          rustup target add ${{ matrix.target }}
+          rustc --version
+          cargo --version
+          $pf = & "$env:GITHUB_WORKSPACE/scripts/ci/pf-version.ps1"   # single source of truth: base is one minor ahead of the latest stable tag
+          $parts = if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            # MSIX needs a purely-numeric 4-part version: drop any -rc/+meta pre-release suffix.
+            (($env:GITHUB_REF_NAME -replace '^v', '') -replace '[-+].*$', '').Split('.')
+          } else {
+            # Canary: <major>.<minor>.<run>.0 — major.minor track one minor ahead of stable, run climbs monotonically.
+            @($pf.PF_MAJOR, $pf.PF_MINOR, $env:GITHUB_RUN_NUMBER)
+          }
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $v = ($parts[0..3] -join '.')
+          "MSIX_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "MSIX version $v  arch ${{ matrix.arch }}  target ${{ matrix.target }}  target-dir ${{ matrix.td }}"
+
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        shell: pwsh
+        continue-on-error: true
+        # Cargo judges path crates by mtime, and this checkout is new. Every job that builds
+        # into this target dir must run this first: scripts/ci/src-mtimes.rs.
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o "$env:RUNNER_TEMP\src-mtimes.exe"; if ($LASTEXITCODE) { throw "src-mtimes build" }
+          & "$env:RUNNER_TEMP\src-mtimes.exe" $env:CARGO_TARGET_DIR; if ($LASTEXITCODE) { throw "src-mtimes" }
+
+      - name: sccache preflight (a dead cache costs a cold build, not the leg)
+        shell: pwsh
+        # A daemon that cannot reach S3 fails cargo at `rustc -vV`, before a line compiles — and
+        # cargo PINS that failed probe in <target-dir>/.rustc_info.json, so one transient 401
+        # wedges this leg on every later run until the file is deleted. A 2026-09-04 blip cost the
+        # arm64 leg 11 runs that way. Probe once here and drop the wrapper when it fails, so the
+        # cached probe records a success.
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          # Capture before truncating: piping a native command into `Select-Object -First`
+          # stops it early, so $LASTEXITCODE stays unset and $null -ne 0 reads as a failure -
+          # which dropped the cache on a daemon that had just answered.
+          $stats = & sccache --show-stats 2>&1
+          $code = $LASTEXITCODE
+          $stats | Select-Object -First 12 | Write-Output
+          if ($code -ne 0) {
+            Write-Warning "sccache daemon failed to start - building this leg without the cache"
+            "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      # All three client binaries, ONCE, in release. The shell spawns punktfunk-session.exe (a
+      # package sibling) for every stream, and punktfunk-cli builds the `punktfunk.exe` the manifest
+      # aliases and pack-msix.ps1 requires (bf981027 added the requirement without the build — the
+      # same gap 90c84ef4 closed for deb). --no-default-features on ARM64 is a no-op for the shell.
+      #
+      # Release, not debug, for the lint legs below too; tests build under `ci-test` (see the header).
+      - name: Build (release)
+        shell: pwsh
+        run: cargo build --release --locked -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli ${{ matrix.session_flags }} --target ${{ matrix.target }}
+
+      - name: Clippy (-D warnings)
+        shell: pwsh
+        run: |
+          # Every crate in the `paths:` trigger above but punktfunk-core is named here: `cargo
+          # clippy -p X` BUILDS a dependency but only LINTS the packages it is given. The arm64
+          # build has no Skia console and no PyroWave, so those two are x64 only.
+          $pkgs = @('-p','punktfunk-client-windows','-p','punktfunk-client-session','-p','punktfunk-cli','-p','pf-client-core','-p','pf-presenter','-p','pf-bitstream','-p','pf-vkdecode','-p','pf-dxvadec','-p','pf-update-check')
+          $sf = @()
+          if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { $sf = @('--no-default-features') } else { $pkgs += @('-p','pf-console-ui','-p','pyrowave-sys') }
+          cargo clippy --release --locked @pkgs --all-targets @sf --target ${{ matrix.target }} -- -D warnings
+          if ($LASTEXITCODE) { throw "clippy" }
+
+      - name: Rustfmt check
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cargo fmt -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-dxvadec -- --check
+          if ($LASTEXITCODE) { throw "rustfmt" }
+
+      - name: Test
+        # x64 only: the aarch64 binaries cross-compile here but cannot RUN on this host.
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cargo test --profile ci-test --locked -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-dxvadec --target ${{ matrix.target }}
+          if ($LASTEXITCODE) { throw "tests" }
+
+      # d3d11va without desktop. The release build above enables desktop, so it never
+      # compiles this feature alone. Same release target dir, and desktop is off, so this
+      # does not rebuild openh264 or open a second debug tree (the C1069 failure).
+      # Clippy with warnings denied, same as the job above. `cargo check` would stay green.
+      - name: Clippy d3d11va without desktop
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cargo clippy --release --locked -p pf-client-core --no-default-features --features d3d11va --target ${{ matrix.target }} -- -D warnings
+          if ($LASTEXITCODE) { throw "d3d11va clippy" }
+
+      - name: sccache stats (visibility only)
+        if: always()
+        shell: pwsh
+        run: sccache --show-stats
+
+      # ── Packaging: pushes, tags and dispatch only. A PR gets the build/lint/test signal above and
+      # stops there — packing would sign with a throwaway cert and publish nothing.
+      - name: Pack + sign MSIX
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          # Azure Artifact Signing (formerly Trusted Signing) — takes precedence over MSIX_CERT_*
+          # when all three are set. Not secret: an account/profile name and a regional endpoint,
+          # inert without the credentials below. The profile's verified subject is also the MSIX
+          # manifest Publisher; pack-msix.ps1 reads the signature back and fails on a mismatch.
+          AZURE_CODESIGNING_ENDPOINT: https://neu.codesigning.azure.net/
+          AZURE_CODESIGNING_ACCOUNT: unomsigning
+          AZURE_CODESIGNING_PROFILE: unom-io
+          # Service principal 'punktfunk-ci-signing', holding ONLY the Artifact Signing Certificate
+          # Profile Signer role, scoped to the unom-io profile — it can sign and nothing else.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          # Legacy self-signed path, kept as the fallback for builds without Azure access.
+          MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+        run: |
+          & clients/windows/packaging/pack-msix.ps1 `
+            -Version $env:MSIX_VERSION -Arch ${{ matrix.arch }} `
+            -TargetDir ${{ matrix.td }}\${{ matrix.target }}\release -OutDir ${{ matrix.td }}\msix
+
+      # The DEFAULT download: a per-user installer exe + a portable zip, packed from the layout
+      # the MSIX step just assembled. The MSIX shape (WindowsApps ACLs, alias-only activation)
+      # breaks Steam's non-Steam-game picker, the Steam overlay injection and Big Picture launch;
+      # the installer's stable %LOCALAPPDATA%\Programs\Punktfunk path is the fix. The MSIX stays
+      # published for Microsoft Store compatibility. Same signing env as the MSIX step above.
+      - name: Pack + sign installer + portable zip
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          AZURE_CODESIGNING_ENDPOINT: https://neu.codesigning.azure.net/
+          AZURE_CODESIGNING_ACCOUNT: unomsigning
+          AZURE_CODESIGNING_PROFILE: unom-io
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+        run: |
+          # The engine exe (punktfunk-setup-client + payload): same name, signing and silent
+          # flags as the Inno installer it replaced, and the same per-user ARP key.
+          & clients/windows/packaging/pack-client-installer.ps1 `
+            -Version $env:MSIX_VERSION -Arch ${{ matrix.arch }} `
+            -LayoutDir ${{ matrix.td }}\msix\layout -OutDir ${{ matrix.td }}\installer
+
+      # The smoke, on the artifact that ships: a signature present, and (x64, where the runner can
+      # run it) the packed client exe's silent dry-run — unelevated, the client twin carries no
+      # UAC manifest — writing the client plan into /LOG=.
+      - name: Smoke the installer (signature, silent dry-run)
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $setup = $env:CLIENT_SETUP_PATH
+          $sig = Get-AuthenticodeSignature $setup
+          Write-Output "client installer Authenticode: $($sig.Status) ($($sig.SignerCertificate.Subject))"
+          if (-not $sig.SignerCertificate) { throw "client installer is unsigned" }
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            $log = "${{ matrix.td }}\installer\smoke.log"
+            $p = Start-Process -FilePath $setup -PassThru -Wait `
+              -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=$log", '--dry-run'
+            if ($p.ExitCode -ne 0) { throw "silent dry-run exited $($p.ExitCode)" }
+            $text = Get-Content $log -Raw
+            foreach ($line in @('client installer', 'would unpack the payload', 'Punktfunk.lnk', 'Done. Next:')) {
+              if (-not $text.Contains($line)) { throw "smoke transcript lacks: $line" }
+            }
+            Get-Content $log
+          }
+          Write-Output "client installer: $([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB"
+
+      - name: Publish to Gitea generic registry
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $base = "https://$($env:REGISTRY)/api/packages/$($env:OWNER)/generic/$($env:PKG)"
+          # stable release -> `latest/` alias; canary main build -> `canary/` alias.
+          $alias = if ($env:GITHUB_REF -like 'refs/tags/v*') { 'latest' } else { 'canary' }
+          # version-less, arch-suffixed alias names so each channel keeps one predictable URL.
+          # Under Azure signing there is no .cer, so MSIX_CER_PATH is unset. The quotes below are
+          # load-bearing: "$($env:UNSET)" interpolates to an empty string (a legal key), whereas a
+          # BARE $env:UNSET is $null and a null key is a hard error in a hash literal — which is
+          # exactly how windows-host.yml's publish step broke. Added explicitly rather than relying
+          # on that accident, so removing the quotes can't silently reintroduce it.
+          $aliasNames = @{ "$($env:MSIX_PATH)" = "$($env:PKG)_${{ matrix.arch }}.msix" }
+          if ($env:MSIX_CER_PATH) { $aliasNames[$env:MSIX_CER_PATH] = "$($env:PKG)_${{ matrix.arch }}.cer" }
+          # The installer + portable zip (the default download; docs point at these alias URLs).
+          if ($env:CLIENT_SETUP_PATH) { $aliasNames[$env:CLIENT_SETUP_PATH] = "punktfunk-client-setup_${{ matrix.arch }}.exe" }
+          if ($env:CLIENT_ZIP_PATH) { $aliasNames[$env:CLIENT_ZIP_PATH] = "$($env:PKG)_${{ matrix.arch }}-portable.zip" }
+          $files = @($env:MSIX_PATH, $env:MSIX_CER_PATH, $env:CLIENT_SETUP_PATH, $env:CLIENT_ZIP_PATH) | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $files) { throw "pack produced no artifacts to publish" }
+          function Put($f, $url) {
+            # The generic registry makes a versioned path immutable and 409s a re-upload, so a tag
+            # re-run re-publishing the identical artifact must be tolerated as a no-op. (The channel
+            # alias below is delete-then-reuploaded and never 409s.) No curl -f, so we can read the
+            # status code instead of aborting on it.
+            $code = [int](curl.exe -sS -o NUL -w "%{http_code}" --user "enricobuehler:$($env:REGISTRY_TOKEN)" --upload-file "$f" "$url")
+            if ($LASTEXITCODE -ne 0) { throw "upload failed (curl exit $LASTEXITCODE): $url" }
+            if ($code -eq 409) { Write-Output "already published (409, immutable): $url"; return }
+            if ($code -lt 200 -or $code -ge 300) { throw "upload failed (HTTP $code): $url" }
+            Write-Output "published ($code): $url"
+          }
+          foreach ($f in $files) {
+            $name = Split-Path $f -Leaf
+            # 1) immutable, versioned path
+            Put $f "$base/$($env:MSIX_VERSION)/$name"
+            # 2) channel alias (delete-then-reupload; the generic registry 409s on an existing file)
+            $an = $aliasNames["$f"]
+            curl.exe -fsS -o NUL --user "enricobuehler:$($env:REGISTRY_TOKEN)" -X DELETE "$base/$alias/$an" 2>$null
+            Put $f "$base/$alias/$an"
+          }
+
+      # On a real release, also attach the installer + portable zip + MSIX (+ its .cer) to the
+      # unified Gitea Release. Both arch legs attach to the same release concurrently — the
+      # helper's create-or-fetch handles the race, and x64/arm64 filenames differ so the assets
+      # don't collide.
+      - name: Attach client artifacts to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.ps1
+          $rid = Ensure-GiteaRelease -Tag $env:GITHUB_REF_NAME -Name $env:GITHUB_REF_NAME -Prerelease 'auto'
+          foreach ($f in @($env:CLIENT_SETUP_PATH, $env:CLIENT_ZIP_PATH, $env:MSIX_PATH, $env:MSIX_CER_PATH)) {
+            if ($f -and (Test-Path $f)) { Upsert-GiteaAsset -ReleaseId $rid -File $f }
+          }

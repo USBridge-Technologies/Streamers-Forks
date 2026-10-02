@@ -1,0 +1,85 @@
+# pf-vdisplay — the all-Rust UMDF IddCx virtual-display driver (M1 step-2 rewrite onto wdk-sys + the
+# owned pf-driver-proto ABI). Replaces the vendored-binding oracle at packaging/windows/vdisplay-driver/
+# (deleted once on-glass parity is reached, per design/windows-host-rewrite.md §14 STEP 8).
+[package]
+name = "pf-vdisplay"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.wdk.driver-model]
+driver-type = "UMDF"
+umdf-version-major = 2
+target-umdf-version-minor = 31
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+wdk-build.workspace = true
+
+[features]
+default = []
+# Spike S5: the probe IOCTLs (`encode_probe.rs`) on top of the shipping backends. CI builds it so
+# the probe keeps compiling under the WDK toolchain.
+encode-probe = []
+
+[dependencies]
+# The encoder backends this driver opens inside WUDFHost — the only Windows video transport.
+# AMF and Media Foundation ride along on every arch; the three x86-64 ones sit in the target
+# table at the end of this file.
+pf-encode-win.workspace = true
+pf-frame.workspace = true
+# The backends' error type; the driver only formats it.
+anyhow = "1"
+# The backends' diagnostics: bridged into `dbglog!` (`log::install_tracing_bridge`) — without a
+# subscriber every NVENC status string and AMF rejection inside WUDFHost is dropped.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The `windows` the encoder backends speak. The driver's own stays 0.58 (below); `encode::convert`
+# bridges the two by `QueryInterface`, so both resolve.
+windows62 = { package = "windows", version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+wdk-sys = { workspace = true, features = ["iddcx"] }
+wdk-iddcx.workspace = true
+pf-driver-proto.workspace = true
+# The control plane's `wdf::Request` token: one contracted `unsafe` per IOCTL callback, safe buffer
+# I/O after it. Same layer the gamepad drivers ride.
+pf-umdf-util.workspace = true
+# Casts the Pod `pf-driver-proto` control structs to/from the request buffers. Version pinned to
+# pf-driver-proto's so the graph resolves ONE bytemuck.
+bytemuck = "1.19"
+
+# The swap-chain processor's render-side D3D11 device + worker. 0.58.0 matches the wdk-build
+# transitive `windows`. The encoder backends' 0.62 (`windows62` above) is a second windows-rs on
+# purpose; `encode::convert` bridges the two by `QueryInterface`.
+[dependencies.windows]
+version = "0.58.0"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+]
+
+[lints]
+workspace = true
+
+# NVENC needs cudarc, QSV CMakes Intel's dispatcher and PyroWave's Granite has no MSVC-ARM64 SIMD
+# path (`simd.hpp: #error "Implement me."`). None of that hardware exists on a Snapdragon SoC
+# either: an ARM64 driver opens Media Foundation and nothing else.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+pf-encode-win = { workspace = true, features = ["nvenc", "qsv", "pyrowave"] }

@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unom <packages@unom.io>
+Subject: [PATCH] fix(steamcompmgr): persist the CLI framerate limit
+
+The CLI cap must survive the refresh-policy update in every paint.
+Writing only the derived target loses it when the persistent override is
+zero, leaving headless VRR clients unpaced.
+
+Seed both screen types through the existing override setter, without
+refresh switching. Steam remains free to replace or clear those defaults.
+Stamp pfhdr10 so callers can require paced headless VRR.
+---
+ src/meson.build      | 3 ++-
+ src/steamcompmgr.cpp | 9 ++++++++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -189,7 +189,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr7 — …and PipeWire teardown cannot SIGSEGV a lingering compositor (no new capability)
+ #   +pfhdr8 — …and the seat's keyboard carries the XKB_DEFAULT_* keymap (honours the box layout)
+ #   +pfhdr9 — …and the headless connector supports adaptive sync (paint on game commit)
+-version_tag = vcs_tag + '+pfhdr9' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr10 — …and the CLI framerate limit persists across paints without switching refresh
++version_tag = vcs_tag + '+pfhdr10' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -8543,7 +8543,14 @@ steamcompmgr_main(int argc, char **argv)
+ 				} else if (strcmp(opt_name, "hdr-itm-target-nits") == 0) {
+ 					g_flHDRItmTargetNits = atof(optarg);
+ 				} else if (strcmp(opt_name, "framerate-limit") == 0) {
+-					g_nSteamCompMgrTargetFPS = atoi(optarg);
++					const int nTargetFPS = atoi( optarg );
++					// Seed both screen types; Steam can replace or clear either override.
++					// The CLI limit must not enable dynamic refresh switching.
++					for ( int i = 0; i < gamescope::GAMESCOPE_SCREEN_TYPE_COUNT; i++ )
++					{
++						steamcompmgr_set_app_refresh_cycle_override(
++							gamescope::GamescopeScreenType( i ), nTargetFPS, false, true );
++					}
+ 				} else if (strcmp(opt_name, "reshade-effect") == 0) {
+ 					g_reshade_effect = optarg;
+ 				} else if (strcmp(opt_name, "reshade-technique-idx") == 0) {

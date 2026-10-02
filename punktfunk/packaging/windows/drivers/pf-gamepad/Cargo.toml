@@ -1,0 +1,36 @@
+# pf-gamepad - punktfunk virtual gamepads (DualSense / DualShock 4 / DualSense Edge / Steam Deck),
+# ONE UMDF2 HID minidriver serving all four identities. Named for the role, not for one of them —
+# it was `pf-dualsense`, which read as if the other three were somewhere else.
+# A member of the in-tree drivers workspace (shares the vendored wdk-sys/wdk-build with the bindgen pin
+# + the crt-static .cargo/config), built from source per release like pf-vdisplay.
+[package]
+name = "pf-gamepad"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+description = "punktfunk virtual DualSense / DualShock 4 UMDF2 HID minidriver"
+
+[package.metadata.wdk.driver-model]
+driver-type = "UMDF"
+umdf-version-major = 2
+target-umdf-version-minor = 31
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+wdk-build.workspace = true
+
+[dependencies]
+wdk-sys.workspace = true
+pf-driver-proto.workspace = true
+pf-umdf-util.workspace = true
+
+[features]
+default = ["hid"]
+hid = ["wdk-sys/hid"]
+nightly = ["wdk-sys/nightly"]
+
+[lints]
+workspace = true

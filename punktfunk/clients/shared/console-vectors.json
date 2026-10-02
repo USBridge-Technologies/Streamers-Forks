@@ -1,0 +1,47 @@
+{
+  "$comment": "CONSOLE-UI vectors, pinned by pf-console-ui's Rust tests: the Skia console draws these on every platform. Sibling of deeplink-vectors.json, same rules: this file is the contract, and a value absent here is a value no client may assume.",
+  "version": 6,
+  "shell_tabs": [
+    {
+      "id": "hosts",
+      "name": "Hosts"
+    },
+    {
+      "id": "games",
+      "name": "Games"
+    },
+    {
+      "id": "players",
+      "name": "Controllers"
+    },
+    {
+      "id": "settings",
+      "name": "Settings"
+    }
+  ],
+  "$shell_tabs": "Version 3: the console's top-level tabs, in strip order. The Skia shell draws them on every platform, so its Rust twin pins them; Apple and Android hold no copy.",
+  "settings_sections": [
+    { "name": "General" },
+    { "name": "Display" },
+    { "name": "Audio" },
+    { "name": "Input" },
+    { "name": "Controllers" },
+    { "name": "Presets" },
+    { "name": "About" }
+  ],
+  "$settings_sections": "Version 4: the Settings tab's sections, in tab order: the categories every client's settings use, plus Presets. The Skia shell draws them on every platform, so its Rust twin pins them.",
+  "motion_springs": {
+    "focus": { "response": 0.32, "damping": 0.78 },
+    "press": { "response": 0.16, "damping": 0.65, "scale": 0.97 },
+    "nav": { "response": 0.42, "damping": 0.88, "push_slide_dp": 36.0, "enter_scale": 0.985, "exit_scale": 0.96, "reveal_alpha": 0.4, "interruptible": true },
+    "modal": { "response": 0.42, "damping": 0.88 },
+    "tab": { "slide_fraction": 0.25 },
+    "entrance": { "stagger_s": 0.04, "scale": 0.96, "rise_dp": 12.0 }
+  },
+  "$motion_springs": "Version 3: the redesign's motion table (design section 3). Springs are integrator-dependent, so this pins parameters, not sampled positions. nav carries the push/pop geometry too: Back mid-push retargets the same spring (interruptible). The Skia shell animates every screen, so its Rust twin pins it.",
+  "pinned_key": [
+    { "host": "9ee34e95aa", "preset": "p-1", "key": "9ee34e95aa\u0000p-1" },
+    { "host": "10.0.0.2:9777", "preset": "work", "key": "10.0.0.2:9777\u0000work" }
+  ],
+  "$pinned_key": "Version 6: a pinned card's row key (HostRow.key) is the host's key, a NUL, then the preset id. The session, Apple and Android producers build it; the console splits it back to the host key."
+}

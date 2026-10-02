@@ -1,0 +1,32 @@
+# Docker disk hygiene for the self-hosted Gitea Actions runner (home-runner-1, 192.168.1.52).
+#
+# Why this exists: every CI push builds and sha-<commit>-tags a Docker image per pipeline
+# (rust-ci, web, docs, fedora-rpm, fedora44-rpm, ...). Those tags are never dangling, so a
+# plain `docker image prune` SKIPS them and they accumulate. Host-level, not per-repo CI,
+# because the runner is shared (punktfunk + other orgs all benefit).
+#
+# THE BIG ONE (2026-06-19): the act_runner CACHE SERVER store lives in the long-running runner
+# container's WRITABLE LAYER (HOME/.cache/actcache/cache inside gitea-runner-runner-1,
+# `cache.dir: ""` -> defaults under /root). `docker prune` can NEVER see it — only stopped
+# containers + unused images/cache are prunable, not a 13-day-up container's layer. That store
+# grew to ~66 GB and filled a 125 GB disk on its own. docker-prune.sh caps it by clearing the
+# blobs in-place (act_runner repopulates; keys are content-hashed).
+#
+# The logic is in docker-prune.sh, NOT inline ExecStart=, because systemd does its own
+# $-expansion on ExecStart and would empty the shell vars / $(...) before sh runs them.
+#
+# Install on the runner host (root):
+#   install -m755 scripts/ci/docker-prune.sh /usr/local/bin/ci-docker-prune.sh
+#   cp scripts/ci/docker-prune.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now docker-prune.timer
+# See also scripts/ci/setup-macos-runner.sh for the macOS runner.
+
+[Unit]
+Description=Prune aged Docker images/cache + cap the act_runner cache (CI runner disk hygiene)
+Documentation=https://git.unom.io/unom/punktfunk
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ci-docker-prune.sh

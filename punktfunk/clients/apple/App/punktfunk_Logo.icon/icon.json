@@ -1,0 +1,87 @@
+{
+  "fill": {
+    "automatic-gradient": "display-p3:0.39502,0.30640,0.96338,1.00000"
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "punktfunk_Minimal_Icon-Composer_Layer-3.svg",
+          "name": "punktfunk_Minimal_Icon-Composer_Layer-3"
+        }
+      ],
+      "name": "Group",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.6
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.6
+      }
+    },
+    {
+      "blur-material": null,
+      "layers": [
+        {
+          "image-name": "punktfunk_Minimal_Icon-Composer_Layer-2 2.svg",
+          "name": "punktfunk_Minimal_Icon-Composer_Layer-2"
+        }
+      ],
+      "lighting": "individual",
+      "name": "Group",
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.56
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 1
+      }
+    },
+    {
+      "blur-material": 0,
+      "layers": [
+        {
+          "fill-specializations": [
+            {
+              "appearance": "dark",
+              "value": {
+                "automatic-gradient": "display-p3:0.44238,0.34595,0.99951,1.00000"
+              }
+            }
+          ],
+          "image-name": "punktfunk_Minimal_Icon-Composer_Layer-1 2.svg",
+          "name": "punktfunk_Minimal_Icon-Composer_Layer-1"
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.6
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.53
+      }
+    },
+    {
+      "layers": [],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.6
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.2
+      }
+    }
+  ],
+  "supported-platforms": {
+    "circles": [
+      "watchOS"
+    ],
+    "squares": "shared"
+  }
+}

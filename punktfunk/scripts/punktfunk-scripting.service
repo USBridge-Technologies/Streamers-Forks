@@ -1,0 +1,114 @@
+# punktfunk plugin/script runner — systemd USER unit (bun runtime, ON BY DEFAULT, opt-out).
+#
+# Runs the operator's automation under supervision: loose files in ~/.config/punktfunk/scripts/ and
+# installed `punktfunk-plugin-*` packages under ~/.config/punktfunk/plugins/. Each unit is an Effect
+# fiber (a plugin restarts on failure with capped-jittered backoff; a bare script is one-shot).
+# SIGTERM interrupts the whole tree STRUCTURALLY, so every plugin's scoped finalizers run before
+# exit (clean deregister / preset release) — hence the generous stop timeout below.
+#
+# ON BY DEFAULT — the packages enable this for every user (`systemctl --global enable` from the
+# .deb/.rpm scriptlets; a baked-in default.target.wants symlink in the sysext image). It used to be
+# opt-in, on the reasoning that the runner does nothing until you add scripts or plugins. That
+# stopped being true when the game-library scanners became plugins: the library is a flagship
+# surface, and a host whose runner is off now comes up with an empty library and no obvious reason
+# why (design/library-scanner-plugins.md D9).
+#
+# It remains opt-OUT, per user:
+#   systemctl --user mask punktfunk-scripting
+# (`mask`, not `disable` — a plain disable cannot remove a symlink that lives in /etc or /usr.)
+#
+# Auto-wired like the console: a plugin's connect() reads the host's SCOPED plugin token + identity
+# cert from ~/.config/punktfunk/{plugin-token,cert.pem} (written by the host's `serve`) — no env
+# editing. The plugin token authorizes the plugin surface but not hook registration or pairing
+# administration; a script that needs the admin surface sets PUNKTFUNK_MGMT_TOKEN explicitly.
+[Unit]
+Description=punktfunk plugin/script runner
+Documentation=https://git.unom.io/unom/punktfunk
+# Plugins talk to the host's loopback mgmt API; order after it. Soft (ordering only, no Requires):
+# the runner supervises each unit with backoff, so a plugin started before the host simply retries.
+After=punktfunk-host.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/punktfunk-scripting
+# `+` runs outside the namespace: the plugin-run and plugin-state binds below need both
+# directories, and inside the read-only home nothing can create them.
+ExecStartPre=+/bin/mkdir -p -m 0700 %h/.config/punktfunk/plugin-run %h/.config/punktfunk/plugin-state
+Restart=on-failure
+RestartSec=2
+# Deliver the stop signal to the runner process itself (it orchestrates the structural shutdown of
+# its unit fibers), and give it room to run their finalizers before the cgroup is reaped.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Sandbox, in two layers. This unit's directives confine the SUPERVISOR and the operator's own
+# loose scripts: an empty home, a read-only system, no setuid re-escalation, and a denylist over
+# the host's own credentials wherever the home tmpfs does not land.
+#
+# They are not what confines a PLUGIN. These are mount-namespace options, and a mount namespace
+# does not hold against a process of the same uid: /proc/<host pid>/root reaches what it hides, as
+# /proc/<pid>/environ and kill(2) reach the rest. So each plugin runs in its own bwrap sandbox
+# (sdk/src/sandbox.ts) with its own pid namespace, which does hold, and sees only the paths its
+# manifest declares plus the folders the operator granted it. This unit sees the union of those.
+#
+# A loose script that must reach something else still gets a drop-in — `systemctl --user edit
+# punktfunk-scripting` — with `ReadWritePaths=/mnt/games`, or `BindPaths=` inside the home.
+#
+# NOTE: these all need unprivileged user namespaces for a *user* unit, as does bwrap itself; on a
+# kernel that restricts them the runner starts no plugin and the console's Troubleshooting page
+# says so.
+#
+# PrivateTmp is deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A plugin's
+# whole job is integrating with things already running on this box, and on Linux those talk over
+# /tmp: VirtualHere's client IPC is the FIFO pair /tmp/vhclient + /tmp/vhclient_response, and X11
+# is /tmp/.X11-unix. A private /tmp namespace hides all of it — the plugin launches the vendor
+# binary fine and then cannot reach the daemon behind it, which presents as an unexplained error
+# that no amount of config fixes (the operator's own shell works, because that has the real /tmp).
+# ReadWritePaths=/tmp puts the write bit back that ProtectSystem=strict takes away.
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ProtectHome=tmpfs
+InaccessiblePaths=-%h/.config/punktfunk/mgmt-token -%h/.config/punktfunk/key.pem
+InaccessiblePaths=-%h/.config/punktfunk/native-key.pem
+# Writable: the installed packages (the runner refreshes their shared SDK with `bun install` on
+# every start) and the one directory a plugin may persist into. '-' on both — neither exists until
+# the first plugin is installed.
+BindPaths=-%h/.config/punktfunk/plugins -%h/.config/punktfunk/plugin-state
+# bun's package cache ($BUN_INSTALL). Only the SDK refresh writes here, and it fails soft without
+# it — but soft means plugins silently keep an old SDK across host upgrades.
+BindPaths=-%h/.bun
+# Read-only: the operator's loose scripts, the drop box another local account fills, the scoped
+# token, and the TLS pin (native-cert.pem after the identity split, cert.pem before it — a host has
+# one or both). mgmt-endpoint carries the port the host REALLY bound; without it a moved listener
+# leaves every plugin dialling 47990 forever.
+BindReadOnlyPaths=-%h/.config/punktfunk/scripts -%h/.config/punktfunk/ingest
+BindReadOnlyPaths=-%h/.config/punktfunk/plugin-token -%h/.config/punktfunk/mgmt-endpoint
+BindReadOnlyPaths=-%h/.config/punktfunk/native-cert.pem -%h/.config/punktfunk/cert.pem
+# What the supervisor hands each sandbox: per-plugin tokens and grants. A directory bind keeps the
+# host's atomic replacements visible; a file bind would pin the deleted inode.
+BindReadOnlyPaths=%h/.config/punktfunk/plugin-run
+# ProtectHome empties /run/user too. %t is where the host publishes its live-stream marker
+# (punktfunk/stream, which scripts source) and where the session bus and compositor sockets live.
+BindPaths=%t
+# What the plugins read in the home — manifest paths and folder grants — the host writes into
+# punktfunk-scripting.service.d/50-plugin-roots.conf. bwrap binds from this unit's view, so a
+# path missing there never reaches a plugin.
+# SteamOS builds the runner under the home and points ExecStart at it (scripts/steamdeck/install.sh
+# rewrites that line only), so the binary has to survive the tmpfs.
+BindReadOnlyPaths=-%h/.local/bin/punktfunk-scripting -%h/.local/lib/punktfunk-scripting
+BindReadOnlyPaths=-%h/.local/share/punktfunk-scripting
+ReadWritePaths=/tmp
+# AF_NETLINK brings up a sandbox's loopback; the sandbox's seccomp filter keeps it from the plugin.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Free for a JS runtime that only talks HTTP and reads files. Absent on purpose:
+# MemoryDenyWriteExecute (bun JITs), PrivateDevices (VirtualHere forwards USB), and
+# ProtectKernelTunables, which refuses bwrap a fresh /proc; the sandbox binds /proc/sys read-only.
+ProtectControlGroups=yes
+# Exactly the namespaces each plugin's bwrap sandbox is built from; `yes` starts no plugin.
+RestrictNamespaces=user mnt pid net ipc uts cgroup
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=default.target

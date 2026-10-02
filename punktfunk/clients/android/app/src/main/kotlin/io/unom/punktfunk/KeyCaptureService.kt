@@ -1,0 +1,111 @@
+package io.unom.punktfunk
+
+import android.accessibilityservice.AccessibilityService
+import android.content.Context
+import android.content.Intent
+import android.view.KeyEvent
+import android.view.accessibility.AccessibilityEvent
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+
+/**
+ * Hardware keys ahead of Android's own shortcuts. The window policy takes Alt+Tab, every Meta
+ * chord and the Language key before an app sees them; an accessibility service that filters keys
+ * runs in the input dispatcher before that policy. The user turns it on under Accessibility.
+ *
+ * It hands every key to the focused stream ([stream], set by [MainActivity]) and consumes what the
+ * stream owns. With no focused stream it touches nothing: other apps' keys pass straight through,
+ * and it never reads window content — the config requests key filtering only.
+ */
+class KeyCaptureService : AccessibilityService() {
+    override fun onServiceConnected() {
+        running = true
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        running = false
+        return super.onUnbind(intent)
+    }
+
+    /** A key consumed here never reaches the dispatcher, so it never repeats there either;
+     *  the stream's handler re-creates the repeat (`MainActivity.armKeyRepeat`). */
+    override fun onKeyEvent(event: KeyEvent): Boolean = stream?.invoke(event) == true
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+    override fun onInterrupt() {}
+
+    companion object {
+        /** The focused stream's key handler; null whenever no stream holds the window. */
+        @Volatile
+        var stream: ((KeyEvent) -> Boolean)? = null
+
+        /** The user has the service on, so Alt+Tab needs no stand-in and the banner says nothing. */
+        var running by mutableStateOf(false)
+            private set
+
+        private const val PREFS = "punktfunk_key_capture"
+        private const val K_ANSWERED = "disclosure_answered"
+
+        /** The launch prompt has been answered once; after that only Settings offers it. */
+        fun disclosureAnswered(context: Context): Boolean =
+            prefs(context).getBoolean(K_ANSWERED, false)
+
+        fun markDisclosureAnswered(context: Context) {
+            prefs(context).edit().putBoolean(K_ANSWERED, true).apply()
+        }
+
+        private fun prefs(context: Context) =
+            context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    }
+}
+
+/**
+ * The prominent disclosure Play requires before the service is turned on, because Punktfunk is not
+ * an accessibility tool: what the service receives, where it goes, and an explicit Agree. It stands
+ * alone; Play rejects one that shares a prompt with other disclosures. Agree opens Android's
+ * Accessibility page; either answer closes the prompt. The text matches the Play listing
+ * paragraph in `clients/android/store/play-listing.md`.
+ */
+@Composable
+fun KeyCaptureDisclosure(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    PunktfunkDialog(
+        title = "Send every keyboard shortcut?",
+        onDismiss = onDismiss,
+        dismissOnOutsideTap = false,
+        actions = listOf(
+            DialogAction("Agree", primary = true) {
+                onDismiss()
+                openAccessibilitySettings(context)
+            },
+            DialogAction("No thanks", onClick = onDismiss),
+        ),
+    ) {
+        PromptText(
+            "Android keeps Alt+Tab, the Windows key and your keyboard's language key for itself. " +
+                "To send them to the computer you stream from, Punktfunk uses Android's " +
+                "AccessibilityService API.",
+        )
+        PromptText(
+            "With it on, Punktfunk receives the keys you press on a hardware keyboard. While a " +
+                "stream is on screen, it sends them to that computer over the encrypted " +
+                "connection. Outside a stream, every key passes through untouched. It can't see " +
+                "the screen, stores nothing and sends nothing anywhere else.",
+        )
+        PromptText(
+            "Agree opens Android's Accessibility settings, where you turn on Punktfunk keyboard " +
+                "shortcuts. You can turn it off there at any time.",
+        )
+    }
+}
+
+/** Android's Accessibility page, where the key service is switched on; a TV without one is a no-op. */
+internal fun openAccessibilitySettings(context: Context) {
+    runCatching {
+        context.startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    }
+}

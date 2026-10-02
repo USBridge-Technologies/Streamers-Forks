@@ -1,0 +1,6 @@
+• The stats overlay shows the same numbers as every other Punktfunk app. Advanced statistics in settings brings back the full view.
+• Profiles are now called presets. Your saved ones carry over.
+• A host saved at its Tailscale address keeps it when you get home.
+• A mouse's Back button reaches the host on Samsung's One UI 8 too.
+• A Steam Controller 2 behind a Puck no longer drops out every few seconds.
+• A lost packet heals cleanly more often.

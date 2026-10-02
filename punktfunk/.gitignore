@@ -1,0 +1,48 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+# generated C header is checked in (see include/), build artifacts are not
+/crates/*/target
+/crates/*/vendor/*/target
+/tools/*/target
+/packaging/windows/pf-vkhdr-layer/target
+node_modules/
+dist/
+# Swift package build artifacts + the locally-built xcframework (rebuild via scripts/build-xcframework.sh)
+clients/apple/.build/
+clients/apple/PunktfunkCore.xcframework/
+clients/apple/.swiftpm/
+# Generated App Store screenshots (tools/screenshots.sh output; uploaded as a CI artifact)
+clients/apple/screenshots/
+clients/linux/screenshots/
+# Xcode per-user state
+xcuserdata/
+
+# Debian package build output
+/dist/
+
+# Windows App SDK staging by windows-reactor build.rs
+/temp/
+/winmd/
+
+# Client crate build artifacts (clients moved out of crates/ -> clients/ 2026-06-18)
+/clients/*/target
+/clients/*/*/target
+
+# Python bytecode (e.g. clients/android/ci tooling)
+__pycache__/
+*.pyc
+
+# Local flatpak-builder output (build-flatpak.sh) — ostree repo + build dir at the repo root.
+.flatpak-repo/
+.flatpak-build/
+
+# Nix build outputs (flake.nix) — `nix build` result symlinks + direnv cache. flake.lock IS tracked.
+/result
+/result-*
+.direnv/
+
+# Gradle build output inside the vendored pyrowave Granite Android platform (regenerated, never ours to commit)
+/crates/pyrowave-sys/vendor/pyrowave/Granite/application/platforms/android/**/.gradle/
+/crates/pyrowave-sys/vendor/pyrowave/Granite/application/platforms/android/**/build/

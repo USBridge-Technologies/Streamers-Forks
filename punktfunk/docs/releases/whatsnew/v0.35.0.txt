@@ -1,0 +1,6 @@
+• PyroWave decodes on the GPU, and 10-bit colour works on an SDR screen.
+• Drag each stick and button of the on-screen controller where you want it.
+• A foldable half-open on a table: picture on the upright half, controller on the flat one.
+• A game's cover holds until it is up. Bind a settings profile to one title.
+• Select+A opens the quick-action ring on any pad. TalkBack names the focused row.
+• Clipboard sharing starts off. Turn it on per host.

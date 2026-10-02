@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+#
+# Installer manifest for the Windows host: punktfunk-setup-win, the self-contained engine exe
+# (crates/punktfunk-setup-win, packed by packaging/windows/pack-host-installer.ps1).
+# It speaks the Inno Setup silent dialect verbatim (design/installer-v2-windows.md D5) and keeps
+# Inno's ARP key + unins000.exe (D6), which is why everything below except InstallerType reads
+# as it did for the Inno Setup years.
+#
+# The host is a machine-wide, elevated install: it registers a SYSTEM service, installs the
+# pf-vdisplay + gamepad drivers, and opens firewall ports. There is no per-user scope.
+PackageIdentifier: unom.PunktfunkHost
+PackageVersion: 0.19.2
+
+# `exe`, not `inno`: winget's inno defaults would also work (same switches), but the artifact is
+# not an Inno Setup binary and must not be treated as one.
+InstallerType: exe
+Scope: machine
+# The exe's manifest asks for requireAdministrator -> it raises its own UAC prompt.
+ElevationRequirement: elevatesSelf
+# Windows 11 22H2 floor: pf-vdisplay is built against IddCx 1.10 with no runtime downgrade, so on
+# anything older the device fails to start with Code 10 (see the MinVersion gate in the .iss).
+MinimumOSVersion: 10.0.22621.0
+
+InstallModes:
+  # interactive keeps the FULL wizard — every task checkbox and the web-console password page.
+  # `winget install unom.PunktfunkHost --interactive`.
+  - interactive
+  - silent
+  - silentWithProgress
+
+InstallerSwitches:
+  # Spelled out: an `exe` manifest has no built-in switches, and this way the unattended
+  # behaviour is reviewable here. No /MERGETASKS: a silent install deliberately takes the SAME
+  # task defaults the wizard shows, so the product does not differ by install channel. The
+  # disclosures the wizard puts on screen are carried by Agreements/InstallationNotes in the
+  # locale manifest instead.
+  #
+  # To CHANGE individual tasks, callers pass the Inno-dialect /MERGETASKS via --override: a bare
+  # name adds a task, a `!` prefix removes one. GameStream is opt-in (its plane pairs over plain HTTP), so
+  # enabling it unattended is the additive form:
+  #   winget install unom.PunktfunkHost --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=gamestream"
+  # and dropping a default-on task is the negated form, e.g. /MERGETASKS=!trayicon
+  # Task names: installdriver, installgamepad, installhdrlayer,
+  #             gamestream, allowpublicfw, startservice, trayicon
+  Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
+  SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART /SP-
+  # <LOGPATH> is winget's OWN token and the only spelling it substitutes (see the schema this file
+  # declares: "…<LOGPATH> token can be included in the switch value so that winget will replace the
+  # token with user provided path"). It was written |LOGPATH| — not a token, so winget passed the
+  # literal string through and the installer rejected it: `|` is not legal in a Windows filename,
+  # giving "Error creating log file: The filename, directory name, or volume label syntax is
+  # incorrect." That aborted the install in EVERY mode, interactive included, for any caller that
+  # asks for a log — UniGetUI does so by default, which is how it was reported.
+  Log: /LOG="<LOGPATH>"
+
+# The ARP entry stays under Inno's `<AppId>_is1` name forever (HOST_ARP_KEY in
+# crates/punktfunk-setup/src/platform/windows/mod.rs): this is what correlates an installed host
+# with the package for `winget list` / `winget upgrade`, across the Inno -> engine boundary too.
+ProductCode: '{7C9E6A52-1F4B-4E8D-A3C7-2B5D8F1E0A93}_is1'
+# The engine upgrades in place (it follows InstallLocation) — do not uninstall first, that would
+# run the service/driver teardown between versions.
+UpgradeBehavior: install
+
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://git.unom.io/unom/punktfunk/releases/download/v0.19.2/punktfunk-host-setup-0.19.2.exe
+    InstallerSha256: 96964117125BFD5AC4556987DAFAA3966A4A57BBC29C838803857852D595BF4D
+
+ManifestType: installer
+ManifestVersion: 1.6.0

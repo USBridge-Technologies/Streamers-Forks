@@ -1,0 +1,61 @@
+# cargo-about config — full-fidelity third-party license harvest for CI.
+#
+#   cargo install cargo-about
+#   cargo about generate about.hbs > THIRD-PARTY-NOTICES.txt   # (or use scripts/gen-third-party-notices.sh)
+#
+# `accepted` is the allow-list of SPDX licenses permitted in the dependency tree. CI fails if a crate
+# carries anything not listed here — the regression guard against a copyleft dependency silently
+# entering the linked set. All entries
+# below are permissive / attribution-only; deliberately NO GPL/LGPL/AGPL/MPL-link/SSPL/EPL.
+#
+# ⚠ KNOW THE LIMIT OF THIS GATE. cargo-about walks the CARGO graph, so it sees CRATES. A native
+# library linked through a permissively-licensed `-sys` crate is INVISIBLE to it, licence and all.
+# FFmpeg was precisely that shape while we linked it: `ffmpeg-sys-next` is WTFPL and passed
+# cleanly, while the LGPL libavcodec/libavutil/swscale it link-imported never appeared in the
+# harvest at all. Nothing links it any more (host encode went native, 2026-09), so the crate graph
+# and the linked set coincide for every artifact — but the gate is no stronger than it was.
+# Copyleft arriving as C behind a -sys crate is a REVIEW question, not a CI one.
+#
+# The dependency-free fallback is scripts/gen-third-party-notices.py (reads the cargo registry cache),
+# which is what produced the committed baseline when cargo-about is unavailable offline.
+
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "CC0-1.0",
+    "Unlicense",
+    "WTFPL",
+]
+
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Per-crate license-acceptance additions (cargo-about ≥0.6 syntax; the old `[crate.clarify]`
+# license-only form fails to deserialize under cargo-about 0.9, which now wants checksummed file
+# clarifications — per-crate `accepted` extensions express the same intent without checksums).
+#
+# r-efi is tri-licensed with an LGPL-2.1-or-later arm; cargo-about resolves OR-expressions to an
+# accepted arm on its own (MIT/Apache-2.0 are globally accepted), so it needs no entry. (It is
+# also UEFI-target-gated out of every shipped build.)
+#
+# cbindgen, below, is the one per-crate entry. `ring` used to need one (its licence is an
+# AND that includes the OpenSSL licence, which was accepted for that crate alone), but the crypto
+# backend moved to aws-lc-rs and the ureq 2 → 3 upgrade removed ring from every target we build.
+# aws-lc-sys 0.44's SPDX is an AND of ISC / Apache-2.0 / MIT / BSD-3-Clause / MIT-0 — all globally
+# accepted above — and carries no OpenSSL clause, so `OpenSSL` left the global list with ring.
+
+# cbindgen (MPL-2.0) is the library tools/gen-headers runs to write include/*.h. No shipped
+# artifact links it, and the header it writes is not a derivative work.
+[cbindgen]
+accepted = ["MPL-2.0"]

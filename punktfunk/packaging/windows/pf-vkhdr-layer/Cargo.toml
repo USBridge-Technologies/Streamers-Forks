@@ -1,0 +1,31 @@
+[package]
+name = "pf-vkhdr-layer"
+version = "0.1.0"
+edition = "2024"
+description = "punktfunk Vulkan implicit layer: inject HDR10/scRGB surface formats on the virtual display so Vulkan games (id Tech, etc.) detect HDR over an IddCx virtual display"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "pf_vkhdr_layer"
+crate-type = ["cdylib"]
+
+[dependencies]
+ash = "=0.38.0+1.3.281"
+
+# This package is its own workspace (see below), so the main workspace's lint tables never reach
+# it — the unsafe discipline has to be restated here or it silently doesn't apply.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+strip = true
+
+# Standalone package (not a member of the main punktfunk cargo workspace) — it's a Windows-only
+# cdylib built on its own by pack-host-installer.ps1, like the UMDF driver crates next to it.
+[workspace]

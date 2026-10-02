@@ -1,0 +1,142 @@
+#version 450
+// The host's reframe for the direct-SDK NVENC path: the crop of a source-size staging slot,
+// scaled into an NVENC input slot, one plane at a time. Pass x filters the crop's rows into a
+// float intermediate (`outW × cropH`); pass y filters its columns and packs the slot's words.
+// Lanczos-3 widened by the downscale ratio, the kernel every client uses; a 1:1 axis copies.
+// Taps clamp inside the crop, so nothing cut off bleeds in.
+//
+// LAYOUT (push): 0 = packed ARGB 8-bit (NVENC byte order B,G,R,A), 1 = packed 10-bit x:R:G:B,
+// 2 = packed 10-bit x:B:G:R, 3 = one byte per pixel (NV12 Y, a YUV444 plane), 4 = two bytes
+// per pixel (NV12 interleaved UV). Slots are uint[] like cursor_blend.comp: pass y owns one
+// whole word per invocation, so no two invocations write the same word.
+//
+// Rebuild (vendored beside this file; CI diffs the disassembly against this source):
+//   glslangValidator -V reframe_buf.comp -o reframe_buf.spv
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 1) buffer Tmp { float tmp[]; };
+layout(std430, binding = 2) buffer Dst { uint dst[]; };
+
+layout(push_constant) uniform Push {
+    uint lay;       // LAYOUT above
+    uint axis;      // 0 = source → intermediate, 1 = intermediate → slot
+    uint srcOff;    // plane start in the staging slot, bytes
+    uint srcPitch;  // plane row stride, bytes
+    uint dstOff;    // plane start in the NVENC slot, bytes (4-aligned)
+    uint dstPitch;  // plane row stride, bytes (4-aligned)
+    int cropX;      // crop in plane pixels
+    int cropY;
+    int cropW;
+    int cropH;
+    uint outW;      // output plane size, pixels
+    uint outH;
+    float stepv;    // source pixels per output pixel on this pass's axis
+    uint words;     // pass y: slot words written per row
+} pc;
+
+const float MAX_STRETCH = 10.0;
+const int MAX_TAPS = 64;
+
+float lanczos3(float x) {
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 3.0) return 0.0;
+    float px = 3.14159265358979 * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+
+uint byte_at(uint off) {
+    return (src[off / 4u] >> ((off % 4u) * 8u)) & 0xFFu;
+}
+
+// Channels of one source pixel, in the layout's own units (0..255 or 0..1023).
+vec3 read_src(int x, int y) {
+    uint base = pc.srcOff + uint(y) * pc.srcPitch;
+    if (pc.lay <= 2u) {
+        uint w = src[(base + uint(x) * 4u) / 4u];
+        if (pc.lay == 0u) return vec3((w >> 16) & 0xFFu, (w >> 8) & 0xFFu, w & 0xFFu);
+        vec3 c = vec3((w >> 20) & 0x3FFu, (w >> 10) & 0x3FFu, w & 0x3FFu);
+        return pc.lay == 1u ? c : c.zyx;
+    }
+    if (pc.lay == 3u) return vec3(byte_at(base + uint(x)), 0.0, 0.0);
+    uint off = base + uint(x) * 2u;
+    return vec3(byte_at(off), byte_at(off + 1u), 0.0);
+}
+
+vec3 tmp_at(int x, int y) {
+    uint i = (uint(y) * pc.outW + uint(x)) * 4u;
+    return vec3(tmp[i], tmp[i + 1u], tmp[i + 2u]);
+}
+
+// One output sample on this pass's axis at output index `o`, the other axis fixed at `other`.
+vec3 filtered(int o, int other) {
+    bool xpass = pc.axis == 0u;
+    int lo = xpass ? pc.cropX : 0;
+    int n = xpass ? pc.cropW : pc.cropH;
+    float s = float(lo) + (float(o) + 0.5) * pc.stepv;
+    if (pc.stepv == 1.0) {
+        int i = clamp(int(floor(s)), lo, lo + n - 1);
+        return xpass ? read_src(i, other) : tmp_at(other, i);
+    }
+    float stretch = clamp(pc.stepv, 1.0, MAX_STRETCH);
+    float support = 3.0 * stretch;
+    int first = int(floor(s - support - 0.5)) + 1;
+    int last = min(int(ceil(s + support - 0.5)) - 1, first + MAX_TAPS - 1);
+    vec3 acc = vec3(0.0);
+    float total = 0.0;
+    for (int i = first; i <= last; i++) {
+        float w = lanczos3((float(i) + 0.5 - s) / stretch);
+        int t = clamp(i, lo, lo + n - 1);
+        acc += w * (xpass ? read_src(t, other) : tmp_at(other, t));
+        total += w;
+    }
+    return acc / total;
+}
+
+uint quantize(float v, float top) {
+    return uint(clamp(floor(v + 0.5), 0.0, top));
+}
+
+void main() {
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (pc.axis == 0u) {
+        if (gx >= int(pc.outW) || gy >= pc.cropH) return;
+        vec3 c = filtered(gx, pc.cropY + gy);
+        uint i = (uint(gy) * pc.outW + uint(gx)) * 4u;
+        tmp[i] = c.x;
+        tmp[i + 1u] = c.y;
+        tmp[i + 2u] = c.z;
+        return;
+    }
+    if (gx >= int(pc.words) || gy >= int(pc.outH)) return;
+    uint idx = (pc.dstOff + uint(gy) * pc.dstPitch) / 4u + uint(gx);
+    int last = int(pc.outW) - 1;
+    if (pc.lay <= 2u) {
+        bool ten = pc.lay != 0u;
+        vec3 c = filtered(gy, gx);
+        float top = ten ? 1023.0 : 255.0;
+        uint r = quantize(c.x, top), g = quantize(c.y, top), b = quantize(c.z, top);
+        if (!ten) dst[idx] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        else if (pc.lay == 1u) dst[idx] = 0xC0000000u | (r << 20) | (g << 10) | b;
+        else dst[idx] = 0xC0000000u | (b << 20) | (g << 10) | r;
+        return;
+    }
+    uint word = 0u;
+    if (pc.lay == 3u) {
+        for (int k = 0; k < 4; k++) {
+            int x = min(gx * 4 + k, last);
+            word |= quantize(filtered(gy, x).x, 255.0) << (uint(k) * 8u);
+        }
+    } else {
+        for (int k = 0; k < 2; k++) {
+            int x = min(gx * 2 + k, last);
+            vec3 c = filtered(gy, x);
+            word |= quantize(c.x, 255.0) << (uint(k) * 16u);
+            word |= quantize(c.y, 255.0) << (uint(k) * 16u + 8u);
+        }
+    }
+    dst[idx] = word;
+}

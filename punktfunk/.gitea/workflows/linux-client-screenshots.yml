@@ -1,0 +1,154 @@
+# Native Linux client screenshots for the app/marketing listings. The client renders
+# host-free mock scenes (PUNKTFUNK_SHOT_SCENE) under a virtual X display; the driver
+# (clients/linux/tools/screenshots.sh) grabs each one — no host, GPU, or Wayland. The
+# Linux analogue of apple.yml's `screenshots` job, gated to STABLE RELEASE tags only.
+# Standalone + best-effort: a failure here reds nothing else. PNGs land as a 30-day
+# artifact; they are not committed or published.
+name: linux-client-screenshots
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Shared compile cache: sccache -> RustFS S3 (storage.unom.io, LAN-pinned via ci-core's
+# unbound). Keys include compiler hash + target + flags, so cross-OS/arch entries can
+# never collide; every Rust job on every host feeds and reads one warm cache.
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # The C/C++ half of the cache — same wiring as ci.yml/deb.yml. Safe at workflow level: no
+  # cross-compiling job here.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  CC_x86_64_unknown_linux_gnu: sccache cc
+  CXX_x86_64_unknown_linux_gnu: sccache c++
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  screenshots:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    # Same image as ci.yml/deb.yml — already carries the Rust toolchain + GTK/SDL build deps.
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
+      # images; this heals the job while the running :latest predates the bake.
+      - name: sccache (no-op once the image bakes it)
+        run: sh scripts/ci/ensure-sccache.sh
+
+      # Client link deps (baked into the image; kept here so the job is green across image
+      # rebuilds — a no-op once present) PLUS the headless-render extras: a virtual X server,
+      # software GL+Vulkan (llvmpipe/lavapipe), the icon theme + fonts the UI draws with, and a
+      # root-window grab tool.
+      - name: Client link + headless-render deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libsdl3-dev libvulkan-dev \
+            xvfb x11-utils imagemagick scrot \
+            libgl1-mesa-dri mesa-vulkan-drivers \
+            adwaita-icon-theme fonts-cantarell fonts-dejavu-core
+
+      # Reuse the workspace cargo caches. The cargo-home (download) cache is shared verbatim —
+      # it is profile-independent.
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+      - id: target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          # A release build in deb.yml's image and layout, so deb's warm tree is the fallback.
+          # Its own exact key: saved under deb's, this one-crate tree would become the newest
+          # entry deb.yml restores.
+          key: cargo-target-shots-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-target-shots-release-v1-${{ env.rustc }}-
+            cargo-target-release-v3-${{ env.rustc }}-
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-shots-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
+
+      - name: Build client
+        run: cargo build --release -p punktfunk-client-linux --locked
+
+      - name: Capture screenshots
+        run: bash clients/linux/tools/screenshots.sh
+
+      # The client's display tests are `#[ignore]`d for wanting an X/Wayland server, and this is
+      # the only job in the repo that HAS one — ci.yml's container has no Xvfb, so they otherwise
+      # execute nowhere. A weak gate (tags only, best-effort); the strong one is Xvfb in
+      # ci/rust-ci.Dockerfile so ci.yml can run them per PR.
+      #
+      # ONE PROCESS PER TEST, not one run: GTK binds to whichever thread first calls
+      # `gtk::init()`, and libtest gives every test its own thread — so a second display test in
+      # the same process dies with "Attempted to initialize GTK from two different threads",
+      # which `--test-threads=1` does not fix. Discovered by name so a new one is picked up.
+      # Each gets a scratch PUNKTFUNK_CONFIG_DIR: the tests that write the stores need one.
+      - name: Display-only client tests
+        run: |
+          cargo test -p punktfunk-client-linux --locked -- --ignored --list --format terse \
+            | sed -n 's/: test$//p' \
+            | while read -r t; do
+                echo "--- $t"
+                PUNKTFUNK_CONFIG_DIR="$(mktemp -d)" xvfb-run -a \
+                  cargo test -p punktfunk-client-linux --locked -- --ignored --exact "$t"
+              done
+
+      - name: Upload screenshots
+        if: always()
+        # v3: Gitea's API rejects upload-artifact@v4 (see apple.yml). Download is a zip.
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
+        with:
+          name: punktfunk-linux-client-screenshots
+          path: clients/linux/screenshots
+          retention-days: 30
+
+      # The artifact above is browser-only (Gitea's API doesn't serve v3 artifacts), which
+      # blocked reusing these shots for the docs. Publish them to the generic package registry
+      # too — fixed version `ci`, delete-then-PUT so each run overwrites, anonymous GET on a
+      # public repo:
+      #   https://git.unom.io/api/packages/unom/generic/punktfunk-linux-client-screenshots/ci/<scene>.png
+      - name: Publish screenshots to the package registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          BASE="https://git.unom.io/api/packages/unom/generic/punktfunk-linux-client-screenshots/ci"
+          for f in clients/linux/screenshots/*.png; do
+            name=$(basename "$f")
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE "$BASE/$name" || true
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" --upload-file "$f" "$BASE/$name"
+            echo "published $BASE/$name"
+          done

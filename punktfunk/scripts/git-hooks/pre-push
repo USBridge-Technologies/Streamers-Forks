@@ -1,0 +1,60 @@
+#!/bin/sh
+# Repo pre-push hook: run the cheap gates CI runs, so a push can never fail on formatting or a
+# textual gate alone. Enable once per clone:
+#
+#     git config core.hooksPath scripts/git-hooks
+#
+# Kept to the CHEAP checks on purpose (seconds, no cargo build): clippy/tests stay in CI and the
+# per-box verify recipes. Check-only, because the commits already exist here — nothing is left
+# to re-stage, and pre-commit is where staged files get formatted. Runs however the commits were
+# made (plain commit, amends, or plumbing like commit-tree).
+#
+# Escape hatch for a genuine emergency: `git push --no-verify`.
+
+set -eu
+root=$(git rev-parse --show-toplevel)
+
+fail() {
+    echo "pre-push: $1" >&2
+    echo "pre-push: fix with: $2" >&2
+    echo "pre-push: (bypass in an emergency with: commit or push --no-verify)" >&2
+    exit 1
+}
+
+# 1. Main workspace — mirrors ci.yml "Format": cargo fmt --all --check.
+if ! (cd "$root" && cargo fmt --all --check >/dev/null 2>&1); then
+    fail "main workspace is not rustfmt-clean (ci.yml would fail)" \
+         "cargo fmt --all"
+fi
+
+# 2. UMDF driver workspace — mirrors windows-drivers.yml's gate (the shipped drivers + the
+# audited safe layer; pf-vdisplay is deliberately NOT gated there, so not here either).
+if ! (cd "$root/packaging/windows/drivers" \
+      && cargo fmt -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse --check >/dev/null 2>&1); then
+    fail "driver workspace is not rustfmt-clean (windows-drivers.yml would fail)" \
+         "(cd packaging/windows/drivers && cargo fmt -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse)"
+fi
+
+# 3. Biome — the `bun run check` ci.yml runs for both JS workspaces. Skipped where the workspace
+# is not installed: a fresh clone must still be able to push, and CI runs it either way.
+if command -v bun >/dev/null 2>&1; then
+    for workspace in web plugin-kit; do
+        [ -d "$root/$workspace/node_modules" ] || continue
+        if ! (cd "$root/$workspace" && bun run check >/dev/null 2>&1); then
+            fail "$workspace is not Biome-clean (ci.yml would fail)" \
+                 "(cd $workspace && bun run biome check --write .)"
+        fi
+    done
+fi
+
+# 4. The textual gates — pure grep/python, no cargo, and they read the same tree CI reads.
+if ! (cd "$root" && sh scripts/ci/check-writing.sh >/dev/null 2>&1); then
+    fail "a commit subject or comment is over the writing gate (ci.yml would fail)" \
+         "sh scripts/ci/check-writing.sh"
+fi
+if ! (cd "$root" && sh scripts/ci/check-unsafe-hygiene.sh >/dev/null 2>&1); then
+    fail "unsafe-hygiene is not clean (ci.yml would fail)" \
+         "sh scripts/ci/check-unsafe-hygiene.sh"
+fi
+
+exit 0

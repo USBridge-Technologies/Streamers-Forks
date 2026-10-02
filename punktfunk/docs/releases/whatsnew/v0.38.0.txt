@@ -1,0 +1,6 @@
+• Picture fit: crop or stretch the stream to fill your screen, in Settings and presets.
+• Controller mouse: a dial button turns your controller into the host's mouse.
+• Settings can stop Back from opening the quick-action dial.
+• Two-finger scrolling starts at once and moves smoothly.
+• A picture no longer stays frozen after the host screen sat still.
+• A Switch Pro controller's ZL and ZR reach the host.

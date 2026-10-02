@@ -1,0 +1,38 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"lib": ["ES2023", "DOM", "DOM.Iterable"],
+		"module": "ESNext",
+		"moduleResolution": "Bundler",
+		"jsx": "react-jsx",
+		"strict": true,
+		"skipLibCheck": true,
+		"esModuleInterop": true,
+		"verbatimModuleSyntax": true,
+		"noUncheckedIndexedAccess": true,
+		"resolveJsonModule": true,
+		"isolatedModules": true,
+		"allowJs": true,
+		"checkJs": false,
+		"noEmit": true,
+		"types": ["vite/client"],
+		"paths": {
+			"@/*": ["./src/*"]
+		}
+	},
+	"include": [
+		"src",
+		"server",
+		// A BARE directory name that starts with a dot is silently skipped by tsc, so the
+		// previous `.storybook` entry typechecked nothing at all. The glob is what pulls it in.
+		".storybook/**/*",
+		"vite.config.ts",
+		"vite.storybook.config.ts",
+		"orval.config.ts"
+	],
+	// Tests run under `bun test`, which typechecks nothing and needs nothing — but `bun:test` has no
+	// types without pulling in @types/bun, and that package redeclares globals this DOM-targeted
+	// config already owns. Not worth a lockfile change (and the bun.nix regeneration it drags along)
+	// to typecheck assertions that bun executes directly.
+	"exclude": ["**/*.test.ts"]
+}

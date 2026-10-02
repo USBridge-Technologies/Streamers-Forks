@@ -1,0 +1,285 @@
+# Windows driver workspace CI — runs on a self-hosted Windows runner (home-windows-runner-1, host
+# mode; label windows-amd64). Part of the Windows-host rewrite (design/windows-host-rewrite.md, M0).
+#
+# Stage 1 (this file): PROBE the runner's driver toolchain (WDK / EWDK / cargo-make / LLVM / the
+# inf2cat/stampinf/devgen/signtool tools) so we know what's provisioned BEFORE writing driver code,
+# and build+test the owned ABI crate (pf-driver-proto) on MSVC to prove it compiles cross-OS and the
+# CI wiring works. The runner has no RTX GPU — that's fine: builds, the IddCx bindgen/link, the
+# /INTEGRITYCHECK self-sign-load, and (later) IDD-push frame flow on the basic display do not need one;
+# only live NVENC encode does, which defers to the RTX box.
+#
+# shell: pwsh deliberately (PowerShell 5.1's Out-File -Encoding utf8 prepends a BOM that corrupts the
+# first GITHUB_ENV line — see windows-client.yml).
+name: windows-drivers
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.gitea/workflows/windows-drivers.yml'
+      - 'crates/pf-driver-proto/**'
+      # The driver hosts the encoder backends, so a change to them is a driver change.
+      - 'crates/pf-encode-core/**'
+      - 'crates/pf-encode-win/**'
+      # …and the crates those backends compile against: pf-frame owns the frame vocabulary
+      # their signatures take, pf-zerocopy and pf-dmabuf sit under it, and the two -sys crates are the
+      # QSV and PyroWave features. Unlisted, a change to any of them reached main with no
+      # driver build behind it — the Cargo.lock-luck gap the host lane already closed.
+      - 'crates/pf-frame/**'
+      - 'crates/pf-zerocopy/**'
+      - 'crates/pf-dmabuf/**'
+      - 'crates/libvpl-sys/**'
+      - 'crates/pyrowave-sys/**'
+      - 'packaging/windows/drivers/**'
+      # Every build job below runs these, and they sit beside the driver tree rather than in it.
+      - 'packaging/windows/drivers-cargo.ps1'
+      - 'scripts/ci/ensure-windows-toolchain.ps1'
+      - 'scripts/ci/src-mtimes.rs'
+  pull_request:
+    paths:
+      - '.gitea/workflows/windows-drivers.yml'
+      - 'crates/pf-driver-proto/**'
+      # The driver hosts the encoder backends, so a change to them is a driver change.
+      - 'crates/pf-encode-core/**'
+      - 'crates/pf-encode-win/**'
+      # …and the crates those backends compile against: pf-frame owns the frame vocabulary
+      # their signatures take, pf-zerocopy and pf-dmabuf sit under it, and the two -sys crates are the
+      # QSV and PyroWave features. Unlisted, a change to any of them reached main with no
+      # driver build behind it — the Cargo.lock-luck gap the host lane already closed.
+      - 'crates/pf-frame/**'
+      - 'crates/pf-zerocopy/**'
+      - 'crates/pf-dmabuf/**'
+      - 'crates/libvpl-sys/**'
+      - 'crates/pyrowave-sys/**'
+      - 'packaging/windows/drivers/**'
+      # Every build job below runs these, and they sit beside the driver tree rather than in it.
+      - 'packaging/windows/drivers-cargo.ps1'
+      - 'scripts/ci/ensure-windows-toolchain.ps1'
+      - 'scripts/ci/src-mtimes.rs'
+
+# Driver builds need the WDK on the runner - the driver-build job below self-provisions it via
+# scripts/ci/ensure-windows-toolchain.ps1, a fast no-op once already present.
+
+jobs:
+  # The Windows driver build is opt-in on a pull request: add the `ci:windows-host` label, or `ci:all`. Only someone with
+  # write access can label, so this is also the trust boundary. Pushes and tags are unaffected.
+  #
+  # Shell rather than a label expression on the job's `if`, because the event payload is a
+  # snapshot: a label added after the last push is not in it, and a re-run replays the old one.
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      heavy: ${{ steps.gate.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Decide whether this pull request runs Windows driver build
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          sh scripts/ci/pr-gate.sh --self-test
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "heavy=true" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          API="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls/$PR"
+          curl -fsS "$API" -H "Authorization: token $GITEA_TOKEN" > /tmp/pr.json || true
+          [ -s /tmp/pr.json ] || curl -fsS "$API" > /tmp/pr.json || true
+          sh scripts/ci/pr-gate.sh --label ci:windows-host < /tmp/pr.json | tee -a "$GITHUB_OUTPUT"
+
+  # SECURITY: builds PULL-REQUEST code on the host-mode, persistent `windows-amd64` runner shared with
+  # the release-signing jobs (windows-host.yml / windows-client.yml). See windows-client.yml for the full
+  # rationale. Definitive fix is server-side (Gitea outside-collaborator approval + isolated PR
+  # runners); the `if:` is a fail-closed backstop — only a PR whose head repo IS this repo runs.
+  probe-and-proto:
+    runs-on: windows-amd64
+    needs: gate
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository
+      && needs.gate.outputs.heavy == 'true')
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Probe driver toolchain (informational — never fails the job)
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function head($t) { Write-Host ""; Write-Host "===== $t =====" }
+
+          head "Windows Kits roots"
+          $kits = @('C:\Program Files (x86)\Windows Kits\10', 'C:\Program Files\Windows Kits\10')
+          foreach ($k in $kits) { if (Test-Path $k) { Write-Host "found: $k" } }
+
+          head "SDK Include versions (um vs km — km => WDK present)"
+          foreach ($k in $kits) {
+            $inc = Join-Path $k 'Include'
+            if (Test-Path $inc) {
+              Get-ChildItem $inc -Directory | ForEach-Object {
+                $hasUm = Test-Path (Join-Path $_.FullName 'um')
+                $hasKm = Test-Path (Join-Path $_.FullName 'km')
+                $wdf   = Test-Path (Join-Path $_.FullName 'km\wdf\umdf\2.31')
+                $iddcx = (Get-ChildItem (Join-Path $_.FullName 'um\iddcx') -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ','
+                Write-Host ("{0,-16} um={1,-5} km={2,-5} wdf2.31={3,-5} iddcx=[{4}]" -f $_.Name, $hasUm, $hasKm, $wdf, $iddcx)
+              }
+            }
+          }
+
+          head "Driver tooling (inf2cat / stampinf / signtool / devgen / InfVerif)"
+          foreach ($tool in 'inf2cat.exe','stampinf.exe','signtool.exe','devgen.exe','InfVerif.exe','makecat.exe') {
+            $hits = @()
+            foreach ($k in $kits) {
+              $hits += Get-ChildItem -Path $k -Filter $tool -Recurse -ErrorAction SilentlyContinue |
+                       Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1 -ExpandProperty FullName
+            }
+            $hits = $hits | Where-Object { $_ } | Select-Object -First 1
+            Write-Host ("{0,-14} -> {1}" -f $tool, ($(if ($hits) { $hits } else { 'NOT FOUND' })))
+          }
+
+          head "EWDK"
+          Write-Host ("EWDKROOT = " + ($env:EWDKROOT ?? '<unset>'))
+
+          head "LLVM / clang (bindgen 0.72 builds on the runner default clang)"
+          Write-Host ("LIBCLANG_PATH = " + ($env:LIBCLANG_PATH ?? '<unset>'))
+          $clang = Get-Command clang -ErrorAction SilentlyContinue
+          if ($clang) { & clang --version } else { Write-Host "clang: NOT on PATH" }
+
+          head "cargo-make (the gamepad drivers' build driver)"
+          $cm = & cargo make --version 2>&1; Write-Host $cm
+
+          head "Rust + targets"
+          & rustc -V; & cargo -V
+          Write-Host "installed targets:"; & rustup target list --installed
+
+          head "Env knobs the WDK build cares about"
+          Write-Host ("Version_Number = " + ($env:Version_Number ?? '<unset>'))
+          Write-Host ("CARGO_HOME     = " + ($env:CARGO_HOME ?? '<unset>'))
+          Write-Host ("CARGO_TARGET_DIR (daemon) = " + ($env:CARGO_TARGET_DIR ?? '<unset>'))
+
+      - name: Build + test pf-driver-proto (MSVC)
+        run: |
+          # Short target dir to dodge MAX_PATH inside the deep act host workdir (see windows-client.yml).
+          $env:CARGO_TARGET_DIR = "C:\t\drv"
+          cargo build --locked -p pf-driver-proto
+          cargo test  --locked -p pf-driver-proto
+          cargo clippy --locked -p pf-driver-proto --all-targets -- -D warnings
+          cargo fmt -p pf-driver-proto -- --check
+
+  # Build the UMDF driver workspace on windows-drivers-rs: proves wdk-sys bindgen/link works on the
+  # runner's WDK + LLVM, that pf-driver-proto path-deps into a driver, and exposes the produced DLL's
+  # FORCE_INTEGRITY (/INTEGRITYCHECK) bit — the M0 self-signed-load question.
+  driver-build:
+    runs-on: windows-amd64
+    needs: gate
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository
+      && needs.gate.outputs.heavy == 'true')
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+        # wdk-build finds the workspace by walking up from OUT_DIR to a Cargo.lock, so the target
+        # path stays in-tree (a junction, below). Compiling steps go through drivers-cargo.ps1,
+        # whose subst keeps MSBuild's CMake .tlog paths under MAX_PATH.
+        working-directory: packaging/windows/drivers
+    env:
+      # wdk-build otherwise picks 10.0.28000.0 (no km/crt) and bindgen fails — pin the WDK SDK version.
+      Version_Number: '10.0.26100.0'
+      # No LIBCLANG_PATH pin: the vendored bindgen 0.72 builds clean on the runner's default clang 22
+      # (the shipping pack proves it). A 0.71-era layout-test overflow once needed LLVM 21; the 0.72 bump
+      # retired that — see design/windows-build-and-packaging.md.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Ensure Windows toolchain (WDK, ARM64 target)
+        # Shared self-provision step (also used by windows-client.yml/windows-host.yml) so
+        # driver-build is self-sufficient on any windows-amd64 runner and never races a manually
+        # dispatched provisioning workflow landing on a different one. Path is relative to the job
+        # working-directory (packaging/windows/drivers). Near-noop once the toolchain is present.
+        run: ../../../scripts/ci/ensure-windows-toolchain.ps1
+      - name: Keep the driver target between runs
+        # C:\t outlives the job, and the runner's disk reclaim purges it whole. Only this job
+        # builds into C:\t\drivers; the runner runs one job at a time.
+        run: |
+          New-Item -ItemType Directory -Force -Path 'C:\t\drivers' | Out-Null
+          New-Item -ItemType Junction -Path target -Target 'C:\t\drivers' | Out-Null
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        # Cargo judges path crates by mtime, and this checkout is new: scripts/ci/src-mtimes.rs.
+        # After the junction, so the directory listing it records includes `target`.
+        run: |
+          Set-Location $env:GITHUB_WORKSPACE
+          rustc -O scripts/ci/src-mtimes.rs -o "$env:RUNNER_TEMP\src-mtimes.exe"; if ($LASTEXITCODE) { throw "src-mtimes build" }
+          & "$env:RUNNER_TEMP\src-mtimes.exe" 'C:\t\drivers'; if ($LASTEXITCODE) { throw "src-mtimes" }
+      - name: cargo build the driver workspace (wdk-iddcx + pf-vdisplay + gamepad drivers)
+        # Whole workspace: wdk-iddcx (DDI wrappers + the iddcx bindgen surface asserts) + pf-vdisplay
+        # (the real IddCx driver) + pf-umdf-util (the safe UMDF primitive layer) + the two gamepad
+        # drivers. pf-vdisplay linking proves the IddCx call sites resolve against IddCxStub end-to-end
+        # (M1 step 2 gate); the gamepad drivers prove pf-umdf-util's WDF dispatch links.
+        run: ../drivers-cargo.ps1 'build --locked -v'
+      - name: cargo clippy the shipped drivers (-D warnings — enforces the unsafe-audit gates)
+        # The gamepad drivers' business logic is 100% safe (it moved onto pf-umdf-util, the audited
+        # unsafe layer); pf-vdisplay + wdk-iddcx are inherently FFI-bound but every `unsafe {}` carries a
+        # `// SAFETY:` proof. Both invariants are lint-gated (`unsafe_op_in_unsafe_fn` +
+        # `undocumented_unsafe_blocks`); this step keeps them from regressing.
+        run: ../drivers-cargo.ps1 'clippy --locked -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse -p wdk-iddcx -p pf-vdisplay --all-targets -- -D warnings'
+      - name: cargo test pf-umdf-util (the safe helpers the drivers share)
+        # A plain lib links no WDF import libs, so its tests run where the cdylib drivers' cannot:
+        # the HID IOCTL table, descriptor lengths, string replies and the channel state machine.
+        run: ../drivers-cargo.ps1 'test --locked -p pf-umdf-util'
+      - name: cargo fmt --check the driver workspace
+        run: cargo fmt -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse -p wdk-iddcx -p pf-vdisplay --check
+      - name: Inspect /INTEGRITYCHECK (before) — expect FORCE_INTEGRITY set by wdk-build
+        run: |
+          # explicit --target (.cargo/config.toml) -> output under the triple subdir.
+          $dll = "target\x86_64-pc-windows-msvc\debug\pf_vdisplay.dll"
+          if (-not (Test-Path $dll)) { throw "pf_vdisplay.dll not produced at $dll" }
+          $b = [IO.File]::ReadAllBytes($dll)
+          $pe = [BitConverter]::ToInt32($b, 0x3c)
+          $dllchar = [BitConverter]::ToUInt16($b, $pe + 0x5e)   # OptionalHeader.DllCharacteristics
+          Write-Host ("pf_vdisplay.dll built OK ({0:N0} bytes)" -f (Get-Item $dll).Length)
+          Write-Host ("BEFORE: DllCharacteristics = 0x{0:X4}; FORCE_INTEGRITY = {1}" -f $dllchar, (($dllchar -band 0x0080) -ne 0))
+      - name: Clear FORCE_INTEGRITY (self-signed-load fix) + verify
+        # wdk-build sets /INTEGRITYCHECK unconditionally -> a self-signed driver won't load. Clear the PE
+        # bit deterministically (the reusable packaging step; signing/.cat happen later for real drivers).
+        run: ../clear-force-integrity.ps1 -Path target\x86_64-pc-windows-msvc\debug\pf_vdisplay.dll
+      - name: cargo build pf-vdisplay --features encode-probe (S5 probe gate)
+        # The shipped build already links NVENC/AMF/QSV/PyroWave; this proves the S5 probe on top
+        # of them still compiles under the WDK toolchain and the static CRT.
+        # LAST on purpose: same profile and target dir, so it overwrites pf_vdisplay.dll and would
+        # otherwise hand the PE-inspection steps above the probe DLL instead of the shipped one.
+        run: ../drivers-cargo.ps1 'build --locked -p pf-vdisplay --features encode-probe -v'
+      - name: cargo build + clippy the driver workspace for aarch64-pc-windows-msvc
+        # The ARM64 host leg (#298). Same x64 runner: the MSVC ARM64 cross compiler and the WDK's
+        # um\arm64 libs are provisioned above. Build + lint only, the DLLs cannot run here. Debug
+        # profile like the x64 steps; the encoder features drop out via the driver's target table.
+        # A failed build must stop here: the warm target still holds the last run's DLL.
+        run: |
+          ../drivers-cargo.ps1 'build --locked --target aarch64-pc-windows-msvc -p pf-vdisplay -p pf-gamepad -p pf-mouse -p pf-xusb -v'
+          if ($LASTEXITCODE) { throw "ARM64 driver build" }
+          ../drivers-cargo.ps1 'clippy --locked --target aarch64-pc-windows-msvc -p pf-umdf-util -p pf-xusb -p pf-gamepad -p pf-mouse -p wdk-iddcx -p pf-vdisplay --all-targets -- -D warnings'
+          if ($LASTEXITCODE) { throw "ARM64 driver clippy" }
+          $dll = "target\aarch64-pc-windows-msvc\debug\pf_vdisplay.dll"
+          if (-not (Test-Path $dll)) { throw "ARM64 pf_vdisplay.dll not produced at $dll" }
+          $b = [IO.File]::ReadAllBytes($dll)
+          $pe = [BitConverter]::ToInt32($b, 0x3c)
+          $machine = [BitConverter]::ToUInt16($b, $pe + 4)   # FileHeader.Machine: 0xAA64 = ARM64
+          if ($machine -ne 0xAA64) { throw ("ARM64 pf_vdisplay.dll has Machine 0x{0:X4}, expected 0xAA64" -f $machine) }
+          Write-Host ("ARM64 pf_vdisplay.dll built OK ({0:N0} bytes, Machine 0xAA64)" -f (Get-Item $dll).Length)

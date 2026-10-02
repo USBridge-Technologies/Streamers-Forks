@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  firewalld service definition for the punktfunk GameStream (Moonlight-compatible) host.
+
+  Installed to /usr/lib/firewalld/services/ by the punktfunk-host package. It is NOT enabled
+  automatically: an Arch package never touches the admin's running firewall. Stock Arch ships no
+  firewall (these ports are already open); Fedora/RHEL and some Arch spins (EndeavourOS) enable
+  firewalld by default, so enable it once with firewall-cmd (add-service=punktfunk-gamestream, then
+  reload). CachyOS and Ubuntu use ufw instead — the package also ships a ufw application profile
+  (punktfunk.ufw). Exact commands: your distro's install guide, or the per-distro packaging README.
+
+  Needed only when the host runs GameStream/Moonlight compat (serve with the gamestream flag). The
+  mgmt REST API (TCP 47990) is opened by the punktfunk-native profile (not here) so paired clients can
+  browse the game library over mTLS; off-loopback it exposes only read-only status/library endpoints.
+  Port map: design/gamestream-host-plan.md.
+-->
+<service>
+  <short>Punktfunk (GameStream / Moonlight)</short>
+  <description>Low-latency game-streaming host over the Moonlight-compatible GameStream protocol. Opens the fixed nvhttp (HTTPS/HTTP), RTSP, video RTP, ENet control/input and Opus audio ports, plus mDNS for auto-discovery.</description>
+  <port protocol="tcp" port="47984"/>  <!-- HTTPS nvhttp (paired, mutual TLS)         -->
+  <port protocol="tcp" port="47989"/>  <!-- HTTP nvhttp (/serverinfo, /pair PIN flow) -->
+  <port protocol="tcp" port="48010"/>  <!-- RTSP handshake                            -->
+  <port protocol="udp" port="47998"/>  <!-- Video RTP (+ FEC)                          -->
+  <port protocol="udp" port="47999"/>  <!-- ENet control stream + remote input        -->
+  <port protocol="udp" port="48000"/>  <!-- Audio (Opus)                              -->
+  <port protocol="udp" port="5353"/>   <!-- mDNS auto-discovery (_nvstream._tcp.local) -->
+</service>

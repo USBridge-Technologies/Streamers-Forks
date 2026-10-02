@@ -1,0 +1,70 @@
+# Unified in-tree workspace for punktfunk's all-Rust UMDF drivers, on microsoft/windows-drivers-rs
+# (crates.io wdk/wdk-sys/wdk-build — NOT the dev-box ../../crates/wdk* path-deps). Part of the
+# Windows-host rewrite (design/windows-host-rewrite.md, M1). pf-vdisplay + the gamepad drivers move here.
+#
+# Separate from the main cargo workspace (own [workspace] root) because driver crates are cdylibs built
+# with the WDK toolchain (cargo-wdk / wdk-build) on Windows only. Path-deps the shared ABI crate
+# crates/pf-driver-proto from the main tree.
+[workspace]
+resolver = "2"
+members = ["wdk-iddcx", "pf-umdf-util", "pf-vdisplay", "pf-gamepad", "pf-xusb", "pf-mouse"]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The same unsafe discipline as the main workspace (see its Cargo.toml for the full rationale).
+# Restated here because THIS IS A SEPARATE WORKSPACE: the main tree's [workspace.lints] does not
+# reach these crates, so any "workspace-wide" lint claim has to be made here too or it is false
+# for the driver surface. Every member opts in with `[lints] workspace = true`.
+# (`unsafe_op_in_unsafe_fn` is already the edition-2024 default; deny pins it explicitly.)
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[workspace.dependencies]
+# NOTE: the high-level `wdk` crate (0.4.1) used to be declared here and taken by five driver
+# crates. None of them ever referenced `wdk::` — every driver goes through `wdk_sys`, including
+# the WDF call macro, which wdk-sys re-exports (see pf-umdf-util, a full WDF crate that never
+# declared `wdk` either). Removing it drops a normal (linked) dependency from all five.
+# `tracing`/`tracing-subscriber` are still in the lock afterwards, but only as wdk-sys BUILD
+# dependencies — build-script machinery, not code in the shipped DLLs.
+wdk-sys = "0.5.1"
+wdk-build = "0.5.1"
+wdk-iddcx = { path = "wdk-iddcx" }
+pf-umdf-util = { path = "pf-umdf-util" }
+pf-driver-proto = { path = "../../../crates/pf-driver-proto" }
+# The Windows encoder backends, reached the same way: pf-vdisplay links them into the shipped
+# DLL. `pf-frame` is named alongside it because it owns the frame vocabulary those backends'
+# signatures take (`CapturedFrame`/`PixelFormat`); pf-encode-win does not re-export it.
+pf-encode-win = { path = "../../../crates/pf-encode-win" }
+pf-frame = { path = "../../../crates/pf-frame" }
+
+# Vendored windows-drivers-rs 0.5.1 (the published, self-contained crates) + an added `iddcx`
+# ApiSubset (M1 — bindgens iddcx/1.10/IddCx.h reusing wdk_default for WDF type-identity). Redirect ALL
+# wdk-sys/wdk-build refs to the patched copies so there is exactly one (iddcx-capable) wdk-sys in the
+# graph. Pinned; do not chase upstream.
+[patch.crates-io]
+wdk-build = { path = "vendor/wdk-build" }
+wdk-sys = { path = "vendor/wdk-sys" }
+
+# wdk-sys's build script reads the WDK driver-model from the WORKSPACE metadata (a workspace build can't
+# know which member it's building for). All our drivers are UMDF 2.x (incl. pf-vdisplay's IddCx), so set
+# it once here; a member needing a different model would get its own [package.metadata.wdk.driver-model].
+[workspace.metadata.wdk.driver-model]
+driver-type = "UMDF"
+umdf-version-major = 2
+target-umdf-version-minor = 31
+
+# No `lto` on dev: nothing ships from it (deploy-dev.ps1 and the packer both build --release), so it
+# only bought slower CI builds.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- punktfunk/1 QUIC/UDP data plane. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- mDNS discovery of _punktfunk._udp on the LAN (native mdns-sd browse). Requested
+         opportunistically — raw multicast reception needs only the MulticastLock, not this. -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+    <!-- HostDiscovery holds a MulticastLock while the native mDNS browse runs — raw multicast
+         reception needs it (also an OEM Wi-Fi power-save hedge). -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- WifiLock.acquire() ENFORCES this (a normal permission, granted at install). Without it the
+         stream's Wi-Fi locks throw SecurityException and power save stays on: downlink delivery
+         clumps at beacon intervals — hundreds of ms of latency mush + periodic whole-frame loss.
+         Its absence went unnoticed for weeks because the acquire was wrapped in a silent
+         runCatching (now logged). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Enforced from Android 17 (SDK 37, our targetSdk) for ALL local-network traffic incl. the
+         QUIC socket — a RUNTIME permission (NEARBY_DEVICES group): App asks on entry, above both
+         shells, and the touch screen gates every dial/wake on it. Harmless on earlier releases. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- Mic uplink to the host's virtual microphone (requested at runtime). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Gamepad rumble feedback. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- The background keep-alive's foreground service: it is what stops the OS freezing the
+         process the moment the app leaves the screen, which would take the audio and the QUIC
+         traffic down with it. mediaPlayback is the honest type — host audio keeps playing, and
+         that is the whole point of staying alive. POST_NOTIFICATIONS is a RUNTIME permission from
+         API 33; the settings toggle asks for it, and a refusal only hides the notification (the
+         service, and so the keep-alive, runs either way). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Steam Controller 2 over direct BLE (Sc2BleLink talks Valve's vendor GATT service to the
+         bonded pad). A RUNTIME permission (NEARBY_DEVICES group) from API 31 — MainActivity asks
+         for it when a BLE-paired SC2 is actually around, and the Controllers screen offers the
+         grant outright. USB capture (wired / Puck dongle) needs no Bluetooth at all.
+         Below API 31 the same two operations (the bonded list + connectGatt) are covered by the
+         install-time legacy permission instead, which BLUETOOTH_CONNECT does NOT imply — without
+         it every BLE capture on Android 11 and older throws SecurityException. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+
+    <!-- We target phone + TV from day one: keep the app installable on TV (no touchscreen) and on
+         devices without a gamepad. -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <!-- Neutralize Play's IMPLIED hard requirements, which filtered real TVs as "not compatible"
+         (reported on a Philips OLED707): RECORD_AUDIO implies android.hardware.microphone and the
+         Wi-Fi state permissions imply android.hardware.wifi, both required=true unless declared
+         otherwise. Some TVs declare no microphone (mic uplink is optional and runtime-gated) and
+         ethernet-only boxes declare no wifi (discovery/WifiLock are best-effort hedges there). -->
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi" android:required="false" />
+    <!-- Steam Controller 2 capture: USB host for the wired pad / Puck dongle, Bluetooth for the
+         direct-BLE pad — both optional (the feature quietly disengages without them). -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <!-- appCategory="game": a game-streaming client IS a game as far as the SoC is concerned.
+         On Snapdragon devices (and other OEMs with a Game Mode / Game Dashboard) this makes the app
+         eligible for the vendor's game performance profile — the aggressive CPU/GPU governor and
+         scheduler treatment games get — which, together with the ADPF hints in the native decode
+         path, is what keeps clocks up for low, consistent decode latency. Also groups it correctly
+         under Games in battery/data usage. Advisory: devices without Game Mode ignore it. -->
+    <application
+        android:allowBackup="false"
+        android:appCategory="game"
+        android:banner="@drawable/tv_banner"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PunktfunkAndroid">
+
+        <!-- Game Mode config (Android 13+): declare we support Performance mode and opt OUT of the
+             OEM interventions that would fight the negotiated stream — resolution downscaling and
+             FPS overrides. A game-streaming client renders exactly the host's mode; a platform
+             downscale/FPS-cap corrupts that. Ignored below API 33. -->
+        <meta-data
+            android:name="android.game_mode_config"
+            android:resource="@xml/game_mode_config" />
+
+        <!-- configChanges includes `keyboard` (not just keyboardHidden): claiming a Steam
+             Controller 2's USB HID interface removes its lizard-mode keyboard/mouse input
+             devices, which flips CONFIG_KEYBOARD (QWERTY→NOKEYS) — without `keyboard` declared,
+             Android RECREATES the activity, disposing StreamScreen and killing the stream the
+             moment the capture engages (tester-diagnosed on-glass, 2026-07-15). Releasing the
+             interfaces at session end brings the devices back — same flip, same need.
+             `uiMode` for the same reason: the dark-theme tile, or Battery Saver turning it on,
+             would otherwise end the stream. The app never follows the system theme. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout|density|navigation|uiMode"
+            android:theme="@style/Theme.PunktfunkAndroid">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- TV launcher entry. -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+            <!-- punktfunk:// deep links (design/client-deep-links.md §2): an external tool, an OS
+                 shortcut or a wiki page opens a stream on a host this device already trusts. The
+                 URL carries only REFERENCES to things that exist here (a host record, a settings
+                 preset, a library id) — never resolution/bitrate/codec values, and never a
+                 pairing route; MainActivity's router enforces the rest. BROWSABLE is what lets a
+                 browser hand it over (behind its own "Open Punktfunk?" prompt).
+                 NOTE: launchMode deliberately stays `standard` and the configChanges set above is
+                 untouched — its `keyboard` entry is what keeps an SC2 claim from killing a running
+                 stream, and neither has anything to gain from this filter. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="punktfunk" />
+            </intent-filter>
+        </activity>
+
+        <!-- The ongoing-session notification, and the background keep-alive behind it. Not
+             exported: the only things that start it are the stream screen and its own End
+             action's PendingIntent. -->
+        <service
+            android:name=".StreamKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- Keys ahead of Android's own shortcuts (Alt+Tab, the Meta chords, the Language key):
+             an accessibility service filters hardware keys before the window policy takes them.
+             The user turns it on under Accessibility; until then it is never bound. -->
+        <service
+            android:name=".KeyCaptureService"
+            android:exported="true"
+            android:label="@string/key_capture_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/key_capture_service" />
+        </service>
+
+        <!-- The USB grant only persists for the activity that matches the attach filter, so it
+             cannot hang on MainActivity: launchMode is standard, and an attach would start a
+             second copy of it. This activity exists to match, and then finishes. -->
+        <activity
+            android:name=".UsbGrantActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+        </activity>
+    </application>
+</manifest>

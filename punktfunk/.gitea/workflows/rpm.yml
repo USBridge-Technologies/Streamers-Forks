@@ -1,0 +1,548 @@
+# Build the punktfunk-host RPM and publish it to Gitea's RPM package registry, so Bazzite /
+# Fedora Atomic hosts layer + update it with rpm-ostree. Counterpart to deb.yml (apt). Runs in
+# the Fedora 43 builder image (ci/fedora-rpm.Dockerfile) so the RPM's auto library Requires
+# match the target's sonames.
+#
+# Registry (public, unom org), group "bazzite":
+#   repo file  https://git.unom.io/api/packages/unom/rpm/bazzite.repo
+# Box setup (once): see packaging/rpm/README.md
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (shared with docker.yml).
+name: rpm
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    branches: [main]
+    # Scope canary builds to what this artifact is built FROM — a docs-only or
+    # web-only push should not light up the whole fleet. Applies to branch pushes;
+    # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
+    paths:
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-capture/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-clipboard/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-dmabuf/**'
+      - 'crates/pf-driver-proto/**'
+      - 'crates/pf-encode/**'
+      - 'crates/pf-encode-core/**'
+      - 'crates/pf-frame/**'
+      - 'crates/pf-gpu/**'
+      - 'crates/pf-host-config/**'
+      - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
+      - 'crates/pf-libva/**'
+      - 'crates/pf-paths/**'
+      - 'crates/pf-paths-win/**'
+      - 'crates/pf-portal/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-update/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pf-vaapi/**'
+      - 'crates/pf-v4l2dec/**'
+      - 'crates/pf-v4l2/**'
+      - 'crates/pf-vdisplay/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-win-display/**'
+      - 'crates/pf-zerocopy/**'
+      - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
+      - 'crates/punktfunk-encode-worker/**'
+      - 'crates/punktfunk-host/**'
+      - 'crates/punktfunk-tray/**'
+      - 'crates/pyrowave-sys/**'
+      - 'clients/linux/**'
+      - 'clients/session/**'
+      - 'clients/shared/**'
+      - 'clients/cli/**'
+      - 'web/**'
+      - 'sdk/**'
+      - 'api/openapi.json'
+      - 'packaging/rpm/**'
+      - 'packaging/gamescope/**'
+      - 'packaging/bazzite/**'
+      - 'packaging/kde/host.env'
+      - 'packaging/linux/*.conf'
+      - 'packaging/linux/*.desktop'
+      - 'packaging/linux/*.rules'
+      - 'packaging/linux/*.service'
+      - 'packaging/linux/*.sh'
+      - 'packaging/linux/*.xml'
+      - 'packaging/linux/icons/**'
+      - 'LICENSE-MIT'
+      - 'LICENSE-APACHE'
+      - 'README.md'
+      - 'THIRD-PARTY-NOTICES.txt'
+      - 'packaging/README.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/60-punktfunk.rules'
+      - 'scripts/60-punktfunk-dualsense.conf'
+      - 'scripts/70-punktfunk-client.rules'
+      - 'scripts/99-punktfunk-net.conf'
+      - 'scripts/99-punktfunk-client-net.conf'
+      - 'scripts/headless/**'
+      - 'scripts/host.env.example'
+      - 'scripts/io.unom.punktfunk.dm-helper.policy'
+      - 'scripts/pf-dm-helper'
+      - 'scripts/punktfunk-host-desktop-session.conf'
+      - 'scripts/punktfunk-host.service'
+      - 'scripts/punktfunk-kde-session.service'
+      - 'scripts/punktfunk-modules.conf'
+      - 'scripts/punktfunk-scripting.service'
+      - 'scripts/punktfunk-web-init.service'
+      - 'scripts/punktfunk-web.service'
+      - 'scripts/web-init.sh'
+      - 'scripts/ci/assert-cap-matrix.sh'
+      - 'scripts/ci/check-dualsense-ucm.sh'
+      - 'scripts/ci/ensure-sccache.sh'
+      - 'scripts/ci/gitea-release.sh'
+      - 'scripts/ci/pf-version.sh'
+      - 'scripts/ci/retry.sh'
+      - 'scripts/alsa-ucm2/**'
+      - 'ci/bun.env'
+      - 'ci/install-bun.sh'
+      - '.gitea/workflows/rpm.yml'
+    # Single project version: a `vX.Y.Z` tag is THE release. main publishes to the `*-canary` rpm
+    # groups, tags to the base groups (`bazzite`/`fedora-44`) — separate repos, so the old
+    # version-shadow (a release outranking rolling builds in one group) is structurally gone.
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # The C/C++ half of the cache (aws-lc-sys, the vendored libopus, openh264's C++). Safe at
+  # workflow level here: unlike ci.yml/deb.yml this workflow has no cross-compiling job whose
+  # image sets its own CC_x86_64_unknown_linux_gnu. See ci.yml's `rust` job for that trap.
+  # This matters twice per push — the f43 and f44 legs are the two longest jobs in the fleet.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  CC_x86_64_unknown_linux_gnu: sccache cc
+  CXX_x86_64_unknown_linux_gnu: sccache c++
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    # One RPM per target whose sonames must match (a binary RPM is soname-coupled to its base):
+    # Fedora 43 == Bazzite, Fedora 44 == the Fedora KDE spin.
+    # Each builds in its matching builder image and publishes to its own registry group.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: punktfunk-fedora-rpm     # Fedora 43 == Bazzite base
+            group: bazzite
+            fedver: 43
+          - image: punktfunk-fedora44-rpm   # Fedora 44 == Fedora KDE spin
+            group: fedora-44
+            fedver: 44
+    container:
+      image: 192.168.1.58:5010/${{ matrix.image }}:latest
+    timeout-minutes: 90
+    env:
+      CARGO_HOME: /usr/local/cargo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
+      # images; this heals the job while the running :latest predates the bake.
+      - name: sccache (no-op once the image bakes it)
+        run: sh scripts/ci/ensure-sccache.sh
+
+      # rpmbuild + git archive need the checkout trusted; cache the crates download.
+      # The client link deps are also baked into the fedora-rpm image, but this job runs
+      # against the image from the PREVIOUS push (docker.yml bootstrap note) — keep it
+      # green across image changes; a no-op once the image has them.
+      - name: Prep
+        run: |
+          git config --global --add safe.directory "$PWD"
+          # No vulkan-headers: nothing in the workspace compiles against the system Vulkan headers.
+          # The host's Vulkan encode hand-rolls its structs, pyrowave-sys bindgens its own vendored
+          # copy, and both host and client reach Vulkan through ash, which dlopens the loader. (The
+          # HDR gamescope leg further down does need them, and pulls them itself via `dnf builddep
+          # gamescope`.) Matches packaging/rpm/punktfunk.spec, which dropped its BuildRequires too.
+          dnf -y install gtk4-devel libadwaita-devel SDL3-devel
+          # sysext build (packaging/bazzite/build-sysext.sh): squashfs + SELinux labeling.
+          # libcap = setcap/getcap: the sysext is the ONLY place the image can acquire
+          # cap_sys_nice=ep on punktfunk-encode-worker (a merged /usr is read-only squashfs and no
+          # scriptlet ever runs), and it is also what the build's host-must-be-uncapped assertion
+          # and the capability-matrix CI leg read with. Without it the image ships the lever inert.
+          dnf -y install squashfs-tools cpio libselinux-utils selinux-policy-targeted libcap
+          # Fedora's own gamescope, for its RUNTIME libraries only — never shipped, never run. The
+          # sysext folds in our punktfunk-gamescope and verifies it by executing `--version`, and
+          # on a cache hit (the common case) nothing else in this job would have pulled libavif /
+          # luajit / seatd / SDL2 in. Cheap, and it tracks gamescope's dep list for us.
+          dnf -y install gamescope || true
+          # bun builds the punktfunk-web console (--with web) and the spec vendors it into
+          # punktfunk-bun, so this job signs those bytes. Baked into the image; the script heals an
+          # image that lags the pin in ci/bun.env (docker.yml bootstrap note).
+          sh ci/install-bun.sh
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /usr/local/cargo/registry
+          key: cargo-home-fedora-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-fedora-
+
+      - name: Version + channel
+        # vX.Y.Z tag -> X.Y.Z-1 in the base group (a real release); main push -> <next-minor>-0.ciN.g<sha>
+        # in the `<base>-canary` group, whose "0." release sorts below the eventual <next-minor>-1 yet
+        # climbs by run number (scripts/ci/pf-version.sh owns the rule). The spec %build stamps
+        # PUNKTFUNK_BUILD_VERSION from these macros into the binary (--version provenance).
+        run: |
+          eval "$(bash scripts/ci/pf-version.sh --format rpm)"   # -> PF_VERSION, PF_RELEASE, PF_CHANNEL
+          case "$PF_CHANNEL" in
+            stable) GROUP="${{ matrix.group }}" ;;
+            *)      GROUP="${{ matrix.group }}-canary" ;;
+          esac
+          echo "GROUP=$GROUP" >> "$GITHUB_ENV"
+          echo "rpm $PF_VERSION-$PF_RELEASE -> group '$GROUP'"
+
+      # ── The web console, built once per (web+sdk content, bun) instead of once per leg ─────────
+      # Two legs run here (f43 + f44) and each built its own identical copy of a bundle that is a
+      # pure function of web/ and sdk/ — see the fuller note in deb.yml, whose key family this
+      # shares, so whichever job builds it first warms the rest of the fleet.
+      #
+      # ⚠ The build has to happen HERE, in the workspace, rather than being left to the spec. Two
+      # reasons, and both are load-bearing:
+      #   * build-rpm.sh packages a `git archive` tarball and web/.output is gitignored, so a
+      #     bundle sitting in the workspace is invisible to rpmbuild — it must be handed over by
+      #     absolute path (PF_PREBUILT_WEB_OUTPUT -> the spec's pf_prebuilt_web macro).
+      #   * the reverse direction is worse: the spec builds into rpmbuild's %{_topdir}, which
+      #     build-rpm.sh creates with mktemp and removes on EXIT. A console built in there is gone
+      #     before actions/cache's post step runs, so the cache would never populate and every run
+      #     would be a miss that quietly rebuilt — the cache would look present and do nothing.
+      - name: Web console cache key
+        run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
+      - name: Cache the built web console
+        id: webconsole
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: web/.output
+          key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
+
+      - name: Build the web console (cache miss only)
+        if: steps.webconsole.outputs.cache-hit != 'true'
+        run: |
+          cd web
+          # Retried: bun's download-and-extract is single-shot, and a truncated tarball reads as
+          # `Fail extracting tarball` (ci.yml's web job has the measurement).
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+          bun run build
+
+      # Same mandatory assertion as deb.yml — a missing or wrong-preset bundle must fail here, not
+      # become a quietly console-less RPM. The spec re-checks the marker on whatever it packages.
+      - name: The console must exist (cache hit or fresh build)
+        run: |
+          if [ ! -f web/.output/server/index.mjs ]; then
+            echo "::error::web/.output is missing — neither the cache restore nor the build produced it"
+            exit 1
+          fi
+          grep -q 'Bun\.serve' web/.output/server/index.mjs || {
+            echo "::error::web/.output is not a bun bundle (wrong nitro preset)"; exit 1; }
+          echo "web console present: $(du -sh web/.output | cut -f1)"
+
+      - name: Build RPM
+        # PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1 → also build the punktfunk-web console + the
+        # punktfunk-scripting runner subpackages, and punktfunk-bun, the runtime both require (the
+        # publish loop globs them in; the host RPM Recommends both). Bun is ensured in Prep.
+        run: |
+          PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" \
+            PF_RPM_TOPDIR=/tmp/pf-rpmbuild \
+            PF_WITH_WEB=1 PF_WITH_SCRIPTING=1 \
+            PF_PREBUILT_WEB_OUTPUT="$GITHUB_WORKSPACE/web/.output" \
+            bash packaging/rpm/build-rpm.sh
+
+      # Visibility only — the two RPM legs are the longest jobs in the fleet, so a cache
+      # regression here is the most expensive one to leave undetected.
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
+
+      # Signs with packages@unom.io (org secret) and self-verifies before publish. On a v* tag a
+      # missing key FAILS the build rather than publishing unsigned RPMs into a gpgcheck=1 repo.
+      - name: Sign RPMs
+        env:
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+          RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
+        run: bash packaging/rpm/sign-rpms.sh
+
+      # Read the file-capability matrix out of the BUILT rpm, before anything is signed or
+      # published. 0.26.0-1 shipped `%caps(cap_sys_nice=ep)` on the host through this very spec —
+      # on Fedora and, via rpm-ostree layering, on Bazzite — and every board was green while every
+      # KDE desktop session died in the field. The lesson recorded then was "verify the PACKAGE,
+      # never the board"; this is that. Host must carry NOTHING; the worker must carry exactly
+      # cap_sys_nice=ep. `--self-test` first, so a guard that has quietly stopped being able to
+      # fail takes the job down instead of waving the release through.
+      - name: The DualSense UCM drop-in must still bite
+        # scripts/alsa-ucm2/ hooks into alsa-ucm-conf's own dispatcher, so an upstream rename or
+        # reorder can neuter it with no error anywhere — and what comes back is the Spider-Man
+        # EXCEPTION_ACCESS_VIOLATION, not a quieter pad. This is the only leg that runs on a real
+        # Fedora tree, hence the two packages. Skips itself on any box without them.
+        run: |
+          dnf -y install alsa-ucm alsa-ucm-utils
+          sh scripts/ci/check-dualsense-ucm.sh
+
+      - name: Assert the capability matrix (rpm)
+        run: |
+          bash scripts/ci/assert-cap-matrix.sh --self-test
+          # Only the main host package carries binaries; -debuginfo/-debugsource and the
+          # client/web/scripting subpackages ship neither and are skipped by the script itself.
+          bash scripts/ci/assert-cap-matrix.sh dist/punktfunk-[0-9]*.rpm
+
+      - name: Publish to the Gitea RPM registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          # Publish only the main package (skip -debuginfo/-debugsource subpackages).
+          for rpm in dist/*.rpm; do
+            case "$rpm" in *debuginfo*|*debugsource*) echo "skip $rpm"; continue;; esac
+            echo "uploading $rpm"
+            # A re-tagged release re-fires this workflow and the rpm registry 409s on duplicate
+            # package versions — delete any prior copy of this exact name/version-release/arch
+            # first (404 on the first publish is fine).
+            NAME=$(rpm -qp --qf '%{NAME}' "$rpm" 2>/dev/null)
+            VR=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$rpm" 2>/dev/null)
+            ARCH=$(rpm -qp --qf '%{ARCH}' "$rpm" 2>/dev/null)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/rpm/$GROUP/package/$NAME/$VR/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$rpm" \
+              "https://$REGISTRY/api/packages/$OWNER/rpm/$GROUP/upload"
+          done
+          echo "published to $OWNER/rpm/$GROUP"
+
+      # The HDR-capable gamescope the sysext carries (packaging/gamescope) — what lets the
+      # gamescope backend stream 10-bit BT.2020 PQ instead of 8-bit SDR.
+      #
+      # CACHED, and that is the whole reason this is affordable: it is a ~10-minute C++ meson build
+      # of an entirely separate tree that depends on NOTHING in this repo except
+      # `packaging/gamescope/**` (the patches and the upstream pin, which lives in the build
+      # script). So the key is that directory's hash and a normal push restores a binary instead of
+      # building one. Per-Fedora-major, because the binary is soname-coupled to its base exactly
+      # like the RPM is — an f43 build does not start on f44.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: gamescope
+        with:
+          path: gs-cache
+          key: punktfunk-gamescope-f${{ matrix.fedver }}-${{ hashFiles('packaging/gamescope/**') }}
+
+      - name: Build the HDR gamescope
+        if: steps.gamescope.outputs.cache-hit != 'true'
+        # Best-effort ON PURPOSE. The sysext is the primary Bazzite delivery path and works without
+        # this binary (the host just stays SDR on the gamescope backend, which is what every
+        # release before this one did) — so a hiccup building someone else's tree must not cost the
+        # whole image. It is loud, though: the warning below, and `--gamescope` silently absent
+        # downstream is impossible because build-sysext.sh verifies the +pfhdr marker itself.
+        run: |
+          set -x
+          # `dnf builddep` resolves Fedora's PACKAGED gamescope, which is older than the master we
+          # pin, so it can come up short — xorg-x11-server-Xwayland-devel is the one that actually
+          # bites (wlroots' configure dies on a missing xserver.wrap several minutes in).
+          dnf -y install dnf-plugins-core meson ninja-build glslc || true
+          dnf builddep -y gamescope || true
+          dnf -y install xorg-x11-server-Xwayland-devel || true
+          # NOT best-effort: build-punktfunk-gamescope.sh appends `-static-libstdc++` to LDFLAGS
+          # (so the binary still starts on SteamOS's older libstdc++ — see its comment), and
+          # without the static library meson's very FIRST sanity check dies with
+          # "cannot find -lstdc++ / have you installed the static version", so nothing builds at
+          # all. That is what happened on the v0.26.0 tag: both Fedora bases warned and skipped,
+          # the job stayed green, and the release shipped with no gamescope RPM while the notes
+          # said it had one. A rename here must be LOUD, hence no `|| true`.
+          dnf -y install libstdc++-static
+          # The rest of the Arch package's makedepends that Fedora's older packaged gamescope does
+          # not necessarily pull. Best-effort: unlike the static runtime, meson finds fallbacks or
+          # does without, and a name that moves between Fedora releases should not fail the job.
+          dnf -y install wayland-protocols-devel glm-devel cmake libXcursor-devel || true
+          if bash packaging/gamescope/build-punktfunk-gamescope.sh \
+               --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
+            # The WHOLE staged tree, not just the binary: it also carries the Vulkan WSI layer built
+            # beside the compositor, which is the only thing that can give a nested game an HDR10
+            # swapchain. Caching the tree rather than a file per artifact is what keeps the next
+            # addition from needing a change here as well as in every packaging script.
+            mkdir -p gs-cache && cp -a gs-stage/. gs-cache/
+          else
+            # Warn only, even on a tag — the hard gate is the LAST step of this job. Failing here
+            # would skip the sysext build, the sysext feed, AND the release attach below, so a
+            # missing gamescope would also withhold the punktfunk RPMs and the .raw images that
+            # built perfectly well. deb.yml learned that the expensive way on v0.26.0.
+            echo "::warning::punktfunk-gamescope failed to build for f${{ matrix.fedver }} — the sysext ships without it (gamescope sessions stay SDR)"
+          fi
+
+      # The same binary, as an ordinary RPM. The sysext below is the Atomic/Bazzite delivery; this
+      # is the one a traditional Fedora-family box (Nobara, plain Fedora) can actually install —
+      # until it existed those users had no packaged route to the patched build at all, and a stock
+      # gamescope tells every game its display is 60 Hz whatever the client negotiated.
+      #
+      # Same best-effort rule as the build above: no binary, no package, and the host stays on its
+      # existing SDR/host-composited path. The spec re-checks the +pfhdr marker itself.
+      - name: Package punktfunk-gamescope as an RPM
+        run: |
+          if [ -x gs-cache/usr/bin/punktfunk-gamescope ] && gs-cache/usr/bin/punktfunk-gamescope --version >/dev/null 2>&1; then
+            bash packaging/gamescope/build-gamescope-rpm.sh \
+              --stage gs-cache \
+              --release "$PF_RELEASE"
+          else
+            # Warn only — see the note on the build step. The gate is the last step of this job.
+            echo "::warning::no usable punktfunk-gamescope for f${{ matrix.fedver }} — skipping its RPM"
+          fi
+
+      # A SECOND signing pass, for this package only. The main "Sign RPMs" step ran back at build
+      # time, long before this RPM existed — the gamescope build sits behind its own ~10-minute
+      # cache and deliberately runs after the host RPMs are already published. So every
+      # punktfunk-gamescope RPM went to the registry UNSIGNED, and the repo file we tell users to
+      # install carries gpgcheck=1: `dnf install punktfunk-gamescope` failed with "The package is
+      # not signed" on every Fedora and Nobara box. The package was in the channel the whole time
+      # and could not be installed from it — which is worse than absent, because the release notes
+      # and the docs-site both say it is there.
+      #
+      # Same fail-closed rule as the first pass: sign-rpms.sh hard-fails on refs/tags/v* if the org
+      # secret is missing, rather than republishing something a user's dnf will reject.
+      - name: Sign punktfunk-gamescope
+        env:
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+          RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
+        run: |
+          shopt -s nullglob
+          rpms=(dist/punktfunk-gamescope-*.rpm)
+          # No RPM here is the best-effort skip above, already warned about — not a signing failure.
+          if [ "${#rpms[@]}" -eq 0 ]; then
+            echo "no punktfunk-gamescope RPM to sign (see the packaging step above)"
+            exit 0
+          fi
+          bash packaging/rpm/sign-rpms.sh "${rpms[@]}"
+
+      - name: Publish punktfunk-gamescope to the Gitea RPM registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          shopt -s nullglob
+          for rpm in dist/punktfunk-gamescope-*.rpm; do
+            case "$rpm" in *debuginfo*|*debugsource*) continue;; esac
+            NAME=$(rpm -qp --qf '%{NAME}' "$rpm" 2>/dev/null)
+            VR=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$rpm" 2>/dev/null)
+            ARCH=$(rpm -qp --qf '%{ARCH}' "$rpm" 2>/dev/null)
+            echo "uploading $rpm"
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/rpm/$GROUP/package/$NAME/$VR/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$rpm" \
+              "https://$REGISTRY/api/packages/$OWNER/rpm/$GROUP/upload"
+          done
+
+      # The no-layering Bazzite path: wrap the just-built host + web RPMs into a systemd-sysext
+      # image and publish it to the per-Fedora-major feed (punktfunk-sysext/f43[-canary], …) that
+      # `punktfunk-sysext install|update` reads. Same RPMs, same channels — just no rpm-ostree.
+      - name: Build the sysext image
+        run: |
+          # Execute it here rather than only handing it over: build-sysext.sh treats an unusable
+          # --version as fatal (rightly — it is how the +pfhdr marker is read), and a cached binary
+          # whose runtime libs are missing from this container must cost the image its HDR, not the
+          # image itself.
+          gs=()
+          if [ -x gs-cache/usr/bin/punktfunk-gamescope ] && gs-cache/usr/bin/punktfunk-gamescope --version >/dev/null 2>&1; then
+            gs=(--gamescope-stage gs-cache)
+            echo "folding in $(gs-cache/usr/bin/punktfunk-gamescope --version 2>&1 | head -1)"
+          else
+            echo "::warning::no usable punktfunk-gamescope for f${{ matrix.fedver }} — the sysext ships without it (gamescope sessions stay SDR)"
+          fi
+          bash packaging/bazzite/build-sysext.sh --version-id "${{ matrix.fedver }}" \
+            --out "dist-sysext/punktfunk-${PF_VERSION}-${PF_RELEASE}-x86-64.raw" \
+            "${gs[@]}" \
+            dist/punktfunk-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
+            dist/punktfunk-web-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
+            dist/punktfunk-scripting-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
+            dist/punktfunk-bun-"${PF_VERSION}-${PF_RELEASE}"*.rpm
+
+      # Read the capability matrix back OUT of the image that is about to be published — the one
+      # channel where getting it wrong is unrepairable, because a merged sysext's /usr is read-only
+      # squashfs and the only fix is a new image plus a feed republish. 0.26.0-1's Bazzite breakage
+      # was confirmed exactly this way, after the fact, by mounting the published .raw and running
+      # getcap on it. Doing it here means the .raw never reaches the feed.
+      #
+      # The script proves its own reader first (cap a file, squash it, unsquash it, read it back)
+      # so a runner that cannot see file capabilities FAILS the leg instead of blessing the image.
+      - name: Assert the capability matrix (sysext image)
+        run: |
+          bash scripts/ci/assert-cap-matrix.sh \
+            "dist-sysext/punktfunk-${PF_VERSION}-${PF_RELEASE}-x86-64.raw"
+
+      # The feed's SHA256SUMS is OpenPGP-signed with the same packages@unom.io key as the RPMs, and
+      # punktfunk-sysext(8) refuses a feed it can't verify — the checksums alone never proved
+      # anything, sitting on the same registry as the images they describe.
+      - name: Publish the sysext feed
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+        run: |
+          case "$GROUP" in
+            *-canary) FEED="f${{ matrix.fedver }}-canary"; KEEP=6; OTHER="f${{ matrix.fedver }}" ;;
+            *)        FEED="f${{ matrix.fedver }}";        KEEP=0; OTHER="f${{ matrix.fedver }}-canary" ;;
+          esac
+          KEEP=$KEEP bash packaging/bazzite/publish-sysext-feed.sh "$FEED" \
+            "dist-sysext/punktfunk-${PF_VERSION}-${PF_RELEASE}-x86-64.raw"
+          # Re-seal this Fedora major's OTHER channel too. Stable feeds only publish on a tag, so
+          # without this a stable box would sit in front of an unsigned (hence refused) feed until
+          # the next release; canary pushes are frequent, so every live feed gets sealed within a
+          # day of this landing, and a key rotation propagates without rebuilding any image.
+          # Best-effort: a channel that has never published yet has no manifest to seal.
+          bash packaging/bazzite/publish-sysext-feed.sh --seal "$OTHER" \
+            || echo "::warning::could not seal the $OTHER feed (no manifest yet?)"
+
+      # On a real release, also attach the .rpms to the unified Gitea Release. Both Fedora bases
+      # (bazzite=F43, fedora-44) build the SAME filename, so suffix the asset with the base to keep
+      # both on the release; canary builds live in the `*-canary` rpm groups (no release page).
+      - name: Attach .rpms to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for rpm in dist/*.rpm; do
+            case "$rpm" in *debuginfo*|*debugsource*) continue;; esac
+            base="$(basename "$rpm" .rpm)"
+            upsert_asset "$RID" "$rpm" "${base}.${{ matrix.group }}.rpm"
+          done
+          for raw in dist-sysext/*.raw; do
+            upsert_asset "$RID" "$raw" "$(basename "$raw" .raw).f${{ matrix.fedver }}.raw"
+          done
+
+      # A release must not be able to make a claim its own CI silently dropped — v0.26.0's notes
+      # said the patched gamescope was dnf-installable while both Fedora bases had skipped it on a
+      # `::warning::` (missing libstdc++-static, which the -static-libstdc++ link needs).
+      #
+      # ⚠ LAST step on purpose, matching deb.yml: failing at the build step instead would skip the
+      # sysext image, the feed publish AND the attach above, withholding the punktfunk RPMs and
+      # .raw images that built perfectly well. Everything good ships first; the job goes red after.
+      - name: A stable tag must ship the gamescope RPM
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        run: |
+          shopt -s nullglob
+          built=(dist/punktfunk-gamescope-*.rpm)
+          keep=()
+          for r in "${built[@]}"; do
+            case "$r" in *debuginfo*|*debugsource*) continue;; esac
+            keep+=("$r")
+          done
+          if [ ${#keep[@]} -eq 0 ]; then
+            echo "::error::no punktfunk-gamescope RPM was built for f${{ matrix.fedver }} — a stable tag must not ship without it (the release notes and docs-site say it is installable). Everything else in this job published normally; see the gamescope build step above for the meson error."
+            exit 1
+          fi
+          echo "gamescope RPM present: ${keep[*]}"

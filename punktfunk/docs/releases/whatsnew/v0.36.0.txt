@@ -1,0 +1,7 @@
+• Keep streaming in the background behind a notification. Off until you turn it on.
+• Hosts show up on Wi-Fi networks that dropped discovery in power save.
+• Alt+Tab, Win chords and Korean and Japanese keyboard keys reach the host.
+• L3 and R3 on the on-screen controller.
+• Steam Controller 2: the USB permission sticks, and it drives the menus without capture.
+• A TV remote drives the quick-action ring, and the TV stats overlay fits the screen.
+• Frames pace evenly on handhelds.

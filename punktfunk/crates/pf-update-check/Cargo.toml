@@ -1,0 +1,49 @@
+# The update-CHECK core, shared by the host and the Linux client (planning:
+# host-update-from-web-console.md §3). It exists because both products answer the same
+# question — "does a newer build exist for this box's channel?" — from the same signed
+# manifest, and a trust rule that lives in two places is a trust rule that will diverge.
+#
+# Deliberately check-only: no apply legs, no package managers, no privileged anything. The
+# host keeps its Windows/Linux apply code; the client keeps its own. What is shared here is
+# exactly the part where being wrong is a security bug: signature verification, manifest
+# validation, and the version comparison that decides whether to tell a user to update.
+[package]
+name = "pf-update-check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Signed update-manifest fetch + verification, install-kind detection and version comparison, shared by the punktfunk host and client."
+publish = false
+
+[features]
+# The signed-manifest half: fetch, signature and manifest checks. Without it the crate is the
+# install-kind ladder, the version compare and the serial floor, which the root helper reads
+# without an HTTP client or TLS in its tree.
+default = ["verify"]
+verify = ["dep:anyhow", "dep:aws-lc-rs", "dep:base64", "dep:ureq"]
+
+[dependencies]
+anyhow = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ed25519 over the exact manifest bytes — the same primitive the plugin-store index uses, on the
+# workspace's one crypto backend. aws-lc-rs's API is ring-compatible, so the call sites are
+# unchanged apart from the crate name. The workspace entry's `prebuilt-nasm` matters here:
+# `cargo test -p pf-update-check` selects no rustls `aws_lc_rs` that would enable it, and without
+# it aws-lc-sys wants NASM on Windows x86_64.
+aws-lc-rs = { workspace = true, optional = true }
+# Feature selection matched to ureq's (and punktfunk-host's) on purpose — 0.23's default-on
+# `simd-unsafe` engine stays off, so a currency bump doesn't quietly add unsafe SIMD to the tree.
+base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
+# Small, sync, bundles webpki roots — no system cert store dependency, which matters on the
+# Deck (Decky's embedded Python has no usable roots either; see clients/decky/main.py).
+ureq = { workspace = true, optional = true, features = ["gzip"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

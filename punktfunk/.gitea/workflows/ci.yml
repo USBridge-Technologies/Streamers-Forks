@@ -1,0 +1,738 @@
+# CI for punktfunk (Gitea Actions). Linux jobs run on the `ubuntu-24.04` fleet label; the
+# Rust job runs inside the prebuilt builder image (ci/rust-ci.Dockerfile — PipeWire, GL/GBM,
+# libcuda link stub, pinned-channel rustup) so the workspace links the
+# same libs as the dev boxes. Builder images come from the LAN registry on home-ci-core
+# (content-keyed, docker.yml) — never the WAN. Apple client CI lives in apple.yml (macOS
+# runner). The report-only benchmarks moved to bench.yml (nightly + dispatch) so they stop
+# occupying a fleet slot on every push.
+name: ci
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Setting `types` at all replaces the default set, so the three defaults are listed again.
+    # `ready_for_review` and `labeled` are listed for the day they work: measured on 1.27.1,
+    # neither starts a run. A Gitea draft is a `WIP:` title prefix, so undrafting is an edit,
+    # not its own event. Until then the gate is re-read on the next push or a manual re-run.
+    types: [opened, reopened, synchronize, ready_for_review, labeled]
+
+# Shared compile cache: sccache -> RustFS S3 (storage.unom.io, LAN-pinned via ci-core's
+# unbound). Keys include compiler hash + target + flags, so cross-OS/arch entries can
+# never collide; every Rust job on every host feeds and reads one warm cache.
+#
+# RUSTC_WRAPPER covers RUST compilations and nothing else. The C/C++ half of this workspace —
+# aws-lc-sys, openh264-sys2's vendored C++, the CMake-built libopus behind audiopus_sys, pyrowave —
+# was paid in full on every run until the CMAKE_*_COMPILER_LAUNCHER / CC_* wiring below existed.
+# Linking is the third phase and is cacheable by nothing: that one is addressed in the builder
+# images with mold (ci/cargo-config-mold.toml).
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # Route CMake-driven C/C++ through the same cache. Safe at workflow level: it names no
+  # triple, and cmake-rs overrides it per-invocation with a `-D` flag when cc-rs reports a
+  # wrapper, so the two can never double-wrap into `sccache sccache cc`.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Which suites this diff can break (scripts/ci/changed.sh), as job outputs. Every gated job
+  # below waits on this one, so it stays a bare runner with no builder image: seconds of a fleet
+  # slot, not minutes. A merge-base diff is the PR's own change — Gitea path filters also see
+  # rebase noise (gitea#34710). No base sha (push, dispatch) runs every bucket.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.paths.outputs.rust }}
+      rust_arm64: ${{ steps.paths.outputs.rust_arm64 }}
+      web: ${{ steps.paths.outputs.web }}
+      docs_site: ${{ steps.paths.outputs.docs_site }}
+      sdk_plugin_kit: ${{ steps.paths.outputs.sdk_plugin_kit }}
+      decky_typecheck: ${{ steps.paths.outputs.decky_typecheck }}
+      heavy: ${{ steps.gate.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          sh scripts/ci/changed.sh --self-test
+          bash scripts/ci/pf-version.sh --self-test
+          if [ -n "${BASE_SHA:-}" ]; then
+            git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null || git fetch origin "$BASE_SHA"
+            git diff --no-renames --name-only "$BASE_SHA...HEAD" > /tmp/changed-paths
+            cat /tmp/changed-paths
+            sh scripts/ci/changed.sh /tmp/changed-paths > /tmp/changed-outputs
+          else
+            CHANGED_ALL=1 sh scripts/ci/changed.sh /dev/null > /tmp/changed-outputs
+          fi
+          tee -a "$GITHUB_OUTPUT" < /tmp/changed-outputs
+
+      # The expensive lanes are opt-in on a pull request. A draft runs the cheap gates only;
+      # marking it ready for review — or labelling it `ci:all` — turns the rest on. Push to
+      # main always runs everything, so nothing escapes verification, it only moves to merge
+      # time. Reads the PR's CURRENT state rather than the event payload: a label added after
+      # the last push is not in the payload, and a re-run replays the old one.
+      - name: Decide whether the expensive lanes run
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          sh scripts/ci/pr-gate.sh --self-test
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "heavy=true" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          API="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls/$PR"
+          # `|| true`: an unreachable API must not fail the gate. pr-gate.sh fails open on an
+          # empty body, so the lanes run and the cost is visible.
+          curl -fsS "$API" -H "Authorization: token $GITEA_TOKEN" > /tmp/pr.json || true
+          [ -s /tmp/pr.json ] || curl -fsS "$API" > /tmp/pr.json || true
+          sh scripts/ci/pr-gate.sh < /tmp/pr.json | tee -a "$GITHUB_OUTPUT"
+
+  rust:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' && needs.changes.outputs.heavy == 'true' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 90
+    env:
+      # cc-rs recognises `sccache` as a compiler wrapper when it leads CC/CXX, and cmake-rs then
+      # forwards it as -DCMAKE_C_COMPILER_LAUNCHER, so this covers both build-script styles.
+      #
+      # ⚠ JOB-scoped, NOT workflow-scoped, and it must stay that way: the `rust-arm64` job below
+      # runs in the cross image, whose own compiler env (ci/rust-ci-arm64cross.Dockerfile) a
+      # workflow-level value would silently overwrite — breaking the cross build in a way that
+      # looks like a header mismatch, not a CI config error.
+      CC_x86_64_unknown_linux_gnu: sccache cc
+      CXX_x86_64_unknown_linux_gnu: sccache c++
+      # Line tables keep file:line in panics and shrink target/ and every link. The value is
+      # part of each sccache key, so changing it means bumping the target key's -vN- too.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # Prebuilt Skia from disk, never github.com; see ci/skia-binaries.sh.
+      SKIA_BINARIES_URL: file:///opt/skia-binaries/skia-binaries-{key}.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
+      # images; this heals the job while the running :latest predates the bake.
+      - name: sccache (no-op once the image bakes it)
+        run: sh scripts/ci/ensure-sccache.sh
+
+      # punktfunk-client-linux link deps. Also baked into rust-ci.Dockerfile — but ci.yml
+      # runs against the image from the PREVIOUS push (docker.yml bootstrap note), so this
+      # keeps the job green across image-content changes; a no-op once the image has them.
+      - name: GTK4/libadwaita/SDL3 dev packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev libsdl3-dev
+
+      # These SPIR-V blobs are pulled in with include_bytes! and rebuilt only by hand — edit a
+      # .comp, forget the rebuild, and the OLD kernel ships with no compile error or failing test.
+      # Recompile each shader and diff the disassembly. Filtering OpSourceExtension (+ --no-header)
+      # is exactly what absorbs the shaderc-vs-glslang generator difference; every instruction, ID
+      # and constant must match.
+      #
+      # Only shaders whose rebuild command is plain `glslangValidator -V` belong here. The four
+      # pf-client-core blobs are compiled by their build.sh with `glslc -O`, so gating them would
+      # pin this diff to CI's spirv-opt version and go red on a toolchain bump, not on drift.
+      #
+      # Disassemble to FILES rather than `diff <(…) <(…)`: Gitea's runner executes a step's `run:`
+      # under `sh -e`, and dash has no process substitution — it rejects the script at PARSE time,
+      # taking the whole `rust` job with it. A gate that cannot run looks exactly like one that
+      # passes, which is the failure it exists to prevent.
+      - name: Shader SPIR-V drift gate (pf-zerocopy, pf-encode)
+        run: |
+          apt-get install -y --no-install-recommends glslang-tools spirv-tools
+          for p in crates/pf-zerocopy/src/imp/rgb2nv12_buf \
+                   crates/pf-zerocopy/src/imp/cursor_blend \
+                   crates/pf-zerocopy/src/imp/convert_img \
+                   crates/pf-zerocopy/src/imp/reframe_buf \
+                   crates/pf-encode/src/enc/linux/reframe \
+                   crates/pf-encode/src/enc/linux/rgb2yuv \
+                   crates/pf-encode/src/enc/linux/rgb2yuv10 \
+                   crates/pf-encode/src/enc/linux/rgb2yuv10_709 \
+                   crates/pf-encode/src/enc/linux/rgb2yuv444; do
+            s=${p##*/}
+            glslangValidator -V "$p.comp" -o "/tmp/$s.spv" >/dev/null
+            spirv-dis --no-header "$p.spv"      | grep -v OpSourceExtension > "/tmp/$s.committed"
+            spirv-dis --no-header "/tmp/$s.spv" | grep -v OpSourceExtension > "/tmp/$s.rebuilt"
+            diff "/tmp/$s.committed" "/tmp/$s.rebuilt" \
+              || { echo "::error::$p.spv is stale — rebuild it from $s.comp"; exit 1; }
+          done
+
+      # Best-effort caches (act_runner's built-in cache server). Keyed on Cargo.lock:
+      # registry/git are download caches, target/ the incremental build. The target key
+      # carries the rustc version — resolved via `rustc --version` (below) rather than parsed
+      # from rust-toolchain.toml, so a pin bump there invalidates stale incremental state too.
+      # Build scripts fetch with a bare curl over a runner network that drops packets under load.
+      - name: curl with retries (build-script fetches have none)
+        run: sh scripts/ci/install-retrying-curl.sh
+
+      # Baked into the image; this fetches the pins while the running :latest predates them.
+      - name: Prebuilt Skia (no-op once the image bakes it)
+        run: sh ci/skia-binaries.sh x86_64-unknown-linux-gnu wasm32-unknown-emscripten
+
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      # Restore only: the save steps at the end of the job run on a push to main, so a pull
+      # request never uploads a multi-GB cache.
+      - name: Restore cargo home
+        id: cargo-home
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          # `-ci-`, never the release builds' `cargo-home-` pool: extracted crate sources compile
+          # without a re-checksum, so an entry here must never reach a signed build.
+          key: cargo-home-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-ci-
+      - name: Restore target
+        id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          # `-debug-` keeps this apart from deb.yml's release tree: a job that hits a shared key
+          # exactly never saves its own. A corrupt entry needs no prefix bump: the next step drops
+          # its debris and a push replaces it.
+          key: cargo-target-debug-v4-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-debug-v4-${{ env.rustc }}-
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-debug-v4-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # rust-safety WP2c: three textual gates for classes no lint covers — unsafe fn markers
+      # carrying no contract, panic across an extern boundary (an abort since 1.81), and
+      # process-global safe APIs (env::set_var & co, count-ratcheted). Pure grep/awk, no cargo.
+      # Both failure modes were demonstrated before this became blocking (planted instances).
+      - name: Unsafe-hygiene grep gates
+        run: sh scripts/ci/check-unsafe-hygiene.sh
+
+      # A crate a platform workflow compiles but its `paths:` filter omits merges with no build
+      # on that platform. Reads the per-target graph from `cargo metadata`, not a second list.
+      - name: Workflow path-filter gate
+        run: |
+          python3 scripts/ci/check-workflow-paths.py --self-test
+          python3 scripts/ci/check-workflow-paths.py
+
+      # The plugin runner's unit replaces the home with a tmpfs, so a config file it reads and the
+      # unit does not bind is ENOENT at runtime — which is how plugin-tokens.json shipped unbound
+      # and no Linux plugin could start. Reads the names out of the SDK, not a second list.
+      - name: Plugin-runner bind gate
+        run: sh scripts/ci/check-runner-binds.sh
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # WP19 (rust-safety): the hardened NATIVE-ONLY host — no Moonlight-compat planes, no
+      # `rusty_enet` (transpiled C ENet), no `rsa`. Kept compiling here so the cfg boundary can't
+      # rot, and the dependency claim is ASSERTED, not assumed: `cargo tree -i` must find neither
+      # crate in the native-only graph (it exits non-zero with "nothing depends on" — inverted).
+      - name: Clippy + tree (native-only host, no gamestream feature)
+        run: |
+          cargo clippy -p punktfunk-host --no-default-features --features pyrowave \
+            --all-targets --locked -- -D warnings
+          if cargo tree -p punktfunk-host --no-default-features --features pyrowave \
+            --locked -i rusty_enet 2>/dev/null | grep -q rusty_enet; then
+            echo "native-only build still depends on rusty_enet"; exit 1; fi
+          if cargo tree -p punktfunk-host --no-default-features --features pyrowave \
+            --locked -i rsa 2>/dev/null | grep -q "^rsa"; then
+            echo "native-only build still depends on rsa"; exit 1; fi
+
+      - name: Build
+        id: build
+        run: cargo build --workspace --locked
+
+      - name: Test (unit + loopback + proptest + C ABI harness)
+        run: cargo test --workspace --locked
+
+      # Discovery without the desktop bundle. The workspace test above enables `desktop`,
+      # which includes this feature, so it never compiles the feature on its own.
+      # Clippy with warnings denied: `cargo check` would stay green on a warning.
+      - name: Clippy discovery without desktop
+        run: cargo clippy -p pf-client-core --locked --no-default-features --features discovery -- -D warnings
+
+      # The browser client (punktfunk/client-web) builds these three for wasm; nothing else here
+      # compiles that target, so this is where a native-only import into them fails.
+      - name: Clippy the browser client's crates on wasm
+        run: |
+          rustup target add wasm32-unknown-emscripten
+          cargo clippy -p punktfunk-core -p pf-console-ui -p pf-client-core --locked \
+            --target wasm32-unknown-emscripten --no-default-features \
+            --features punktfunk-core/pake -- -D warnings
+
+      # The installer's behavioural gates — detection per family, the derived defaults, channel
+      # switching both ways — driven against the binary. They ran in the docs-drift lane while
+      # the installer was a shell script; they live here now because that lane has no cargo.
+      - name: Installer behaviour (detection, defaults, channel switching)
+        run: sh scripts/ci/check-installer-behavior.sh
+
+      # The deep half of the docs-drift gates (the `docs-drift` job checks the docs-site copy
+      # and the textual rest): the committed spec must match what the binary actually serves.
+      # Build already compiled punktfunk-host with default features, so this re-links at worst.
+      # Byte diff on purpose — the generator is deterministic, and if that ever stops being
+      # true it deserves to surface here.
+      - name: OpenAPI spec drift gate
+        run: |
+          cargo run -p punktfunk-host --locked -- openapi > /tmp/openapi.regen.json
+          diff -u api/openapi.json /tmp/openapi.regen.json >/dev/null || {
+            echo "::error::api/openapi.json is stale — regenerate: cargo run -p punktfunk-host -- openapi > api/openapi.json && cp api/openapi.json docs-site/public/openapi.json"
+            exit 1
+          }
+
+      # The GPU encode backends are OFF by default, so every step above compiles ~none of them:
+      # `nvenc` gates enc/linux/nvenc_cuda.rs (+ nvenc_core/nvenc_status) and `vulkan-encode` gates
+      # enc/linux/vulkan_video.rs (+ the vendored vk_av1_encode/vk_valve_rgb bindings) — ~8,150
+      # lines carrying ~70 `unsafe` blocks. Their ONLY prior CI coverage was deb.yml's
+      # `cargo build`, where warnings are not errors, so the `undocumented_unsafe_blocks` deny
+      # (now hoisted into [workspace.lints]) — pf-encode's stated unsafe-proof gate —
+      # was never actually enforced on them. (`pyrowave` needs no extra step: punktfunk-host has
+      # `default = ["pyrowave"]`, so the steps above already cover it.)
+      #
+      # `--all-targets` is load-bearing, not decoration: without it the feature-gated
+      # `#[cfg(test)]` modules are never compiled, which is exactly how all ten
+      # `NvencCudaEncoder::open` call sites in nvenc_cuda.rs's tests drifted to the wrong arity
+      # (E0061 x10) without any job noticing.
+      #
+      # GPU-free: every test needing real hardware is `#[ignore]`d, and NVENC/CUDA resolve their
+      # entry points at RUNTIME (dlopen), so the test binary links without a driver present.
+      # (On MSVC the same crate link-imports those symbols instead, which is why windows-host.yml
+      # can only type-check these tests via clippy — see the note there.)
+      #
+      # Scoped to `-p pf-encode` with ITS OWN feature names: punktfunk-host has no code gated on
+      # `nvenc`/`vulkan-encode` (its only `cfg(feature)` sites are the two `pyrowave` ones in
+      # capture.rs, and pyrowave is default-on, so the steps above already cover them). Going
+      # through `--features punktfunk-host/...` would force punktfunk-host into the selection and
+      # re-run its entire test suite a second time for no extra coverage.
+      #
+      # `pyrowave` (the host's default) is listed explicitly: selecting only `-p pf-encode` takes
+      # the host out of the resolution, and pf-encode's own default is empty. Naming it keeps this
+      # the SHIPPED Linux feature set — deb.yml builds
+      # `--features punktfunk-host/nvenc,punktfunk-host/vulkan-encode` WITHOUT
+      # `--no-default-features`, so the .deb carries nvenc + vulkan-encode + pyrowave together, and
+      # that combination is what deserves the lint. The bare crate lints on its own.
+      #
+      # pf-encode-core rides along under the same feature names: its NVENC session and Vulkan
+      # Video tests compile under no other feature set.
+      - name: Clippy + test the feature-gated Linux encode backends
+        run: |
+          cargo clippy -p pf-encode -p pf-encode-core --all-targets --locked \
+            --features nvenc,vulkan-encode,pyrowave -- -D warnings
+          cargo clippy -p pf-encode --all-targets --locked -- -D warnings
+          cargo test -p pf-encode -p pf-encode-core --locked --features nvenc,vulkan-encode,pyrowave
+
+      - name: C ABI harness (standalone link proof)
+        run: bash crates/punktfunk-ffi/tests/c/run.sh
+
+      - name: sccache stats (visibility only)
+        run: sccache --show-stats
+
+      - name: Verify generated headers are committed & up to date
+        run: |
+          # gen-headers exits non-zero on a cbindgen parse failure, so a stale header cannot
+          # pass as an unchanged one.
+          cargo run -q -p gen-headers --locked
+          git config --global --add safe.directory "$PWD"
+          git diff --exit-code include/ \
+            || (echo "include/ is stale — run 'cargo run -p gen-headers' and commit the headers" && exit 1)
+
+      - name: THIRD-PARTY-NOTICES drift gate
+        # Every other derived artifact here is gated — the OpenAPI spec and the cbindgen header
+        # above, sdk/src/gen, web/bun.nix. This one was not, and went 36 crates stale while three
+        # separate comments claimed something regenerated it. It is also the only one whose
+        # staleness is a compliance defect rather than a build annoyance: the .deb, three RPM
+        # subpackages and the signed Windows host installer ship it verbatim as their licence
+        # file, and both MIT and Apache-2.0 require the notice.
+        #
+        # Not in check-docs-drift.sh, whose stated budget is "no cargo": the generator reads
+        # `cargo metadata`. Its output is reproducible across machines — the same 600 crates and
+        # the same SHA-256 on macOS and on Linux with unrelated registry caches — so this compares
+        # bytes rather than the crate count.
+        run: |
+          bash scripts/gen-third-party-notices.sh
+          git config --global --add safe.directory "$PWD"
+          git diff --exit-code -- \
+            THIRD-PARTY-NOTICES.txt \
+            clients/linux/THIRD-PARTY-NOTICES.txt \
+            clients/windows/THIRD-PARTY-NOTICES.txt \
+            clients/apple/Sources/PunktfunkKit/Resources/THIRD-PARTY-NOTICES.txt \
+            clients/android/app/src/main/assets/THIRD-PARTY-NOTICES.txt \
+            || (echo "::error::attribution is stale — run scripts/gen-third-party-notices.sh and commit" && exit 1)
+
+      # Main writes the caches every pull request restores. A job whose restore missed or
+      # timed out would otherwise upload another full copy of the same key.
+      - name: Save cargo home
+        if: github.event_name == 'push' && steps.cargo-home.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-ci-${{ hashFiles('Cargo.lock') }}
+      # Every push that compiled anything saves, even on an exact hit, so pull requests start
+      # from main's tip rather than from the key's first save. src-mtimes writes its manifest
+      # before the first cargo step, and cargo rewrites a fingerprint only for a unit it rebuilds.
+      - name: Did this job compile anything
+        id: compiled
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.build.outcome == 'success' }}
+        run: |
+          if [ ! -e target/.src-mtimes ] || [ -n "$(find target -maxdepth 5 -path '*/.fingerprint/*' -newer target/.src-mtimes -print -quit)" ]; then
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          fi
+      # Saves once Build passed, even when a later step failed. A cancelled job saves nothing.
+      - name: Save target
+        if: ${{ !cancelled() && steps.compiled.outputs.save == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-debug-v4-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+
+  # The client stack cross-checked for aarch64. NOT an artifact job — deb.yml ships those —
+  # this exists so a portability defect fails here instead of surfacing in a release build or
+  # on a user's board. It earns its runtime: the bug that motivated it (a Vulkan extension
+  # array typed `*const i8`, where `c_char` is signed on x86_64 and UNSIGNED on aarch64)
+  # compiled cleanly on every target CI built at the time.
+  #
+  # Client crates only, listed explicitly: the host's encode stack is x86 (NVENC/QSV/AMF) and
+  # `--workspace` would drag it in. Runs in the cross image (amd64 toolchain + arm64 sysroot,
+  # ci/rust-ci-arm64cross.Dockerfile) on the ordinary runner — no arm64 runner involved.
+  rust-arm64:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust_arm64 == 'true' && needs.changes.outputs.heavy == 'true' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci-arm64cross:latest
+    timeout-minutes: 60
+    env:
+      SKIA_BINARIES_URL: file:///opt/skia-binaries/skia-binaries-{key}.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
+      # images; this heals the job while the running :latest predates the bake.
+      - name: sccache (no-op once the image bakes it)
+        run: sh scripts/ci/ensure-sccache.sh
+
+      # Build scripts fetch with a bare curl over a runner network that drops packets under load.
+      - name: curl with retries (build-script fetches have none)
+        run: sh scripts/ci/install-retrying-curl.sh
+
+      - name: Prebuilt Skia (no-op once the image bakes it)
+        run: sh ci/skia-binaries.sh aarch64-unknown-linux-gnu
+
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      # Restore only: the save steps at the end of the job run on a push to main, so a pull
+      # request never uploads a multi-GB cache.
+      - name: Restore cargo home
+        id: cargo-home
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          # `-ci-`, never the release builds' `cargo-home-` pool: extracted crate sources compile
+          # without a re-checksum, so an entry here must never reach a signed build.
+          key: cargo-home-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-ci-
+      - name: Restore target
+        id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          # Own prefix: aarch64 artifacts never share the amd64 target cache. `-debug-` keeps it
+          # apart from deb.yml's arm64 release tree: a job that hits a shared key exactly never
+          # saves its own.
+          key: cargo-target-arm64-debug-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-arm64-debug-v1-${{ env.rustc }}-
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-arm64-debug-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
+
+      - name: Clippy for aarch64 (deny warnings)
+        run: |
+          cargo clippy --target aarch64-unknown-linux-gnu --all-targets --locked \
+            -p punktfunk-core -p punktfunk-ffi -p pf-client-core -p pf-presenter -p pf-console-ui \
+            -p punktfunk-client-session -p punktfunk-client-linux \
+            --features punktfunk-ffi/quic -- -D warnings
+
+      # The minimal embedded build — no Skia, no PyroWave — is what a small image installs, so
+      # it has to keep compiling on its own, not just as a subset of the default features.
+      - name: Build the session binary, minimal features
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu --locked \
+            -p punktfunk-client-session --no-default-features
+
+      # Main writes the caches; see the save steps at the end of the `rust` job.
+      - name: Save cargo home
+        if: github.event_name == 'push' && steps.cargo-home.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-ci-${{ hashFiles('Cargo.lock') }}
+      - name: Save target
+        if: github.event_name == 'push' && steps.target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-arm64-debug-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+
+      # Visibility only — but the ONLY way to tell a warm cache from a cold one after the fact.
+      # Every Rust job in this repo ends with this line for that reason; a hit rate that quietly
+      # collapses (a toolchain bump, a flag change, an S3 outage) is otherwise invisible and just
+      # looks like "CI got slower".
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
+
+  web:
+    needs: changes
+    if: ${{ needs.changes.outputs.web == 'true' && needs.changes.outputs.heavy == 'true' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1.4.2
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      # oven/bun ships neither git nor a real node (only a bun shim) — actions/checkout
+      # needs both. The slim Debian base also lacks ca-certificates, so without it git's
+      # HTTPS fetch of the repo dies with "Problem with the SSL CA cert (path? access
+      # rights?)" — no CA bundle to validate git.unom.io's (public) Let's Encrypt cert.
+      - name: Install git + node + CA certs
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # RETRIED, like every other single-shot network call in CI (scripts/ci/retry.sh's header
+      # has the why: this box runs many jobs in parallel and drops packets under that load).
+      # `bun install` streams download-and-extract, so a tarball truncated mid-stream surfaces
+      # as `error: Fail extracting tarball for "<pkg>"` — which reads like a corrupt package and
+      # is not one. Measured 2026-08-20: run 19630's docs-site died that way on
+      # @rolldown/binding-linux-x64-gnu (8.3 MB) while the web job installed the same registry
+      # in the same run, and run 19632 installed the identical lockfile seven minutes later. The
+      # tarball's sha512 matches the lockfile and both bun 1.3.13 and 1.3.14 extract it from
+      # disk, so there was never anything wrong with the package. 3 attempts (10s+20s backoff),
+      # not retry.sh's usual 5: a genuinely stale lockfile fails deterministically here, and
+      # 30s is enough to ride out a load burst without making that wait a minute and a half.
+      - name: Install dependencies
+        run: bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+      # biome.json is configured and the tree is clean, but nothing ran it — `lint` is tsc.
+      # Before the build on purpose: biome honours .gitignore, so the generated orval client
+      # and paraglide messages are out of scope either way, and this fails in a second.
+      - name: Biome (format + lint)
+        run: bun run check
+      # Build first: it generates the orval API client + paraglide messages that
+      # typechecking imports.
+      - name: Build
+        run: bun run build
+      - name: Typecheck
+        run: bun run lint
+      # Scoped to server/ and nitro-entry/: the console's browser code has no test runner, but two
+      # gates here do — the one keeping a plugin's origin apart from the console's, whose failure
+      # mode is a well-formed header that only a browser rejects, and the one picking which of the
+      # host's two identities the console serves, whose failure mode is a cert no browser accepts.
+      # Neither would be caught anywhere else.
+      - name: Test
+        run: bun run test
+
+  docs-site:
+    needs: changes
+    if: ${{ needs.changes.outputs.docs_site == 'true' && needs.changes.outputs.heavy == 'true' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1.4.2
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: docs-site
+    steps:
+      # ca-certificates: the slim Debian base lacks a CA bundle, so actions/checkout's
+      # HTTPS fetch otherwise fails with "Problem with the SSL CA cert" (see web job).
+      - name: Install git + CA certs
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Retried — see the web job above; this is the job the flake was measured on.
+      - name: Install dependencies
+        run: bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+      # Build first: fumadocs-mdx emits the .source typegen the typecheck imports.
+      - name: Build
+        run: bun run build
+      - name: Typecheck
+        run: bun run lint
+
+  sdk-plugin-kit:
+    needs: changes
+    if: ${{ needs.changes.outputs.sdk_plugin_kit == 'true' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1.4.2
+    timeout-minutes: 15
+    steps:
+      - name: Install git + CA certs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Both suites run here, not only on a `sdk-v*` / `plugin-kit-v*` publish tag: 25 test files
+      # gating the client, the runner CLI and the plugin runtime, for ~5 s. On the tag alone a
+      # break surfaces a whole release cycle after the commit that caused it.
+      - name: Typecheck + test SDK
+        working-directory: sdk
+        run: |
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+          bun run typecheck
+          bun run test
+          bun run build
+      # The generated client is committed so consumers never need the generator, which means it
+      # can drift from api/openapi.json without anything noticing. This is the thing that notices:
+      # the same shape as the host's own OpenAPI drift gate, one layer down.
+      - name: SDK client matches api/openapi.json
+        working-directory: sdk
+        run: |
+          bun run gen
+          git diff --exit-code -- src/gen/ || {
+            echo "::error::sdk/src/gen/punktfunk.ts is stale — run 'bun run gen' in sdk/ and commit"
+            exit 1
+          }
+      - name: Typecheck + test plugin kit
+        working-directory: plugin-kit
+        run: |
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+          if ! test -f node_modules/@punktfunk/host/package.json; then
+            rm -rf node_modules/@punktfunk/host
+            cp -R ../sdk node_modules/@punktfunk/host
+          fi
+          bun run check
+          bun run typecheck
+          bun run test
+
+  decky-typecheck:
+    needs: changes
+    if: ${{ needs.changes.outputs.decky_typecheck == 'true' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: node:22-bookworm
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: clients/decky
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Typecheck
+        run: |
+          corepack enable
+          corepack prepare pnpm@9 --activate
+          pnpm install --frozen-lockfile
+          pnpm run typecheck
+
+  # web/bun.nix and sdk/bun.nix are GENERATED from their bun.lock (bun2nix) and committed; the Nix
+  # build fetches node_modules from nothing else. They regenerate only on a local `bun install` that
+  # runs lifecycle scripts — never under CI's `--ignore-scripts`, and never on a merge or rebase,
+  # which happily carries a lockfile change past a bun.nix generated before it. That is not
+  # theoretical: web/bun.nix sat stale on main for 553 commits (2026-07-27 → 2026-08-05) with
+  # `nix build .#punktfunk-web` broken, and was repaired only by accident when an advisory bump
+  # happened to rerun a real `bun install`.
+  #
+  # Deliberately UNFILTERED and in ci.yml rather than nix.yml: it needs no Nix, takes well under a
+  # minute, and the whole point is that the drift arrives through commits that look unrelated to
+  # Nix. The Nix-toolchain gates (flake eval + building the bun packages) live in nix.yml.
+  bun-nix:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1.4.2
+    timeout-minutes: 15
+    steps:
+      # oven/bun ships neither git nor a real node, and the slim base has no CA bundle —
+      # actions/checkout needs all three (see the web job).
+      - name: Install git + node + CA certs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Regenerates each bun.nix from its committed bun.lock and diffs, and checks that the
+      # bun2nix version pin agrees across flake.nix and both package.json files (bun.nix has no
+      # schema stability across bun2nix releases). Fix with: scripts/ci/check-bun-nix.sh --fix
+      - name: bun.nix drift gate
+        run: sh scripts/ci/check-bun-nix.sh
+
+  # Docs drift gates — pure git-grep textual checks, no cargo, no bun install (the deep half,
+  # regenerating the OpenAPI spec from the built host, rides in the `rust` job above). Same
+  # reasoning as bun-nix for being UNFILTERED: docs drift arrives through commits that look
+  # unrelated to docs — a renamed env var, a removed subcommand, a moved page.
+  docs-drift:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1.4.2
+    timeout-minutes: 15
+    steps:
+      # oven/bun ships neither git nor a real node, and the slim base has no CA bundle —
+      # actions/checkout needs all three (see the web job).
+      - name: Install git + node + CA certs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git nodejs python3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # OpenAPI snapshot in sync, PUNKTFUNK_* vars in docs still exist, undocumented-var
+      # ratchet (baseline: scripts/ci/docs-undocumented-env-baseline.txt), host-cli.md commands
+      # still exist, data/platforms.json parses.
+      - name: Docs drift gates
+        run: sh scripts/ci/check-docs-drift.sh
+      # Internal links only: /docs/* page links and their #anchors, relative file links in
+      # the repo's markdown. External URLs are deliberately not checked.
+      - name: Docs link check
+        run: sh scripts/ci/check-docs-links.sh
+      # Touched Rust comments fail at 6 (`//`) / 24 (`//!`/`///`). Self-test plants
+      # those failures before the live tree is checked.
+      - name: Writing-style gates
+        env:
+          WRITING_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # No --depth here: a shallow fetch grafts the base commit parentless, and
+          # base..HEAD then lints every commit in the repository's history.
+          if [ -n "${WRITING_BASE:-}" ]; then
+            git fetch origin "$WRITING_BASE" 2>/dev/null || true
+          fi
+          sh scripts/ci/check-writing.sh --self-test
+          sh scripts/ci/check-writing.sh

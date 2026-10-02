@@ -1,0 +1,79 @@
+#version 450
+// One axis of the host's reframe (`punktfunk_core::video_fit::Reframe`): x from the crop of
+// the captured picture into an intermediate, then y into the encoder's picture. Lanczos-3
+// widened by the downscale ratio, the kernel the clients use; a 1:1 axis copies. Taps clamp
+// inside the crop, so nothing that was cut off bleeds in, and the result clamps to [0, 1] so
+// ringing cannot leave the CSC's input range.
+//
+// The x pass blends the cursor into every source tap, so the pointer is filtered with the
+// picture at source size. The y pass disables it.
+//
+// Regenerate: `glslangValidator -V reframe.comp -o reframe.spv`.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(binding = 2) uniform sampler2D cursorTex;
+
+layout(push_constant) uniform Push {
+    ivec2 origin;    // source texel at the crop's top-left
+    ivec2 extent;    // crop size in source texels
+    float step;      // source texels per output pixel on the filtered axis
+    int axis;        // 0 = filter x, 1 = filter y
+    ivec2 curOrigin; // cursor top-left in source pixels
+    ivec2 curSize;   // x <= 0 disables the blend
+} pc;
+
+// Footprint cap: a 10x downscale still fits the tap loop.
+const float MAX_STRETCH = 10.0;
+const int MAX_TAPS = 64;
+
+float lanczos3(float x) {
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 3.0) return 0.0;
+    float px = 3.14159265358979 * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+
+vec3 tap(ivec2 p) {
+    vec3 c = texelFetch(src, p, 0).rgb;
+    if (pc.curSize.x <= 0) return c;
+    ivec2 cp = p - pc.curOrigin;
+    if (cp.x < 0 || cp.y < 0 || cp.x >= pc.curSize.x || cp.y >= pc.curSize.y) return c;
+    vec4 k = texelFetch(cursorTex, cp, 0);
+    return mix(c, k.rgb, k.a);
+}
+
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(dst);
+    if (o.x >= size.x || o.y >= size.y) return;
+    int a = pc.axis;
+    int b = 1 - a;
+    ivec2 p;
+    p[b] = pc.origin[b] + o[b];
+    int lo = pc.origin[a];
+    int hi = pc.origin[a] + pc.extent[a] - 1;
+    // Source coordinate of this output pixel's centre; texel i covers [i, i+1).
+    float s = float(pc.origin[a]) + (float(o[a]) + 0.5) * pc.step;
+    vec3 acc;
+    if (pc.step == 1.0) {
+        p[a] = clamp(int(floor(s)), lo, hi);
+        acc = tap(p);
+    } else {
+        float stretch = clamp(pc.step, 1.0, MAX_STRETCH);
+        float support = 3.0 * stretch;
+        int first = int(floor(s - support - 0.5)) + 1;
+        int last = min(int(ceil(s + support - 0.5)) - 1, first + MAX_TAPS - 1);
+        acc = vec3(0.0);
+        float total = 0.0;
+        for (int i = first; i <= last; i++) {
+            float w = lanczos3((float(i) + 0.5 - s) / stretch);
+            p[a] = clamp(i, lo, hi);
+            acc += w * tap(p);
+            total += w;
+        }
+        acc /= total;
+    }
+    imageStore(dst, o, vec4(clamp(acc, 0.0, 1.0), 1.0));
+}

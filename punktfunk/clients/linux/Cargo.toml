@@ -1,0 +1,51 @@
+[package]
+name = "punktfunk-client-linux"
+description = "Native Linux punktfunk/1 client — GTK4/libadwaita shell, PipeWire audio, SDL3 gamepads; streaming runs in the spawned punktfunk-session binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "punktfunk-client"
+path = "src/main.rs"
+
+[features]
+default = ["console"]
+# The shell's doorway to the console (`punktfunk-session --browse`). A build whose session
+# has no console (`--no-default-features`, as Nix builds it) drops the doorway with it.
+console = []
+
+# Everything is Linux-gated so `cargo build --workspace` stays green on macOS (the Mac
+# client lives in clients/apple); on other platforms this builds as a stub binary.
+[target.'cfg(target_os = "linux")'.dependencies]
+# Settings, trust, discovery, gamepads, audio devices, the library model and the spawner —
+# the UI-agnostic plumbing this shell shares with the session binary. No `pyrowave`: the
+# default feature set CMake-builds a vendored C++ tree for a decoder that only the session
+# binary runs, and this crate decodes nothing. Same shape as cli/session/windows.
+pf-client-core = { path = "../../crates/pf-client-core", default-features = false, features = [
+    "desktop",
+] }
+punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
+
+# UI shell. GTK 4.20 is already the package floor (Ubuntu 26.04, Fedora 43, GNOME 50), and
+# every such target ships libadwaita ≥ 1.8: Spinner, WrapBox, ToggleGroup, ShortcutsDialog.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_20"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_8"] }
+async-channel = "2"
+
+serde = "1"
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+relm4 = { version = "0.11", features = ["libadwaita"] }
+
+# Compiles data/ (the OS-mark symbolic icons) into the embedded gresource (build.rs) —
+# needs `glib-compile-resources`, which ships with the GTK dev stack this crate needs anyway.
+[target.'cfg(target_os = "linux")'.build-dependencies]
+glib-build-tools = "0.22"
+
+[lints]
+workspace = true

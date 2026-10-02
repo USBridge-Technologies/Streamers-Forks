@@ -1,0 +1,131 @@
+;/*++
+; pf-vdisplay - punktfunk virtual display, UMDF2 IddCx driver INF (template; stampinf -> .inf).
+;
+; For the all-Rust wdk-sys / windows-drivers-rs driver in THIS tree
+; (packaging/windows/drivers/pf-vdisplay/). The driver registers the OWNED pf_driver_proto
+; control-interface GUID in CODE (WdfDeviceCreateDeviceInterface), so this INF is GUID-agnostic and
+; is byte-identical to the superseded oracle's (packaging/windows/vdisplay-driver/.../pf_vdisplay.inx,
+; itself adapted from MolotovCherry/virtual-display-rs (MIT) + SudoVDA's control-device security DACL).
+; HWID Root\pf_vdisplay + IddCx0102 + the DACL match the host backend (crates/punktfunk-host/src/
+; vdisplay/pf_vdisplay.rs) and install-pf-vdisplay.ps1's Test-PfVdisplayPresent / nefconc node-create.
+;--*/
+[Version]
+PnpLockdown=1
+Signature="$Windows NT$"
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=pf_vdisplay.cat
+DriverVer=
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%DeviceName%=pf_vdisplay_Install, Root\pf_vdisplay
+; Our own per-session id. Nothing creates a devnode with it today, so this line binds nothing on a
+; normal install; it exists so the seat sections below have a claim that is ours to make.
+%DeviceName%=pf_vdisplay_Seat_Install, pf_vdisplay_IndirectDisplay
+; DELIBERATELY NOT CLAIMED HERE:
+;   %DeviceName%=pf_vdisplay_Seat_Install, RdpIdd_IndirectDisplay
+; That id is the one the terminal-services stack actually starts, so a seat display needs it — but
+; claiming it takes over EVERY RDP session on the machine, admin sessions included. It is an
+; install-time choice the seats add-on makes, never something installing punktfunk implies. The
+; seats package ships its own INF that adds the line back; see docs/multi-seat-contract.
+; Winning the id is not about the certificate: inbox rdpidd.inf ranks 0x00FF0000 too, and the tie
+; goes to the newer DriverVer date (`windows-seat-display-tier.md` §5d).
+
+[SourceDisksFiles]
+pf_vdisplay.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+; =================== UMDF IddCx device ====================
+
+[pf_vdisplay_Install.NT]
+CopyFiles=UMDriverCopy
+
+[pf_vdisplay_Install.NT.hw]
+AddReg=pf_vdisplay_HardwareDeviceSettings
+
+[pf_vdisplay_HardwareDeviceSettings]
+HKR, , "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
+; (no "WUDF"/DeviceGroupId value: it only means anything under ProcessSharingEnabled, and this
+; driver sets UmdfHostProcessSharing=ProcessSharingDisabled below — code in monitor.rs/control.rs
+; reasons from the dedicated-WUDFHost guarantee, so the group id was dead weight.)
+; Only the host (LocalSystem service) + admins may open the control device. Deliberately NO Everyone
+; ACE (SudoVDA ships one for its user-mode host): the control plane creates/removes monitors and
+; opens the encoder on the sealed AU section (IOCTL_SET_ENCODE), so it is not for unprivileged callers.
+HKR, , "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+; =================== seat (remote-session) device ====================
+; Same driver, one difference that matters: the remoting stack OPENS this device itself, under the
+; SESSION's own token, and a SYSTEM+Admins DACL fails that open with E_ACCESSDENIED — the server
+; reports `IddInterfaceArrivalFailure` and drops the session. That opener is TermService, so
+; NETWORK SERVICE is the whole grant — no user reaches this control plane, where RdpIdd ships
+; `D:P(A;;GA;;;WD)`. The console device keeps its own locked-down DACL.
+
+[pf_vdisplay_Seat_Install.NT]
+CopyFiles=UMDriverCopy
+
+[pf_vdisplay_Seat_Install.NT.hw]
+AddReg=pf_vdisplay_SeatDeviceSettings
+
+[pf_vdisplay_SeatDeviceSettings]
+HKR, , "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
+HKR, , "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;NS)"
+
+[pf_vdisplay_Seat_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[pf_vdisplay_Seat_Install.NT.Wdf]
+UmdfService=pf_vdisplay, pf_vdisplay_Install
+UmdfServiceOrder=pf_vdisplay
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfHostProcessSharing=ProcessSharingDisabled
+UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
+
+[pf_vdisplay_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[pf_vdisplay_Install.NT.Wdf]
+UmdfService=pf_vdisplay, pf_vdisplay_Install
+UmdfServiceOrder=pf_vdisplay
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfHostProcessSharing=ProcessSharingDisabled
+UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
+
+[pf_vdisplay_Install]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%12%\UMDF\pf_vdisplay.dll
+; "IddCx0102" is the extension's REGISTERED IDENTITY string (every IddCx release keeps it — the
+; sample drivers ship it unchanged at IddCx 1.10); the real version floor is the binary's exported
+; IddMinimumVersionRequired=10 (src/lib.rs). Do not "fix" this to IddCx0110 — that identity does
+; not exist and the install would fail.
+UmdfExtensions=IddCx0102
+
+[WUDFRD_ServiceInstall]
+DisplayName=%WudfRdDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF
+
+[UMDriverCopy]
+pf_vdisplay.dll
+
+[Strings]
+ManufacturerName="Punktfunk"
+DiskName="Punktfunk Virtual Display Installation Disk"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
+DeviceName="Punktfunk Virtual Display"
+
+REG_MULTI_SZ=0x00010000
+REG_SZ=0x00000000
+REG_EXPAND_SZ=0x00020000
+REG_DWORD=0x00010001

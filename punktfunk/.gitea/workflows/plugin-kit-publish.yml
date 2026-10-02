@@ -1,0 +1,116 @@
+# Publish the plugin framework (@punktfunk/plugin-kit) to the Gitea npm registry
+# (https://git.unom.io/api/packages/unom/npm/).
+#
+# Trigger: push a tag `plugin-kit-vX.Y.Z` (must equal plugin-kit/package.json "version"),
+# or run manually. Versions independently of the app's `v*` and the SDK's `sdk-v*` tags.
+#
+# The kit's devDependency on @punktfunk/host is `file:../sdk`, so the SDK's dist must be
+# built BEFORE the kit's `bun install` copies it.
+#
+# Auth: REGISTRY_TOKEN — the same repo Actions secret sdk-publish.yml uses.
+name: plugin-kit-publish
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    tags: ['plugin-kit-v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1.4.2
+    timeout-minutes: 15
+    steps:
+      # oven/bun's slim base ships neither git, a CA bundle, nor node — actions/checkout's HTTPS
+      # fetch needs git + ca-certificates, and the version-guard step below uses node.
+      - name: Install git + node + CA certs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Both installs retried: bun's download-and-extract is single-shot, and a truncated tarball
+      # reads as `Fail extracting tarball` (ci.yml's web job has the measurement). A publish job
+      # is the worst place to lose to a dropped packet — the tag is already pushed.
+      - name: Build the SDK (file:../sdk dependency source)
+        working-directory: sdk
+        run: |
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+          bun run build
+
+      - name: Install dependencies
+        working-directory: plugin-kit
+        run: bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+
+      # bun 1.3 installs a `file:` dependency by copying its DIRECTORIES but symlinking each
+      # top-level FILE to itself — `node_modules/@punktfunk/host/package.json -> package.json`, a
+      # dangling self-reference. `dist/` therefore arrives intact while the manifest that points at
+      # it does not, so module resolution dies at the first step and every `@punktfunk/host` import
+      # reads as "cannot find module". Replacing the tree with a real copy is the whole fix; drop
+      # this step once bun links `file:` deps correctly again.
+      - name: "Repair the file: dependency (bun 1.3 self-symlink)"
+        working-directory: plugin-kit
+        run: |
+          # -f follows the link, so this is true only when the manifest actually resolves.
+          if test -f node_modules/@punktfunk/host/package.json; then
+            echo "bun linked it correctly — this step can go"
+          else
+            rm -rf node_modules/@punktfunk/host
+            cp -R ../sdk node_modules/@punktfunk/host
+          fi
+          test -f node_modules/@punktfunk/host/package.json
+          test -f node_modules/@punktfunk/host/dist/index.d.ts
+
+      # The kit had no biome config and no lint step, while every plugin repo that consumes it does
+      # — so its source drifted (unused imports, formatting) with nothing to catch it. Now gated
+      # here, on the same config and pinned biome version the plugins use.
+      - name: Lint & format
+        working-directory: plugin-kit
+        run: bun run check
+
+      - name: Typecheck
+        working-directory: plugin-kit
+        run: bun run typecheck
+
+      - name: Test
+        working-directory: plugin-kit
+        run: bun test
+
+      - name: Build (dist/ JS + .d.ts + theme.css)
+        working-directory: plugin-kit
+        run: bun run build
+
+      - name: Tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: plugin-kit
+        run: |
+          TAG="${GITHUB_REF_NAME#plugin-kit-v}"
+          PKG="$(node -p "require('./package.json').version")"
+          test "$TAG" = "$PKG" || { echo "tag $GITHUB_REF_NAME does not match package version $PKG"; exit 1; }
+
+      # A version published by hand (the runner queue was deep) must not turn the tag's lane red:
+      # the registry refuses a second upload of the same version, so skip it instead.
+      - name: Skip a version the registry already serves
+        id: published
+        working-directory: plugin-kit
+        run: |
+          if bun -e 'const p = require("./package.json"); (async () => { const r = await fetch("https://git.unom.io/api/packages/unom/npm/" + encodeURIComponent(p.name)); if (!r.ok) process.exit(1); const d = await r.json(); process.exit(d.versions && d.versions[p.version] ? 0 : 1); })()'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish to Gitea registry
+        if: steps.published.outputs.skip != 'true'
+        working-directory: plugin-kit
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN" || { echo "REGISTRY_TOKEN secret is empty"; exit 1; }
+          printf '//git.unom.io/api/packages/unom/npm/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
+          bun publish

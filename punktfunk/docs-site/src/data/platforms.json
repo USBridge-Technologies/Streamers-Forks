@@ -1,0 +1,263 @@
+{
+  "$comment": "Single source for the install/port facts that used to drift across four surfaces (docs-and-onboarding-overhaul WP1). Consumers: docs-site install pages (<Install platform=…/> and <Ports/> in docs-site/src/components/platforms.tsx, reading the byte-identical snapshot docs-site/src/data/platforms.json that check-docs-drift.sh gates), the website download page (WP3), the guided install script (WP4). A port number, repo URL or install command lives HERE and nowhere else — pages quote it, they don't restate it. `install` is the shell snippet that puts the package on the box (lines, in order); `url` is a download/store link — the canonical download when a platform ships one, with or without an `install` snippet beside it; `floor` is the one-line minimum system that platform's package runs on, as a person reads it — the download page quotes it under every install action. Validated by scripts/ci/check-docs-drift.sh (parse + snapshot sync; ponytail: cross-check against code literals when a consumer exists).",
+
+  "ports": {
+    "mgmt": {
+      "port": 47990,
+      "proto": "tcp",
+      "what": "management REST API (HTTPS + token; read-only status/library off loopback)",
+      "env": "PUNKTFUNK_MGMT_BIND",
+      "conflict": "Sunshine / Apollo / Vibeshine serve their web UI on 47990 too — the one port still shared with them once GameStream compat is off. Move it via PUNKTFUNK_MGMT_BIND; clients relearn it from discovery."
+    },
+    "web": {
+      "port": 47992,
+      "proto": "tcp",
+      "what": "web console (HTTPS, login-gated); plugin interfaces on 47993",
+      "also": [47993]
+    },
+    "native": {
+      "port": 9777,
+      "proto": "udp",
+      "what": "punktfunk/1 QUIC control port",
+      "env": "PUNKTFUNK_NATIVE_PORT"
+    },
+    "browser": {
+      "port": 9778,
+      "proto": "udp",
+      "what": "browser streaming (preview, off until switched on)",
+      "env": "PUNKTFUNK_WEBTRANSPORT_PORT"
+    },
+    "data": {
+      "port": null,
+      "proto": "udp",
+      "what": "per-session video data plane — ephemeral port the client hole-punches; nothing fixed to open",
+      "env": "PUNKTFUNK_DATA_PORT"
+    },
+    "mdns": {
+      "port": 5353,
+      "proto": "udp",
+      "what": "mDNS discovery"
+    },
+    "gamestream": {
+      "tcp": [47984, 47989, 48010],
+      "udp": [47998, 47999, 48000],
+      "what": "GameStream/Moonlight-compat planes (opt-in, PUNKTFUNK_GAMESTREAM=1)",
+      "conflict": "Sunshine / Apollo / Vibeshine bind these same fixed ports and advertise the same mDNS name — run only one GameStream host at a time, or keep punktfunk native-only."
+    }
+  },
+
+  "firewall": {
+    "$comment": "Service/profile names the Linux packages install for firewalld and ufw — the packages never open a port themselves.",
+    "native": "punktfunk-native",
+    "gamestream": "punktfunk-gamestream",
+    "web": "punktfunk-web"
+  },
+
+  "installer": {
+    "$comment": "The guided Linux installer (WP4, preview). Canonical URL is the website's /install.sh, a redirect to the raw script on main so it's versioned with the code it installs; the docs hub and the download page quote these lines.",
+    "status": "preview",
+    "url": "https://punktfunk.unom.io/install.sh",
+    "source": "https://git.unom.io/unom/punktfunk/raw/branch/main/scripts/install.sh",
+    "oneLiner": "curl -fsSL https://punktfunk.unom.io/install.sh | sh",
+    "canaryOneLiner": "curl -fsSL https://punktfunk.unom.io/install.sh | sh -s -- --channel canary",
+    "inspectFirst": [
+      "curl -fsSLO https://punktfunk.unom.io/install.sh",
+      "less install.sh",
+      "sh install.sh"
+    ],
+    "docs": "/docs/install#guided-install-preview"
+  },
+
+  "conflicts": {
+    "hosts": ["Sunshine", "Apollo", "Vibeshine"],
+    "detect": "punktfunk-host detect-conflicts",
+    "detectExit": "1 only when a conflicting host runs or will start on its own; dormant leftovers print but exit 0",
+    "docs": "/docs/switching-from-sunshine"
+  },
+
+  "platforms": [
+    {
+      "id": "debian",
+      "name": "Debian 13+ / Ubuntu 26.04+",
+      "installs": "host",
+      "packageManager": "apt",
+      "docs": "/docs/debian",
+      "floor": "Debian 13 or newer; Ubuntu 26.04 or newer",
+      "repo": "https://git.unom.io/api/packages/unom/debian",
+      "install": [
+        "sudo install -d -m 0755 /etc/apt/keyrings",
+        "curl -fsSL https://git.unom.io/api/packages/unom/debian/repository.key | sudo tee /etc/apt/keyrings/punktfunk.asc >/dev/null",
+        "echo \"deb [signed-by=/etc/apt/keyrings/punktfunk.asc] https://git.unom.io/api/packages/unom/debian stable main\" | sudo tee /etc/apt/sources.list.d/punktfunk.list",
+        "sudo apt update",
+        "sudo apt install punktfunk-host punktfunk-web punktfunk-scripting"
+      ]
+    },
+    {
+      "id": "arch",
+      "name": "Arch Linux / CachyOS",
+      "installs": "host",
+      "packageManager": "pacman",
+      "docs": "/docs/arch",
+      "floor": "Current Arch Linux or CachyOS",
+      "repo": "https://git.unom.io/api/packages/unom/arch",
+      "install": [
+        "curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key | sudo pacman-key --add -",
+        "sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69",
+        "grep -q '^\\[punktfunk\\]' /etc/pacman.conf || printf '\\n[punktfunk]\\nServer = https://git.unom.io/api/packages/unom/arch/$repo/$arch\\n' | sudo tee -a /etc/pacman.conf >/dev/null",
+        "sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-scripting"
+      ]
+    },
+    {
+      "$comment": "Omarchy IS Arch for delivery — same signed repo, same packages — but NOT the same install command. Omarchy ships a libalpm PreTransaction hook (00-omarchy-update-guard) that ABORTS any transaction whose pacman invocation carries both -S and -u, so Arch's `pacman -Syu <pkgs>` dies with 'Woah partner...' and installs nothing (measured on 4.0.1, 2026-08-28). `-Sy` refreshes without a sysupgrade and is not blocked, and `-S` then installs. Everything Omarchy-specific is the setup line after them.",
+      "id": "omarchy",
+      "name": "Omarchy",
+      "installs": "host",
+      "packageManager": "pacman",
+      "docs": "/docs/omarchy",
+      "floor": "Current Omarchy",
+      "repo": "https://git.unom.io/api/packages/unom/arch",
+      "install": [
+        "curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key | sudo pacman-key --add -",
+        "sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69",
+        "grep -q '^\\[punktfunk\\]' /etc/pacman.conf || printf '\\n[punktfunk]\\nServer = https://git.unom.io/api/packages/unom/arch/$repo/$arch\\n' | sudo tee -a /etc/pacman.conf >/dev/null",
+        "sudo pacman -Sy",
+        "sudo pacman -S punktfunk-host punktfunk-web punktfunk-scripting punktfunk-client",
+        "punktfunk-omarchy setup"
+      ]
+    },
+    {
+      "id": "fedora",
+      "name": "Fedora 43+",
+      "installs": "host",
+      "packageManager": "dnf",
+      "docs": "/docs/fedora",
+      "floor": "Fedora 43 or newer",
+      "repo": "https://git.unom.io/api/packages/unom/rpm/fedora-44",
+      "install": [
+        "sudo tee /etc/yum.repos.d/punktfunk.repo >/dev/null <<'REPO'",
+        "[punktfunk]",
+        "name=punktfunk",
+        "# fedora-44 on Fedora 44; bazzite on Fedora 43 (a plain Fedora 43 build of the same package)",
+        "baseurl=https://git.unom.io/api/packages/unom/rpm/fedora-44",
+        "enabled=1",
+        "gpgcheck=1",
+        "repo_gpgcheck=1",
+        "gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key",
+        "       https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk",
+        "REPO",
+        "sudo dnf install punktfunk punktfunk-web punktfunk-scripting"
+      ]
+    },
+    {
+      "id": "bazzite",
+      "name": "Bazzite / Fedora Atomic",
+      "installs": "host",
+      "packageManager": "sysext",
+      "docs": "/docs/bazzite",
+      "floor": "Current Bazzite; Fedora Atomic 43 or newer",
+      "install": [
+        "curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh",
+        "sudo bash punktfunk-sysext.sh install"
+      ]
+    },
+    {
+      "id": "nixos",
+      "name": "NixOS",
+      "installs": "host",
+      "packageManager": "nix",
+      "docs": "/docs/nixos",
+      "floor": "NixOS with flakes",
+      "install": [
+        "# flake input: inputs.punktfunk.url = \"git+https://git.unom.io/unom/punktfunk?ref=nix-stable\";",
+        "# then: imports = [ punktfunk.nixosModules.default ]; services.punktfunk.host.enable = true;"
+      ]
+    },
+    {
+      "id": "steamos",
+      "name": "SteamOS (Steam Deck as host)",
+      "installs": "host",
+      "packageManager": "script",
+      "docs": "/docs/steamos-host",
+      "floor": "SteamOS 3",
+      "install": [
+        "git clone --branch stable https://git.unom.io/unom/punktfunk ~/punktfunk",
+        "bash ~/punktfunk/scripts/steamdeck/install.sh"
+      ]
+    },
+    {
+      "id": "windows",
+      "name": "Windows 11 (22H2+)",
+      "installs": "host",
+      "packageManager": "installer",
+      "docs": "/docs/windows-host",
+      "floor": "Windows 11 22H2 (build 22621) or newer, x64",
+      "url": "https://git.unom.io/api/packages/unom/generic/punktfunk-host-windows/latest/punktfunk-host-setup.exe",
+      "install": [
+        "winget source add -n punktfunk https://winget.punktfunk.unom.io -t Microsoft.Rest",
+        "winget install unom.PunktfunkHost"
+      ]
+    },
+    {
+      "id": "linux-client",
+      "name": "Linux client (any distro)",
+      "installs": "client",
+      "packageManager": "flatpak",
+      "docs": "/docs/install-client#linux-desktop-flatpak",
+      "floor": "Any distro with Flatpak; native packages on Ubuntu 26.04, Fedora 43 and Arch, or newer",
+      "install": [
+        "flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref"
+      ]
+    },
+    {
+      "id": "steam-deck-client",
+      "name": "Steam Deck (Gaming Mode)",
+      "installs": "client",
+      "packageManager": "decky",
+      "docs": "/docs/steam-deck",
+      "floor": "SteamOS 3 with Decky Loader"
+    },
+    {
+      "id": "windows-client",
+      "name": "Windows client",
+      "installs": "client",
+      "packageManager": "installer",
+      "docs": "/docs/install-client#windows",
+      "floor": "Windows 10 or newer, x64 and Arm64",
+      "url": "https://git.unom.io/api/packages/unom/generic/punktfunk-client-windows/latest/punktfunk-client-setup_x64.exe",
+      "urlArm64": "https://git.unom.io/api/packages/unom/generic/punktfunk-client-windows/latest/punktfunk-client-setup_arm64.exe",
+      "install": [
+        "curl.exe -LO https://git.unom.io/api/packages/unom/generic/punktfunk-client-windows/latest/punktfunk-client-setup_x64.exe",
+        ".\\punktfunk-client-setup_x64.exe"
+      ]
+    },
+    {
+      "id": "macos-client",
+      "name": "macOS",
+      "installs": "client",
+      "packageManager": "dmg",
+      "docs": "/docs/install-client#macos",
+      "floor": "macOS 14 or newer",
+      "url": "https://git.unom.io/unom/punktfunk/releases"
+    },
+    {
+      "id": "apple-client",
+      "name": "iPhone, iPad, Apple TV",
+      "installs": "client",
+      "packageManager": "appstore",
+      "docs": "/docs/install-client#ios-ipados-apple-tv",
+      "floor": "iOS, iPadOS and tvOS 17 or newer",
+      "url": "https://apps.apple.com/app/id6779991756",
+      "testflight": "https://testflight.apple.com/join/Qr7uSemk"
+    },
+    {
+      "id": "android-client",
+      "name": "Android / Android TV",
+      "installs": "client",
+      "packageManager": "play",
+      "docs": "/docs/install-client#android",
+      "floor": "Android 9 or newer",
+      "url": "https://play.google.com/store/apps/details?id=io.unom.punktfunk",
+      "apk": "https://git.unom.io/api/packages/unom/generic/punktfunk-android/latest/punktfunk-android.apk"
+    }
+  ]
+}

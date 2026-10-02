@@ -1,0 +1,72 @@
+# Per-release SBOM (CRA Annex I Part II §1: identify and document the components in the product,
+# in a commonly used machine-readable format — we emit CycloneDX JSON).
+#
+# Tag push → the SBOM is attached to the Gitea release, next to the artifacts it describes.
+# Release assets are never pruned (security updates must stay available ≥10 years, CRA Art. 13),
+# so the SBOM's retention rides on the release's.
+# workflow_dispatch on a non-tag ref → generated and uploaded as a workflow artifact only
+# (pipeline validation / an on-demand snapshot); no release is touched.
+#
+# What goes in: scripts/ci/gen-sbom.sh = syft over the checkout (every lockfile-pinned dep in
+# both Rust workspaces + the JS trees + Swift Package.resolved) merged with
+# compliance/sbom/manual-components.cdx.json (vendored C/C++, bundled DLLs, gamescope).
+name: sbom
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  sbom:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 20
+    steps:
+      # fetch-depth 0: the dispatch path derives the canary base from the tag history
+      # (scripts/ci/pf-version.sh), which a shallow clone cannot see.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install pinned syft
+        run: |
+          set -euo pipefail
+          asset=syft_1.49.0_linux_amd64.tar.gz
+          curl -fsSL --retry 5 --retry-all-errors \
+            -o "/tmp/$asset" "https://github.com/anchore/syft/releases/download/v1.49.0/$asset"
+          echo '7aa2f03ee92739cf643279ba3990548b9925d4e22cae13f46831ee62821147fe  /tmp/syft_1.49.0_linux_amd64.tar.gz' | sha256sum -c -
+          tar -xzf "/tmp/$asset" -C /tmp syft
+          install -m 0755 /tmp/syft /usr/local/bin/syft
+      - name: Generate SBOM
+        run: |
+          git config --global --add safe.directory "$PWD"
+          case "$GITHUB_REF" in
+            refs/tags/v*) VERSION="${GITHUB_REF_NAME#v}" ;;
+            *) eval "$(bash scripts/ci/pf-version.sh)"; VERSION="${PF_BASE}-snapshot" ;;
+          esac
+          sh scripts/ci/gen-sbom.sh "$VERSION" "punktfunk-${VERSION}.cdx.json"
+          echo "SBOM_FILE=punktfunk-${VERSION}.cdx.json" >> "$GITHUB_ENV"
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          upsert_asset "$RID" "$SBOM_FILE"
+      # v3, not v4: Gitea's artifact backend rejects upload-artifact@v4 (see apple.yml).
+      - name: Upload artifact (non-tag runs)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
+        with:
+          name: sbom
+          path: punktfunk-*.cdx.json

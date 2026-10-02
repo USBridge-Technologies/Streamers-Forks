@@ -1,0 +1,474 @@
+# Maintainer: unom <packages@unom.io>
+#
+# Arch Linux / SteamOS split package: punktfunk-host (the gaming-rig HOST, NVENC) and
+# punktfunk-client (the native GTK4/libadwaita Linux CLIENT). Mirrors the rpm subpackages
+# (packaging/rpm/punktfunk.spec) and the two deb build scripts. On a Steam Deck you want
+# `punktfunk-client` (it's what the Decky plugin launches); on a gaming rig, `punktfunk-host`.
+#
+# Two build modes:
+#   - AUR / standalone:  makepkg in this dir (fetches the git tag below).
+#   - In-tree / CI:       PF_SRCDIR=$(git rev-parse --show-toplevel) makepkg --holdver
+#                         (builds the working tree instead of the tagged source — see build()).
+#
+# Host encode: NVENC on NVIDIA (nvidia-utils), VAAPI on AMD/Intel (mesa) — PUNKTFUNK_ENCODER=auto
+# picks per GPU. The CLIENT decodes via VAAPI (AMD/Intel, incl. the Deck) with a software
+# fallback, so it works everywhere. See README.md.
+pkgbase=punktfunk
+# punktfunk-web (the browser console) and punktfunk-scripting (the plugin/script runner) are OPT-IN:
+# both need `bun` (AUR-only as bun-bin on stock Arch/SteamOS), so a default makepkg builds only
+# host+client with no JS tooling — mirroring the RPM spec's `%bcond_with web` / `%bcond_with
+# scripting` (off by default). Set PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1 to also build them (each
+# appends its pkgname + bun to makedepends below).
+# aarch64 (Arch Linux ARM) is CLIENT-ONLY — see the `arch` note below. Dropping the host from
+# `pkgname` (rather than giving package_punktfunk-host a per-package arch) is what keeps makepkg
+# from entering the host's build/package path at all, and mirrors how PF_WITH_WEB extends this
+# array further down.
+if [ "${CARCH:-x86_64}" = 'aarch64' ]; then
+  pkgname=('punktfunk-client' 'punktfunk-icons')
+else
+  pkgname=('punktfunk-host' 'punktfunk-client' 'punktfunk-icons')
+fi
+# CI (.gitea/workflows/arch.yml) drives the version: stable tags -> X.Y.Z-1, main pushes ->
+# X.Y.Z-0.<run#> in the separate punktfunk-canary repo (mirrors the RPM's 0.ciN release; pkgrel
+# allows only digits+dots, so the run number carries the monotonic ordering).
+pkgver="${PF_PKGVER:-0.7.0}"
+pkgrel="${PF_PKGREL:-1}"
+# The CLIENT builds and runs on aarch64 (Arch Linux ARM); the HOST does not — its encode stack is
+# NVENC/QSV/AMF, all x86. On aarch64 the split below drops punktfunk-host from `pkgname`, so
+# makepkg builds only the client and never tries to compile the host crate.
+arch=('x86_64' 'aarch64')
+url="https://git.unom.io/unom/punktfunk"
+license=('MIT OR Apache-2.0')
+# !lto: makepkg's `lto` option injects -flto=auto into CFLAGS; aws-lc-sys (rustls' crypto)
+# compiles its C with those flags and GCC LTO bitcode objects are unreadable by rust's lld
+# linker -> "undefined symbol: aws_lc_*" at link (reproduced 2026-07-04, Arch + rust 1.90).
+# !debug: skip the -debug split package (debuginfo bloat, not shipped).
+options=('!lto' '!debug')
+
+# All build deps for both packages (Arch runtime packages ship their own headers, so these cover
+# build + link). aws-lc/ring need clang+cmake; nasm is for asm. No vulkan-headers:
+# nothing in the workspace compiles against the system Vulkan headers any more (pyrowave-sys builds
+# against its own vendored copy, and both binaries reach Vulkan through ash, which dlopens it).
+makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git'
+             'gtk4' 'libadwaita' 'sdl3' 'pipewire' 'wayland' 'libxkbcommon' 'opus' 'libei')
+
+# Opt-in punktfunk-web / punktfunk-scripting: only then is bun (the build tool AND the vendored
+# runtime) required. Adding bun twice is harmless (makepkg dedups makedepends). Either one also
+# builds punktfunk-bun, the one runtime both run on.
+if [ "${PF_WITH_WEB:-0}" = 1 ]; then
+  pkgname+=('punktfunk-web')
+  makedepends+=('bun')   # `bun-bin` from the AUR if bun isn't in your configured repos
+fi
+if [ "${PF_WITH_SCRIPTING:-0}" = 1 ]; then
+  pkgname+=('punktfunk-scripting')
+  makedepends+=('bun')
+fi
+if [ "${PF_WITH_WEB:-0}" = 1 ] || [ "${PF_WITH_SCRIPTING:-0}" = 1 ]; then
+  pkgname+=('punktfunk-bun')
+fi
+
+# AUR source (a tagged release). For an in-tree CI build, set PF_SRCDIR to the repo root —
+# build() uses it instead AND the fetch is skipped entirely (a canary pkgver has no tag to
+# clone, and CI already has the checkout).
+if [ -z "${PF_SRCDIR:-}" ]; then
+  source=("git+https://git.unom.io/unom/punktfunk.git#tag=v${pkgver}")
+  sha256sums=('SKIP')
+else
+  source=()
+  sha256sums=()
+fi
+
+_repo() { printf '%s' "${PF_SRCDIR:-$srcdir/punktfunk}"; }
+
+build() {
+  cd "$(_repo)"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR="$srcdir/target"
+  export PUNKTFUNK_BUILD_VERSION="${pkgver}-${pkgrel}"   # stamp --version / mgmt /health (build.rs)
+  # The host's zero-copy FFI link-needs libcuda at build time; nvidia-utils provides it on an
+  # NVIDIA builder. On a GPU-less builder symlink the CUDA stub into the link path first (same
+  # caveat the RPM documents): ln -s "$(find / -name libcuda.so -path '*stubs*'|head -1)" /usr/lib/
+  # punktfunk-client-session is the Vulkan/Skia streamer the shell (punktfunk-client) execs for
+  # a connect — both binaries must ship or streaming from the desktop client breaks.
+  # `--features punktfunk-host/nvenc` compiles in the direct-SDK NVENC path (real RFI + recovery
+  # anchor on Linux NVIDIA; design/linux-direct-nvenc.md). AMD/Intel-SAFE: the NVENC/CUDA entry
+  # points are dlopen'd at RUNTIME (libloading), never link-imported — `objdump -p` shows the same
+  # DT_NEEDED as a plain build (no libcuda/libnvidia-encode), so the binary starts fine driver-less
+  # and only touches NVIDIA on a CUDA capture frame. AMD/Intel never reach it — the `cuda` gate
+  # leaves them on VAAPI. Without this feature an NVIDIA box has no NVENC at all.
+  # `punktfunk-host/vulkan-encode` is the AMD/Intel twin: a raw VK_KHR_video_encode_h265 backend with
+  # real RFI (clean P-frame recovery anchor via DPB reference slots; design/linux-vulkan-video-encode.md).
+  # Pure Rust `ash` (no new lib, no link-time deps); default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0
+  # opts back to the native VAAPI session), and a failed open falls back to it so unsupported
+  # devices are safe.
+  if [ "$CARCH" = 'aarch64' ]; then
+    # Client-only: no host crate, so none of the encode features below apply. pf-update still
+    # builds — the client package ships its own copy for `--apply-update`.
+    cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session \
+      -p punktfunk-cli -p pf-update
+  else
+  # `-p punktfunk-encode-worker`: the capability-carrying PyroWave encode worker, shipped next to
+  # the host in /usr/bin and setcap'd by punktfunk-host.install. It MUST be its own file — the host
+  # can never carry a capability (KWin identification; see the scriptlet) — and it must ship in the
+  # SAME package as the host, because host and worker version-check each other over their socket
+  # and fall back to the in-process encoder on any mismatch. Co-built here on purpose: v1 accepts
+  # that the worker shares the host's dependency graph (same package, same sonames, no new break
+  # class), so cargo's feature unification across this one invocation is harmless.
+  cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
+    -p punktfunk-host -p punktfunk-encode-worker \
+    -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
+    -p pf-update
+  # The status tray in its OWN cargo invocation — load-bearing, not tidiness. Cargo unifies features
+  # across everything in one build, so co-building the tray with the host pulls the host's
+  # ashpd -> zbus/tokio onto the tray's shared zbus; the tray (ksni async-io + blocking, no tokio
+  # runtime by design) then panics at startup ("there is no reactor running, must be called from the
+  # context of a Tokio 1.x runtime"). Built alone, its zbus stays on async-io. (Same split the .deb does.)
+  cargo build --release --locked -p punktfunk-tray
+  fi
+  # Management web console (opt-in): the Nitro `bun`-preset .output bundle (Bun.serve TLS),
+  # built AND run with bun.
+  #
+  # Build-if-missing, matching packaging/debian/build-web-deb.sh. An in-tree CI build runs with
+  # PF_SRCDIR pointing at the workspace, so when arch.yml has restored web/.output from the shared
+  # actions cache it is already sitting right here and rebuilding it would be pure duplication —
+  # this console was being built six times per push across the fleet. A local `makepkg` has no
+  # .output and builds exactly as before.
+  #
+  # The Bun.serve assertion covers BOTH paths: a reused bundle is one more thing that can be wrong,
+  # and node cannot run a Bun.serve entry, so shipping the wrong preset is a dead console.
+  if [ "${PF_WITH_WEB:-0}" = 1 ]; then
+    if [ -f web/.output/server/index.mjs ]; then
+      echo "==> reusing the already-built web console at web/.output"
+    else
+      ( cd web && bun install --frozen-lockfile && bun run build )
+    fi
+    grep -q 'Bun\.serve' web/.output/server/index.mjs \
+      || { echo "ERROR: web build is not a bun bundle — need the 'bun' preset + custom entry" >&2; exit 1; }
+  fi
+  # Plugin/script runner (opt-in): one self-contained JS via `bun build --target=bun` (effect + the
+  # SDK inlined; the dynamic plugin import stays a runtime import). bun is also its vendored runtime.
+  if [ "${PF_WITH_SCRIPTING:-0}" = 1 ]; then
+    ( cd sdk && bun install --frozen-lockfile --ignore-scripts && \
+      bun build src/runner-cli.ts --target=bun --outfile="$srcdir/runner-cli.js" )
+    grep -q 'attempt=' "$srcdir/runner-cli.js" \
+      || { echo "ERROR: runner bundle missing the dynamic plugin import — wrong build" >&2; exit 1; }
+  fi
+}
+
+package_punktfunk-host() {
+  pkgdesc="Low-latency desktop/game streaming HOST (Moonlight-compatible + punktfunk/1)"
+  # NVENC + GPU EGL/CUDA come from the NVIDIA driver (nvidia-utils) — kept an optdepend, never a
+  # hard dep, exactly as the RPM (__requires_exclude libcuda) and deb (shlibdeps filter) do.
+  # The host captures the sink monitor through NATIVE PipeWire (pf-audio) — it never
+  # opens a Pulse socket itself, so pipewire-pulse is an OPTdepend, not a depend: it exists
+  # for the GAMES, which commonly emit through the PulseAudio API. Hard-depending on it made
+  # the package uninstallable next to real `pulseaudio`, which serves those games just as well.
+  # punktfunk-icons: the brand mark the Omarchy webapp entry and the tray name. It lives in its
+  # own package because the CLIENT needs the same file — two packages shipping one path is a
+  # pacman file conflict the moment both land on one box (found exactly that way).
+  depends=('pipewire' 'wireplumber' 'opus' 'libei'
+           'mesa' 'libglvnd' 'libxkbcommon' 'wayland' 'punktfunk-icons')
+  optdepends=('rtkit: data-plane thread priority without a relogin (else the shipped LimitNICE drop-in applies from next login)'
+              'pipewire-pulse: PulseAudio-API audio from games/apps (real `pulseaudio` also works)'
+              'nvidia-utils: NVENC hardware encode + GPU EGL/CUDA zero-copy (REQUIRED to encode on NVIDIA)'
+              'gamescope: per-session nested compositor backend (no desktop login needed) — needs >=3.16.22'
+              'punktfunk-gamescope: HDR (10-bit BT.2020 PQ) streaming on the gamescope backend — attempted by default when installed'
+              'kwin: stream a KDE Plasma desktop (kwin VirtualDisplay backend)'
+              'mutter: stream a GNOME desktop (Mutter RecordVirtual backend)'
+              'sway: stream a wlroots desktop (Sway VirtualDisplay backend)'
+              # Owed independently of Omarchy: the Hyprland backend has been first-class for
+              # releases (headless outputs, xdph capture, exclusive topology) with no dependency
+              # naming it, so a Hyprland box could install the host and find capture unavailable.
+              'hyprland: stream a Hyprland desktop (headless-output backend) — Omarchy ships this'
+              'xdg-desktop-portal-hyprland: ScreenCast portal for the Hyprland backend (REQUIRED to capture on Hyprland)'
+              'xdg-desktop-portal-kde: portal for the headless KDE session helper'
+              'xdg-desktop-portal-wlr: portal for the headless Sway session helper'
+              'punktfunk-web: browser management console (device pairing + status)'
+              'punktfunk-scripting: plugin/script runner for host automation (bun)')
+  install=punktfunk-host.install
+  # User-editable config: the headless game-mode drop-in (see below) — don't clobber local edits.
+  backup=('etc/gamescope-session-plus/sessions.d/steam')
+  local R; R="$(_repo)"; local T="$srcdir/target/release"
+
+  install -Dm0755 "$T/punktfunk-host"                 "$pkgdir/usr/bin/punktfunk-host"
+  # The PyroWave encode worker — a SEPARATE file in the same bindir (the host resolves it as a
+  # sibling of /proc/self/exe). punktfunk-host.install setcaps this one, and only this one; the
+  # host must stay capability-free or KWin cannot identify it and desktop streaming dies.
+  install -Dm0755 "$T/punktfunk-encode-worker"        "$pkgdir/usr/bin/punktfunk-encode-worker"
+  # /dev/uinput + /dev/uhid -> input group (virtual gamepads + DualSense UHID)
+  install -Dm0644 "$R/scripts/60-punktfunk.rules"     "$pkgdir/usr/lib/udev/rules.d/60-punktfunk.rules"
+  install -Dm0644 "$R/scripts/60-punktfunk-dualsense.conf" \
+                                                      "$pkgdir/usr/share/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf"
+  # ALSA UCM for the DualSense's own sound card — the `SpeakerHaptic` device alsa-ucm-conf has
+  # never carried. Without it the pad's only playback route is a 1-channel `Speaker` split, and a
+  # game that opens GE-Proton's "Sony controller speaker" endpoint overruns it. Keyed by USB
+  # vid:pid, these only redefine which profile the pad resolves to, so nothing alsa-ucm-conf owns
+  # is replaced — no `conflicts=`, no `backup=`. Complements the WirePlumber rules above rather
+  # than overlapping them: those hold the device open and keep it off the graph-driver election,
+  # this decides which sinks the card offers at all. See scripts/alsa-ucm2/.
+  for f in USB-Audio/conf.d/054c-0ce6.conf USB-Audio/conf.d/054c-0df2.conf \
+           USB-Audio/Punktfunk/DualSense-PS5-Haptic.conf \
+           USB-Audio/Punktfunk/DualSense-PS5-Haptic-HiFi.conf; do
+    install -Dm0644 "$R/scripts/alsa-ucm2/$f" "$pkgdir/usr/share/alsa/ucm2/$f"
+  done
+  # Managed gamescope takeover on DM-autologin boxes: root helper + polkit action so the host can
+  # stop/restore the display manager for the stream. Arch has no /usr/libexec — install under
+  # /usr/lib/punktfunk and rewrite the policy's exec.path annotation to match (the host probes both).
+  install -Dm0755 "$R/scripts/pf-dm-helper"           "$pkgdir/usr/lib/punktfunk/pf-dm-helper"
+  install -Dm0644 "$R/scripts/io.unom.punktfunk.dm-helper.policy" \
+    "$pkgdir/usr/share/polkit-1/actions/io.unom.punktfunk.dm-helper.policy"
+  sed -i 's#/usr/libexec/punktfunk/pf-dm-helper#/usr/lib/punktfunk/pf-dm-helper#' \
+    "$pkgdir/usr/share/polkit-1/actions/io.unom.punktfunk.dm-helper.policy"
+  # ...and the other half of stopping a display manager: with it stopped the box has no active
+  # local session, so logind's power actions fall to auth_admin_keep and Steam's power menu goes
+  # quiet mid-stream. No path annotation to rewrite — a .rules file names a group, not a binary.
+  install -Dm0644 "$R/packaging/linux/49-punktfunk-power.rules" \
+    "$pkgdir/usr/share/polkit-1/rules.d/49-punktfunk-power.rules"
+  # Web-console-triggered updates (host-update-from-web-console.md §7): root helper + oneshot
+  # unit + group-scoped polkit rule. Same no-libexec relocation as pf-dm-helper, with the
+  # unit's ExecStart rewritten to match. On pacman the helper additionally requires the
+  # explicit PACMAN_FULL_SYSUPGRADE opt-in (partial upgrades are against Arch doctrine).
+  install -Dm0755 "$T/pf-update"                      "$pkgdir/usr/lib/punktfunk/pf-update"
+  install -Dm0644 "$R/packaging/linux/punktfunk-update.service" \
+    "$pkgdir/usr/lib/systemd/system/punktfunk-update.service"
+  sed -i 's#/usr/libexec/punktfunk/pf-update#/usr/lib/punktfunk/pf-update#' \
+    "$pkgdir/usr/lib/systemd/system/punktfunk-update.service"
+  install -Dm0644 "$R/packaging/linux/49-punktfunk-update.rules" \
+    "$pkgdir/usr/share/polkit-1/rules.d/49-punktfunk-update.rules"
+  # An upgrade of any punktfunk server package restarts the running services, once per transaction.
+  install -Dm0755 "$R/packaging/linux/restart-user-units.sh" "$pkgdir/usr/lib/punktfunk/restart-user-units"
+  install -Dm0644 "$R/packaging/arch/punktfunk-restart.hook" \
+    "$pkgdir/usr/share/libalpm/hooks/punktfunk-restart.hook"
+  # vhci-hcd autoload — usbip transport for the virtual Steam Deck pad (Steam only adopts USB pads)
+  install -Dm0644 "$R/scripts/punktfunk-modules.conf" "$pkgdir/usr/lib/modules-load.d/punktfunk.conf"
+  # 32 MB UDP socket buffers (send-side headroom at high bitrate)
+  install -Dm0644 "$R/scripts/99-punktfunk-net.conf"  "$pkgdir/usr/lib/sysctl.d/99-punktfunk-net.conf"
+  # Nice-limit headroom for the host's data-plane threads: raises the user-session RLIMIT_NICE so
+  # pf-frame's setpriority() works on boxes without RealtimeKit (with rtkit the host never needs
+  # it). A limit, not a grant — and NEVER a file capability on the host binary (see the KWin
+  # identification note in punktfunk-host.install). Applies from the next login.
+  install -Dm0644 "$R/packaging/linux/50-punktfunk-nice.conf" \
+    "$pkgdir/usr/lib/systemd/system/user@.service.d/50-punktfunk-nice.conf"
+  # systemd USER units (the host runs in the graphical session, not as root); repoint ExecStart.
+  install -Dm0644 "$R/scripts/punktfunk-host.service" "$pkgdir/usr/lib/systemd/user/punktfunk-host.service"
+  sed -i 's#%h/punktfunk/target/release/punktfunk-host#/usr/bin/punktfunk-host#' \
+    "$pkgdir/usr/lib/systemd/user/punktfunk-host.service"
+  # Optional drop-in for a DESKTOP-LOGIN host: binds the host to graphical-session.target so a
+  # Plasma/GNOME restart restarts it instead of leaving it on a dead compositor connection. Shipped
+  # under /usr/share (NOT as an active drop-in) because it is wrong for the appliance route — the
+  # operator copies it into ~/.config/systemd/user/punktfunk-host.service.d/ when they want it.
+  install -Dm0644 "$R/scripts/punktfunk-host-desktop-session.conf" \
+    "$pkgdir/usr/share/punktfunk/punktfunk-host-desktop-session.conf"
+  # Install-kind + channel marker, read by the host's update-check surface (planning:
+  # host-update-from-web-console.md §4.1). A canary build's pkgrel is `0.<zero-padded run>`.
+  local _pf_update_channel=stable
+  [[ $pkgrel == 0.* ]] && _pf_update_channel=canary
+  printf 'pacman %s\n' "$_pf_update_channel" | \
+    install -Dm0644 /dev/stdin "$pkgdir/usr/share/punktfunk/install-kind"
+  install -Dm0644 "$R/scripts/punktfunk-kde-session.service" "$pkgdir/usr/lib/systemd/user/punktfunk-kde-session.service"
+  sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#/usr/share/punktfunk/headless/run-headless-kde.sh#' \
+    "$pkgdir/usr/lib/systemd/user/punktfunk-kde-session.service"
+  # KWin Desktop-mode authorization: non-launcher .desktop whose X-KDE-Wayland-Interfaces lets the
+  # host bind KWin's restricted zkde_screencast (virtual output) + fake_input globals on an
+  # interactive Plasma session. Must ship with the host (KWin caches the per-exe grant on first
+  # connect). See the file's header comment.
+  install -Dm0644 "$R/packaging/linux/io.unom.Punktfunk.Host.desktop" \
+    "$pkgdir/usr/share/applications/io.unom.Punktfunk.Host.desktop"
+  # Status tray: per-user SNI icon + XDG autostart entry (self-gating: --autostart exits silently
+  # for users who don't run a host) + the hicolor status icons it names.
+  install -Dm0755 "$T/punktfunk-tray" "$pkgdir/usr/bin/punktfunk-tray"
+  install -Dm0644 "$R/packaging/linux/io.unom.Punktfunk.Tray.desktop" \
+    "$pkgdir/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop"
+  local sz png
+  for sz in 22x22 48x48; do
+    for png in "$R"/packaging/linux/icons/hicolor/$sz/apps/*.png; do
+      install -Dm0644 "$png" "$pkgdir/usr/share/icons/hicolor/$sz/apps/$(basename "$png")"
+    done
+  done
+  # headless session helpers + env templates + OpenAPI doc
+  install -Dm0755 "$R/scripts/headless/run-headless-kde.sh"  "$pkgdir/usr/share/punktfunk/headless/run-headless-kde.sh"
+  install -Dm0755 "$R/scripts/headless/run-headless-sway.sh" "$pkgdir/usr/share/punktfunk/headless/run-headless-sway.sh"
+  install -Dm0644 "$R/scripts/headless/kde-authorized"       "$pkgdir/usr/share/punktfunk/headless/kde-authorized"
+  install -Dm0644 "$R/scripts/headless/punktfunk-sink.conf"  "$pkgdir/usr/share/punktfunk/headless/punktfunk-sink.conf"
+  install -Dm0644 "$R/scripts/host.env.example"              "$pkgdir/usr/share/punktfunk/host.env.example"
+  install -Dm0644 "$R/packaging/bazzite/host.env"            "$pkgdir/usr/share/punktfunk/host.env.bazzite"
+  install -Dm0644 "$R/packaging/kde/host.env"                "$pkgdir/usr/share/punktfunk/host.env.kde"
+  # Headless GAME-mode fix: gamescope-session-plus drop-in that uses the headless backend when no
+  # display is connected (so SteamOS/Bazzite "Switch to Game Mode" works on a display-less streaming
+  # host). No-op on display-attached boxes; sourced as /etc/gamescope-session-plus/sessions.d/steam.
+  install -Dm0644 "$R/packaging/bazzite/gamescope-headless-session" \
+    "$pkgdir/etc/gamescope-session-plus/sessions.d/steam"
+  install -Dm0644 "$R/api/openapi.json"                 "$pkgdir/usr/share/punktfunk/openapi.json"
+  # The session drop-in as a TEMPLATE the Omarchy setup script installs into the user's unit dir.
+  # It is already shipped to /usr/lib/systemd/user/... as a documented no-op elsewhere; here it is
+  # a file `punktfunk-omarchy setup` can copy, because on Omarchy graphical-session.target really
+  # starts and binding to it is what makes the host restart with the session.
+  install -Dm0644 "$R/scripts/punktfunk-host-desktop-session.conf" \
+    "$pkgdir/usr/share/punktfunk/punktfunk-host-desktop-session.conf"
+  # Omarchy integration (design/omarchy-integration.md). The script is INSTALLED, never run: a
+  # package that opened firewall ports or edited a user's config on install would be doing both
+  # behind the operator's back. `punktfunk-omarchy setup` is the consent step.
+  install -Dm0755 "$R/packaging/linux/omarchy/punktfunk-omarchy" \
+    "$pkgdir/usr/bin/punktfunk-omarchy"
+  for h in pairing-pending stream-started stream-stopped idle-guard; do
+    install -Dm0755 "$R/packaging/linux/omarchy/hooks/$h" \
+      "$pkgdir/usr/share/punktfunk/omarchy/hooks/$h"
+  done
+  install -Dm0644 "$R/packaging/linux/omarchy/themed/punktfunk.json.tpl" \
+    "$pkgdir/usr/share/punktfunk/omarchy/themed/punktfunk.json.tpl"
+  # The Quickshell bar widget (see plugin/README.md). Shipped as data only — the shell discovers
+  # plugins in the USER's config dir, so `punktfunk-omarchy setup` copies it there with consent,
+  # the same split as the hooks above.
+  for f in manifest.json Panel.qml Service.qml Model.js README.md; do
+    install -Dm0644 "$R/packaging/linux/omarchy/plugin/$f" \
+      "$pkgdir/usr/share/punktfunk/omarchy/plugin/$f"
+  done
+  # Firewall openers — NOT auto-enabled (an Arch package never touches the admin's running firewall).
+  # Stock Arch ships no firewall; CachyOS ships ufw; some spins (EndeavourOS) enable firewalld — so we
+  # install BOTH a ufw application profile and firewalld service definitions, and the one for whatever
+  # firewall you actually run is a one-liner. See README.md → Firewall.
+  #   ufw:       sudo ufw allow punktfunk-native            (or punktfunk-gamestream)
+  #   firewalld: sudo firewall-cmd --reload && sudo firewall-cmd --permanent --add-service=punktfunk-native && sudo firewall-cmd --reload
+  install -Dm0644 "$R/packaging/linux/punktfunk.ufw" \
+    "$pkgdir/etc/ufw/applications.d/punktfunk"
+  install -Dm0644 "$R/packaging/linux/punktfunk-gamestream.xml" \
+    "$pkgdir/usr/lib/firewalld/services/punktfunk-gamestream.xml"
+  install -Dm0644 "$R/packaging/linux/punktfunk-native.xml" \
+    "$pkgdir/usr/lib/firewalld/services/punktfunk-native.xml"
+  # Web console opener (TCP 47992) — only meaningful with the optional punktfunk-web package; opened
+  # deliberately (see README.md → Firewall). ufw's equivalent is the punktfunk-web profile above.
+  install -Dm0644 "$R/packaging/linux/punktfunk-web.xml" \
+    "$pkgdir/usr/lib/firewalld/services/punktfunk-web.xml"
+  install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-MIT"
+  install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-APACHE"
+  install -Dm0644 "$R/README.md"      "$pkgdir/usr/share/doc/punktfunk-host/README.md"
+}
+
+package_punktfunk-client() {
+  pkgdesc="Low-latency desktop/game streaming CLIENT — native GTK4/libadwaita Linux app"
+  # The GTK4/libadwaita shell + its Vulkan session streamer: SDL3 gamepads, native decode
+  # (Vulkan Video, VAAPI, and openh264 + rav1d in software), PipeWire audio/mic.
+  # No ffmpeg since M10: the client links no libav* at all, and its VAAPI rung dlopens libva
+  # rather than linking it, so the driver optdepends below are all it needs.
+  # vulkan-icd-loader: the session binary loads libvulkan at runtime (ash) for both its decoder
+  # and its ash/Skia presenter.
+  # NOT pipewire-pulse: the client speaks NATIVE PipeWire (audio.rs drives libpipewire-0.3
+  # directly for both playback and the mic uplink) and never opens a Pulse socket, so the
+  # compat shim buys it nothing — while `pipewire-pulse` CONFLICTS with `pulseaudio`, which
+  # made the package uninstallable for anyone keeping real PulseAudio. Matches the .deb
+  # (Recommends) and the RPM (Recommends, "degrade gracefully without it").
+  # punktfunk-icons: the shared brand mark — see the host's depends note.
+  depends=('gtk4' 'libadwaita' 'sdl3' 'pipewire' 'wireplumber'
+           'opus' 'libglvnd' 'vulkan-icd-loader' 'punktfunk-icons')
+  optdepends=('libva-mesa-driver: VAAPI hardware decode on AMD (incl. Steam Deck); software fallback otherwise'
+              'intel-media-driver: VAAPI hardware decode on Intel'
+              'vulkan-radeon: Vulkan Video decode + presenter on AMD'
+              'vulkan-nouveau: Vulkan Video decode + presenter on NVIDIA (nvidia-utils for the proprietary ICD)'
+              'gamescope: run the client fullscreen in a Gaming-Mode session')
+  install=punktfunk-client.install
+  local R; R="$(_repo)"; local T="$srcdir/target/release"
+
+  install -Dm0755 "$T/punktfunk-client"  "$pkgdir/usr/bin/punktfunk-client"
+  # The session streamer the shell execs for a connect (resolved as its sibling in /usr/bin).
+  install -Dm0755 "$T/punktfunk-session" "$pkgdir/usr/bin/punktfunk-session"
+  # The headless CLI (design/client-architecture-split.md §4).
+  install -Dm0755 "$T/punktfunk" "$pkgdir/usr/bin/punktfunk"
+  install -Dm0644 "$R/packaging/linux/io.unom.Punktfunk.desktop" \
+    "$pkgdir/usr/share/applications/io.unom.Punktfunk.desktop"
+  # Second launcher, straight into the gamepad console (`--browse`) — the couch entry point.
+  install -Dm0644 "$R/packaging/linux/io.unom.Punktfunk.Console.desktop" \
+    "$pkgdir/usr/share/applications/io.unom.Punktfunk.Console.desktop"
+  # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).
+  install -Dm0644 "$R/scripts/70-punktfunk-client.rules" \
+    "$pkgdir/usr/lib/udev/rules.d/70-punktfunk-client.rules"
+  # 32 MB UDP recv buffer (so high-bitrate streams don't overflow the kernel socket buffer).
+  install -Dm0644 "$R/scripts/99-punktfunk-client-net.conf" \
+    "$pkgdir/usr/lib/sysctl.d/99-punktfunk-client-net.conf"
+  # One-tap client updates (`punktfunk-client --apply-update`, which is what the Decky plugin
+  # runs): the same root helper the host package ships, under the CLIENT's own paths — a
+  # client-only box (a Deck) has no host package, and two packages owning one path is a hard
+  # pacman conflict. Same no-libexec relocation as the host's copy, with the unit's ExecStart
+  # rewritten to match. On pacman the helper additionally requires the explicit
+  # PACMAN_FULL_SYSUPGRADE opt-in (partial upgrades are against Arch doctrine).
+  install -Dm0755 "$T/pf-update" "$pkgdir/usr/lib/punktfunk/pf-update-client"
+  install -Dm0644 "$R/packaging/linux/punktfunk-client-update.service" \
+    "$pkgdir/usr/lib/systemd/system/punktfunk-client-update.service"
+  sed -i 's#/usr/libexec/punktfunk/pf-update#/usr/lib/punktfunk/pf-update-client#' \
+    "$pkgdir/usr/lib/systemd/system/punktfunk-client-update.service"
+  install -Dm0644 "$R/packaging/linux/49-punktfunk-client-update.rules" \
+    "$pkgdir/usr/share/polkit-1/rules.d/49-punktfunk-client-update.rules"
+  # Install-kind + channel marker for the CLIENT, read by `punktfunk-client --check-update`
+  # (planning: host-update-from-web-console.md §4.1). Its own directory, matching the RPM (where
+  # the host subpackage's %{_datadir}/punktfunk/* glob would otherwise co-own a sibling file) —
+  # one path per product across every format, so the detector has one answer to remember.
+  local _pf_client_channel=stable
+  [[ $pkgrel == 0.* ]] && _pf_client_channel=canary
+  printf 'pacman %s\n' "$_pf_client_channel" | \
+    install -Dm0644 /dev/stdin "$pkgdir/usr/share/punktfunk-client/install-kind"
+  install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-client/LICENSE-MIT"
+  install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-client/LICENSE-APACHE"
+}
+
+# The brand mark both the host's and the client's desktop entries name (`Icon=io.unom.Punktfunk`).
+# Its own package because each side must work STANDALONE (a host-only Omarchy box wants a webapp
+# icon; a client-only laptop wants an app icon), and the same path in two packages is a pacman
+# file conflict on any box that installs both.
+package_punktfunk-icons() {
+  pkgdesc="Punktfunk brand icons shared by the host and client packages"
+  depends=()
+  local R; R="$(_repo)"
+  install -Dm0644 "$R/packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg"
+}
+
+package_punktfunk-web() {
+  pkgdesc="punktfunk management web console (Nitro SSR on bun, HTTPS/HTTP-1.1 over TLS) — pairing + status in the browser"
+  # Runs on punktfunk-bun's private bun (Bun.serve), pinned to this exact build. Auto-wired to the
+  # host's mgmt token + identity cert via the systemd --user units; enable with
+  # `systemctl --user enable --now punktfunk-web`. No nodejs or system bun dependency.
+  depends=("punktfunk-bun=${pkgver}-${pkgrel}")
+  local R; R="$(_repo)"
+
+  # Pre-built bun-preset bundle (from build()) + a PATH-stable launcher (matches the .deb/.rpm).
+  install -d "$pkgdir/usr/share/punktfunk-web/.output"
+  cp -r "$R/web/.output/server" "$pkgdir/usr/share/punktfunk-web/.output/server"
+  cp -r "$R/web/.output/public" "$pkgdir/usr/share/punktfunk-web/.output/public"
+  install -d "$pkgdir/usr/bin"
+  printf '%s\n' '#!/bin/sh' 'exec /usr/lib/punktfunk-bun/bun /usr/share/punktfunk-web/.output/server/index.mjs "$@"' \
+    > "$pkgdir/usr/bin/punktfunk-web-server"
+  chmod 0755 "$pkgdir/usr/bin/punktfunk-web-server"
+  # systemd USER units: the console runs per-user; web-init generates the login password on first start.
+  install -Dm0644 "$R/scripts/punktfunk-web.service"      "$pkgdir/usr/lib/systemd/user/punktfunk-web.service"
+  install -Dm0644 "$R/scripts/punktfunk-web-init.service" "$pkgdir/usr/lib/systemd/user/punktfunk-web-init.service"
+  install -Dm0755 "$R/scripts/web-init.sh"                "$pkgdir/usr/share/punktfunk-web/web-init.sh"
+  install -Dm0644 "$R/web/web.env.example"                "$pkgdir/usr/share/punktfunk-web/web.env.example"
+  install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-web/LICENSE-MIT"
+  install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-web/LICENSE-APACHE"
+}
+
+package_punktfunk-scripting() {
+  pkgdesc="punktfunk plugin/script runner (Effect SDK on bun) — supervises host automation scripts + punktfunk-plugin-* packages"
+  # bubblewrap builds each plugin's sandbox; the runner starts no plugin without it. The runtime is
+  # punktfunk-bun's private bun (it import()s the operator's .ts plugins), pinned to this build.
+  depends=('bubblewrap' "punktfunk-bun=${pkgver}-${pkgrel}")
+  local R; R="$(_repo)"
+
+  # Pre-built self-contained bundle (from build()) + a PATH-stable launcher (matches the .deb/.rpm).
+  install -Dm0644 "$srcdir/runner-cli.js" "$pkgdir/usr/share/punktfunk-scripting/runner-cli.js"
+  install -d "$pkgdir/usr/bin"
+  printf '%s\n' '#!/bin/sh' 'exec /usr/lib/punktfunk-bun/bun /usr/share/punktfunk-scripting/runner-cli.js "$@"' \
+    > "$pkgdir/usr/bin/punktfunk-scripting"
+  chmod 0755 "$pkgdir/usr/bin/punktfunk-scripting"
+  # systemd USER unit — installed but NOT auto-enabled (opt-in). Enable once you have automation:
+  #   systemctl --user enable --now punktfunk-scripting
+  install -Dm0644 "$R/scripts/punktfunk-scripting.service" "$pkgdir/usr/lib/systemd/user/punktfunk-scripting.service"
+  install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-scripting/LICENSE-MIT"
+  install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-scripting/LICENSE-APACHE"
+}
+
+# The build env's bun, vendored once for web and scripting. A private dir, never on PATH, so it
+# never collides with a system-wide bun. A native binary, so the package is arch-specific.
+package_punktfunk-bun() {
+  pkgdesc="Bun runtime for punktfunk-web and punktfunk-scripting (private, not on PATH)"
+  depends=()
+  install -Dm0755 "$(command -v bun)" "$pkgdir/usr/lib/punktfunk-bun/bun"
+}

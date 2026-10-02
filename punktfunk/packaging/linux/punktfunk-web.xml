@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  firewalld service definition for the punktfunk management web console (the optional punktfunk-web
+  package: device pairing, status, GPU selection, performance graphs).
+
+  Installed to /usr/lib/firewalld/services/ by the punktfunk-host package. NOT enabled automatically
+  (packages never touch the admin's firewall). Only useful if you installed the console (punktfunk-web)
+  AND want to reach it from another device on the LAN — the console binds all interfaces on TCP 47992
+  (HTTPS, login-gated), and serves plugin UIs from a SEPARATE ORIGIN on TCP 47993 (see below).
+  The streaming host itself does not need this open; enable it deliberately with
+  firewall-cmd (add-service=punktfunk-web, then reload). CachyOS/Ubuntu: use the ufw punktfunk-web
+  profile instead.
+
+  The mgmt REST API (TCP 47990) is a different surface — the console proxies to it over loopback, and
+  it is opened for paired clients by the punktfunk-native profile (not here). Off-loopback the mgmt API
+  serves only read-only status/library to a paired client cert; its admin surface stays loopback-only.
+-->
+<service>
+  <short>Punktfunk web console</short>
+  <description>The optional punktfunk management web console (device pairing, status, GPU selection, performance graphs) over HTTPS. Open only if you run the punktfunk-web package and want the console reachable from other devices on the LAN.</description>
+  <port protocol="tcp" port="47992"/>  <!-- HTTPS web console (login-gated) -->
+  <!--
+    Plugin UIs, on their OWN ORIGIN. Not a second console: a plugin's interface is third-party code,
+    and serving it on the console's origin let it act as the logged-in operator (security-review
+    2026-08-05 H-3). Same host, same certificate, different port — a different origin to the browser,
+    but still same-site, so the session cookie reaches it. Login-gated exactly like the console.
+    Only needed if you use plugins that ship a UI and want to reach them from another device.
+  -->
+  <port protocol="tcp" port="47993"/>  <!-- HTTPS plugin UIs (login-gated, separate origin) -->
+</service>

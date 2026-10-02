@@ -1,0 +1,109 @@
+{
+  "$comment": "Cross-language contract for video placement (design/video-fit-and-scaling.md §2.1). The Rust (crates/punktfunk-core/src/video_fit.rs), Swift, Kotlin and TypeScript ports each run every case. `view` is device pixels of the drawing surface, `frame` the decoded frame. `dst` is [x, y, w, h] in view pixels and always lies inside the view; `src` is [x, y, w, h] of the visible frame region (compare within 1e-4). `kernel` is [x, y]. Each `to_frame` row is [view_x, view_y, frame_x, frame_y]. Centring floors the origin; sizes round half away from zero.",
+  "version": 1,
+  "cases": [
+    {
+      "name": "fit-phone-pillarbox",
+      "fit": "fit", "view": [3216, 1440], "frame": [1920, 1080],
+      "expect": {
+        "dst": [328, 0, 2560, 1440], "src": [0, 0, 1920, 1080], "kernel": ["catmull-rom", "catmull-rom"],
+        "to_frame": [[328, 0, 0, 0], [2888, 1440, 1920, 1080], [0, 720, 0, 540]]
+      }
+    },
+    {
+      "name": "crop-phone-cuts-top-and-bottom",
+      "fit": "crop", "view": [3216, 1440], "frame": [1920, 1080],
+      "expect": {
+        "dst": [0, 0, 3216, 1440], "src": [0, 110.447761, 1920, 859.701493], "kernel": ["catmull-rom", "catmull-rom"],
+        "to_frame": [[0, 0, 0, 110.447761], [3216, 1440, 1920, 970.149254]]
+      }
+    },
+    {
+      "name": "stretch-phone",
+      "fit": "stretch", "view": [3216, 1440], "frame": [1920, 1080],
+      "expect": {
+        "dst": [0, 0, 3216, 1440], "src": [0, 0, 1920, 1080], "kernel": ["catmull-rom", "catmull-rom"],
+        "to_frame": [[1608, 720, 960, 540]]
+      }
+    },
+    {
+      "name": "fit-monitor-letterboxes-a-20-9-frame",
+      "fit": "fit", "view": [1920, 1080], "frame": [3216, 1440],
+      "expect": {
+        "dst": [0, 110, 1920, 860], "src": [0, 0, 3216, 1440], "kernel": ["lanczos", "lanczos"],
+        "to_frame": [[960, 540, 1608, 720], [960, 0, 1608, 0]]
+      }
+    },
+    {
+      "name": "crop-monitor-cuts-the-sides",
+      "fit": "crop", "view": [1920, 1080], "frame": [3216, 1440],
+      "expect": {
+        "dst": [0, 0, 1920, 1080], "src": [328, 0, 2560, 1440], "kernel": ["lanczos", "lanczos"],
+        "to_frame": [[0, 0, 328, 0], [1920, 1080, 2888, 1440]]
+      }
+    },
+    {
+      "name": "fit-native-is-copy",
+      "fit": "fit", "view": [1920, 1080], "frame": [1920, 1080],
+      "expect": { "dst": [0, 0, 1920, 1080], "src": [0, 0, 1920, 1080], "kernel": ["copy", "copy"] }
+    },
+    {
+      "name": "fit-odd-window-snaps-to-copy",
+      "fit": "fit", "view": [1921, 1081], "frame": [1920, 1080],
+      "expect": { "dst": [0, 0, 1920, 1080], "src": [0, 0, 1920, 1080], "kernel": ["copy", "copy"] }
+    },
+    {
+      "name": "fit-thin-bars-snap-to-copy",
+      "fit": "fit", "view": [1928, 1088], "frame": [1920, 1080],
+      "expect": { "dst": [4, 4, 1920, 1080], "src": [0, 0, 1920, 1080], "kernel": ["copy", "copy"] }
+    },
+    {
+      "name": "fit-4k-panel-replicates-1080p",
+      "fit": "fit", "view": [3840, 2160], "frame": [1920, 1080],
+      "expect": {
+        "dst": [0, 0, 3840, 2160], "src": [0, 0, 1920, 1080], "kernel": ["nearest", "nearest"],
+        "to_frame": [[1, 1, 0.5, 0.5]]
+      }
+    },
+    {
+      "name": "fit-16-10-panel-replicates-with-bars",
+      "fit": "fit", "view": [3840, 2400], "frame": [1920, 1080],
+      "expect": { "dst": [0, 120, 3840, 2160], "src": [0, 0, 1920, 1080], "kernel": ["nearest", "nearest"] }
+    },
+    {
+      "name": "fit-near-double-crops-a-few-pixels",
+      "fit": "fit", "view": [3832, 2152], "frame": [1920, 1080],
+      "expect": { "dst": [0, 0, 3832, 2152], "src": [2, 2, 1916, 1076], "kernel": ["nearest", "nearest"] }
+    },
+    {
+      "name": "fit-just-past-the-snap-resamples",
+      "fit": "fit", "view": [3880, 2182], "frame": [3840, 2160],
+      "expect": { "dst": [0, 0, 3879, 2182], "src": [0, 0, 3840, 2160], "kernel": ["catmull-rom", "catmull-rom"] }
+    },
+    {
+      "name": "fit-ipad-downscale",
+      "fit": "fit", "view": [2732, 2048], "frame": [2880, 2160],
+      "expect": { "dst": [0, 0, 2731, 2048], "src": [0, 0, 2880, 2160], "kernel": ["lanczos", "lanczos"] }
+    },
+    {
+      "name": "fit-render-scale-2-supersample",
+      "fit": "fit", "view": [1920, 1080], "frame": [3840, 2160],
+      "expect": { "dst": [0, 0, 1920, 1080], "src": [0, 0, 3840, 2160], "kernel": ["lanczos", "lanczos"] }
+    },
+    {
+      "name": "fit-portrait-frame-rounds-half-away",
+      "fit": "fit", "view": [1920, 1080], "frame": [1080, 1920],
+      "expect": { "dst": [656, 0, 608, 1080], "src": [0, 0, 1080, 1920], "kernel": ["lanczos", "lanczos"] }
+    },
+    {
+      "name": "stretch-snaps-each-axis-alone",
+      "fit": "stretch", "view": [3840, 1081], "frame": [1920, 1080],
+      "expect": { "dst": [0, 0, 3840, 1080], "src": [0, 0, 1920, 1080], "kernel": ["nearest", "copy"] }
+    },
+    {
+      "name": "empty-view-places-nothing",
+      "fit": "fit", "view": [0, 1080], "frame": [1920, 1080],
+      "expect": { "dst": [0, 0, 0, 0], "src": [0, 0, 0, 0], "kernel": ["copy", "copy"] }
+    }
+  ]
+}

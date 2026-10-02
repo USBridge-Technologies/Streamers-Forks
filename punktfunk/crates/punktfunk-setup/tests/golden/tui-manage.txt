@@ -1,0 +1,15 @@
+│
+◆  punktfunk-host 0.34.0 · canary
+│  https://docs.punktfunk.unom.io/docs/arch
+│
+│  ▸ Apply these changes
+│  ──────────────────────────────────────────────────────────
+│    This machine is          the PC I stream from (host)
+│    Channel                  canary
+│    Full controller support  yes — joins the punktfunk group (grants usbip attach)
+│    Third-party clients      no  — punktfunk's own apps don't need it
+│    Shared clipboard         yes
+│    Host service             yes
+│    Uninstall — remove the packages and the repo
+│
+│  ↑↓ move · Enter select/edit · q quit — nothing runs until you confirm

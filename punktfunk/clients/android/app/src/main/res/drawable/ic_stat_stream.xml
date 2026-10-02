@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Status-bar icon for the ongoing-session notification: the Punktfunk silhouette, the same two
+  overlapping circles as the launcher's monochrome layer. Its own file rather than a reuse of
+  `ic_launcher_monochrome`, because an adaptive-icon layer carries the launcher's safe-zone
+  padding — dropped into a 24dp status-bar slot the mark comes out small and off-centre. The
+  system alpha-masks and tints this, so the white fill is convention, not a colour choice.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="608"
+    android:viewportHeight="608">
+    <group
+        android:translateX="-196.5"
+        android:translateY="-196.2">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M403.037,791.672c107.586,0 194.41,-86.824 194.41,-194.41c0,-107.586 -86.824,-194.41 -194.41,-194.41c-107.586,0 -194.41,86.824 -194.41,194.41c0,107.586 86.824,194.41 194.41,194.41Z" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M735.276,540.321c76.075,-76.075 76.075,-198.862 0,-274.937c-76.075,-76.075 -198.862,-76.075 -274.937,0c-76.075,76.075 -76.075,198.862 0,274.937c76.075,76.075 198.862,76.075 274.937,0Z" />
+    </group>
+</vector>

@@ -1,0 +1,213 @@
+# pacman install scriptlet — mirrors the RPM %post / deb postinst.
+_ensure_update_group() {
+  # The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
+  getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || true
+}
+
+_ensure_punktfunk_group() {
+  # Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Separate from 'input' on
+  # purpose: writing 'attach' materialises an arbitrary emulated USB device, which is a root-only
+  # kernel primitive and must not ride on the group users are told to join for gamepads
+  # (security-review 2026-08-05 M-4). It is ALSO the group pf-dm-helper authorizes on (its polkit
+  # action must stay allow_any, so membership is the real gate), i.e. what a managed gamescope
+  # takeover needs to stop the display manager. Creating the group is necessary and NOT sufficient
+  # for either use: membership is.
+  getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || true
+}
+
+# NO capability on the host binary — and an active removal of the one 0.26.0-1 granted.
+#
+# 0.26.0-1 ran `setcap cap_sys_nice=ep` here, to let the encoder open an elevated global-priority
+# Vulkan queue (PyroWave shares the GPU's shader cores with the game; measured 2026-08-08 on an
+# RTX 5070 Ti, the encode dispatch goes ~2 ms -> 15-18 ms at 95 % game load without it). That grant
+# BROKE DESKTOP STREAMING ON EVERY KDE BOX, and it cannot be made to work — the two are mutually
+# exclusive at the kernel level:
+#
+#   KWin hands out its restricted Wayland protocols (zkde_screencast_unstable_v1, which mints our
+#   virtual output, and org_kde_kwin_fake_input, which injects input) only to a client it can
+#   IDENTIFY, by resolving that client's /proc/<pid>/exe and matching it against an installed
+#   .desktop's Exec= (ours is io.unom.Punktfunk.Host.desktop). The kernel refuses that readlink to
+#   any reader whose effective set is not a superset of the target's PERMITTED set
+#   (cap_ptrace_access_check), and KWin holds no capabilities. So the moment this binary carries a
+#   capability it becomes unidentifiable: KWin's executablePath() is empty, nothing matches, the
+#   globals are never advertised, and every session dies with
+#   "KWin does not expose zkde_screencast_unstable_v1 to this client" after 8 retries — while
+#   looking exactly like a missing or wrong .desktop file.
+#
+# Verified on CachyOS (kernel 7.1.6), same-uid reader, cap_sys_nice=ep on the target:
+#   no capability .............................. readlink /proc/<pid>/exe OK
+#   capability ................................. EPERM
+#   capability + prctl(PR_SET_DUMPABLE, 1) ..... EPERM   <- dumpable is NOT the gate
+#   capability dropped + PR_SET_DUMPABLE(1) .... OK      <- only a capability-free process works
+#
+# The third row also rules out the obvious "move it to the systemd unit": AmbientCapabilities= puts
+# CAP_SYS_NICE in exactly the same permitted set and fails identically. Nothing short of not having
+# the capability restores identification, so the host does not get one. The encoder already walks
+# REALTIME -> HIGH -> default when the class is refused (pf-zerocopy vulkan.rs), so this costs
+# pacing under a GPU-bound game and nothing else — 0.25.0's behaviour exactly.
+#
+# The removal below heals boxes that ran 0.26.0-1's scriptlet. A pacman upgrade writes a new inode
+# and file capabilities do not survive that, so this is belt-and-braces for reinstall/downgrade
+# paths — cheap, and the failure it prevents is an 8-retry session death with a misleading message.
+_revoke_sched_capability() {
+  setcap -r usr/bin/punktfunk-host 2>/dev/null || true
+}
+
+# CAP_SYS_NICE on the ENCODE WORKER — the same GPU-scheduling grant 0.26.0-1 aimed at the wrong
+# binary, now on a binary that can carry it.
+#
+# punktfunk-encode-worker is a separate executable (never a hardlink or a subcommand of the host —
+# a shared inode would share the file capability and silently re-create the breakage above). It is
+# spawned per PyroWave session, speaks one socketpair to its parent, and never connects to Wayland,
+# D-Bus or the network — so it is not a KWin client, nothing ever resolves its /proc/<pid>/exe, and
+# a capability on it is invisible to the identification path that the host must keep clear.
+#
+# What it buys: PyroWave encodes on the same GPU shader cores the game saturates, and an elevated
+# VK_KHR_global_priority queue is the preemption lever for that. Every driver tested (NVIDIA and
+# RADV alike) refuses EVERY priority class without CAP_SYS_NICE, so without this line the lever is
+# decoration. Measured on .21 (RTX 5070 Ti, GRID 2 loop): encode p99 6.4 -> 4.4 ms.
+#
+# NARROW: CAP_SYS_NICE permits raising scheduling priority only (nice/ioprio/affinity/RT class). No
+# filesystem, network or user-switching privilege, and it is NOT setuid.
+#
+# BEST-EFFORT, always: an uncapped worker still encodes, at default priority. A box without libcap,
+# or a filesystem that cannot store capabilities, must never fail an install over a pacing lever.
+#
+# Two consequences worth knowing before debugging the WORKER (they do not apply to the host):
+#  * a file capability makes the process AT_SECURE, so the loader ignores LD_LIBRARY_PATH and
+#    LD_PRELOAD for it — a library-path shim that rescues the host will NOT reach the worker.
+#  * core dumps are suppressed for capability-carrying binaries by default (fs.suid_dumpable).
+_grant_worker_sched_capability() {
+  [ -f usr/bin/punktfunk-encode-worker ] || return 0
+  setcap 'cap_sys_nice=ep' usr/bin/punktfunk-encode-worker 2>/dev/null || true
+}
+
+post_install() {
+  _ensure_update_group
+  _ensure_punktfunk_group
+  _revoke_sched_capability
+  _grant_worker_sched_capability
+  udevadm control --reload-rules 2>/dev/null || true
+  udevadm trigger --subsystem-match=misc 2>/dev/null || true
+  # Apply the UDP socket-buffer tuning now (also auto-applied at boot by systemd-sysctl).
+  sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
+  cat <<'MSG'
+punktfunk-host installed.
+  1. Add yourself to the 'input' group for virtual gamepads:
+       sudo usermod -aG input "$USER"     # then re-login
+     ALSO join 'punktfunk' if this box streams Steam Gaming Mode (gamescope), or you want the
+     virtual Steam Deck pad (usbip):
+       sudo usermod -aG punktfunk "$USER"   # then log out and back in
+     It authorizes stopping the display manager for a managed gamescope session, and the pad's
+     usbip nodes. It can emulate arbitrary USB devices — join it only on a machine you trust.
+  2. Settings live in the console (Host -> Settings). A line in ~/.config/punktfunk/host.env
+     locks that setting there; annotated templates: /usr/share/punktfunk/host.env.{bazzite,kde}
+  3. Enable the host:
+       systemctl --user enable --now punktfunk-host
+
+NOTE: encode is NVENC-only. Install 'nvidia-utils' on an NVIDIA host. An AMD Steam Deck is NOT
+      yet supported — it needs a VAAPI (hevc_vaapi) encoder backend (see packaging/arch/README.md).
+MSG
+  # Firewall: stock Arch ships none (ports already open); CachyOS ships ufw; some spins (EndeavourOS)
+  # enable firewalld. We install a ufw app profile AND firewalld service definitions but never touch
+  # the running firewall — just point the way for whichever is active.
+  if command -v ufw >/dev/null 2>&1; then
+    cat <<'MSG'
+
+  4. ufw is installed — open the streaming ports once (native-only host shown; add
+     'punktfunk-gamestream' as well for Moonlight compat):
+       sudo ufw allow punktfunk-native
+MSG
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    cat <<'MSG'
+
+  4. firewalld is active — open the streaming ports once (native-only host shown; add
+     'punktfunk-gamestream' as well for Moonlight compat):
+       sudo firewall-cmd --reload                                     # load the new service def
+       sudo firewall-cmd --permanent --add-service=punktfunk-native
+       sudo firewall-cmd --reload
+MSG
+  fi
+  # Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so
+  # the warning lives in one place. Exit 1 = found; never fail the install on it.
+  if command -v punktfunk-host >/dev/null 2>&1; then
+    if ! conflict="$(punktfunk-host detect-conflicts 2>/dev/null)"; then
+      printf '\n%s\n' "$conflict"
+    fi
+  fi
+}
+
+post_upgrade() {
+  _ensure_update_group
+  # Also on UPGRADE, not just post_install: 'punktfunk' was introduced in 0.25.0, so every box that
+  # reached it by `pacman -Syu` from 0.24.x ran only this function and never got the group at all —
+  # leaving 60-punktfunk.rules to chgrp to a nonexistent group, the vhci attach/detach nodes
+  # root-only, and the virtual Steam Deck pad silently unable to attach. groupadd is idempotent, so
+  # this is a no-op on boxes that installed fresh.
+  _ensure_punktfunk_group
+  # Strip the cap_sys_nice 0.26.0-1 granted: it makes the host unidentifiable to KWin (see above).
+  _revoke_sched_capability
+  # And (re-)grant it to the encode worker. On UPGRADE too, and this one is not belt-and-braces:
+  # pacman writes a REPLACED binary as a new inode, file capabilities live on the inode, so the
+  # grant is gone after every single upgrade unless it is re-applied here.
+  _grant_worker_sched_capability
+  udevadm control --reload-rules 2>/dev/null || true
+  sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
+  _warn_stale_firewall_ports
+}
+
+# An open firewall keeps the ports a profile had when it was allowed: ufw stores the expanded rules,
+# and a running firewalld serves the service it last loaded. Name each profile that lacks a port this
+# package added, with the command that refreshes it. The running firewall stays the operator's call.
+_warn_stale_firewall_ports() {
+  # `ufw status verbose` prints each rule with its EXPANDED ports — "47992/tcp (punktfunk-web)"
+  # before the refresh, "47992,47993/tcp (punktfunk-web)" after — so one listing answers both "is
+  # the profile allowed at all" and "does that rule know the new port". (Plain `ufw status` prints
+  # the profile NAME instead, which cannot tell the two apart.)
+  if command -v ufw >/dev/null 2>&1 &&
+     ufw status verbose 2>/dev/null | grep -q 'punktfunk-web' &&
+     ! ufw status verbose 2>/dev/null | grep -q '47993'; then
+    cat <<'MSG'
+
+punktfunk: your ufw rule for 'punktfunk-web' predates TCP 47993, the separate origin plugin UIs
+are served from. Until it is refreshed, plugin interfaces will not load in the web console:
+     sudo ufw app update punktfunk-web && sudo ufw reload
+MSG
+  fi
+  if command -v ufw >/dev/null 2>&1 &&
+     ufw status verbose 2>/dev/null | grep -q 'punktfunk-native' &&
+     ! ufw status verbose 2>/dev/null | grep -q '9778'; then
+    cat <<'MSG'
+
+punktfunk: your ufw rule for 'punktfunk-native' predates UDP 9778, browser streaming. Until it is
+refreshed, a browser cannot connect to this host:
+     sudo ufw app update punktfunk-native && sudo ufw reload
+MSG
+  fi
+  # `--info-service` asks the DAEMON, which answers from the definition it loaded at its last
+  # (re)start — precisely the stale copy we are warning about. The file on disk already says 47993.
+  if command -v firewall-cmd >/dev/null 2>&1 &&
+     firewall-cmd --state >/dev/null 2>&1 &&
+     firewall-cmd --query-service=punktfunk-web >/dev/null 2>&1 &&
+     ! firewall-cmd --info-service=punktfunk-web 2>/dev/null | grep -q '47993'; then
+    cat <<'MSG'
+
+punktfunk: the punktfunk-web firewalld service now also covers TCP 47993, the separate origin
+plugin UIs are served from. Reload so the running firewall picks it up, or plugin interfaces will
+not load in the web console:
+     sudo firewall-cmd --reload
+MSG
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 &&
+     firewall-cmd --state >/dev/null 2>&1 &&
+     firewall-cmd --query-service=punktfunk-native >/dev/null 2>&1 &&
+     ! firewall-cmd --info-service=punktfunk-native 2>/dev/null | grep -q '9778'; then
+    cat <<'MSG'
+
+punktfunk: the punktfunk-native firewalld service now also covers UDP 9778, browser streaming.
+Reload so the running firewall picks it up, or a browser cannot connect to this host:
+     sudo firewall-cmd --reload
+MSG
+  fi
+}

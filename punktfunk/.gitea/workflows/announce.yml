@@ -1,0 +1,193 @@
+# Announce a stable release to the Discord #releases channel.
+#
+# This is the deliberate "go" step for a release. Release notes live in the repo at
+# docs/releases/<tag>.md and are seeded into the Gitea release body at creation by the build
+# workflows (scripts/ci/gitea-release.sh), so the release is never noteless. Once every
+# platform's CI is green for a tag, dispatch this workflow with that tag: it re-asserts the notes
+# file over the live release and posts a formatted embed to #releases.
+#
+# Manual on purpose — pressing "go" is the quality gate that says "all platforms built, notes are
+# final, tell the community." It is NOT wired to the tag push, so a half-built or failed release
+# is never announced. Stable-only: a -rc/pre-release tag is refused unless allow_prerelease=true.
+#
+# Requires the repo secret DISCORD_RELEASE_WEBHOOK (the #releases channel webhook URL); GITEA auth
+# reuses REGISTRY_TOKEN like the other release workflows.
+name: announce
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to announce (e.g. v0.18.0)"
+        required: true
+      allow_prerelease:
+        description: "Announce even if the tag is a pre-release (-rc)"
+        required: false
+        default: "false"
+      authenticode_sha256:
+        description: "Stable installer leaf SHA-256 from the Windows signing-job log"
+        required: false
+        default: ""
+
+jobs:
+  announce:
+    runs-on: ubuntu-24.04
+    steps:
+      # SHA-pinned, unlike the plain `@v4` the build workflows use: this job holds
+      # UPDATE_MANIFEST_KEY — the Ed25519 key every host pins to decide whether an update is real —
+      # and a tag is mutable, so whoever can move it runs code in front of that key. Same style as
+      # the appleboy pins in deploy-services.yml; the trailing comment is the release it resolves to.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Publish the SIGNED stable update manifest — the moment every host's update check learns
+      # about this release (planning: host-update-from-web-console.md §3.3). Deliberately here in
+      # announce, not on the tag: the manual "fleet is green, go" gate doubles as the gate for the
+      # fleet-wide "update available". Fails the announce loudly if the key is missing (fail-closed)
+      # or the installer's live bytes don't match their .sha256 sidecar. Pre-release tags are
+      # ALWAYS skipped — an -rc must never enter the stable feed, even with allow_prerelease.
+      # Reads the installer's Authenticode signer for the publisher cross-check below — a plain
+      # Ubuntu package on the plain ubuntu-24.04 runner.
+      - name: Install osslsigncode
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends osslsigncode
+
+      - name: Publish the stable update manifest
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          UPDATE_MANIFEST_KEY: ${{ secrets.UPDATE_MANIFEST_KEY }}
+          # The Azure Artifact Signing certificate's subject CN — the publisher identity every
+          # stable manifest binds (security-review 2026-08-31 H-3). A repo VARIABLE, not a
+          # secret: it is public knowledge (it is in every signed installer).
+          AUTHENTICODE_SUBJECT: ${{ vars.AUTHENTICODE_SUBJECT }}
+          # Through the ENVIRONMENT, never interpolated into the script body. A `${{ }}` expansion
+          # is a raw textual substitution performed BEFORE the shell sees the line, so a
+          # workflow_dispatch input containing shell syntax executes as this step — and this is the
+          # step holding UPDATE_MANIFEST_KEY, the Ed25519 key every host pins to decide whether an
+          # update is real (2026-08-05 review H-6). As `$INPUT_TAG` it is only ever data.
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_AUTHENTICODE_SHA256: ${{ inputs.authenticode_sha256 }}
+        run: |
+          set -euo pipefail
+          TAG="$INPUT_TAG"
+          # Shape-check before the value reaches a URL or a filename: tags are `vX.Y.Z[-suffix]`.
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "refusing to publish for a tag that is not vX.Y.Z: $TAG" >&2; exit 1 ;;
+          esac
+          case "$TAG" in
+            *[!A-Za-z0-9.+_-]*) echo "tag has characters no release tag has: $TAG" >&2; exit 1 ;;
+          esac
+          case "$TAG" in
+            *-*) echo "pre-release tag $TAG — not publishing to the stable update feed"; exit 0 ;;
+          esac
+          VER="${TAG#v}"
+          URL="https://git.unom.io/unom/punktfunk/releases/download/${TAG}/punktfunk-host-setup-${VER}.exe"
+          # Re-download and re-hash the real bytes; the sidecar is a cross-check, never the truth.
+          curl -fsSL "$URL" -o /tmp/installer.exe
+          curl -fsSL "$URL.sha256" -o /tmp/installer.sha256
+          SHA="$(sha256sum /tmp/installer.exe | awk '{print $1}')"
+          grep -qi "$SHA" /tmp/installer.sha256 || {
+            echo "ERROR: installer sha256 $SHA does not match the release's .sha256 sidecar" >&2
+            exit 1
+          }
+          # The operator copies this leaf hash from the Windows signing-job log, not from the
+          # replaceable release asset. Schema-1 clients already enforce this field, so the first
+          # secure rollout protects old clients that do not understand authenticode_subject.
+          LEAF_SHA="$(printf '%s' "$INPUT_AUTHENTICODE_SHA256" | tr 'A-F' 'a-f')"
+          if ! printf '%s' "$LEAF_SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "ERROR: authenticode_sha256 must be the 64-hex signing-job value" >&2
+            exit 1
+          fi
+          if [ -z "$AUTHENTICODE_SUBJECT" ]; then
+            echo "ERROR: set AUTHENTICODE_SUBJECT to the stable signing certificate CN" >&2
+            exit 1
+          fi
+          # Azure Trusted Signing chains to the Microsoft Identity Verification Root CA 2020, which
+          # the Mozilla bundle does not carry, so the root is vendored and pinned; the timestamp
+          # chain roots there too. The pin is what keeps a verified signature past the 3-day leaf.
+          ROOT=ci/certs/microsoft-identity-verification-root-2020.pem
+          VERIFY="$(osslsigncode verify \
+            -CAfile "$ROOT" -TSA-CAfile "$ROOT" \
+            -require-leaf-hash "sha256:$LEAF_SHA" \
+            -in /tmp/installer.exe 2>&1)" || {
+            printf '%s\n' "$VERIFY"
+            echo "ERROR: Authenticode verification of the x64 installer failed" >&2
+            exit 1
+          }
+          printf '%s\n' "$VERIFY"
+          # The CN comes from the certificate carrying the pinned leaf hash, decoded by openssl:
+          # a BMPString CN (any non-ASCII byte) prints \x-escaped in osslsigncode's own listing.
+          osslsigncode extract-signature -pem -in /tmp/installer.exe -out /tmp/sig.pem >/dev/null
+          openssl pkcs7 -in /tmp/sig.pem -print_certs -out /tmp/chain.pem >/dev/null
+          rm -rf /tmp/chain && mkdir /tmp/chain
+          awk '/-----BEGIN CERTIFICATE-----/{n++} n{print > ("/tmp/chain/" n ".pem")}' /tmp/chain.pem
+          SIGNER=""
+          for c in /tmp/chain/*.pem; do
+            if [ "$(openssl x509 -in "$c" -outform DER | sha256sum | awk '{print $1}')" = "$LEAF_SHA" ]; then
+              SIGNER="$(openssl x509 -in "$c" -noout -subject -nameopt utf8,-esc_msb,sep_multiline \
+                | sed -n 's/^ *CN=//p' | sed -n '1p')"
+              break
+            fi
+          done
+          if [ -z "$SIGNER" ] || [ "$SIGNER" != "$AUTHENTICODE_SUBJECT" ]; then
+            echo "ERROR: installer signer '$SIGNER' is not '$AUTHENTICODE_SUBJECT'" >&2
+            exit 1
+          fi
+          # The arm64 installer is optional on a release; when present it carries the same leaf.
+          A64_URL="https://git.unom.io/unom/punktfunk/releases/download/${TAG}/punktfunk-host-setup-${VER}_arm64.exe"
+          if curl -fsSL "$A64_URL" -o /tmp/installer-arm64.exe; then
+            A64_SHA="$(sha256sum /tmp/installer-arm64.exe | awk '{print $1}')"
+            osslsigncode verify -CAfile "$ROOT" -TSA-CAfile "$ROOT" \
+              -require-leaf-hash "sha256:$LEAF_SHA" -in /tmp/installer-arm64.exe >/dev/null || {
+              echo "ERROR: the arm64 installer is not signed by leaf $LEAF_SHA" >&2; exit 1; }
+          else
+            echo "no arm64 installer on ${TAG} - publishing the x64 leg only"; A64_URL=""; A64_SHA=""
+          fi
+          CHANNEL=stable VERSION="$VER" REQUIRE_KEY=1 \
+            WINDOWS_URL="$URL" WINDOWS_SHA256="$SHA" \
+            WINDOWS_ARM64_URL="$A64_URL" WINDOWS_ARM64_SHA256="$A64_SHA" \
+            AUTHENTICODE_SHA256="$LEAF_SHA" AUTHENTICODE_SUBJECT="$AUTHENTICODE_SUBJECT" \
+            NOTES_URL="https://git.unom.io/unom/punktfunk/releases/tag/${TAG}" \
+            bash scripts/ci/publish-update-manifest.sh
+
+      # SteamOS installs build the `stable` branch on the device. It moves with the manifest
+      # above, so a Deck's update offer and the feed's version change together. No force: Gitea
+      # answers a non-fast-forward with 422 and the branch stays.
+      - name: Move the stable branch to the release
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="$INPUT_TAG"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "refusing to move stable to a tag that is not vX.Y.Z: $TAG" >&2; exit 1 ;;
+          esac
+          case "$TAG" in
+            *-*) echo "pre-release tag $TAG — stable stays where it is"; exit 0 ;;
+          esac
+          # An annotated tag lists its commit on the `^{}` line, which sorts last.
+          SHA="$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | tail -n1 | cut -f1)"
+          [ -n "$SHA" ] || { echo "origin has no tag $TAG" >&2; exit 1; }
+          API="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/branches"
+          AUTH="Authorization: token $REGISTRY_TOKEN"
+          code="$(curl -sS --retry 3 -o branch.out -w '%{http_code}' -X PUT "$API/stable" \
+            -H "$AUTH" -H 'Content-Type: application/json' -d "{\"new_commit_id\":\"$SHA\"}")"
+          case "$code" in
+            204) ;;
+            404) curl -fsS --retry 3 -X POST "$API" -H "$AUTH" -H 'Content-Type: application/json' \
+                   -d "{\"new_branch_name\":\"stable\",\"old_ref_name\":\"$SHA\"}" > /dev/null ;;
+            422) echo "::warning::stable is already past $TAG; left in place"; exit 0 ;;
+            *) echo "::error::moving stable returned $code: $(cat branch.out)"; exit 1 ;;
+          esac
+          echo "stable → $TAG ($SHA)"
+
+      - name: Post release announcement to Discord
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          ALLOW_PRERELEASE: ${{ inputs.allow_prerelease }}
+          # Same reasoning as the publish step above: the input is data in the environment, never
+          # text spliced into the command line.
+          INPUT_TAG: ${{ inputs.tag }}
+        run: bash scripts/ci/discord-announce.sh "$INPUT_TAG"

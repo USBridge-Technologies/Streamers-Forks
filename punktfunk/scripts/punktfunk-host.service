@@ -1,0 +1,65 @@
+# punktfunk streaming host — systemd USER unit. Runs the SECURE native-only host by default
+# (punktfunk/1 clients + the management API; no plain-HTTP pairing / legacy GCM nonce reuse —
+# security-review #5/#9). Stock-Moonlight (GameStream) compat is OPT-IN: turn on GameStream
+# under Host → Settings in the web console and restart — no unit editing needed. Only do that
+# on a TRUSTED LAN; the compat planes need their extra ports too.
+#
+# Install (against an already-running compositor session — the host auto-detects and follows it,
+# so host.env needs no backend config):
+#   mkdir -p ~/.config/systemd/user && cp scripts/punktfunk-host.service ~/.config/systemd/user/
+#   cp scripts/host.env.example ~/.config/punktfunk/host.env   # defaults are right for a desktop
+#   systemctl --user daemon-reload && systemctl --user enable --now punktfunk-host
+#
+# On that desktop-login route, ALSO install scripts/punktfunk-host-desktop-session.conf as a drop-in:
+# it binds the host to graphical-session.target, so a Plasma/GNOME restart restarts the host instead
+# of leaving it holding a dead Wayland socket + portal connection (the PartOf= below only covers the
+# appliance route, where we start the compositor ourselves). The drop-in's header has the commands.
+#
+# The host does NOT need the login shell's environment: it detects the live session itself per
+# connect and derives WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, XDG_CURRENT_DESKTOP,
+# HYPRLAND_INSTANCE_SIGNATURE and SWAYSOCK from the running compositor (vdisplay::apply_session_env).
+# So host.env carries policy, not session plumbing, and `systemctl --user import-environment` is not
+# a prerequisite — the host pushes the live values into the manager env itself when a session switch
+# needs the portal to re-read them.
+#
+# Self-contained boot appliance (no login, no manual steps after boot). These routes PIN the
+# backend via PUNKTFUNK_COMPOSITOR — correct for a dedicated single-session box, but it turns off
+# live-session auto-detection, so never do it on a desktop that switches sessions (Game Mode etc.):
+#   - kwin backend (stream the Plasma desktop): also install + enable
+#     punktfunk-kde-session.service (it brings up the headless KWin session this After=s), and use
+#     the shipped packaging/kde/host.env (pins kwin + WAYLAND_DISPLAY=wayland-kde on purpose).
+#   - gamescope backend (stream a nested app, no desktop): set PUNKTFUNK_COMPOSITOR=gamescope in
+#     host.env — the host spawns gamescope per session, so no kde-session unit is needed.
+#   Then `sudo loginctl enable-linger "$USER"` so user units start at boot, and reboot.
+#
+# The host LISTENS as soon as it starts and only touches the compositor per session (on a client
+# connect), so the After= below is a soft ordering, not a hard readiness gate — the kde-session
+# unit (when present) just needs to be up by the time a client streams (seconds later, user-driven).
+# A missing After= unit (e.g. gamescope backend, no kde-session installed) is simply ignored.
+[Unit]
+Description=punktfunk streaming host
+After=pipewire.service punktfunk-kde-session.service
+# Capture and audio ride PipeWire. A desktop login starts it; a lingering headless manager has
+# nothing else that would, so pull it in (a missing unit is ignored).
+Wants=pipewire.service
+# PartOf the kwin session (when present): the host's libei input uses the RemoteDesktop portal,
+# whose D-Bus connection goes stale if the compositor session restarts the portal under it — the
+# in-process reopen loop can't recover that, but a full restart re-establishes it. So restart the
+# host whenever the kde-session restarts. Ignored when punktfunk-kde-session isn't installed
+# (gamescope / other backends).
+PartOf=punktfunk-kde-session.service
+
+[Service]
+# '-' optional: NO package creates this file — deb/RPM/Arch ship only host.env.* templates under
+# /usr/share and the postinst merely prints the copy command — so a mandatory read would fail a
+# fresh install outright ("Failed to load environment files"), before the host ever ran. Absent
+# just means every knob at its default (pf-host-config has one for each), which is exactly what
+# `punktfunk-host serve` by hand already does. Contrast punktfunk-web.service, which marks
+# mgmt-token mandatory ON PURPOSE so Restart waits for the host to write it — this is not that.
+EnvironmentFile=-%h/.config/punktfunk/host.env
+ExecStart=%h/punktfunk/target/release/punktfunk-host serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

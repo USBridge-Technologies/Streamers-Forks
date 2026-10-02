@@ -1,0 +1,37 @@
+# punktfunk web console pre-start — systemd USER one-shot.
+#
+# Three jobs, all of which must happen BEFORE the console's exec:
+#
+#  0. Write host.env's PUNKTFUNK_UI_BIND once, so the operator finds where the console listens
+#     (see web-init.sh).
+#  1. Generate the console login password (PUNKTFUNK_UI_PASSWORD) in the streaming user's
+#     ~/.config/punktfunk on first start, surfaced to the --user journal for retrieval. A .deb
+#     postinst runs as root (wrong $HOME), so credential generation must happen as the user —
+#     hence this unit.
+#  2. Block until the HOST has written the files the console cannot start without (mgmt-token +
+#     its identity cert/key). punktfunk-web.service's `After=punktfunk-host.service` does not do
+#     this: the host is Type=simple, so systemd calls it started the instant it is spawned. Being
+#     Type=oneshot, THIS unit is the ordering the console already declares — see web-init.sh.
+#
+# Pulled in by punktfunk-web.service (Wants= + After=); also runnable directly.
+#
+# Deliberately NOT gated on `ConditionPathExists=!%h/.config/punktfunk/web-password`, which is what
+# it carried while step 1 was its only job. That condition skips the unit from the second boot
+# onward — which is exactly when step 2 must still run, and it would tie a host-readiness gate to
+# the presence of an unrelated password file. The script is idempotent instead: it writes the
+# password only when absent, and in steady state the host's files already exist, so it returns
+# without sleeping.
+[Unit]
+Description=punktfunk web console pre-start (login password; waits for the host)
+
+[Service]
+Type=oneshot
+# NOT RemainAfterExit: an active oneshot is never re-run, so a `systemctl --user restart
+# punktfunk-web` in a live session skipped both jobs above — including the bind line the console
+# is about to read. Inactive, `Wants=` pulls it again and `After=` still waits for it, so every
+# console start goes through the gate. Steady state costs nothing: the host's files already exist.
+RemainAfterExit=no
+ExecStart=/usr/share/punktfunk-web/web-init.sh
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,355 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./timing-functions.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* Pull @unom/ui's compiled component classes (bg-neutral,
+   rounded-card, p-padding-card, ring-accent, h-input-height, material…) into the
+   Tailwind 4 scan so their utilities aren't purged. */
+@source "../node_modules/@unom/ui/dist/**/*.{js,mjs}";
+
+/* ── Punktfunk brand · violet product chrome ────────────────────────────────
+   Two themes on one violet identity: LIGHT (lavender docs surface — the same
+   palette the design/Scalar reference uses: white bg, faint-violet cards/borders,
+   #6c5bf3 brand) is the :root default; DARK (the violet-tinted app-icon chrome
+   #141019 / #1c1530, #a79ff8 brand) is the `.dark` override. The live console
+   pins `<html class="dark">` so it stays dark by default — removing or toggling
+   that class (e.g. Storybook's theme switch) yields light. The token set feeds
+   BOTH @unom/ui's semantic contract (--brand/--primary/--accent/--neutral/
+   --main…) and the shadcn-style tokens the console's primitives + routes use
+   (--background/--card/--muted…), mapped onto one palette so both render the
+   same identity.
+
+   Brand constants and the surface tokens that are pure indirections
+   (--main, --neutral*, --error → other tokens) live in :root only — CSS resolves
+   var() per-theme at use time, so .dark overrides just the raw values. */
+:root {
+	--radius: 0.625rem;
+
+	/* The page's own far end. The mark's tones are mixed TOWARDS it, so "the tone that
+	   stands furthest off the page" stays that on white as well as on black. Mixing
+	   always toward white is what left the wordmark at 1.13:1 in light mode. */
+	--pf-tint-end: black;
+	/* The console's own page colour, untinted. Surfaces are mixed from it toward the
+	   accent, which is what the literals below always were — with the violet baked in. */
+	--pf-page: #ffffff;
+
+	/* Brand — the violet lens mark (from the Punktfunk app icon). Ordered by distance
+	   from the page, not by lightness: --pf-highlight carries the wordmark. */
+	--pf-brand: #6c5bf3; /* deep violet — primary on light */
+	--pf-brand-light: color-mix(in oklab, #6c5bf3 55%, var(--pf-tint-end));
+	--pf-highlight: color-mix(in oklab, #6c5bf3 15%, var(--pf-tint-end));
+	--pf-glow: rgb(108 91 243 / 0.45); /* the lens mark's drop shadow */
+
+	/* Surfaces — light · lavender (white bg, faint-violet cards/borders). */
+	--background: #ffffff;
+	--foreground: #1b1430;
+	--card: #f6f2ff;
+	--card-foreground: #1b1430;
+	--popover: #ffffff;
+	--popover-foreground: #1b1430;
+	--muted: #f1ecfd;
+	--muted-foreground: #6f6a86;
+	--secondary: #ece6fb;
+	--secondary-foreground: #1b1430;
+	/* shadcn `accent` = subtle hover surface; also @unom/ui's card ring colour,
+     so we tint it toward the brand violet (the same in both themes). */
+	--accent: var(--pf-brand);
+	--accent-foreground: #ffffff;
+	--border: #e4dcf7;
+	--input: #e4dcf7;
+	--ring: var(--pf-brand);
+
+	/* Primary = the brand (buttons, active nav, default badges). */
+	--primary: var(--pf-brand);
+	--primary-foreground: #ffffff;
+
+	--success: oklch(0.6 0.14 160);
+	/* Amber — "needs your attention but nothing is broken" (unsaved edits), the badge
+	   counterpart of the inline amber warning text. */
+	--warning: oklch(0.72 0.15 75);
+	--destructive: oklch(0.55 0.22 18);
+	--destructive-foreground: #ffffff;
+
+	/* ── @unom/ui semantic token contract (its components read these names). ──
+     These are indirections — they follow the raw tokens above per-theme. */
+	--main: var(--foreground);
+	--brand: var(--pf-brand);
+	--brand-light: var(--pf-brand-light);
+	--highlight: var(--pf-highlight);
+	--neutral: var(--card); /* @unom card default surface (bg-neutral) */
+	--neutral-accent: var(
+		--secondary
+	); /* accent / nested surface (bg-neutral-accent) */
+	--neutral-highlight: var(--border);
+	--error: var(--destructive);
+
+	--font-display: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+	--font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+
+	/* @unom/ui radius/spacing contract (pill buttons, rounded cards, tall inputs). */
+	--radius-card-min: var(--radius);
+}
+
+/* Dark · the violet-tinted app-icon chrome. Overrides only the raw values —
+   the indirection tokens in :root resolve to these automatically. */
+.dark {
+	--pf-tint-end: white;
+	--pf-page: #141019;
+	/* Measured against the dark chrome; kept as literals so it does not drift. */
+	--pf-brand-light: #a79ff8;
+	--pf-highlight: #d2c9fb;
+
+	--background: #141019;
+	--foreground: oklch(0.985 0 0);
+	--card: #1c1530;
+	--card-foreground: oklch(0.985 0 0);
+	--popover: #1c1530;
+	--popover-foreground: oklch(0.985 0 0);
+	--muted: #1f1830;
+	--muted-foreground: oklch(0.728 0.03 286);
+	--secondary: #241c3d;
+	--secondary-foreground: oklch(0.985 0 0);
+	--border: #2a2148;
+	--input: #2a2148;
+	--ring: var(--pf-brand-light);
+
+	/* Lighter violet reads better against the dark surface. */
+	--primary: var(--pf-brand-light);
+	--primary-foreground: #141019;
+
+	--success: oklch(0.7 0.15 160);
+	--warning: oklch(0.78 0.16 75);
+	--destructive: oklch(0.62 0.21 18);
+	--destructive-foreground: oklch(0.985 0 0);
+}
+
+/* ── The desktop's own palette, expanded into the console's tokens. ──
+   Two attributes, because two kinds of source exist (design/web-console-overhaul.md §7):
+
+     [data-accent]  an accent and nothing else — a GNOME/Plasma/COSMIC desktop over the
+                    XDG portal, Windows' DWM, or the operator's own pick in Settings.
+                    Re-tints the brand and leaves the console's own surfaces alone.
+     [data-omarchy] the full four values. Omarchy renders our template, so it publishes a
+                    background and foreground too, and the surfaces are mixed out of them.
+
+   Omarchy sets both. Splitting them is what stops a desktop that reports one value from
+   being painted in half a palette — the surfaces would go unset and the page would read
+   as broken rather than untinted.
+
+   `:root[data-omarchy]` outranks both `:root` and `.dark`, so ONE block covers both
+   modes: the surface mixes take their direction from the theme's own background /
+   foreground pair, and "toward the foreground" is darker on a light theme and
+   lighter on a dark one — which is exactly what surfaces need either way.
+
+   Every ratio here was measured against six shipped Omarchy themes (Tokyo Night,
+   Gruvbox, Nord, Catppuccin Latte, Rose Pine Dawn, Everforest Light) for WCAG
+   contrast and, for the mark, for visible separation between its three tints.
+
+   Surfaces and the brand follow the theme. --success / --warning / --destructive do
+   NOT: they encode meaning, and a theme whose accent is red must not leave "delete"
+   and "save" the same colour. */
+
+/* Accent only. Everything here derives from --pf-accent alone, so it applies whether the
+   colour came from a desktop, from Omarchy, or from the operator. */
+:root[data-accent] {
+	/* The lens mark, rebuilt from the accent: deep circle, lighter circle, and the
+	   highlight where they overlap. Mixed toward black and white rather than toward the
+	   theme's own foreground — measured, because on a theme whose accent and foreground
+	   are close (Tokyo Night) mixing them collapses the three tints into one flat blob.
+	   These also carry --primary and --ring, which is why they are worth this care. */
+	--pf-brand: color-mix(in oklab, var(--pf-accent) 88%, black);
+	--pf-brand-light: color-mix(
+		in oklab,
+		var(--pf-accent) 55%,
+		var(--pf-tint-end)
+	);
+	--pf-highlight: color-mix(in oklab, var(--pf-accent) 15%, var(--pf-tint-end));
+	--pf-glow: color-mix(in oklab, var(--pf-accent) 45%, transparent);
+
+	/* Surfaces follow the accent too. They always were accent-tinted — #f6f2ff is 4%
+	   violet over white — the violet was just baked into the literal, so picking a red
+	   accent left every card and border violet. A desktop that publishes a real palette
+	   overrides all of this: [data-omarchy] comes after.
+
+	   Toward the accent ITSELF, not the accent dulled toward the page's far end: the latter
+	   is a grey, and mixing white toward a grey turns the light console grey with it.
+
+	   These proportions are meant to be SEEN. At 2% on the page the difference between a
+	   red console and a green one was two points of sRGB, which is not a colour anyone
+	   picked a colour to get. */
+	--background: color-mix(in oklab, var(--pf-page) 90%, var(--pf-accent));
+	--card: color-mix(in oklab, var(--pf-page) 84%, var(--pf-accent));
+	--popover: var(--card);
+	--muted: color-mix(in oklab, var(--pf-page) 80%, var(--pf-accent));
+	--secondary: color-mix(in oklab, var(--pf-page) 76%, var(--pf-accent));
+	--border: color-mix(in oklab, var(--pf-page) 66%, var(--pf-accent));
+	--input: var(--border);
+	/* NOT a wash of the accent. `--accent` is the card's ring as well as its hover
+	   surface, and the hover already dilutes it to 30% at the call site — so a token
+	   diluted here too left every unselected card with no visible outline. :root does
+	   the same thing with the brand violet, which is what this follows. */
+	--accent: var(--pf-accent);
+}
+
+/* Light mode takes --primary from --pf-brand and keeps :root's white text, so the
+   button has to be deep enough to hold it: a soft accent (a dusty rose, a sage) is
+   only 3.9:1 at --pf-brand, and 5.7:1 here. */
+:root[data-accent]:not(.dark) {
+	--primary: color-mix(in oklab, var(--pf-accent) 75%, black);
+}
+
+/* Surfaces. Needs the background/foreground pair, so only a source that publishes all
+   four values switches this on — and it steps aside for an accent the operator CHOSE,
+   which is a decision to stop following the desktop's palette rather than a request to
+   tint it. Stepping aside beats overriding it afterwards: the whole block goes, so the
+   console's own foregrounds stay with the console's own surfaces. */
+:root[data-omarchy]:not([data-accent="custom"]) {
+	--background: var(--pf-bg);
+	--foreground: var(--pf-fg);
+	/* Cards, hovers and borders are the background lifted off itself by increasing
+	   amounts of foreground, so they stay in the theme's hue instead of sitting on it.
+	   The lift carries a quarter of the desktop's own accent, which is all this block ever
+	   sees: an accent the operator chose has already taken the block out of the cascade. */
+	--pf-lift: color-mix(in oklab, var(--pf-fg) 75%, var(--pf-accent));
+	--card: color-mix(in oklab, var(--pf-bg) 94%, var(--pf-lift));
+	--card-foreground: var(--pf-fg);
+	--popover: var(--card);
+	--popover-foreground: var(--pf-fg);
+	--muted: color-mix(in oklab, var(--pf-bg) 90%, var(--pf-lift));
+	/* ponytail: 88% is as muted as this can go and stay readable, and on a theme whose
+	   own foreground is only 5.2:1 against its own background (Everforest Light) NO
+	   ratio reaches 4.5 on a card — the headroom is the theme's, not ours. Measured
+	   worst case 3.8:1 there; every dark theme clears 4.5 comfortably. Give this its own
+	   token if a theme ever needs a hand-picked value. */
+	--muted-foreground: color-mix(in oklab, var(--pf-fg) 88%, var(--pf-bg));
+	--secondary: color-mix(in oklab, var(--pf-bg) 86%, var(--pf-lift));
+	--secondary-foreground: var(--pf-fg);
+	--border: color-mix(in oklab, var(--pf-bg) 80%, var(--pf-lift));
+	--input: var(--border);
+
+	/* shadcn's `accent` is a subtle hover SURFACE (and @unom/ui's card ring), not the
+	   brand at full strength — so it is a background-weighted tint of the accent, which
+	   is what keeps the theme's own foreground readable on top of it. */
+	--accent: color-mix(in oklab, var(--pf-bg) 86%, var(--pf-accent));
+	--accent-foreground: var(--pf-fg);
+}
+
+/* `.dark` takes --primary from the LIGHT tint, so the text on it has to be the dark
+   end of the theme — its own background. Needs --pf-bg, so it stays with the surfaces. */
+:root[data-omarchy]:not([data-accent="custom"]).dark {
+	--primary-foreground: var(--pf-bg);
+}
+
+/* Map the palette to Tailwind colour/util tokens — both the shadcn vocabulary
+   and @unom/ui's, resolved to one set of values. */
+@theme inline {
+	--radius-sm: calc(var(--radius) - 4px);
+	--radius-md: calc(var(--radius) - 2px);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) + 4px);
+	--radius-button: 9999px;
+	--radius-card: calc(var(--radius) * 2);
+	--radius-main: calc(var(--radius) * 2);
+
+	--spacing-input-height: 3rem;
+	--spacing-padding-card: 1.25rem;
+	--spacing-card: 1.5rem;
+	--spacing-main: 15px;
+
+	--font-sans: var(--font-sans);
+	--font-display: var(--font-display);
+
+	/* shadcn-style colour tokens. */
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-destructive-foreground: var(--destructive-foreground);
+	--color-success: var(--success);
+	--color-warning: var(--warning);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+
+	/* @unom/ui colour tokens. */
+	--color-main: var(--main);
+	--color-brand: var(--brand);
+	--color-brand-light: var(--brand-light);
+	--color-neutral: var(--neutral);
+	--color-neutral-accent: var(--neutral-accent);
+	--color-neutral-highlight: var(--neutral-highlight);
+	--color-highlight: var(--highlight);
+	--color-error: var(--error);
+}
+
+/* Accordion / collapsible keyframes @unom/ui's interactive surfaces animate to. */
+@theme {
+	--animate-accordion-down: accordion-down 0.4s var(--ease-out-quart);
+	--animate-accordion-up: accordion-up 0.4s var(--ease-out-quart);
+	--animate-collapsible-down: collapsible-down 0.4s var(--ease-out-quart);
+	--animate-collapsible-up: collapsible-up 0.4s var(--ease-out-quart);
+
+	@keyframes accordion-down {
+		from {
+			height: 0;
+		}
+		to {
+			height: var(--radix-accordion-content-height);
+		}
+	}
+	@keyframes accordion-up {
+		from {
+			height: var(--radix-accordion-content-height);
+		}
+		to {
+			height: 0;
+		}
+	}
+	@keyframes collapsible-down {
+		from {
+			height: 0;
+			opacity: 0;
+		}
+		to {
+			height: var(--radix-collapsible-content-height);
+			opacity: 1;
+		}
+	}
+	@keyframes collapsible-up {
+		from {
+			height: var(--radix-collapsible-content-height);
+			opacity: 1;
+		}
+		to {
+			height: 0;
+			opacity: 0;
+		}
+	}
+}
+
+@layer base {
+	* {
+		border-color: var(--border);
+	}
+	body {
+		background-color: var(--background);
+		color: var(--foreground);
+		font-family: var(--font-sans);
+		font-feature-settings:
+			"rlig" 1,
+			"calt" 1;
+	}
+}

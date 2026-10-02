@@ -1,0 +1,67 @@
+# bootc / OCI image layer that bakes punktfunk into a Bazzite-based atomic image.
+#
+# Bazzite is already a bootc image (Fedora Atomic + gamescope + PipeWire + the NVIDIA
+# stack), so we layer punktfunk on top: enable RPM Fusion (for the freeworld VAAPI drivers) and unom's
+# Gitea RPM registry (NOT COPR — only the registry carries the punktfunk-web subpackage),
+# install the packages, and pre-enable the udev rule. Build + push this image, then
+# `bootc switch` (or rebase) a Bazzite host onto it for an image-based, atomic install —
+# no per-host `rpm-ostree install` drift.
+#
+#   podman build -t ghcr.io/<you>/bazzite-punktfunk -f packaging/bootc/Containerfile .
+#   podman push  ghcr.io/<you>/bazzite-punktfunk
+#   # on the target Bazzite host:
+#   sudo bootc switch ghcr.io/<you>/bazzite-punktfunk   # then reboot
+#
+# Pick the base tag that matches your hardware (NVIDIA shown). See ublue-os/bazzite tags.
+ARG BASE_IMAGE=ghcr.io/ublue-os/bazzite-nvidia:stable
+FROM ${BASE_IMAGE}
+
+# punktfunk's RPMs come from unom's Gitea RPM registry (the recommended path — see
+# packaging/rpm/README). Use it rather than COPR specifically because it carries the
+# punktfunk-web management console subpackage, which COPR's mock chroot can't build (no `bun`).
+# Group "bazzite" == the Fedora 43 base; override for a different base. Gitea signs the repo
+# metadata (repo_gpgcheck=1) and the packages are GPG-signed (gpgcheck=1, the packages@unom.io key).
+ARG PUNKTFUNK_RPM_GROUP=bazzite
+
+# RPM Fusion provides mesa-va-drivers-freeworld, the AMD/Intel VAAPI driver with HEVC and AV1
+# encode enabled. (Bazzite usually has RPM Fusion enabled already; this is belt-and-suspenders.)
+RUN dnf5 -y install \
+        https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm \
+        https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm \
+    || true
+
+# Add the Gitea RPM repo and install the host + the web console (punktfunk-web pulls nodejs).
+RUN printf '%s\n' \
+      '[gitea-unom-punktfunk]' \
+      'name=punktfunk (unom)' \
+      "baseurl=https://git.unom.io/api/packages/unom/rpm/${PUNKTFUNK_RPM_GROUP}" \
+      'enabled=1' 'gpgcheck=1' 'repo_gpgcheck=1' \
+      'gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk' \
+      > /etc/yum.repos.d/punktfunk.repo \
+ && dnf5 -y install punktfunk punktfunk-web \
+ && dnf5 clean all
+
+# The udev rule + systemd *user* units ship in the RPMs; nothing else to enable at image build
+# time (host + console run per-user in the graphical session, enabled after first boot with
+# `systemctl --user enable --now punktfunk-host punktfunk-web`).
+
+# NO `setcap` here — deliberately, in BOTH directions, and this file must stay that way.
+#
+#   /usr/bin/punktfunk-host          must carry NO capability. A capability-carrying process
+#                                    cannot have its /proc/<pid>/exe read, so KWin cannot identify
+#                                    it, never advertises zkde_screencast_unstable_v1, and every
+#                                    KDE desktop session dies. That is the 0.26.0-1 incident; a
+#                                    layered/bootc image is as unrepairable in place as a sysext.
+#   /usr/bin/punktfunk-encode-worker carries cap_sys_nice=ep, declared with %caps in
+#                                    packaging/rpm/punktfunk.spec. rpm applies file capabilities
+#                                    from package metadata during the dnf5 install above and the
+#                                    ostree commit preserves the security.capability xattr — so it
+#                                    arrives correctly without anything to do here, and the
+#                                    capability matrix is asserted on the .rpm in CI
+#                                    (scripts/ci/assert-cap-matrix.sh, .gitea/workflows/rpm.yml).
+#
+# If a capability is ever wanted in this image, change the SPEC, never this file: a setcap here
+# would apply to one channel and drift from the other four.
+
+# bootc image hygiene: the container build must leave a clean ostree commit.
+RUN ostree container commit

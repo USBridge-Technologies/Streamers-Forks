@@ -1,0 +1,15 @@
+[package]
+name = "loss-harness"
+description = "FEC loss-resilience sweep over the punktfunk-core loopback (plan §10)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+punktfunk-core = { path = "../../crates/punktfunk-core" }
+
+[lints]
+workspace = true

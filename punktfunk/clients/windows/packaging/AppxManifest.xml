@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX package manifest for the punktfunk Windows client (WinUI 3 via windows-reactor).
+
+  This is a TEMPLATE: packaging/pack-msix.ps1 substitutes {VERSION} (4-part numeric, e.g.
+  0.2.137.0) and {PUBLISHER} (must EXACTLY equal the signing cert's subject DN — the default is
+  the verified subject of the Azure `unom-io` certificate profile; the self-signed fallback mints
+  a throwaway cert with that same subject so canary and release share a package identity).
+
+  Package identity is Name + Publisher, so changing {PUBLISHER} makes this a DIFFERENT package:
+  installs of the older publisher cannot be upgraded in place and must be uninstalled first. That
+  is a user-visible migration, not a packaging detail — mention it in the release notes. pack-msix.ps1
+  reads the signature back off the packed .msix and fails the build if the two ever drift.
+
+  Why this packages cleanly even though the app was built "unpackaged": windows-reactor calls
+  MddBootstrapInitialize2 with OnPackageIdentity_NOOP (crates/libs/reactor/src/app.rs), so under
+  MSIX package identity the App SDK bootstrapper is a no-op and the runtime is resolved from the
+  <PackageDependency> below instead. The framework family + min version mirror what the runner has
+  installed and what reactor pins (WINDOWSAPPSDK_RELEASE_MAJORMINOR = 0x20000 = 2.0 ->
+  Microsoft.WindowsAppRuntime.2).
+
+  Full-trust Win32 app (EntryPoint Windows.FullTrustApplication + runFullTrust) — it owns raw D3D11,
+  Win32 low-level input hooks, WASAPI and SDL3, none of which fit the UWP app container.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap5 rescap">
+
+  <Identity
+    Name="unom.Punktfunk"
+    Publisher="{PUBLISHER}"
+    Version="{VERSION}"
+    ProcessorArchitecture="{ARCH}" />
+
+  <Properties>
+    <DisplayName>Punktfunk</DisplayName>
+    <PublisherDisplayName>unom</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+    <PackageDependency
+      Name="Microsoft.WindowsAppRuntime.2"
+      MinVersion="2.2.0.0"
+      Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="Punktfunk" Executable="punktfunk-client.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Punktfunk"
+        Description="Low-latency desktop and game streaming client"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Square71x71Logo="Assets\Square71x71Logo.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <!--
+          The punktfunk:// scheme (design/client-deep-links.md §4.2). Protocol activation of a
+          full trust packaged exe delivers the URI as the command line, so this and a shortcut
+          land in the same place: the positional URL parse in main().
+
+          Declared here rather than written to the registry on install, so uninstall leaves
+          nothing behind. Windows also asks the user before handing a scheme to a newly
+          installed app, which is the origin friction this design wants and does not duplicate.
+        -->
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="punktfunk">
+            <uap:DisplayName>Punktfunk stream link</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
+        <!--
+          An app execution alias so a written shortcut can target punktfunk-client.exe by name
+          from anywhere, without knowing the package install path (which changes on every
+          update). The .lnk writer uses exactly this.
+        -->
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="punktfunk-client.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+    <!-- console:begin -->
+    <!--
+      Second entry point: the couch/console UI, for an HTPC or a TV-attached box where the
+      desktop shell is the wrong first screen. Its own executable (punktfunk-console.exe)
+      because an MSIX Application entry cannot pass arguments to a full-trust exe; it hands
+      straight off to the session binary's controller-driven browse mode (host list,
+      pairing, settings, library) fullscreen.
+
+      NOTE: never write a double hyphen in this file. XML forbids it inside a comment, and
+      makepri rejects the whole manifest ("Appx manifest not found or is invalid") — which
+      is exactly how the console flag spelled out here broke the v0.15.0 MSIX build.
+    -->
+    <Application Id="PunktfunkConsole" Executable="punktfunk-console.exe"
+                 EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Punktfunk Console"
+        Description="Controller-driven couch interface for TVs and HTPCs"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Square71x71Logo="Assets\Square71x71Logo.png" />
+      </uap:VisualElements>
+    </Application>
+    <!-- console:end -->
+    <!--
+      The headless CLI (design/client-architecture-split.md §4). AppListEntry="none" keeps it
+      out of the Start menu: it is a command, not a tile. Its alias is what a plugin or a
+      script types, and what the Playnite importer shells to for `punktfunk library`.
+    -->
+    <Application Id="PunktfunkCli" Executable="punktfunk.exe"
+                 EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements AppListEntry="none"
+        DisplayName="Punktfunk CLI"
+        Description="Headless Punktfunk client commands"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="punktfunk.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

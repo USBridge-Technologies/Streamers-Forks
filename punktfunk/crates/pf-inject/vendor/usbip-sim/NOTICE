@@ -1,0 +1,53 @@
+This crate (`usbip-sim`) is a vendored, trimmed copy of:
+
+    usbip v0.8.0
+    Copyright (c) Jiajie Chen <c@jia.je> and contributors
+    https://github.com/jiegec/usbip
+    Licensed under the MIT License.
+
+Modifications by the punktfunk project:
+  - Removed the USB host modules (`src/host.rs`) and the `rusb`/`nusb` device
+    constructors in `src/lib.rs` (`with_rusb_*`, `with_nusb_*`, `new_from_host*`),
+    eliminating the libusb runtime dependency (which also broke `musl`).
+  - Removed the example helper interface handlers `src/cdc.rs` and `src/hid.rs`.
+  - Replaced the `rusb::Direction` re-export and `rusb::Version` conversions with
+    local definitions.
+  - Dropped the in-crate test modules (kept the library surface only).
+  - Paced interrupt/bulk IN endpoint transfers by bInterval (so a simulated
+    interrupt-IN mimics a real device's NAK-until-bInterval behaviour rather
+    than free-running over the loopback link); added the tokio `time` feature
+    for it. Each paced IN URB waits in its own task and one writer sends every
+    reply, so control and OUT transfers never queue behind another endpoint's
+    poll. `CMD_UNLINK` cancels a waiting poll with `-ECONNRESET`
+    (`UsbIpResponse::usbip_ret_unlink_reset`); added the tokio `macros` feature
+    for the handler's `select!`.
+  - Added **alternate settings** (`UsbAltSetting`, `UsbDevice::with_alt_settings`).
+    Upstream emits one interface descriptor per interface with
+    `bAlternateSetting` hardcoded to 0, which cannot express a USB Audio Class
+    streaming interface (alt 0 zero-bandwidth, alt 1 carrying the endpoint).
+    Endpoint descriptors gained an in-descriptor `extra` tail so a UAC
+    isochronous endpoint can be the 9-byte form (`bRefresh`/`bSynchAddress`).
+  - Added **isochronous transfer** support (`UsbInterfaceHandler::handle_iso_urb`,
+    `IsoPacket`, `UsbIpResponse::usbip_ret_submit_iso`, the ISO branch in
+    `handler`). Upstream parsed `number_of_packets`/`iso_packet_descriptor` off
+    the wire and then discarded them, always replying with an empty packet
+    table, which stalls any ISO endpoint. ISO completion is paced by
+    bInterval × packet count, because for an audio endpoint the completion rate
+    *is* the device's sample clock.
+  - Non-isochronous **OUT** URBs are acknowledged with `actual_length` = the
+    bytes accepted (`UsbIpResponse::usbip_ret_submit_out_success`). Upstream
+    answered them through the IN constructor with an empty buffer, i.e.
+    `actual_length = 0`; `vhci_hcd` copies that field into the URB verbatim, so
+    every synchronous writer (`write()` on hidraw, `HIDIOCSFEATURE`) was told it
+    transferred 0 bytes and treated the write as failed.
+  - Isochronous completion is paced against an absolute per-endpoint deadline
+    ledger (`UsbDevice::iso_deadlines`) rather than a relative
+    `sleep(interval × packets)` per URB. The relative sleep added scheduling
+    overhead on top of every period, so the simulated device's audio clock ran
+    measurably slow (~26 % under load) — the PCM backed up into xruns and
+    anything clocked off the device dragged. Late completions now catch up;
+    a stall beyond 20 ms re-anchors instead of fast-forwarding.
+
+Only the USB/IP server *simulation* path is retained: the device model, the
+USB/IP wire protocol, and the `UsbInterfaceHandler` trait. The original MIT
+license text is reproduced in LICENSE-MIT.

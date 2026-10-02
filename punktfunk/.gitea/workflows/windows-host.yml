@@ -1,0 +1,883 @@
+# Build the punktfunk Windows HOST as a signed punktfunk-setup-win installer and publish it to Gitea's
+# generic package registry, so a Windows GPU box can install the streaming host (SYSTEM service + bundled
+# pf-vdisplay virtual-display driver + the web management console + the opt-in plugin/script runner,
+# run by scheduled tasks on a bundled bun) from one signed setup.exe. Runs on a self-hosted
+# windows-amd64 runner
+# (host mode; same MSVC/Windows-SDK/LLVM env as windows-client.yml — generic from unom/infra's
+# windows-runner/; the WDK and the ARM64 target self-provision via the "Ensure Windows toolchain"
+# step below).
+#
+# Why an installer and not MSIX (like the client): the host installs a LocalSystem SCM service that
+# CreateProcessAsUserW's into the interactive session for secure-desktop capture, and bundles a
+# kernel/IDD driver — neither is expressible in MSIX's sandbox. The real install logic already lives
+# in `punktfunk-host service install` (crates/punktfunk-host/src/service.rs); the installer just lays
+# the exe down and calls it elevated. Packaging internals: packaging/windows/README.md.
+#
+# Registry (public reads, unom org): https://git.unom.io/unom/-/packages  (generic group)
+#
+# Versioning (free-form; not MSIX's 4-part rule) — single project version:
+#   vX.Y.Z tag -> X.Y.Z   (THE release; published + stable `latest/` alias + attached to the
+#                          unified Gitea Release).
+#   main push / dispatch -> <next-minor>.<run_number>  (canary; `canary/` alias; base one minor
+#                          ahead of the latest stable tag via scripts/ci/pf-version.ps1, run climbs).
+#
+# Signing goes through Azure Artifact Signing (account `unomsigning`, profile `unom-io`) — a publicly
+# trusted CA, so there is no .cer for users to import and no SmartScreen "unknown publisher" prompt.
+# It falls back to the old MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD self-signed cert, and then to an
+# ephemeral one, for builds without Azure access. Those fallbacks are for canary/CI ONLY — on a v* tag
+# the pack script FAILS CLOSED rather than ship a release signed by a per-build throwaway cert.
+# See packaging/windows/pack-host-installer.ps1.
+#
+# The bundled DRIVERS are NOT signed by Azure — they keep their own DRIVER_CERT_* cert and are still
+# trusted by planting that cert in the machine Root store at install time. Independent by design:
+# Windows checks the installer's signature via SmartScreen/UAC and driver catalogs via PnP, and never
+# requires a common signer. See packaging/windows/README.md for why that root-plant is still there.
+#
+# GPU backends: the host builds with --features nvenc,qsv = all three vendors in one installer.
+#  - NVENC (NVIDIA, direct SDK): nothing needed at build time — the entry points are resolved at
+#    RUNTIME from the driver's nvEncodeAPI64.dll (a link-time import would kill the binary on
+#    AMD/Intel-only boxes before main).
+#  - QSV native (Intel, VPL — design/native-qsv-encoder.md): the MIT dispatcher is built from the
+#    vendored tree (libvpl-sys, cmake+bindgen — LIBCLANG_PATH already in the runner env for
+#    pyrowave-sys) and statically linked; the GPU runtime comes from the Intel driver store at run
+#    time, so no new DLL ships and non-Intel boxes are unaffected.
+#  - AMF (AMD, native SDK): unconditional, no feature and no build-time env — pf-encode-win loads
+#    amfrt64.dll from the AMD driver at run time.
+# CI launches the exe only for `--version`, so no GPU is needed here.
+#
+# Two architectures from ONE x64 runner (#298), the client workflow's pattern: the x64 MSVC toolset
+# carries the ARM64 cross compiler and aarch64-pc-windows-msvc has host tools. The arm64 leg builds
+# `--no-default-features --features gamestream` — NVENC (cudarc), QSV (Intel dispatcher) and
+# PyroWave (Granite has no MSVC-ARM64 SIMD path) do not exist there, and
+# Media Foundation, which needs no feature, is its only encoder. Tests, the silent dry-run and
+# winget stay x64: the arm64 binaries cannot run on this runner, and the arm64
+# installer ships to the `canary/` alias only until it has run on a Snapdragon box.
+name: windows-host
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    branches: [main]
+    # The crate lines are the Windows host + tray build closure. scripts/ci/check-workflow-paths.py
+    # fails CI when one is missing, in either leg.
+    paths:
+      - 'crates/punktfunk-host/**'
+      - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
+      - 'crates/punktfunk-tray/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-encode/**'
+      - 'crates/pf-encode-core/**'
+      - 'crates/pf-encode-win/**'
+      - 'crates/libvpl-sys/**'
+      - 'crates/pf-frame/**'
+      - 'crates/pf-gpu/**'
+      - 'crates/pf-zerocopy/**'
+      - 'crates/pf-host-config/**'
+      - 'crates/pf-capture/**'
+      - 'crates/pf-win-display/**'
+      - 'crates/pf-vdisplay/**'
+      - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
+      - 'crates/pf-paths/**'
+      - 'crates/pf-paths-win/**'
+      - 'crates/pf-driver-proto/**'
+      - 'crates/pf-clipboard/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pyrowave-sys/**'
+      - 'tools/display-disturb/**'
+      - 'packaging/windows/**'
+      - 'scripts/windows/**'
+      - 'web/**'
+      - 'sdk/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.gitea/workflows/windows-host.yml'
+    tags: ['v*']
+  # Same paths as the push leg, driving the lint-only `pr-lint` job below, so the Windows-only
+  # code meets a compiler before merge.
+  pull_request:
+    paths:
+      - 'crates/punktfunk-host/**'
+      - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
+      - 'crates/punktfunk-tray/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-encode/**'
+      - 'crates/pf-encode-core/**'
+      - 'crates/pf-encode-win/**'
+      - 'crates/libvpl-sys/**'
+      - 'crates/pf-frame/**'
+      - 'crates/pf-gpu/**'
+      - 'crates/pf-zerocopy/**'
+      - 'crates/pf-host-config/**'
+      - 'crates/pf-capture/**'
+      - 'crates/pf-win-display/**'
+      - 'crates/pf-vdisplay/**'
+      - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
+      - 'crates/pf-paths/**'
+      - 'crates/pf-paths-win/**'
+      - 'crates/pf-driver-proto/**'
+      - 'crates/pf-clipboard/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pyrowave-sys/**'
+      - 'tools/display-disturb/**'
+      - 'packaging/windows/**'
+      - 'scripts/windows/**'
+      - 'web/**'
+      - 'sdk/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.gitea/workflows/windows-host.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Upload the installer to the generic registry + refresh the channel alias'
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  PKG: punktfunk-host-windows
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # SECURITY: this runner is host-mode, persistent, and shared with the release-signing jobs, so a
+  # pull request must never reach it with the packaging steps' secrets. `pr-lint` below is the only
+  # job a PR runs, it is fail-closed to same-repo PRs, and `package` stays off PRs entirely.
+  # See windows-client.yml for the full rationale.
+  pr-lint:
+    runs-on: windows-amd64
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Ensure Windows toolchain (WDK, ARM64 target)
+        run: ./scripts/ci/ensure-windows-toolchain.ps1
+
+      - name: Configure
+        # Same two knobs the package job sets, and for the same reasons: CARGO_TARGET_DIR=C:\t
+        # dodges the MAX_PATH wall in the CMake-from-source crates, and CMake 4.x refuses the
+        # vendored opus' `cmake_minimum_required < 3.5` without the policy floor. Reusing C:\t
+        # rather than a lint-only tree is deliberate — a second dep tree on this runner is the
+        # C1069 disk-exhaustion trigger, and cargo's own lock serialises us against a `main` build.
+        run: |
+          "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CMAKE_POLICY_VERSION_MINIMUM=3.5" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        shell: pwsh
+        continue-on-error: true
+        # Cargo judges path crates by mtime, and this checkout is new. Every job that builds
+        # into this target dir must run this first: scripts/ci/src-mtimes.rs.
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o "$env:RUNNER_TEMP\src-mtimes.exe"; if ($LASTEXITCODE) { throw "src-mtimes build" }
+          & "$env:RUNNER_TEMP\src-mtimes.exe" $env:CARGO_TARGET_DIR; if ($LASTEXITCODE) { throw "src-mtimes" }
+
+      - name: sccache preflight (a dead cache costs a cold build, not the leg)
+        # Verbatim from the package job: storage.unom.io has answered the daemon's startup check
+        # with a 401, which kills cargo at `rustc -vV` before a line compiles.
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $stats = & sccache --show-stats 2>&1
+          $code = $LASTEXITCODE
+          $stats | Select-Object -First 12 | Write-Output
+          if ($code -ne 0) {
+            Write-Warning "sccache daemon failed to start - building this leg without the cache"
+            "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Clippy (Windows host subsystem)
+        # --release and --locked for the same reasons as the package job: reuse C:\t\release
+        # instead of spawning a second dep tree, and resolve the graph that is committed.
+        # pf-encode-core, pf-encode-win, pf-inject, pf-audio, pf-win-display and display-disturb are
+        # here because no other workflow's -p list type-checks their Windows code or tests.
+        # The encode crates take nvenc,qsv and not pyrowave: this lane never builds the PyroWave
+        # C++ tree, and the drivers lane already compiles that backend. Two runs, not eight:
+        # every extra feature set re-checks the crates the runs share.
+        run: |
+          cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+
+      - name: Format check
+        # Cheap, needs no compile, and the Linux lane cannot see these crates' Windows modules.
+        run: cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p punktfunk-tray --check
+
+      - name: Test (pf-capture + pf-vdisplay + pf-win-display, Windows)
+        # The crates whose Windows test binaries link against nothing this runner lacks —
+        # settled empirically when the package job's equivalents were added. The host and
+        # pf-encode(-win) stay clippy-only: nvidia-video-codec-sdk cannot link on MSVC.
+        #
+        # pf-win-display joins them for the same reason as pf-capture: its manifest is
+        # punktfunk-core (default-features off), pf-paths, tracing and windows — no encoder in
+        # the tree, so the link objection does not apply. Its 29 tests are the CCD path/mode
+        # array transforms (keep_only_supplied, remap_mode_idx, anchor_kept_sources_at_origin,
+        # prune_saved_config_for_targets) — pure code that decides what the operator's desktop
+        # looks like, compiled by clippy here and executed nowhere until now.
+        run: |
+          cargo test --release --locked -p pf-capture --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-capture tests" }
+          cargo test --release --locked -p pf-vdisplay --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-vdisplay tests" }
+          cargo test --release --locked -p pf-win-display --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-win-display tests" }
+
+  package:
+    runs-on: windows-amd64
+    # Never on a pull request: every step below this job's tests packages, signs or publishes, and
+    # the PR lane above covers the compile question without touching a secret.
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 90
+    # The arm64 leg must never hold back the x64 canary (and its update manifest) while it is
+    # unproven on hardware; drop the override once a Snapdragon box has run it.
+    continue-on-error: ${{ matrix.arch == 'arm64' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            td: C:\t
+            host_flags: '--features nvenc,qsv'
+            encode_flags: '--features nvenc,qsv'
+            bun_ship_zip: bun-windows-x64-baseline.zip
+            bun_ship_sha: 78c221c2376f79731ccf4e4af0b3bb46d81fefa3296c5abee09ad8a1b21e68c6
+            suffix: ''
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            td: C:\t-a64
+            host_flags: '--no-default-features --features gamestream'
+            encode_flags: ''
+            bun_ship_zip: bun-windows-aarch64.zip
+            bun_ship_sha: a7a16b876a305fd1029c66dbd27007b4f6112ae896532f675878731a21e50cfd
+            suffix: '_arm64'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Ensure Windows toolchain (WDK, ARM64 target)
+        shell: pwsh
+        run: ./scripts/ci/ensure-windows-toolchain.ps1
+
+      - name: Locale-safety gate (installer-run scripts must be ASCII)
+        shell: pwsh
+        # The installer runs these via powershell.exe (Windows PowerShell 5.1) and cmd.exe on the END
+        # USER's box. PS 5.1 reads a BOM-less script in the active ANSI codepage, so on a non-UTF-8 locale
+        # (e.g. German Windows-1252) a stray em-dash mis-decodes into a curly quote and the script aborts
+        # with "unterminated string" - exactly how the pf-vdisplay driver install silently failed in the
+        # field. Keep every installer-run script pure ASCII (matches install-gamepad-drivers.ps1).
+        run: |
+          $bad = Get-ChildItem packaging/windows/*.ps1, scripts/windows/*.ps1, scripts/windows/*.cmd -ErrorAction SilentlyContinue |
+            Where-Object { [IO.File]::ReadAllText($_.FullName) -match '[^\x00-\x7F]' }
+          if ($bad) {
+            $bad.FullName | ForEach-Object { Write-Output "::error::non-ASCII in installer-run script: $_" }
+            throw "installer-run scripts must be pure ASCII (PS 5.1 mis-parses them on non-UTF-8 locales)"
+          }
+          Write-Output "installer-run scripts are ASCII-clean"
+
+      - name: Configure + version
+        shell: pwsh
+        run: |
+          # CARGO_TARGET_DIR=C:\t dodges the MAX_PATH wall in the CMake-from-source crates (aws-lc,
+          # opus) the host pulls; via GITHUB_ENV (pwsh Out-File utf8 = no BOM, unlike Windows
+          # PowerShell 5.1 — keeps the first line clean).
+          "CARGO_TARGET_DIR=${{ matrix.td }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # audiopus_sys' vendored opus declares cmake_minimum_required < 3.5, which CMake 4.x
+          # refuses outright. Green runs today only survive on the cached configure output — a
+          # target-dir purge (the runner's disk-cleanup task) would fail the fresh configure, as
+          # observed on a clean build on this very runner (2026-07-17). No-op for compliant
+          # projects (libvpl-sys pins 3.13+).
+          "CMAKE_POLICY_VERSION_MINIMUM=3.5" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # No FFMPEG_DIR: neither the host nor the client links libav* any more. A runner
+          # provisioned before that still has the tree and the daemon env var; both are inert.
+          # LIBCLANG_PATH is in the runner daemon env.
+          $pf = & "$env:GITHUB_WORKSPACE/scripts/ci/pf-version.ps1"   # single source of truth: base is one minor ahead of the latest stable tag
+          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            # Canary: <major>.<minor>.<run> — major.minor track one minor ahead of stable, run climbs monotonically.
+            "$($pf.PF_MAJOR).$($pf.PF_MINOR).$($env:GITHUB_RUN_NUMBER)"
+          }
+          # Not PUNKTFUNK_BUILD_VERSION: the packer stamps $v into the finished exe, so a new run
+          # number never recompiles the host (packaging/windows/stamp-version.ps1).
+          "HOST_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "host version $v"
+
+      - name: Keep the pack's driver target between runs
+        shell: pwsh
+        # The pack builds the UMDF drivers in-tree (wdk-build finds its Cargo.lock from OUT_DIR)
+        # from drivers-cargo.ps1's fixed X: root, so a kept target's paths stay valid. Before the
+        # carry, whose listing of packaging/windows/drivers must include `target`.
+        run: |
+          New-Item -ItemType Directory -Force -Path '${{ matrix.td }}\pack-drivers' | Out-Null
+          New-Item -ItemType Junction -Path packaging/windows/drivers/target -Target '${{ matrix.td }}\pack-drivers' | Out-Null
+
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        shell: pwsh
+        continue-on-error: true
+        # Cargo judges path crates by mtime, and this checkout is new. Every job that builds
+        # into this target dir must run this first: scripts/ci/src-mtimes.rs.
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o "$env:RUNNER_TEMP\src-mtimes.exe"; if ($LASTEXITCODE) { throw "src-mtimes build" }
+          & "$env:RUNNER_TEMP\src-mtimes.exe" $env:CARGO_TARGET_DIR; if ($LASTEXITCODE) { throw "src-mtimes" }
+
+      - name: sccache preflight (a dead cache costs a cold build, not the leg)
+        shell: pwsh
+        # storage.unom.io has answered the daemon's startup check with a 401 (2026-09-04), which
+        # kills cargo at `rustc -vV` before a line compiles. A job that finds a daemon already
+        # running never re-runs that check, so one leg can pass while the next dies. Probe once
+        # here; when the daemon cannot start, drop the wrapper for the rest of the job, the way
+        # the Linux lanes fall back to a passthrough shim without cache secrets.
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          # Capture before truncating: piping a native command into `Select-Object -First`
+          # stops it early, so $LASTEXITCODE stays unset and $null -ne 0 reads as a failure -
+          # which dropped the cache on a daemon that had just answered.
+          $stats = & sccache --show-stats 2>&1
+          $code = $LASTEXITCODE
+          $stats | Select-Object -First 12 | Write-Output
+          if ($code -ne 0) {
+            Write-Warning "sccache daemon failed to start - building this leg without the cache"
+            "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Build (release, host)
+        shell: pwsh
+        # x64 = all-vendor host: NVENC (NVIDIA, direct SDK) + native QSV (Intel, static VPL
+        # dispatcher) + native AMF (AMD, always compiled in).
+        # arm64 = gamestream only; the driver's Media Foundation backend carries no feature.
+        # The fingerprint log names why each rebuilt unit was dirty; a fresh unit prints nothing.
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
+        run: cargo build --release --locked -p punktfunk-host ${{ matrix.host_flags }} --target ${{ matrix.target }}
+
+      - name: Build (release, status tray)
+        shell: pwsh
+        # The per-user notification-area companion the installer bundles (punktfunk-tray.exe).
+        run: cargo build --release --locked -p punktfunk-tray --target ${{ matrix.target }}
+
+      - name: Clippy (host + tray, Windows)
+        shell: pwsh
+        # --release reuses the tree the Build steps made. A debug clippy builds a second one, and
+        # its second openh264 C++ build tips this runner into C1069 (disk/temp exhaustion).
+        # The subsystem crates take --all-targets so their Windows `#[cfg(test)]` modules are
+        # type-checked; `-p punktfunk-host` builds them only as dependencies. The host and
+        # pf-encode stay lint-only: with `nvenc` a test binary cannot link on MSVC.
+        # Two runs, not eight: every extra feature set re-checks the crates the runs share.
+        run: |
+          $t = '${{ matrix.target }}'
+          cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray ${{ matrix.host_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p display-disturb --all-targets ${{ matrix.encode_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+
+      - name: Test (pf-capture, Windows)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        # The only Rust tests that RUN on Windows CI. pf-capture's `#[cfg(target_os = "windows")]`
+        # test modules cover code no Linux job compiles, let alone executes: 19 declared, of which
+        # 18 execute here — the IDD-push StallWatch state machine and ring-generation masking
+        # (idd_push.rs), the cursor shape→wire truth table (idd_push/cursor_poll.rs), and
+        # `f32_to_f16` including the rounding-carry / saturation edges the HDR P010 path depends on
+        # (dxgi/selftest.rs). All 18 are pure — no Win32, no device, no desktop. The 19th,
+        # `hdr_p010_selftest_intel_1080_live`, is `#[ignore]`d because it needs a real Intel
+        # adapter; it stays a manual `-- --ignored` run on the validation boxes. Until this step
+        # the whole set was type-checked by the clippy line above and nothing more.
+        #
+        # --release for the same reason as the clippy step: it reuses C:\t\release instead of
+        # spawning a second debug dep tree (the C1069 disk-exhaustion trigger). If this step ever
+        # starts tripping C1069 anyway, record THAT here rather than quietly dropping the step.
+        #
+        # The link question this step turns on was settled empirically before it was added: the same
+        # command was run on a Windows dev box against a workspace checkout and linked + executed
+        # cleanly, building in ~51 s off an existing release target dir.
+        run: |
+          cargo test --release --locked -p pf-capture --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-capture tests" }
+          # Same argument, same tree shape: pf-win-display has no encoder dependency either, and
+          # its 29 CCD path/mode transform tests were compiled by clippy and run nowhere.
+          cargo test --release --locked -p pf-win-display --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-win-display tests" }
+
+      - name: Test (pf-vdisplay, Windows)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        # pf-vdisplay's Windows half is ~3,400 lines (manager.rs, pf_vdisplay.rs, ddc.rs, the three
+        # manager/ submodules) that NO other job compiles — the host lint above builds the crate as
+        # a dependency, so its test targets were reaching no compiler anywhere. Worse, the only two
+        # Windows `#[test]`s were `if env::var("PUNKTFUNK_PF_VDISPLAY_LIVE").is_err() { return; }`
+        # early-returns, so an unrun hardware test reported `ok`. They are `#[ignore]`d now and this
+        # step reports them as `ignored`, which is the truth.
+        #
+        # The link objection recorded for the host and pf-encode above does NOT apply here, for the
+        # same reason it does not apply to pf-capture: `pf-encode` is `default = []`, and nothing in
+        # `-p pf-vdisplay`'s graph turns on `nvenc`/`qsv`, so no nvidia/libvpl
+        # import libs are ever asked for. Settled empirically before this step was added, to the
+        # same standard as pf-capture's: the exact two commands were run on this runner against a
+        # checkout at C:\temp\pf-vd-check — clippy clean, then 46 passed / 2 ignored in 0.19 s.
+        #
+        # --release to reuse C:\t\release rather than spawning a debug tree (the C1069 trigger).
+        # Note this DOES build a second, featureless pf-encode; it is small precisely because none
+        # of the encoder features are on.
+        run: |
+          cargo test --release --locked -p pf-vdisplay --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-vdisplay tests" }
+
+      - name: Build + lint the HDR Vulkan layer (pf-vkhdr-layer)
+        shell: pwsh
+        # Standalone cdylib (own [workspace]) the installer bundles + registers (it lets Vulkan games
+        # like Doom use HDR on the virtual display). Lint here so a regression fails CI instead of
+        # silently shipping the host without the layer (pack-host-installer.ps1 builds it non-fatally).
+        # Windows-only FFI (user32 + the vk_layer loader glue) → can't be linted on the Linux CI.
+        run: |
+          Push-Location packaging/windows/pf-vkhdr-layer
+          cargo fmt --check; if ($LASTEXITCODE) { throw "pf-vkhdr-layer rustfmt" }
+          cargo clippy --release --locked --target ${{ matrix.target }} -- -D warnings; if ($LASTEXITCODE) { throw "pf-vkhdr-layer clippy" }
+          Pop-Location
+
+      # The console output is fully self-contained (Nitro noExternals) and most pushes
+      # don't touch web/ or sdk/ — restore it from the central cache and skip the ~2.5 min
+      # bun build+smoke entirely on a hit. First workflow on this runner to use the
+      # actions cache at all (the runner's config.yaml needed cache.external_server —
+      # see unom/infra runners/ci-core/README.md).
+      - name: Cache web console output
+        id: webconsole
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: web/.output
+          key: web-console-win-${{ hashFiles('web/**', 'sdk/**') }}
+
+      - name: Fetch portable bun runtime (build tool + bundled to run the console)
+        shell: pwsh
+        run: |
+          # ONE pinned bun version. The x64 binary BUILDS the console on this runner (BUN_EXE); the
+          # one the installer ships to RUN it (BUN_SHIP_EXE) is the matrix asset of the same release:
+          # x64 ships `-baseline`, which starts on CPUs without AVX2 (the plain build exits 255). The .output is self-contained (Nitro
+          # noExternals — deps bundled + tree-shaken, no node_modules), so the installer ships just
+          # bun + a ~75-file .output instead of node + a node_modules forest.
+          $ver = 'bun-v1.4.2'
+          # SHA-256 of each exact asset, pinned. GitHub release assets are MUTABLE at a fixed URL, so
+          # the tag alone vouches for nothing — this binary is Authenticode-signed into our installer
+          # and its hash published in the Ed25519 update manifest, i.e. our signature vouches for bytes
+          # we downloaded. Verify them. On a bun bump, update $ver, this hash AND the matrix's
+          # bun_ship_sha pair (from the release's SHASUMS256.txt). security-review 2026-08-15 finding 12.
+          $sha = 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405'
+          $td = '${{ matrix.td }}'
+          New-Item -ItemType Directory -Force -Path $td | Out-Null
+          function Get-Bun([string]$asset, [string]$pin, [string]$dst) {
+            $url = "https://github.com/oven-sh/bun/releases/download/$ver/$asset"
+            $zip = Join-Path $td "$asset"
+            Invoke-WebRequest -Uri $url -OutFile $zip
+            $got = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+            if ($got -ne $pin) { throw "bun zip sha256 mismatch for ${ver}/${asset}: got $got, pinned $pin" }
+            if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+            Expand-Archive -Path $zip -DestinationPath $dst -Force
+            $exe = (Get-ChildItem -Path $dst -Recurse -Filter bun.exe | Select-Object -First 1).FullName
+            if (-not $exe) { throw "bun.exe not found in $url" }
+            $exe
+          }
+          $bun = Get-Bun 'bun-windows-x64.zip' $sha (Join-Path $td 'bundist')
+          "BUN_EXE=$bun" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $bun --version
+          $ship = Get-Bun '${{ matrix.bun_ship_zip }}' '${{ matrix.bun_ship_sha }}' (Join-Path $td 'bundist-ship')
+          "BUN_SHIP_EXE=$ship" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build + smoke-boot web console (bun)
+        if: steps.webconsole.outputs.cache-hit != 'true'
+        shell: pwsh
+        env:
+          # PAT with read access to the unom org packages — the @unom npm registry needs auth to BUILD.
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        # The bun fetched above builds the Nitro server AND runs it. noExternals (vite.config) makes the
+        # output self-contained, so there's no .output/server install — the installer ships bun + the
+        # ~75-file .output. The runner is SYSTEM with no ~/.npmrc, so supply the private @unom token in
+        # the SYSTEM home .npmrc to BUILD (kept OUT of the shipped bundle — web\.npmrc has only the
+        # registry mapping, and nothing copies it into .output).
+        run: |
+          $bun = $env:BUN_EXE
+          if ($env:REGISTRY_TOKEN) {
+            $rc = Join-Path $env:USERPROFILE '.npmrc'
+            Add-Content -Path $rc -Value '@unom:registry=https://git.unom.io/api/packages/unom/npm/'
+            Add-Content -Path $rc -Value "//git.unom.io/api/packages/unom/npm/:_authToken=$env:REGISTRY_TOKEN"
+          }
+          Push-Location web
+          # `--ignore-scripts` like every other web install in CI (ci.yml, web-screenshots.yml,
+          # sdk/plugin-kit-publish, and the SDK install further down this same file). This step was
+          # the one site that ran lifecycle scripts, and web's `postinstall` is `bun2nix -o bun.nix`
+          # — a NIX codegen step that shells out to `bun` on PATH. CI runs a fetched PORTABLE bun by
+          # absolute path (`$env:BUN_EXE`), so PATH has none, and bun2nix aborted the install:
+          #   error: bun is not installed in %PATH% ... postinstall script exited with 255
+          # Nothing here needs those scripts — `build` re-runs its own `prebuild` codegen — and
+          # bun.nix is a Nix artifact this job neither consumes nor commits.
+          & $bun install --frozen-lockfile --ignore-scripts; if ($LASTEXITCODE) { throw "bun install failed ($LASTEXITCODE)" }
+          & $bun run build; if ($LASTEXITCODE) { throw "web build failed ($LASTEXITCODE)" }
+          if (-not (Select-String -Path .output\server\index.mjs -Pattern 'Bun\.serve' -Quiet)) {
+            throw "web build is not a bun bundle - need the 'bun' preset + custom entry"
+          }
+          Pop-Location
+          # Gate the installer on a real boot under the BUNDLED bun (the runtime it ships), serving /login.
+          $env:PORT = '3009'; $env:HOST = '127.0.0.1'; $env:PUNKTFUNK_UI_PASSWORD = 'ci'
+          $server = (Resolve-Path 'web\.output\server\index.mjs').Path
+          $p = Start-Process -FilePath $bun -ArgumentList $server -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 4
+          try { $code = (Invoke-WebRequest -Uri 'http://127.0.0.1:3009/login' -UseBasicParsing -TimeoutSec 10).StatusCode } catch { $code = 0 }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Write-Output "web console smoke (bun): /login -> $code"
+          if ($code -ne 200) { throw "web console failed to boot under bun" }
+
+      # WEB_OUTPUT_DIR has to be exported whether or not the step above ran. It used to be that step's
+      # last line, so a CACHE HIT skipped it and left the variable unset — and pack-host-installer.ps1
+      # treats an unset WEB_OUTPUT_DIR as "don't bundle the console", silently ("installer built
+      # WITHOUT the web console"). That shipped in 0.22.1 and 0.22.2: no {app}\web, so no web-run.cmd,
+      # so `web setup` bails, so no PunktfunkWeb task and no console at all. It also removed the only
+      # thing that stopped bun before the copy (StopBunRuntimes was #ifdef WithWeb), while bun.exe kept
+      # shipping under WithScripting — which is the "DeleteFile failed; code 5" modal on bun.exe.
+      # The throw is the point: never silently ship a console-less installer again.
+      - name: Export the console output dir (cache hit or fresh build)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'web\.output\server\index.mjs')) {
+            throw "web\.output is missing - neither the cache restore nor the build produced it, and the installer must not ship without the console"
+          }
+          "WEB_OUTPUT_DIR=$((Resolve-Path 'web\.output').Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build plugin/script runner bundle (bun)
+        shell: pwsh
+        # `bun build --target=bun` bundles the SDK's runner CLI to ONE self-contained JS (effect + the
+        # SDK inlined; the dynamic plugin import stays a runtime import). pack-host-installer.ps1 ships
+        # it (+ the shared bun) and registers its scheduled task DISABLED (opt-in). The SDK's deps are
+        # public npm (effect), so no @unom token is needed here.
+        run: |
+          $bun = $env:BUN_EXE
+          Push-Location sdk
+          & $bun install --frozen-lockfile --ignore-scripts; if ($LASTEXITCODE) { throw "sdk bun install failed ($LASTEXITCODE)" }
+          $scr = '${{ matrix.td }}\scripting'
+          New-Item -ItemType Directory -Force -Path $scr | Out-Null
+          & $bun build src/runner-cli.ts --target=bun --outfile=$scr\runner-cli.js; if ($LASTEXITCODE) { throw "runner bundle build failed ($LASTEXITCODE)" }
+          Pop-Location
+          if (-not (Select-String -Path $scr\runner-cli.js -Pattern 'attempt=' -Quiet)) {
+            throw "runner bundle missing the dynamic plugin import - wrong build"
+          }
+          "SCRIPTING_BUNDLE=$scr\runner-cli.js" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Every payload this job is SUPPOSED to bundle, asserted before packing. The packer treats each
+      # one as optional — correct for a local debug pack, and the reason 0.22.1/0.22.2 shipped with no
+      # web console: an unset WEB_OUTPUT_DIR omitted it behind a single Write-Host. CI knows it bundles
+      # all of these, so here a missing input is a build failure rather than a quietly smaller
+      # installer. (pack-host-installer.ps1 already does this for VB-CABLE, for the same reason.)
+      - name: Verify every installer payload is present
+        shell: pwsh
+        run: |
+          $need = @(
+            @{ n = 'web console (WEB_OUTPUT_DIR)';    p = $env:WEB_OUTPUT_DIR;   f = 'server\index.mjs' }
+            @{ n = 'bun runtime (BUN_SHIP_EXE)';      p = $env:BUN_SHIP_EXE;     f = '' }
+            @{ n = 'plugin runner (SCRIPTING_BUNDLE)';p = $env:SCRIPTING_BUNDLE; f = '' }
+          )
+          $missing = @()
+          foreach ($x in $need) {
+            if (-not $x.p) { $missing += "$($x.n): env var not set"; continue }
+            $full = if ($x.f) { Join-Path $x.p $x.f } else { $x.p }
+            if (-not (Test-Path $full)) { $missing += "$($x.n): missing $full" }
+            else { Write-Output "payload OK - $($x.n) -> $full" }
+          }
+          if ($missing.Count) {
+            $missing | ForEach-Object { Write-Output "MISSING PAYLOAD - $_" }
+            throw "$($missing.Count) installer payload(s) missing - refusing to ship an incomplete installer"
+          }
+
+      - name: Pack + sign installer
+        shell: pwsh
+        env:
+          # Azure Artifact Signing (formerly Trusted Signing) — takes precedence over MSIX_CERT_*
+          # when all three of these are set. Not secret: an account/profile name and a regional
+          # endpoint, all inert without the credentials below, so they live here where a reviewer
+          # can see which profile a release was signed by.
+          AZURE_CODESIGNING_ENDPOINT: https://neu.codesigning.azure.net/
+          AZURE_CODESIGNING_ACCOUNT: unomsigning
+          AZURE_CODESIGNING_PROFILE: unom-io
+          # Service principal 'punktfunk-ci-signing', holding ONLY the Artifact Signing Certificate
+          # Profile Signer role, scoped to the unom-io profile — it can sign and nothing else.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          # Legacy self-signed path, kept as the fallback for builds without Azure access.
+          MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+          # The DRIVER cert is separate from the host/MSIX one and reaches the two driver build
+          # scripts through the environment (pack-host-installer.ps1 invokes them, they read
+          # $env:DRIVER_CERT_PFX_B64 themselves). Without it they sign with a per-build throwaway,
+          # which the installer then trusts as a machine root — see packaging/windows/README.md.
+          # NOT moved to Azure: driver catalogs are a separate track, see that README.
+          DRIVER_CERT_PFX_B64: ${{ secrets.DRIVER_CERT_PFX_B64 }}
+          DRIVER_CERT_PASSWORD: ${{ secrets.DRIVER_CERT_PASSWORD }}
+        run: |
+          # The engine exe (punktfunk-setup-win + payload). It keeps the Inno silent flags (D5)
+          # and the ARP key + unins000.exe (D6), so the updater, winget and every fielded Inno
+          # install upgrade onto it unchanged.
+          & packaging/windows/pack-host-installer.ps1 `
+            -Version $env:HOST_VERSION -TargetDir ${{ matrix.td }}\${{ matrix.target }}\release -OutDir ${{ matrix.td }}\out `
+            -Arch ${{ matrix.arch }} -BunExe $env:BUN_SHIP_EXE
+
+      - name: sccache stats (visibility only)
+        if: always()
+        shell: pwsh
+        run: sccache --show-stats
+
+      # WP3.3's smoke, now on the artifact that ships: the sandwich inspects, the file carries a
+      # signature, and the packed exe's silent dry-run — the exact fielded updater spawn plus
+      # --dry-run, no mutation on the shared runner — writes the expected plan into /LOG=.
+      - name: Smoke the installer (inspect, signature)
+        shell: pwsh
+        run: |
+          $setup = $env:HOST_SETUP_PATH
+          & $env:HOST_PACK_TOOL inspect $setup
+          if ($LASTEXITCODE -ne 0) { throw "inspect failed ($LASTEXITCODE)" }
+          $sig = Get-AuthenticodeSignature $setup
+          Write-Output "installer Authenticode: $($sig.Status) ($($sig.SignerCertificate.Subject))"
+          if (-not $sig.SignerCertificate) { throw "installer is unsigned" }
+          # PE machine of the wizard the sandwich rides on: 0x8664 = x64, 0xAA64 = ARM64.
+          $b = [IO.File]::ReadAllBytes($setup)
+          $machine = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3c) + 4)
+          $want = if ('${{ matrix.arch }}' -eq 'arm64') { 0xAA64 } else { 0x8664 }
+          if ($machine -ne $want) { throw ("installer PE Machine is 0x{0:X4}, expected 0x{1:X4}" -f $machine, $want) }
+          Write-Output ("installer: {0} MB, PE Machine 0x{1:X4}" -f [math]::Round((Get-Item $setup).Length / 1MB, 1), $machine)
+
+      - name: Smoke the stamped version
+        # The updater compares this string: a stamp the build folded away reads as an old
+        # build forever. x64 only: an arm64 exe cannot run here.
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $got = & '${{ matrix.td }}\out\punktfunk-host.exe' --version
+          if ($got -ne "punktfunk-host $env:HOST_VERSION") { throw "stamped exe reports '$got', not $env:HOST_VERSION" }
+          Write-Output $got
+
+      - name: Smoke the installer (silent dry-run)
+        # The exact fielded updater spawn plus --dry-run, no mutation on the shared runner. x64 only:
+        # an arm64 exe cannot run here.
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $setup = $env:HOST_SETUP_PATH
+          $log = '${{ matrix.td }}\out\smoke.log'
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $setup -PassThru -Wait `
+            -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=$log", '--dry-run'
+          if ($p.ExitCode -ne 0) { throw "silent dry-run exited $($p.ExitCode)" }
+          $text = Get-Content $log -Raw
+          foreach ($line in @('==> Detected Windows', 'punktfunk-host.exe" service install', 'web setup', 'Done. Next:')) {
+            if (-not $text.Contains($line)) { throw "smoke transcript lacks: $line" }
+          }
+          Get-Content $log
+          Write-Output "installer: $([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB"
+
+      - name: Report stable Authenticode identity
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature $env:HOST_SETUP_PATH
+          if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate) {
+            throw "stable installer Authenticode status is $($sig.Status)"
+          }
+          $sha = [BitConverter]::ToString(
+            [System.Security.Cryptography.SHA256]::Create().ComputeHash($sig.SignerCertificate.RawData)
+          ).Replace('-', '').ToLowerInvariant()
+          $simple = [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName
+          Write-Output "AUTHENTICODE LEAF SHA-256 FOR ANNOUNCE: $sha"
+          Write-Output "AUTHENTICODE SUBJECT FOR ANNOUNCE: $($sig.SignerCertificate.GetNameInfo($simple, $false))"
+
+      - name: Publish to Gitea generic registry
+        # A branch dispatch is a compile check; only an explicit `publish` lets it touch the
+        # registry, since the alias refresh below replaces the public canary installer.
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        shell: pwsh
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          # Check curl's exit code ourselves — a best-effort DELETE (404 on first run) must not abort.
+          $PSNativeCommandUseErrorActionPreference = $false
+          function Publish-File($f, $url) {
+            # The generic registry makes a versioned path immutable and 409s a re-upload, so a tag
+            # re-run re-publishing the identical artifact must be tolerated as a no-op. (The channel
+            # alias below is delete-then-reuploaded and never 409s.) No curl -f, so we can read the
+            # status code instead of aborting on it.
+            $code = [int](curl.exe -sS -o NUL -w "%{http_code}" --user "enricobuehler:$($env:REGISTRY_TOKEN)" --upload-file "$f" "$url")
+            if ($LASTEXITCODE -ne 0) { throw "upload failed (curl exit $LASTEXITCODE): $url" }
+            if ($code -eq 409) { Write-Output "already published (409, immutable): $url"; return }
+            if ($code -lt 200 -or $code -ge 300) { throw "upload failed (HTTP $code): $url" }
+            Write-Output "published ($code): $url"
+          }
+          $files = @($env:HOST_SETUP_PATH, $env:HOST_CER_PATH) | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $files) { throw "pack produced no artifacts to publish" }
+          $base = "https://$($env:REGISTRY)/api/packages/$($env:OWNER)/generic/$($env:PKG)"
+          foreach ($f in $files) { Publish-File $f "$base/$($env:HOST_VERSION)/$(Split-Path $f -Leaf)" }
+          # Refresh the channel alias (delete-then-reupload, like flatpak.yml/decky.yml) for a
+          # predictable download URL: stable release -> `latest/`, canary main build -> `canary/`.
+          $alias = if ($env:GITHUB_REF -like 'refs/tags/v*') { 'latest' } else { 'canary' }
+          # Build this incrementally, NOT as one literal: under Azure signing there is no .cer, so
+          # HOST_CER_PATH is unset — and an unset $env: var is $null, which is a HARD ERROR as a hash
+          # literal key ("A null key is not allowed in a hash literal"), not the empty-string key it
+          # looks like it should be. The $files guard above filters the missing .cer out just fine;
+          # this line ran before anything could use it and failed the whole publish step.
+          $aliasNames = @{ $env:HOST_SETUP_PATH = 'punktfunk-host-setup${{ matrix.suffix }}.exe' }
+          # One signing cert for both arches: the x64 leg owns the .cer alias.
+          if ($env:HOST_CER_PATH -and '${{ matrix.arch }}' -eq 'x64') { $aliasNames[$env:HOST_CER_PATH] = 'punktfunk-host-windows.cer' }
+          foreach ($f in $files) {
+            $an = $aliasNames[$f]; if (-not $an) { continue }
+            curl.exe -fsS -o NUL --user "enricobuehler:$($env:REGISTRY_TOKEN)" -X DELETE "$base/$alias/$an" 2>$null
+            Publish-File $f "$base/$alias/$an"
+          }
+
+      # On a real release, also attach the signed installer (+ its .cer) to the unified Gitea Release.
+      - name: Attach host installer to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.ps1
+          $rid = Ensure-GiteaRelease -Tag $env:GITHUB_REF_NAME -Name $env:GITHUB_REF_NAME -Prerelease 'auto'
+          $cer = if ('${{ matrix.arch }}' -eq 'x64') { $env:HOST_CER_PATH } else { $null }
+          foreach ($f in @($env:HOST_SETUP_PATH, $cer)) {
+            if ($f -and (Test-Path $f)) { Upsert-GiteaAsset -ReleaseId $rid -File $f }
+          }
+
+      # winget manifests for the release just attached above. Runs AFTER the attach step so the
+      # InstallerUrl the manifest pins is already live — winget validates the URL + hash, and a
+      # manifest published ahead of its artifact is a hard 404 for every client that picks it up.
+      # Stable tags only: winget pins one immutable artifact per version, so the rolling `canary/`
+      # alias has nothing it could point at.
+      - name: Emit + attach winget manifests (stable tags only)
+        # x64 only until the arm64 host has run on hardware; a second Installers entry is P4 of #298.
+        if: startsWith(gitea.ref, 'refs/tags/v') && matrix.arch == 'x64'
+        shell: pwsh
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          & scripts/ci/winget-manifest.ps1 `
+            -Version $env:HOST_VERSION -InstallerPath $env:HOST_SETUP_PATH -OutDir ${{ matrix.td }}\out\winget
+          . scripts/ci/gitea-release.ps1
+          $rid = Ensure-GiteaRelease -Tag $env:GITHUB_REF_NAME -Name $env:GITHUB_REF_NAME -Prerelease 'auto'
+          foreach ($f in (Get-ChildItem ${{ matrix.td }}\out\winget -Filter *.yaml)) {
+            Upsert-GiteaAsset -ReleaseId $rid -File $f.FullName
+          }
+
+  # Republish the winget REST source on unom-1 once the release above carries its manifests.
+  #
+  # A separate Linux job, not another step in `package`: the deploy actions are Docker-based and do
+  # not run on a Windows runner. `needs: package` also gives the ordering that matters — build-data
+  # reads the manifests from the release, so it must not run before they are attached.
+  # Publish the SIGNED canary update manifest after the canary installer lands (planning:
+  # host-update-from-web-console.md §3.3 — canary rides this workflow because the installer is
+  # the only artifact the manifest references by URL; other canary channels may trail by minutes,
+  # which the per-PM apply path tolerates). A Linux job: the signer is bash+openssl. Skips (with
+  # a warning) when UPDATE_MANIFEST_KEY is absent — a canary build must not fail over it.
+  canary-manifest:
+    needs: package
+    if: gitea.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Publish the canary update manifest
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          UPDATE_MANIFEST_KEY: ${{ secrets.UPDATE_MANIFEST_KEY }}
+        run: |
+          set -euo pipefail
+          # Same derivation the package job used: canary = <next-minor base>'s major.minor + run#.
+          eval "$(bash scripts/ci/pf-version.sh)"
+          VER="${PF_MAJOR}.${PF_MINOR}.${GITHUB_RUN_NUMBER}"
+          URL="https://${REGISTRY}/api/packages/${OWNER}/generic/${PKG}/${VER}/punktfunk-host-setup-${VER}.exe"
+          curl -fsSL "$URL" -o /tmp/installer.exe
+          SHA="$(sha256sum /tmp/installer.exe | awk '{print $1}')"
+          # The arm64 leg is continue-on-error; a missing asset leaves its key out of the manifest.
+          A64_URL="https://${REGISTRY}/api/packages/${OWNER}/generic/${PKG}/${VER}/punktfunk-host-setup-${VER}_arm64.exe"
+          if curl -fsSL "$A64_URL" -o /tmp/installer-arm64.exe; then
+            A64_SHA="$(sha256sum /tmp/installer-arm64.exe | awk '{print $1}')"
+          else
+            echo "no arm64 installer for ${VER} - publishing the x64 leg only"; A64_URL=""; A64_SHA=""
+          fi
+          CHANNEL=canary VERSION="$VER" CI_RUN="${GITHUB_RUN_NUMBER}" \
+            WINDOWS_URL="$URL" WINDOWS_SHA256="$SHA" \
+            WINDOWS_ARM64_URL="$A64_URL" WINDOWS_ARM64_SHA256="$A64_SHA" \
+            NOTES_URL="https://git.unom.io/unom/punktfunk/releases" \
+            bash scripts/ci/publish-update-manifest.sh
+
+  winget-source:
+    needs: package
+    if: startsWith(gitea.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # build-data re-derives the WHOLE catalogue from the releases rather than appending this one,
+      # so the result cannot drift and re-running any tag reproduces it byte for byte.
+      - name: Build + test the source catalogue
+        working-directory: packaging/winget/server
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          node build-data.mjs --out data/data.json
+          # A wrong response SHAPE does not fail loudly — winget just reports "no package found".
+          # Gate on the suite before anything reaches the box.
+          node test.mjs
+
+      # Content only. server.mjs/handler.mjs/compose land via deploy-services.yml, matching how the
+      # flatpak repo's content and config deploy on separate paths.
+      - name: Ship the catalogue to unom-1
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "packaging/winget/server/data/data.json"
+          target: "~/unom-winget/data"
+          strip_components: 4
+          overwrite: true
+
+      # No restart: server.mjs reloads on mtime change. This only proves the new catalogue is the
+      # one actually being served, and fails the release if it is not.
+      - name: Verify the served catalogue
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            curl -fsS http://127.0.0.1:3240/healthz
+            echo
+            curl -fsS -X POST http://127.0.0.1:3240/manifestSearch \
+              -H 'content-type: application/json' -d '{"FetchAllManifests":true}' \
+              | grep -q "${GITHUB_REF_NAME#v}" \
+              || { echo "served catalogue does not contain ${GITHUB_REF_NAME#v}"; exit 1; }
+            echo "winget source serving ${GITHUB_REF_NAME#v}"
+          # `env:` below populates the RUNNER's environment; this action runs `script` on the
+          # REMOTE host, which inherits nothing from it. `envs:` is the action's OWN input —
+          # it must live under `with:` (matching docker.yml/deploy-services.yml's REGISTRY_TOKEN
+          # forwarding) — naming the variables to forward into the remote shell. A prior fix put
+          # it as a step-level sibling of `with:`/`env:` instead: that key is not part of the
+          # step schema, so appleboy/ssh-action never received it as an input and the step kept
+          # failing ("GITHUB_REF_NAME: unbound variable") on every tag after 24d2f97e too.
+          envs: GITHUB_REF_NAME
+        env:
+          GITHUB_REF_NAME: ${{ gitea.ref_name }}

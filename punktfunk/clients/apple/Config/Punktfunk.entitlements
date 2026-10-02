@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Keychain Sharing: a team-scoped access group so the punktfunk/1 client identity in
+	     the data-protection keychain is gated by the app's entitlement (team + bundle id),
+	     not a per-binary ACL. That is what makes Keychain access persist across rebuilds
+	     with NO prompt — see ClientIdentityStore. $(AppIdentifierPrefix) expands to the
+	     team prefix at signing time. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)io.unom.punktfunk</string>
+	</array>
+	<!-- Wake-on-LAN needs to send a UDP broadcast magic packet (a sleeping host has no ARP
+	     entry, so unicast can't wake it). Since iOS 14 / tvOS 14 the OS blocks sending to
+	     broadcast/multicast addresses unless the app carries this managed entitlement — it must
+	     be approved by Apple for the App ID and enabled in the provisioning profile. macOS is not
+	     gated by this (its App Sandbox network.client/server cover it), hence its separate file.
+	     Approved and provisioned, so it's enabled here and PunktfunkConnection.wakeOnLANAvailable
+	     is true on iOS/tvOS too. -->
+	<key>com.apple.developer.networking.multicast</key>
+	<true/>
+	<!-- App Group: the shared UserDefaults suite (group.io.unom.punktfunk) that both the app and
+	     the Widget/Live-Activity extension read — the saved-host store moved there so a launcher
+	     widget can see it (HostStore reads UserDefaults(suiteName:)). Must be registered on the
+	     developer portal and enabled in the provisioning profile for BOTH app ids
+	     (io.unom.punktfunk + io.unom.punktfunk.widgets). tvOS carries the key harmlessly. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.io.unom.punktfunk</string>
+	</array>
+</dict>
+</plist>

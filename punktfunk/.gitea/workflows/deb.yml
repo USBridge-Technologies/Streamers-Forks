@@ -1,0 +1,825 @@
+# Build the punktfunk .debs and publish them to Gitea's Debian package registry, so Debian and
+# Ubuntu boxes get new builds via `apt update && apt upgrade`. Five jobs; the four builders all
+# publish to the same apt distribution/component, and the fifth checks the result:
+#
+#   build-publish       — client + web + scripting, on the Ubuntu 26.04 rust-ci image (the client
+#                         needs 24.04-absent libs: SDL3, GTK4 ≥ 4.20).
+#   build-publish-client-arm64
+#                       — the same client package for arm64, CROSS-compiled on the same amd64
+#                         runner in the rust-ci-arm64cross image. No host counterpart: the Linux
+#                         host's encode stack is x86 (NVENC/QSV/AMF).
+#   build-publish-host  — the HOST, on the Ubuntu 24.04 rust-ci-noble image. That lowers the host's
+#                         glibc floor to 2.39, so the ONE host .deb installs on Ubuntu 24.04 LTS
+#                         through 26.04 — and, for free, on Debian 13.
+#                         (A 26.04-built host .deb is uninstallable on 24.04 — the reason this job
+#                         exists; see packaging/debian/README.md.)
+#   build-publish-gamescope
+#                       — the patched `punktfunk-gamescope`, on DEBIAN 13. It lived in the host job
+#                         until 2026-08 and never once succeeded there: noble's wayland is 1.22.0
+#                         and the vendored wlroots floors it at 1.23.1, so v0.26.0 and v0.27.0 both
+#                         shipped without the package while the docs told apt users to install it.
+#   smoke-install       — installs what was just published, from the registry, in pristine
+#                         ubuntu:24.04 / ubuntu:26.04 / debian:trixie images. Nothing here used to
+#                         install a package it built, which is how both of the above survived.
+#
+# Both compute VERSION identically (scripts/ci/pf-version.sh is deterministic per commit), so the
+# host and client packages always share a version line. The release-attach helpers are race-safe
+# (ensure_release create-or-fetch; upsert_asset only conflicts on same-name), so the jobs run parallel.
+#
+# Registry (public, unom org): https://git.unom.io/unom/-/packages
+# Box setup (once):  see packaging/debian/README.md
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (shared with docker.yml).
+name: deb
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    branches: [main]
+    # Scope canary builds to what this artifact is built FROM — a docs-only or
+    # web-only push should not light up the whole fleet. Applies to branch pushes;
+    # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
+    paths:
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-capture/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-clipboard/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-dmabuf/**'
+      - 'crates/pf-driver-proto/**'
+      - 'crates/pf-encode/**'
+      - 'crates/pf-encode-core/**'
+      - 'crates/pf-frame/**'
+      - 'crates/pf-gpu/**'
+      - 'crates/pf-host-config/**'
+      - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
+      - 'crates/pf-libva/**'
+      - 'crates/pf-paths/**'
+      - 'crates/pf-paths-win/**'
+      - 'crates/pf-portal/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-update/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pf-vaapi/**'
+      - 'crates/pf-v4l2dec/**'
+      - 'crates/pf-v4l2/**'
+      - 'crates/pf-vdisplay/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-win-display/**'
+      - 'crates/pf-zerocopy/**'
+      - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
+      - 'crates/punktfunk-encode-worker/**'
+      - 'crates/punktfunk-host/**'
+      - 'crates/punktfunk-tray/**'
+      - 'crates/pyrowave-sys/**'
+      - 'clients/linux/**'
+      - 'clients/session/**'
+      - 'clients/shared/**'
+      - 'clients/cli/**'
+      - 'web/**'
+      - 'sdk/**'
+      - 'api/openapi.json'
+      - 'packaging/debian/**'
+      - 'packaging/gamescope/**'
+      - 'packaging/linux/*.conf'
+      - 'packaging/linux/*.desktop'
+      - 'packaging/linux/*.rules'
+      - 'packaging/linux/*.service'
+      - 'packaging/linux/*.sh'
+      - 'packaging/linux/*.ufw'
+      - 'packaging/linux/*.xml'
+      - 'packaging/linux/icons/**'
+      - 'packaging/bazzite/host.env'
+      - 'packaging/kde/host.env'
+      - 'LICENSE-MIT'
+      - 'LICENSE-APACHE'
+      - 'README.md'
+      - 'THIRD-PARTY-NOTICES.txt'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/60-punktfunk.rules'
+      - 'scripts/60-punktfunk-dualsense.conf'
+      - 'scripts/70-punktfunk-client.rules'
+      - 'scripts/99-punktfunk-net.conf'
+      - 'scripts/99-punktfunk-client-net.conf'
+      - 'scripts/headless/**'
+      - 'scripts/host.env.example'
+      - 'scripts/io.unom.punktfunk.dm-helper.policy'
+      - 'scripts/pf-dm-helper'
+      - 'scripts/punktfunk-host-desktop-session.conf'
+      - 'scripts/punktfunk-host.service'
+      - 'scripts/punktfunk-kde-session.service'
+      - 'scripts/punktfunk-modules.conf'
+      - 'scripts/punktfunk-scripting.service'
+      - 'scripts/punktfunk-web-init.service'
+      - 'scripts/punktfunk-web.service'
+      - 'scripts/web-init.sh'
+      - 'scripts/alsa-ucm2/**'
+      - 'scripts/ci/assert-cap-matrix.sh'
+      - 'scripts/ci/deb-install-smoke.sh'
+      - 'scripts/ci/drop-partial-target.sh'
+      - 'scripts/ci/ensure-sccache.sh'
+      - 'scripts/ci/gitea-release.sh'
+      - 'scripts/ci/pf-version.sh'
+      - 'scripts/ci/retry.sh'
+      - 'ci/skia-binaries.sh'
+      - 'ci/bun.env'
+      - 'ci/install-bun.sh'
+      - '.gitea/workflows/deb.yml'
+    # Single project version: a `vX.Y.Z` tag is THE release for every platform (see
+    # docs-site channels.md). The old version-shadow (a client tag shipping a host package
+    # that outranked rolling builds) is now structurally impossible — main publishes to the
+    # `canary` apt distribution, tags to `stable`, so the two never share a version line.
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  COMPONENT: main
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # CMake-driven C/C++ through the same cache (aws-lc-sys, the vendored libopus). Workflow level
+  # is safe — it names no triple; the CC_*/CXX_* half is per-job below, because the arm64 leg's
+  # image needs its own CC_x86_64 wrapper. See ci.yml's `rust` job for the full note.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 90
+    env:
+      # ⚠ Job-scoped, never workflow-scoped: build-publish-client-arm64 runs in the cross image,
+      # whose own CC_x86_64_unknown_linux_gnu=pf-host-cc must survive. See ci.yml's `rust` job.
+      CC_x86_64_unknown_linux_gnu: sccache cc
+      CXX_x86_64_unknown_linux_gnu: sccache c++
+      # Prebuilt Skia from disk, never github.com; see ci/skia-binaries.sh.
+      SKIA_BINARIES_URL: file:///opt/skia-binaries/skia-binaries-{key}.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
+      # images; this heals the job while the running :latest predates the bake.
+      - name: sccache (no-op once the image bakes it)
+        run: sh scripts/ci/ensure-sccache.sh
+
+      - name: Version + channel
+        # vX.Y.Z tag -> X.Y.Z in the `stable` apt distribution; a main push -> <next-minor>~ciN.g<sha>
+        # in `canary`, where the '~' sorts below the eventual tag (scripts/ci/pf-version.sh owns the
+        # rule, see channels.md). Computed BEFORE the build so it's stamped into the binary
+        # (PUNKTFUNK_BUILD_VERSION -> build.rs -> --version).
+        run: |
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "package version $PF_VERSION -> apt distribution '$PF_CHANNEL'"
+
+      # dpkg-shlibdeps (Depends resolution) + dpkg-deb live in dpkg-dev. The client's link
+      # deps are also baked into the rust-ci image, but this job runs against the image
+      # from the PREVIOUS push (docker.yml bootstrap note) — keep it green across image
+      # changes; a no-op once the image has them.
+      - name: dpkg-dev + client link deps
+        run: |
+          apt-get update
+          # python3 is used by scripts/ci/gitea-release.sh for the stable-tag release attach.
+          # No libvulkan-dev: nothing here compiles or links against Vulkan (ash dlopens
+          # libvulkan and pf-vkdecode binds nothing at build time), so neither the compile nor
+          # dpkg-shlibdeps — which resolves DT_NEEDED sonames only — ever asks for it. The
+          # client's `Depends: libvulkan1` is added by hand in packaging/debian/build-client-deb.sh
+          # precisely because a dlopen is invisible to shlibdeps.
+          apt-get install -y --no-install-recommends dpkg-dev python3 \
+            libgtk-4-dev libadwaita-1-dev libsdl3-dev
+
+      - name: Prebuilt Skia (no-op once the image bakes it)
+        run: sh ci/skia-binaries.sh x86_64-unknown-linux-gnu
+
+      # The cargo-home (registry/git) cache IS shared with ci.yml — those are pure downloads,
+      # profile-independent, and deduping them across the fleet is the whole point. The target
+      # cache is NOT; see below.
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+      - id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          # `-release-`, never ci.yml's debug key: a job that hits a shared key exactly skips its
+          # save, so this release tree would never be stored.
+          key: cargo-target-release-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-release-v3-${{ env.rustc }}-
+      # A failed restore reads as a miss, so the save at the end of the job replaces the entry.
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-release-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
+
+      - name: Build release clients
+        env:
+          PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binaries (build.rs)
+        run: |
+          git config --global --add safe.directory "$PWD"
+          # FOUR binaries ship in the client .deb, so all four are built here: the GTK shell,
+          # punktfunk-client-session (the Vulkan/Skia streamer the shell execs for a connect),
+          # punktfunk-cli (the headless `punktfunk` front-end), and pf-update (the root helper
+          # behind `punktfunk-client --apply-update`). build-client-deb.sh installs all four;
+          # leaving punktfunk-cli out here made it fall over on `install: No such file or
+          # directory`, because its build-if-missing guard only tested the first two and so decided
+          # everything was already built. The HOST is built separately in the build-publish-host
+          # job (Ubuntu 24.04 image).
+          cargo build --release --locked \
+            -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli -p pf-update
+
+      # ── The web console, built ONCE per (web+sdk content, bun) rather than once per job ────────
+      # This bundle was being rebuilt six times on every push — ci.yml, here, both RPM legs, arch,
+      # and the docker app image — at ~2.5 min each, for output that is a pure function of web/ and
+      # sdk/. windows-host.yml has cached it this way for a while; this is the same arrangement for
+      # the Linux packaging legs, sharing one key family so a hit in one warms the others.
+      #
+      # The bun version is IN THE KEY. Each builder image installs its own bun (rust-ci, fedora-rpm
+      # and arch-ci each run the bun.sh installer at image-build time), so without it a bundle built
+      # by one image's bun could be shipped by a job running a different one. They are usually the
+      # same version and do share; when they diverge, they simply stop sharing instead of silently
+      # mixing.
+      - name: Web console cache key
+        run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
+      - name: Cache the built web console
+        id: webconsole
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: web/.output
+          key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
+
+      - name: Build + smoke-boot web console (bun preset)
+        # Skipped when the cache already holds this exact (web+sdk, bun) bundle — the assertion step
+        # below is what makes that safe. The bundle in the cache was smoke-booted by the run that
+        # produced it, and ci.yml's `web` job still builds and tests the console on every push.
+        if: steps.webconsole.outputs.cache-hit != 'true'
+        # Gate the .deb on a real bun boot: the punktfunk-web .deb runs the Nitro `bun` preset
+        # (our Bun.serve TLS entry), so prove the build IS a bun bundle and serves /login.
+        # No TLS env here, so the custom entry binds plain HTTP — the smoke curl stays simple.
+        run: |
+          # bun builds AND runs the console, and build-bun-deb.sh vendors it into punktfunk-bun
+          # (BUN_BIN, below). Baked into the rust-ci image; the script heals an image that lags the
+          # pin in ci/bun.env (docker.yml bootstrap lag).
+          sh ci/install-bun.sh
+          export PATH="$HOME/.bun/bin:$PATH"
+          cd web
+          # --ignore-scripts, like every other web install in CI (ci.yml, web-screenshots.yml,
+          # windows-host.yml, the SDK installs). This was the ONE site still running lifecycle
+          # scripts, and web's `postinstall` is `bun2nix -o bun.nix` — a Nix codegen step this job
+          # neither consumes nor commits, whose only effect here is to make the install depend on
+          # bun2nix resolving. `build` re-runs its own `prebuild` codegen regardless.
+          # Retried: bun's download-and-extract is single-shot, and a truncated tarball reads as
+          # `Fail extracting tarball` (ci.yml's web job has the measurement).
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+          bun run build
+          if ! grep -q 'Bun\.serve' .output/server/index.mjs; then
+            echo "ERROR: web build is not a bun bundle — need the 'bun' preset + custom entry"; exit 1
+          fi
+          PORT=3009 HOST=127.0.0.1 PUNKTFUNK_UI_PASSWORD=ci bun .output/server/index.mjs &
+          NP=$!; sleep 3
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3009/login || echo 000)
+          kill "$NP" 2>/dev/null || true
+          echo "web console smoke: /login -> $code"
+          [ "$code" = 200 ] || { echo "ERROR: web console failed to boot under bun"; exit 1; }
+
+      # ⚠ NOT optional, and it must run on BOTH paths (cache hit and fresh build). The packaging
+      # scripts treat a missing web/.output as "build it yourself", which is right for a local run
+      # and wrong here: it would silently turn a broken cache restore into a slow, quiet rebuild, or
+      # — with the build step skipped and the restore empty — into a package with no console at all.
+      # windows-host.yml shipped exactly that in 0.22.1/0.22.2 (an unset WEB_OUTPUT_DIR behind a
+      # single Write-Host), which is why its equivalent step throws too. Fail loudly instead.
+      - name: The console must exist (cache hit or fresh build)
+        run: |
+          if [ ! -f web/.output/server/index.mjs ]; then
+            echo "::error::web/.output is missing — neither the cache restore nor the build produced it"
+            exit 1
+          fi
+          grep -q 'Bun\.serve' web/.output/server/index.mjs || {
+            echo "::error::web/.output is not a bun bundle (wrong nitro preset)"; exit 1; }
+          echo "web console present: $(du -sh web/.output | cut -f1)"
+
+      - name: Build .debs
+        run: |
+          export PATH="$HOME/.bun/bin:$PATH"
+          # host .deb is built in build-publish-host (Ubuntu 24.04 image); this job ships the rest.
+          VERSION="$VERSION" bash packaging/debian/build-client-deb.sh
+          # The one vendored runtime web and scripting both depend on. Reuse CI's pinned bun.
+          VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-bun-deb.sh
+          VERSION="$VERSION" bash packaging/debian/build-web-deb.sh
+          # The plugin/script runner (bun-bundled Effect SDK).
+          VERSION="$VERSION" bash packaging/debian/build-scripting-deb.sh
+
+      # Visibility only. With the target cache now actually saving release artifacts (see the
+      # cache key note above), this is how a regression in that arrangement becomes visible:
+      # a run that suddenly reports thousands of misses is a cache that stopped restoring.
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
+
+      - name: Publish to the Gitea apt registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          for DEB in dist/*.deb; do
+            echo "uploading $DEB"
+            # A re-tagged release re-fires this workflow and the apt registry 409s on duplicate
+            # package versions — delete any prior copy of this exact name/version/arch first
+            # (404 on the first publish is fine).
+            NAME=$(dpkg-deb -f "$DEB" Package)
+            VER=$(dpkg-deb -f "$DEB" Version)
+            ARCH=$(dpkg-deb -f "$DEB" Architecture)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/$NAME/$VER/$ARCH" || true
+            # PAT owner (enricobuehler), not the push actor — matches docker.yml's registry login.
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
+          done
+          echo "published to $OWNER/debian $DISTRIBUTION/$COMPONENT"
+
+      # On a real release, also attach the .debs to the unified Gitea Release so they're on the
+      # downloads page next to every other platform's artifact (canary builds live in the apt
+      # `canary` distribution above — no release page for those).
+      - name: Attach .debs to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for DEB in dist/*.deb; do
+            upsert_asset "$RID" "$DEB"
+          done
+
+      # Only main writes the target cache, so no branch dispatch feeds a published build. Only on
+      # a miss: the version-stamped binaries rebuild every run, so a save per push costs more
+      # than it saves.
+      - name: Save target
+        if: github.ref == 'refs/heads/main' && steps.target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-release-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+
+  # ---------------------------------------------------------------------------------------------
+  # The HOST .deb — built on Ubuntu 24.04 (noble), so it installs on Ubuntu 24.04 LTS through
+  # 26.04 (see the file header + packaging/debian/README.md). Runs in
+  # parallel with build-publish and publishes to the SAME distribution/component; both version steps
+  # run `pf-version.sh --format deb`, so host and clients share a version line.
+  build-publish-host:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci-noble:latest
+    timeout-minutes: 90
+    env:
+      # ⚠ Job-scoped — see build-publish above and ci.yml's `rust` job.
+      CC_x86_64_unknown_linux_gnu: sccache cc
+      CXX_x86_64_unknown_linux_gnu: sccache c++
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
+      # images; this heals the job while the running :latest predates the bake.
+      - name: sccache (no-op once the image bakes it)
+        run: sh scripts/ci/ensure-sccache.sh
+
+      - name: Version + channel
+        run: |
+          git config --global --add safe.directory "$PWD"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "host package version $PF_VERSION -> apt distribution '$PF_CHANNEL'"
+
+      # dpkg-shlibdeps/dpkg-deb are baked into rust-ci-noble; python3 is for the release-attach
+      # helper. Re-install defensively so the job stays green against the PREVIOUS image on the
+      # same push (docker.yml bootstrap lag) — a no-op once the image ships them.
+      - name: dpkg-dev + python3
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends dpkg-dev python3
+
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+      - id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          # Own key: this target dir is built against 24.04's glibc/toolchain and must NOT share
+          # ci.yml's 26.04 target cache (mixing would poison both). It is also the only job using
+          # this prefix, so — unlike the amd64/arm64 pairs above — it has always been able to save
+          # and restore its own release artifacts. `-release-` is spelled out anyway so the whole
+          # file reads consistently and nobody "unifies" it back into a shared key later.
+          key: cargo-target-noble-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-noble-release-v1-${{ env.rustc }}-
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-noble-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
+
+      - name: Build release host
+        env:
+          PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binary (build.rs)
+        run: |
+          git config --global --add safe.directory "$PWD"
+          # Same features the old combined build used: --nvenc (direct-SDK NVENC, real RFI on NVIDIA;
+          # NVENC/CUDA is dlopen'd — no link dep, so this image needs no libcuda stub) + --vulkan-encode
+          # (raw VK_KHR_video_encode_h265 on AMD/Intel, pure ash).
+          #
+          # punktfunk-tray is deliberately NOT in this invocation — build-deb.sh builds it separately,
+          # and that split is load-bearing (see the identical note in the RPM spec / Arch PKGBUILD):
+          # cargo unifies features across one build, so co-building the tray with the host pulls the
+          # host's ashpd -> zbus/tokio onto the tray's shared zbus and the tray panics at every launch
+          # with "there is no reactor running, must be called from the context of a Tokio 1.x runtime".
+          # It WAS listed here, which is why only the .deb shipped a crashing tray while the RPM and
+          # Arch packages — which already split it — were fine.
+          #
+          # punktfunk-encode-worker IS in this invocation: it is the capability-carrying PyroWave
+          # encode worker that ships next to the host in /usr/bin, and build-deb.sh only builds it
+          # if the artifact is missing — building it here keeps it on the same sccache pass as the
+          # host. Unlike the tray it shares the host's dependency graph by design (v1 accepts that
+          # the worker shares the host dependency graph), so feature unification here is harmless.
+          cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
+            -p punktfunk-host -p punktfunk-encode-worker
+
+      - name: Build host .deb
+        run: |
+          VERSION="$VERSION" bash packaging/debian/build-deb.sh
+
+      # Visibility only — placed here, right after the last compile, rather than at the end of the
+      # job: the gamescope gate below must stay the final step (see its own note).
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
+
+      # Read the capability matrix out of the BUILT .deb before it is published. dpkg carries no
+      # capability metadata — the postinst applies them — so this reads the postinst that will
+      # actually run on a user's box, plus the payload. 0.26.0-1 granted the host cap_sys_nice=ep
+      # from exactly that postinst and killed every KDE desktop session while every board stayed
+      # green: host must carry NOTHING, worker exactly cap_sys_nice=ep. `--self-test` first so a
+      # guard that can no longer fail takes the job down instead of waving the release through.
+      - name: Assert the capability matrix (host .deb)
+        run: |
+          bash scripts/ci/assert-cap-matrix.sh --self-test
+          bash scripts/ci/assert-cap-matrix.sh dist/punktfunk-host_*.deb
+
+      - name: Publish to the Gitea apt registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          for DEB in dist/*.deb; do
+            echo "uploading $DEB"
+            NAME=$(dpkg-deb -f "$DEB" Package)
+            VER=$(dpkg-deb -f "$DEB" Version)
+            ARCH=$(dpkg-deb -f "$DEB" Architecture)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/$NAME/$VER/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
+          done
+          echo "published host to $OWNER/debian $DISTRIBUTION/$COMPONENT"
+
+      - name: Attach the host .deb to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for DEB in dist/*.deb; do
+            upsert_asset "$RID" "$DEB"
+          done
+
+      # Same rule as build-publish's save.
+      - name: Save target
+        if: github.ref == 'refs/heads/main' && steps.target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-noble-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+
+  # ---------------------------------------------------------------------------------------------
+  # `punktfunk-gamescope` for apt — the patched build that gives a gamescope session HDR, a cursor,
+  # and the client's real refresh rate instead of a hardcoded 60 Hz. Same reasoning as the RPM leg
+  # in rpm.yml: without a package, a Debian/Ubuntu box has no route to it except compiling by hand.
+  #
+  # ⚠ THIS IS ITS OWN JOB, ON DEBIAN 13, BECAUSE THE NOBLE BUILD COULD NEVER HAVE WORKED.
+  # It used to be a few best-effort steps inside build-publish-host (Ubuntu 24.04), where it failed
+  # every single time:
+  #     wlroots| Dependency wayland-server found: NO found 1.22.0 but need: '>=1.23.1'
+  # Our pin vendors wlroots 0.19.3, which floors wayland-server at 1.23.1; noble ships 1.22.0 and
+  # always will. v0.26.0 AND v0.27.0 both shipped with no gamescope .deb — while the release notes
+  # and docs-site told apt users to install it — because every rung of that path was a `::warning::`
+  # that returned 0, and the one hard gate ran last by design (so good artifacts still publish) and
+  # was simply never acted on. Moving it to trixie makes the build possible; making it a job of its
+  # own makes its failure visible instead of a footnote in someone else's log.
+  #
+  # Debian 13 is the OLDEST apt distro the tree configures on (wayland 1.23.1, libxcb-errors,
+  # libdisplay-info 0.2). The binary it produces needs GLIBC_2.38 and links no libstdc++, so what
+  # actually bounds it is wayland: Debian 13 and Ubuntu 26.04 YES, Ubuntu 24.04 NO — and 24.04
+  # could not run this binary however it was built, so nothing was lost by leaving noble.
+  build-publish-gamescope:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-gamescope-trixie:latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Only the channel is used here. The package version is the gamescope upstream version + our
+      # patch level, which build-gamescope-deb.sh derives itself; this package moves on its own
+      # cadence, not the punktfunk version line.
+      - name: Channel
+        run: |
+          git config --global --add safe.directory "$PWD"
+          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_CHANNEL
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "gamescope -> apt distribution '$PF_CHANNEL'"
+
+      # CACHED on packaging/gamescope/** alone — it depends on nothing else in this repo, so a
+      # normal push restores a binary instead of spending ~10 minutes on someone else's tree.
+      # Keyed `-trixie-` so the noble cache entries (which only ever held misses) can't be hit.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: gamescope
+        with:
+          path: gs-cache
+          key: punktfunk-gamescope-trixie-${{ hashFiles('packaging/gamescope/**') }}
+
+      # NOT best-effort, unlike the noble version of this step. Every dependency now comes from the
+      # image (which asserts the wayland floor at build time), so a failure here is a real
+      # regression in the tree or the pin — exactly the thing the previous arrangement hid.
+      - name: Build the patched gamescope
+        if: steps.gamescope.outputs.cache-hit != 'true'
+        # `--extra-fallback libdisplay-info` is what makes ONE .deb serve both Debian 13 and
+        # Ubuntu 26.04. Built against the distro's copy, the package picks up
+        # `Depends: libdisplay-info2 (>= 0.2.0)` on trixie — and Ubuntu 26.04 carries
+        # libdisplay-info **3** (0.3.0), so apt refuses it there ("Depends libdisplay-info2 …" —
+        # measured, not predicted). gamescope vendors the library as a submodule, so linking the
+        # vendored copy drops the dependency entirely. Same reasoning the build script already
+        # applies to wlroots: a binary we SHIP must not follow the build host's shared libraries.
+        run: |
+          bash packaging/gamescope/build-punktfunk-gamescope.sh \
+            --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)" \
+            --extra-fallback libdisplay-info
+          # The WHOLE staged tree, not just the binary: it also carries the Vulkan WSI layer built
+          # beside the compositor, which is the only route to an HDR10 swapchain for a nested game.
+          mkdir -p gs-cache && cp -a gs-stage/. gs-cache/
+
+      # The binary must RUN, not merely link: `--version` is what the old job used as its ship
+      # gate, and it is the cheapest proof that the static-libstdc++ trick and the vendored wlroots
+      # actually produced a working compositor.
+      - name: Build the .deb
+        run: |
+          gs-cache/usr/bin/punktfunk-gamescope --version
+          bash packaging/debian/build-gamescope-deb.sh --stage gs-cache
+
+      - name: Publish to the Gitea apt registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          for DEB in dist/punktfunk-gamescope_*.deb; do
+            echo "uploading $DEB"
+            NAME=$(dpkg-deb -f "$DEB" Package)
+            VER=$(dpkg-deb -f "$DEB" Version)
+            ARCH=$(dpkg-deb -f "$DEB" Architecture)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/$NAME/$VER/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
+          done
+          echo "published gamescope to $OWNER/debian $DISTRIBUTION/$COMPONENT"
+
+      - name: Attach the gamescope .deb to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for DEB in dist/punktfunk-gamescope_*.deb; do
+            upsert_asset "$RID" "$DEB"
+          done
+
+  # ---------------------------------------------------------------------------------------------
+  # The aarch64 CLIENT .deb. Cross-compiled on the ordinary amd64 runner in the
+  # punktfunk-rust-ci-arm64cross image (the rust-ci toolchain + an arm64 multiarch sysroot — see
+  # ci/rust-ci-arm64cross.Dockerfile); there is no arm64 runner in the fleet and none is needed.
+  # Client only, by decision: the Linux host encodes with NVENC/QSV/AMF, all x86.
+  # Publishes to the same distribution/component as the amd64 jobs — the apt registry keys pool
+  # entries by arch, so `apt` on an arm64 box picks this one up with no client-side configuration.
+  build-publish-client-arm64:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci-arm64cross:latest
+    timeout-minutes: 90
+    env:
+      SKIA_BINARIES_URL: file:///opt/skia-binaries/skia-binaries-{key}.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
+      # images; this heals the job while the running :latest predates the bake.
+      #
+      # NOTE this job deliberately sets no CC_x86_64_unknown_linux_gnu: the cross image points it
+      # at a wrapper that keeps host-side build-script probes off the arm64 include dirs. The
+      # target-side compiles go through CC_aarch64_unknown_linux_gnu (also set by the image) and
+      # are not sccache-wrapped.
+      - name: sccache (no-op once the image bakes it)
+        run: sh scripts/ci/ensure-sccache.sh
+
+      # pf-version.sh is deterministic per commit, so the arm64 package shares the amd64 version line.
+      - name: Version + channel
+        run: |
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "package version $PF_VERSION -> apt distribution '$PF_CHANNEL' (arm64)"
+
+      # dpkg-shlibdeps + dpkg-deb. The arm64 link deps themselves are the cross image's whole
+      # point and are already baked in; python3 is for scripts/ci/gitea-release.sh.
+      - name: dpkg-dev
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends dpkg-dev python3
+
+      - name: Prebuilt Skia (no-op once the image bakes it)
+        run: sh ci/skia-binaries.sh aarch64-unknown-linux-gnu
+
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+      - id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          # Its OWN key: aarch64 artifacts never share the amd64 target cache, and `-release-`
+          # keeps them apart from ci.yml's `rust-arm64` debug tree for the reason above.
+          key: cargo-target-arm64-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-arm64-release-v1-${{ env.rustc }}-
+      - name: Drop a partial target restore
+        run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-arm64-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
+
+      - name: Build the arm64 client .deb
+        env:
+          PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binaries (build.rs)
+        run: |
+          git config --global --add safe.directory "$PWD"
+          # The restored target holds the binaries the cache was saved with, and the packer
+          # ships any binary it finds. Build first, as build-publish does.
+          cargo build --release --locked --target aarch64-unknown-linux-gnu \
+            -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli -p pf-update
+          ARCH=arm64 TARGET=aarch64-unknown-linux-gnu \
+            bash packaging/debian/build-client-deb.sh
+          # Fail here rather than shipping an amd64 binary under an arm64 package name.
+          readelf -h target/aarch64-unknown-linux-gnu/release/punktfunk-session \
+            | grep -q AArch64 || { echo "ERROR: session binary is not AArch64"; exit 1; }
+          # The update check compares the version the shell carries; it must be this run's.
+          grep -qaF "$VERSION" target/aarch64-unknown-linux-gnu/release/punktfunk-client \
+            || { echo "ERROR: punktfunk-client does not carry version $VERSION"; exit 1; }
+
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
+
+      - name: Publish to the Gitea apt registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          for DEB in dist/*.deb; do
+            echo "uploading $DEB"
+            NAME=$(dpkg-deb -f "$DEB" Package)
+            VER=$(dpkg-deb -f "$DEB" Version)
+            ARCH=$(dpkg-deb -f "$DEB" Architecture)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/$NAME/$VER/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
+          done
+          echo "published arm64 client to $OWNER/debian $DISTRIBUTION/$COMPONENT"
+
+      - name: Attach the arm64 .deb to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for DEB in dist/*.deb; do
+            upsert_asset "$RID" "$DEB"
+          done
+
+      # Same rule as build-publish's save.
+      - name: Save target
+        if: github.ref == 'refs/heads/main' && steps.target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-arm64-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+
+  # ---------------------------------------------------------------------------------------------
+  # Does the thing we just published actually INSTALL? Nothing in this repo asked that before, and
+  # the cost of not asking was two independent, long-lived facts nobody knew:
+  #   * `punktfunk-host` has installed cleanly on Debian 13 for a long time — while docs-site said
+  #     "Debian isn't a supported target … nobody has verified it".
+  #   * `punktfunk-gamescope` was missing from apt entirely across two releases.
+  # Both are exactly what a five-minute install check catches, so it is now a job.
+  #
+  # It runs on the RUNNER (no `container:`) and drives docker directly — the same access
+  # docker.yml's image builds use — because the check must happen in a pristine distro image, not
+  # in a builder image with the deps already present.
+  #
+  # It installs FROM THE REGISTRY, after the publish jobs, rather than from a local .deb: that
+  # exercises the real path a user takes (repo key, apt distribution, dependency resolution against
+  # the distro's own package set), and it matches this workflow's established order — publish the
+  # good artifacts first, go red afterwards, never let a gate withhold a shipping fix.
+  smoke-install:
+    needs: [build-publish, build-publish-host, build-publish-gamescope]
+    # `needs` for ORDER only — this must still run when a builder went red, or the failure that
+    # matters most (a package that did not publish) is exactly the one that skips its own check and
+    # leaves the run looking merely "partly red" instead of saying what a user would hit.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Recomputes the SAME version string the builder jobs stamped — pf-version.sh is
+      # deterministic per commit and GITHUB_RUN_NUMBER is shared across a run's jobs — so the check
+      # below can insist the registry is serving THIS run's build. Without that, a smoke job that
+      # beats the index regeneration installs the previous build, passes, and proves nothing.
+      - name: Channel + expected version
+        run: |
+          git config --global --add safe.directory "$PWD"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "EXPECT_VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "expecting $PF_VERSION in apt distribution '$PF_CHANNEL'"
+
+      # The support matrix, asserted rather than asserted-in-prose. Each row names the packages
+      # that MUST install on that distro; anything absent from the row is expected not to and is
+      # not checked here (the client's glibc 2.43 floor keeps it off 24.04 and Debian 13 —
+      # see docs-site/content/docs/(guide)/(install)/debian.mdx).
+      - name: Install from the apt registry on every supported distro
+        run: bash scripts/ci/deb-install-smoke.sh
+        env:
+          PF_APT_DISTRIBUTION: ${{ env.DISTRIBUTION }}
+          PF_EXPECT_VERSION: ${{ env.EXPECT_VERSION }}

@@ -1,0 +1,397 @@
+# Build + push the dockerized pieces.
+#
+# Two very different image families now:
+#
+#   BUILDER images (punktfunk-rust-ci{,-noble,-arm64cross}, punktfunk-fedora{,44}-rpm)
+#     live on the LAN registry (home-ci-core — unom/infra runners/ci-core/) and are
+#     CONTENT-KEYED: the tag is a hash of what they are built from (the ci/ tree, +
+#     rust-toolchain.toml for the cross image), and a build only happens when that key
+#     has no manifest yet. An app-only push costs one curl per builder image, pushes
+#     no builder bytes, and mints no per-SHA tag debris on the runners — the failure
+#     mode that filled the fleet's disks. `:latest` is re-pushed
+#     alongside every new key and is what the consuming workflows pin.
+#
+#     READS come from :5010 and need no credential. WRITES go to :5011 and need
+#     CI_REGISTRY_PASSWORD. Same store behind both — a registry keys by repository name,
+#     not by the host:port the client used — so an image pushed to :5011 is the same
+#     image every consumer pulls from :5010.
+#
+#   APP images (punktfunk-web, punktfunk-docs) are deployables: they keep going to the
+#     Gitea registry (git.unom.io) with :latest + :sha-<8> (+ :vX.Y.Z on tags), because
+#     unom-1 deploys pull from there and releases pin them.
+#
+# Host and clients are intentionally NOT containerized.
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (app images).
+# CI_REGISTRY_PASSWORD: repo Actions secret, the LAN registry's push credential for user
+# `ci`. Generated on ci-core into /srv/ci/stack/registry-secret; rotate in both places.
+#
+# --- security-review-2026-08-05 H-6, FIXED 2026-08-05 -------------------------------
+# The registry used to accept anonymous pushes from any LAN peer, and every
+# secret-bearing job in this repo runs INSIDE an image pulled from it. Attacker
+# position #1 of the project's own threat model did not need to break any signing
+# logic: push one tag, and the next android.yml run executes their code in the same job
+# that does `echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > release.jks`. Same shape for
+# rpm.yml (RPM_GPG_PRIVATE_KEY) and android-promote.yml (SERVICE_ACCOUNT_JSON).
+#
+# The infra half is done (unom/infra runners/ci-core/): :5010 serves GET/HEAD only and
+# refuses everything else with 405, :5011 demands basic auth on every request. The half
+# in this file is done below: pushes and release-tag manifest PUTs authenticate.
+#
+# ⚠ On the second half as the review originally worded it — "pin consumers by @sha256:
+# digest". We deliberately do something else, because after authentication the digest
+# pin no longer buys what it was meant to buy. The set of people who can overwrite a tag
+# is now exactly the set who can push to main and edit a pinned digest in this very
+# file: a pin defends against nobody it did not already trust, while costing a
+# two-commit dance on every ci/ change (~3x a month) during which consumers silently run
+# a builder image that predates the ci/ change they are testing.
+#
+# What actually closes the residual gap — a tag quietly overwritten out of band — is
+# making :latest a CHECKED function of the tree instead of a tag someone remembered to
+# move. The "Reconcile :latest" step below asserts on every run that :latest and
+# :ck-$KEY are the same digest, repairs it when they are not, and says so loudly. That
+# catches an out-of-band overwrite on the next push to main, needs no churn, and fixes
+# a real pre-existing bug on the side: reverting ci/ used to leave :latest pointing at
+# the newer build forever. Revisit inline digest pins if the push credential ever leaves
+# the maintainer trust set.
+#
+# Bootstrap note: consuming workflows pull <LAN>/punktfunk-rust-ci:latest, so the LAN
+# registry must hold a seeded :latest once (done 2026-07-29 from the last Gitea-registry
+# images); after that, this workflow keeps :latest current whenever ci/ changes.
+name: docker
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ci/**'
+      - 'web/**'
+      - 'docs-site/**'
+      - 'api/openapi.json'
+      - 'rust-toolchain.toml'
+      - '.dockerignore'
+      - '.gitea/scripts/reconcile-latest.sh'
+      - '.gitea/workflows/docker.yml'
+      - 'compose.production.yml'
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  # Read port (anonymous, GET/HEAD only) and write port (basic auth). Two doors onto
+  # one store; see the header.
+  CI_REGISTRY: 192.168.1.58:5010
+  CI_REGISTRY_PUSH: 192.168.1.58:5011
+
+jobs:
+  builders:
+    runs-on: ${{ matrix.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - image: punktfunk-rust-ci
+            dockerfile: ci/rust-ci.Dockerfile
+          # Ubuntu 24.04 LTS host builder: same purpose as rust-ci but lowers the host .deb's glibc
+          # floor to 2.39 and lowers the glibc floor, so the package installs on 24.04 LTS
+          # (rust-ci's 26.04 build is uninstallable there). Consumed by deb.yml's build-publish-host job.
+          - image: punktfunk-rust-ci-noble
+            dockerfile: ci/rust-ci-noble.Dockerfile
+          # Debian 13 gamescope builder. The gamescope .deb used to be built in the noble image
+          # and NEVER once succeeded there — noble's wayland is 1.22.0 and the vendored wlroots
+          # 0.19.3 floors it at 1.23.1, so two releases shipped without the package. trixie is the
+          # oldest apt distro the tree configures on. Consumed by deb.yml's build-publish-gamescope.
+          - image: punktfunk-gamescope-trixie
+            dockerfile: ci/gamescope-trixie.Dockerfile
+          - image: punktfunk-fedora-rpm
+            dockerfile: ci/fedora-rpm.Dockerfile
+          # Fedora 44 builder (Fedora KDE spin): same Dockerfile, newer base.
+          - image: punktfunk-fedora44-rpm
+            dockerfile: ci/fedora-rpm.Dockerfile
+            buildargs: --build-arg FEDORA_VERSION=44
+            keysuffix: -f44
+          # Android builder (JDK + SDK/NDK + cargo-ndk + sccache) — android.yml and
+          # android-screenshots.yml run in it; ~3 GB of per-run Google downloads became
+          # image layers.
+          - image: punktfunk-android-ci
+            dockerfile: ci/android-ci.Dockerfile
+          # Arch builder (base-devel + both makepkg legs' deps + bun + sccache) —
+          # arch.yml runs in it; ~1 GB of per-run pacman traffic became image layers.
+          - image: punktfunk-arch-ci
+            dockerfile: ci/arch-ci.Dockerfile
+          # Flatpak builder (flatpak + flatpak-builder + ostree + the GNOME 50 runtime/SDK
+          # and the rust-stable/llvm20 extensions) — flatpak.yml runs in it. ~5 min of
+          # per-run dnf plus a 168 s restore of a 1.5 GB runtime cache became image layers;
+          # the ci/ tree is also where the runtime pins now live, so a GNOME bump in the
+          # manifest means bumping this Dockerfile's ARGs in the same commit.
+          - image: punktfunk-flatpak-ci
+            dockerfile: ci/flatpak-ci.Dockerfile
+          # The same builder for flatpak.yml's aarch64 leg, built natively on the arm64 runner:
+          # flatpak-builder runs its sandbox in the target arch.
+          - image: punktfunk-flatpak-ci-arm64
+            dockerfile: ci/flatpak-ci.Dockerfile
+            runner: linux-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The key is the git TREE HASH of ci/ — every byte any of these Dockerfiles can see
+      # (they all use ci/ as build context). One key for the whole family on purpose: a
+      # change to any of them re-keys all four, and a spurious rebuild of a sibling is
+      # cheap, rare, and infinitely better than a stale one.
+      - name: Content key
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "KEY=ck-$(git rev-parse HEAD:ci | cut -c1-12)${{ matrix.keysuffix }}" >> "$GITHUB_ENV"
+
+      - name: Check whether this key already exists
+        id: exists
+        run: |
+          ACCEPT='Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          if curl -sf -o /dev/null -H "$ACCEPT" \
+              "http://$CI_REGISTRY/v2/${{ matrix.image }}/manifests/$KEY"; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ matrix.image }}:$KEY already in the LAN registry — nothing to build"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Tagged for the WRITE port: :5010 refuses a push outright, so a tag that names it
+      # can only fail. Consumers still pull the identical image from :5010.
+      - name: Build
+        if: steps.exists.outputs.hit == 'false'
+        # --pull is cheap now: base images come through the ci-core pull-through mirror.
+        run: |
+          docker build --pull ${{ matrix.buildargs }} \
+            -f "${{ matrix.dockerfile }}" \
+            -t "$CI_REGISTRY_PUSH/${{ matrix.image }}:$KEY" \
+            -t "$CI_REGISTRY_PUSH/${{ matrix.image }}:latest" \
+            ci
+
+      # Gated like Build/Push: only the docker CLI needs this login (Reconcile and Tag-for-release
+      # authenticate via curl -u), so a cache-hit job with nothing to push must not be able to fail
+      # on a login it never uses — proven on run 16013, where a host with a misconfigured daemon
+      # failed exactly here on a hit=true leg.
+      - name: Log in to the LAN registry
+        if: steps.exists.outputs.hit == 'false'
+        run: |
+          echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY_PUSH" -u ci --password-stdin
+        env:
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+
+      - name: Push
+        if: steps.exists.outputs.hit == 'false'
+        run: |
+          docker push "$CI_REGISTRY_PUSH/${{ matrix.image }}:$KEY"
+          docker push "$CI_REGISTRY_PUSH/${{ matrix.image }}:latest"
+
+      # :latest must be whatever ci/ says it is, on every run — not only on the runs that
+      # happened to build. Two things break that: an out-of-band overwrite (the H-6
+      # attack, now only reachable by someone holding the push credential), and a plain
+      # revert of ci/, which leaves :latest on the newer build because the older key is
+      # already a cache hit and nothing re-points it. Both look identical from here and
+      # both are repaired the same way, so repair and shout rather than fail the build.
+      - name: Reconcile :latest with the content key
+        run: .gitea/scripts/reconcile-latest.sh "${{ matrix.image }}" "$KEY"
+        env:
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+
+      # A release pins reproducible builder images without any rebuild: copy the key's
+      # manifest to a vX.Y.Z tag via the registry API (no image bytes move).
+      - name: Tag for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ACCEPT='Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          MT=$(curl -sfI -H "$ACCEPT" "http://$CI_REGISTRY/v2/${{ matrix.image }}/manifests/$KEY" \
+            | tr -d '\r' | sed -n 's/^[Cc]ontent-[Tt]ype: //p')
+          curl -sf -H "$ACCEPT" -o /tmp/manifest.json \
+            "http://$CI_REGISTRY/v2/${{ matrix.image }}/manifests/$KEY"
+          curl -sf -u "ci:$CI_REGISTRY_PASSWORD" -X PUT -H "Content-Type: $MT" \
+            --data-binary @/tmp/manifest.json \
+            "http://$CI_REGISTRY_PUSH/v2/${{ matrix.image }}/manifests/$GITHUB_REF_NAME"
+        env:
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+
+      # Today the job container is ephemeral (the ubuntu-24.04 label is a docker://
+      # image), so the credential docker login wrote would die with it anyway. Don't
+      # make that a load-bearing assumption about a runner label somebody may change to
+      # a host runner later.
+      - name: Log out of the LAN registry
+        if: always()
+        run: docker logout "$CI_REGISTRY_PUSH" || true
+
+  # The aarch64 CROSS builder — a SEPARATE job because it is `FROM punktfunk-rust-ci:latest`
+  # (the LAN copy) and so must not race the matrix entry that publishes that base. Consumed
+  # by the arm64 client legs in ci.yml/deb.yml. Its key also folds in rust-toolchain.toml:
+  # the Dockerfile installs the aarch64 target against the toolchain the workspace pins.
+  builders-arm64cross:
+    runs-on: ubuntu-24.04
+    needs: builders
+    timeout-minutes: 60
+    env:
+      IMAGE: punktfunk-rust-ci-arm64cross
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Content key
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "KEY=ck-$(printf '%s%s' "$(git rev-parse HEAD:ci)" "$(git rev-parse HEAD:rust-toolchain.toml)" | sha256sum | cut -c1-12)" >> "$GITHUB_ENV"
+
+      - name: Check whether this key already exists
+        id: exists
+        run: |
+          ACCEPT='Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          if curl -sf -o /dev/null -H "$ACCEPT" \
+              "http://$CI_REGISTRY/v2/$IMAGE/manifests/$KEY"; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$IMAGE:$KEY already in the LAN registry — nothing to build"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.exists.outputs.hit == 'false'
+        # Root context: it needs rust-toolchain.toml to install the target against the
+        # toolchain the workspace actually pins.
+        run: |
+          docker build --pull \
+            -f ci/rust-ci-arm64cross.Dockerfile \
+            -t "$CI_REGISTRY_PUSH/$IMAGE:$KEY" \
+            -t "$CI_REGISTRY_PUSH/$IMAGE:latest" \
+            .
+
+      # Same gate as the builders job above: the login only serves Push.
+      - name: Log in to the LAN registry
+        if: steps.exists.outputs.hit == 'false'
+        run: |
+          echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY_PUSH" -u ci --password-stdin
+        env:
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+
+      - name: Push
+        if: steps.exists.outputs.hit == 'false'
+        run: |
+          docker push "$CI_REGISTRY_PUSH/$IMAGE:$KEY"
+          docker push "$CI_REGISTRY_PUSH/$IMAGE:latest"
+
+      - name: Reconcile :latest with the content key
+        run: .gitea/scripts/reconcile-latest.sh "$IMAGE" "$KEY"
+        env:
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+
+      - name: Tag for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ACCEPT='Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          MT=$(curl -sfI -H "$ACCEPT" "http://$CI_REGISTRY/v2/$IMAGE/manifests/$KEY" \
+            | tr -d '\r' | sed -n 's/^[Cc]ontent-[Tt]ype: //p')
+          curl -sf -H "$ACCEPT" -o /tmp/manifest.json \
+            "http://$CI_REGISTRY/v2/$IMAGE/manifests/$KEY"
+          curl -sf -u "ci:$CI_REGISTRY_PASSWORD" -X PUT -H "Content-Type: $MT" \
+            --data-binary @/tmp/manifest.json \
+            "http://$CI_REGISTRY_PUSH/v2/$IMAGE/manifests/$GITHUB_REF_NAME"
+        env:
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+
+      - name: Log out of the LAN registry
+        if: always()
+        run: docker logout "$CI_REGISTRY_PUSH" || true
+
+  # Deployable app images — unchanged flow, Gitea registry, per-SHA + release tags.
+  apps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        include:
+          - image: punktfunk-web
+            dockerfile: web/Dockerfile
+            context: .
+          - image: punktfunk-docs
+            dockerfile: docs-site/Dockerfile
+            context: docs-site
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Login to registry
+        # Username must be the owner of the REGISTRY_TOKEN PAT, not the push actor.
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: printf '%s\n' "$REGISTRY_TOKEN" | docker login "$REGISTRY" -u enricobuehler --password-stdin
+
+      - name: Build
+        run: |
+          # On a release tag, also tag the image vX.Y.Z so a release pins reproducible web/docs images.
+          EXTRA=""
+          case "$GITHUB_REF" in refs/tags/v*) EXTRA="-t $REGISTRY/$OWNER/${{ matrix.image }}:${GITHUB_REF_NAME}" ;; esac
+          docker build --pull \
+            -f "${{ matrix.dockerfile }}" \
+            -t "$REGISTRY/$OWNER/${{ matrix.image }}:latest" \
+            -t "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}" \
+            $EXTRA \
+            "${{ matrix.context }}"
+
+      - name: Push
+        run: |
+          docker push "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}"
+          docker push "$REGISTRY/$OWNER/${{ matrix.image }}:latest"
+          case "$GITHUB_REF" in refs/tags/v*) docker push "$REGISTRY/$OWNER/${{ matrix.image }}:${GITHUB_REF_NAME}" ;; esac
+
+  # Deploy the docs site to unom-1, the DMZ services VM website/cms also deploy to
+  # (docs.punktfunk.unom.io via Caddy on home-reverse-proxy-1 -> :3220). Same secret set
+  # as unom/website's deploy: DEPLOY_HOST/DEPLOY_USER/DEPLOY_PORT/DEPLOY_SSH_KEY (the
+  # unom-ci-deploy key).
+  deploy-docs:
+    runs-on: ubuntu-24.04
+    needs: apps
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Sync compose file
+        # SHA-pinned (not tag-pinned): this action receives DEPLOY_SSH_KEY + host/user/port, so a
+        # moved tag would mean credential exfiltration. v0.1.7 = 917f8b8. Bump both the SHA and the
+        # trailing version together when upgrading.
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "compose.production.yml"
+          target: "~/punktfunk-docs"
+          overwrite: true
+
+      - name: Pull and start docs
+        # SHA-pinned: receives DEPLOY_SSH_KEY + REGISTRY_TOKEN (see the scp step above). v1.2.5 = 0ff4204.
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Token enters via env, never the script text (keeps it out of run logs).
+          envs: REGISTRY_TOKEN
+          script: |
+            set -euo pipefail
+            # Log out on EVERY exit path: unlike the ephemeral LAN-registry runners, this is a
+            # long-lived internet-facing VM, so a `write:package` PAT left base64-encoded in
+            # ~/.docker/config.json is credential-at-rest on the most exposed host in the estate.
+            # The LAN jobs above already `docker logout`; this one omitted it. security-review
+            # 2026-08-15 finding 14.
+            trap 'docker logout git.unom.io || true' EXIT
+            printf '%s' "$REGISTRY_TOKEN" | docker login git.unom.io -u enricobuehler --password-stdin
+            cd ~/punktfunk-docs
+            docker compose -f compose.production.yml pull docs
+            docker compose -f compose.production.yml up -d --no-build docs

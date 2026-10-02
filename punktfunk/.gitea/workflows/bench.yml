@@ -1,0 +1,54 @@
+# Report-only CPU benchmarks, moved out of ci.yml: they never fail the build (shared CI
+# hardware is too noisy to gate on), so running them per-push only occupied a fleet slot
+# during fan-out storms. Nightly + on demand is exactly as much signal at none of the
+# queue cost. The tight regression gate + the real encode/stream path live on the
+# self-hosted GPU runner (Tier 3, bench-gpu.yml).
+name: bench
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+
+# Shared compile cache: sccache -> RustFS S3 (storage.unom.io, LAN-pinned via ci-core's
+# unbound). Keys include compiler hash + target + flags, so cross-OS/arch entries can
+# never collide; every Rust job on every host feeds and reads one warm cache.
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  bench:
+    # Tier-1 (criterion microbenchmarks) + Tier-2 (FEC loss recovery) — GPU-free, so they run here.
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
+      # images; this heals the job while the running :latest predates the bake.
+      - name: sccache (no-op once the image bakes it)
+        run: sh scripts/ci/ensure-sccache.sh
+
+      - name: Prep
+        run: |
+          git config --global --add safe.directory "$PWD"
+          command -v python3 >/dev/null || { apt-get update && apt-get install -y --no-install-recommends python3; }
+      - name: Tier-1 microbenchmarks (criterion)
+        run: cargo bench -p punktfunk-core --bench pipeline -- --warm-up-time 1 --measurement-time 3
+      - name: Tier-2 FEC loss recovery (loss-harness)
+        run: cargo run -q -p loss-harness
+      - name: Compare vs baseline (report-only)
+        run: python3 scripts/bench/compare.py --threshold 0.5

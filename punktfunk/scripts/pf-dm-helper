@@ -1,0 +1,83 @@
+#!/bin/sh
+# Privileged display-manager verbs for the punktfunk managed gamescope takeover.
+#
+# On DM-autologin boxes whose display manager does not survive a masked session unit (Nobara's
+# plasmalogin, unknown DMs), taking the Gaming Mode session over means stopping the display
+# manager for the length of the stream and restarting it afterwards — root-only operations. The
+# host invokes this helper via pkexec under its own polkit action
+# (io.unom.punktfunk.dm-helper.policy, installed by the packages), the same mechanism these
+# distros use for their own session switching (Nobara's os-session-select).
+#
+# The unit is NEVER caller-controlled: it is derived here from the display-manager.service alias
+# symlink, so the polkit grant's blast radius is exactly "the box's own display manager" — a
+# local-seat operation, not arbitrary unit management.
+set -eu
+
+# The polkit action has to stay permissive (`allow_any=yes`): the host commonly runs as a LINGERING
+# user unit, which has no logind session at all, so polkit classifies it under `allow_any` and any
+# stricter default would make the takeover unauthorizable in its primary deployment. The cost of
+# that is that polkit alone authorizes *every* local subject — a seatless ssh session, a service
+# account — to run this as root (2026-08-05 review L-14).
+#
+# So the authorization decision is made HERE instead, where the caller is knowable: pkexec sets
+# PKEXEC_UID from the authenticated caller, and only a member of the `punktfunk` group (created by
+# the packages) may proceed. That keeps the sessionless host working while making membership of one
+# explicit group — not merely "has a local uid" — the thing that grants these verbs.
+require_authorized_caller() {
+  uid=${PKEXEC_UID:-}
+  [ -n "$uid" ] || {
+    echo "pf-dm-helper: no PKEXEC_UID in the environment — refusing to run unauthenticated" >&2
+    exit 1
+  }
+  user=$(getent passwd "$uid" | cut -d: -f1) || user=
+  [ -n "$user" ] || {
+    echo "pf-dm-helper: PKEXEC_UID $uid resolves to no local user — refusing" >&2
+    exit 1
+  }
+  # `id -nG` lists the primary group too, so a user whose primary group IS punktfunk also passes.
+  for g in $(id -nG "$user" 2>/dev/null); do
+    [ "$g" = punktfunk ] && return 0
+  done
+  echo "pf-dm-helper: user '$user' is not in the 'punktfunk' group — refusing." >&2
+  echo "  Grant it with: sudo usermod -aG punktfunk $user   (then re-login)" >&2
+  exit 1
+}
+
+require_authorized_caller
+
+dm_unit() {
+  target=$(readlink /etc/systemd/system/display-manager.service) || {
+    echo "pf-dm-helper: no display-manager.service alias — no display manager to manage" >&2
+    exit 1
+  }
+  basename "$target"
+}
+
+case "${1-}" in
+  stop)
+    exec systemctl stop "$(dm_unit)"
+    ;;
+  restore)
+    dm=$(dm_unit)
+    # reset-failed first: a relogin loop may have tripped the unit's start limit, and a plain
+    # restart would be refused until the accounting is cleared.
+    systemctl reset-failed "$dm" 2>/dev/null || :
+    exec systemctl restart "$dm"
+    ;;
+  linger)
+    # Keep the caller's own `systemd --user` manager alive across the stop. Stopping the display
+    # manager ends the user's last login session, and logind then stops user@<uid>.service after
+    # UserStopDelaySec (10s by default) — which takes the host that asked for the takeover with
+    # it, so nothing is left to restart the display manager and the box stays dark. Lingering is
+    # what breaks that dependency (the setup docs already ask for it).
+    #
+    # The user is NEVER caller-named: PKEXEC_UID is set by pkexec from the authenticated caller,
+    # so this grant enables lingering for that caller alone. (Its presence is already checked by
+    # `require_authorized_caller` above, which also proved the caller is in the punktfunk group.)
+    exec loginctl enable-linger "${PKEXEC_UID}"
+    ;;
+  *)
+    echo "usage: pf-dm-helper stop|restore|linger" >&2
+    exit 2
+    ;;
+esac

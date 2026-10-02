@@ -1,0 +1,30 @@
+[package]
+name = "punktfunk-probe"
+description = "punktfunk reference/probe client: headless punktfunk/1 client for testing + latency measurement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
+# Same identity files as the desktop client. Default features would pull the desktop
+# ladder into this binary; the probe only needs the store.
+pf-client-core = { path = "../../crates/pf-client-core", default-features = false }
+quinn = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# LAN host discovery (`--discover`): browse the native `_punktfunk._udp` mDNS service the host
+# advertises (same crate/version the host advertises with).
+mdns-sd = "0.21"
+# Opus: multistream DECODE of the host's audio plane (the surround validator) + `--mic-test`'s
+# encoder. libopus is already in the graph via `punktfunk-core`'s quic feature; this exposes the
+# name directly. Cross-platform (cmake-vendored), so the probe builds + validates everywhere.
+opus = "0.3"
+
+[lints]
+workspace = true

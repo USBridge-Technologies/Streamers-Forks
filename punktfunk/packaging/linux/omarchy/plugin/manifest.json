@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "punktfunk",
+  "name": "Punktfunk",
+  "version": "0.1.0",
+  "author": "unom",
+  "license": "MIT OR Apache-2.0",
+  "description": "Start the host, pair a device, and watch the live session from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Punktfunk",
+    "description": "Start the host, pair a device, and watch the live session.",
+    "category": "System",
+    "defaultSection": "right",
+    "aliases": ["punktfunk", "streaming"],
+    "allowMultiple": false
+  }
+}

@@ -1,0 +1,91 @@
+#!/bin/sh
+# Format staged Rust and JavaScript files, then check their writing style. Enable once per
+# clone: core.hooksPath = scripts/git-hooks
+# Mixed staged/unstaged files stay untouched to preserve the unstaged edit.
+# pre-push re-checks the whole tree: plumbing commits never reach this hook.
+
+set -eu
+root=$(git rev-parse --show-toplevel)
+
+fail() {
+    echo "pre-commit: $1" >&2
+    echo "pre-commit: fix with: $2" >&2
+    echo "pre-commit: (bypass with: git commit --no-verify)" >&2
+    exit 1
+}
+
+format_staged_rust() {
+    staged="${TMPDIR:-/tmp}/punktfunk-rustfmt-staged.$$"
+    trap 'rm -f "$staged"' EXIT HUP INT TERM
+
+    git -C "$root" diff --cached --name-only --diff-filter=ACMR |
+        while IFS= read -r file; do
+            case "$file" in
+                *.rs)
+                    case "$file" in
+                        */vendor/*) ;;
+                        *) printf '%s\n' "$file" ;;
+                    esac
+                    ;;
+            esac
+        done > "$staged"
+
+    [ -s "$staged" ] || return 0
+    while IFS= read -r file; do
+        git -C "$root" diff --quiet -- "$file" ||
+            fail "$file also has unstaged edits" "stage or stash that file, then commit again"
+        dir=$(dirname "$file")
+        base=$(basename "$file")
+        if ! (cd "$root/$dir" && rustfmt --edition 2024 --config skip_children=true "$base"); then
+            fail "$file could not be formatted" \
+                "rustfmt --edition 2024 --config skip_children=true $file"
+        fi
+        git -C "$root" add -- "$file"
+    done < "$staged"
+    rm -f "$staged"
+    trap - EXIT HUP INT TERM
+}
+
+format_staged_biome() {
+    workspace=$1
+    staged="${TMPDIR:-/tmp}/punktfunk-biome-staged.$$"
+    trap 'rm -f "$staged"' EXIT HUP INT TERM
+
+    git -C "$root" diff --cached --name-only --diff-filter=ACMR -- "$workspace" |
+        while IFS= read -r path; do
+            case "$path" in
+                *.css|*.graphql|*.gql|*.html|*.js|*.jsx|*.json|*.jsonc|*.ts|*.tsx)
+                    printf '%s\n' "$path"
+                    ;;
+            esac
+        done > "$staged"
+
+    [ -s "$staged" ] || return 0
+    while IFS= read -r path; do
+        git -C "$root" diff --quiet -- "$path" ||
+            fail "$path also has unstaged edits" "stage or stash that file, then commit again"
+    done < "$staged"
+
+    # Biome reads `--staged` through its own git client. Git exports GIT_DIR to every hook, and in
+    # a worktree it names `.git/worktrees/<name>`; biome then sees no staged files and exits 1 on a
+    # clean tree. Its discovery from the workspace is correct, so clear only that one variable.
+    # GIT_INDEX_FILE must survive: a partial commit points it at a temp index holding exactly what
+    # is being committed, and biome honours it.
+    if ! (cd "$root/$workspace" && unset GIT_DIR &&
+            bun run biome check --write --staged .); then
+        fail "$workspace staged files are not Biome-clean" \
+            "(cd $workspace && bun install && bun run biome check --write --staged .)"
+    fi
+    while IFS= read -r path; do
+        git -C "$root" add -- "$path"
+    done < "$staged"
+    rm -f "$staged"
+    trap - EXIT HUP INT TERM
+}
+
+format_staged_rust
+format_staged_biome web
+format_staged_biome plugin-kit
+if ! (cd "$root" && sh scripts/ci/check-writing.sh --staged >/dev/null 2>&1); then
+    fail "staged writing-style checks failed" "sh scripts/ci/check-writing.sh --staged"
+fi
