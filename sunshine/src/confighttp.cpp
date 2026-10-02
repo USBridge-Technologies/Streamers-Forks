@@ -2381,10 +2381,16 @@ namespace confighttp {
     server.resource["^/assets\\/.+$"]["GET"] = getAsset;
 
     server.config.reuse_address = true;
-    server.config.address = net::get_bind_address(address_family);
+    // web_bind_address overrides bind_address for the admin UI only (e.g. "127.0.0.1" to keep it localhost-only)
+    server.config.address = config::sunshine.web_bind_address.empty()
+      ? net::get_bind_address(address_family)
+      : config::sunshine.web_bind_address;
     server.config.port = port_https;
 
-    const auto display_addr = net::get_bind_address_url_host();
+    // web_bind_address is shown as-is (IPv6 literals bracketed); otherwise fall back to upstream's bind_address-derived host.
+    const std::string display_addr = config::sunshine.web_bind_address.empty()
+      ? net::get_bind_address_url_host()
+      : (config::sunshine.web_bind_address.find(':') != std::string::npos ? "[" + config::sunshine.web_bind_address + "]" : config::sunshine.web_bind_address);
 
     auto accept_and_run = [&](auto *server) {
       try {
