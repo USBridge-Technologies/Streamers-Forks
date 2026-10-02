@@ -150,10 +150,15 @@ enum SessionPads {
     /// Windows UMDF HID Xbox pad — the native plane's default.
     #[cfg(target_os = "windows")]
     Hid(crate::inject::xbox_windows::XboxWindowsManager),
+    /// Under the USBridge agent: Xbox 360 pads on its USB broker's USB/IP ports.
+    Usbridge(super::usbridge::Pads),
 }
 
 impl SessionPads {
     fn new() -> SessionPads {
+        if super::usbridge::pads_via_broker() {
+            return SessionPads::Usbridge(super::usbridge::Pads::new());
+        }
         #[cfg(target_os = "windows")]
         if crate::native::gamepad::windows_xbox_hid() {
             return SessionPads::Hid(crate::inject::xbox_windows::XboxWindowsManager::new());
@@ -167,6 +172,7 @@ impl SessionPads {
             SessionPads::Xusb(m) => m.handle(ev),
             #[cfg(target_os = "windows")]
             SessionPads::Hid(m) => m.handle(ev),
+            SessionPads::Usbridge(p) => p.handle(ev),
         }
     }
 
@@ -178,6 +184,7 @@ impl SessionPads {
             SessionPads::Xusb(m) => m.pump_rumble(rumble),
             #[cfg(target_os = "windows")]
             SessionPads::Hid(m) => m.pump(rumble, |_| {}),
+            SessionPads::Usbridge(p) => p.pump_rumble(rumble),
         }
     }
 }
@@ -482,6 +489,9 @@ struct ControlPeer {
     /// What the client last heard over HDR-mode (0x010e). A client starts in SDR.
     hdr_signalled: Option<HdrMeta>,
     pads: SessionPads,
+    /// Raw HID devices of a USBridge client, built by the agent's USB broker. Clients send
+    /// them only after seeing `SS_FF_USBRIDGE_RAW_HID` (rtsp.rs).
+    raw_hid: super::usbridge::RawHid,
     /// SS_PEN/SS_TOUCH → tablet / wire touch. Clients send these only after seeing
     /// `SS_FF_PEN_TOUCH_EVENTS` (rtsp.rs).
     pointer: super::pen::GsPointer,
@@ -506,6 +516,7 @@ impl ControlPeer {
             decrypt_fails: 0,
             hdr_signalled: None,
             pads: SessionPads::new(),
+            raw_hid: super::usbridge::RawHid::new(),
             pointer: super::pen::GsPointer::new(),
             held: Default::default(),
             repeat: super::input::KeyRepeat::for_this_host(),
@@ -538,6 +549,8 @@ impl ControlPeer {
         self.decrypt_fails = 0;
         self.hdr_signalled = None;
         self.pads = SessionPads::new();
+        // Closing the broker connection unplugs the session's devices.
+        self.raw_hid = super::usbridge::RawHid::new();
         self.pointer = super::pen::GsPointer::new();
         self.repeat = super::input::KeyRepeat::for_this_host();
         for ev in self.held.release() {
@@ -751,6 +764,17 @@ fn on_receive(
         if peer.drops.permitted(grants, GrantClass::Gamepad) {
             state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
             peer.pads.handle(&gp);
+        }
+        return;
+    }
+
+    // A USBridge client's HID device (only after our feature flag): pointer-class, as the
+    // pen is — what it sends is a tablet.
+    if let Some(frame) = super::usbridge::raw_hid_frame(&pt) {
+        crate::sleep_inhibit::note_input();
+        if peer.drops.permitted(grants, GrantClass::Pointer) {
+            state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
+            peer.raw_hid.forward(frame);
         }
         return;
     }

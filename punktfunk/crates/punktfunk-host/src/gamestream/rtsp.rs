@@ -597,11 +597,15 @@ fn describe_sdp(codecs: u32) -> String {
     // Advertise pen/touch only where we can inject (Linux uinput; same gate
     // as HOST_CAP_PEN). Else 0 so Moonlight keeps client-side mouse emulation.
     // `PUNKTFUNK_PEN=0` is the kill-switch inside `pen_supported`.
-    let feature_flags: u32 = if crate::inject::pen_supported() {
+    let mut feature_flags: u32 = if crate::inject::pen_supported() {
         SS_FF_PEN_TOUCH_EVENTS
     } else {
         0
     };
+    // Under the USBridge agent: its client may send a HID device over this stream.
+    if super::usbridge::raw_hid_offered() {
+        feature_flags |= super::usbridge::SS_FF_USBRIDGE_RAW_HID;
+    }
     let (supported, requested) = enc_flags(gs_encryption_offer());
     let mut lines: Vec<String> = vec![
         format!("a=x-ss-general.featureFlags:{feature_flags}"),
