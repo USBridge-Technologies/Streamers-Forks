@@ -51,8 +51,8 @@ fn broker_addr() -> Option<SocketAddr> {
 /// module before it tells a client that raw HID works.
 pub const PROBE_LINE: &str = "usbridge-bridge 1";
 
-/// Opens a `hid_stream`. The reply says whether the broker builds raw HID devices right now
-/// (a license matter on its side).
+/// Opens a `hid_stream`. The reply says whether the broker builds raw HID devices; which of
+/// them need a license (a Wacom tablet) is decided on its side, per device.
 fn open(addr: SocketAddr) -> std::io::Result<(TcpStream, bool)> {
     let mut conn = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     conn.set_nodelay(true)?;
@@ -73,8 +73,8 @@ fn open(addr: SocketAddr) -> std::io::Result<(TcpStream, bool)> {
     Ok((conn, reply.contains("\"raw_hid\":true")))
 }
 
-/// Whether to advertise [`SS_FF_USBRIDGE_RAW_HID`]: a broker is there and would build a
-/// device now. Asked per DESCRIBE, so a license change needs no restart.
+/// Whether to advertise [`SS_FF_USBRIDGE_RAW_HID`]: a broker is there and builds raw HID
+/// devices. Asked per DESCRIBE, so a broker that comes up later needs no restart.
 pub fn raw_hid_offered() -> bool {
     broker_addr().is_some_and(builds_raw_hid)
 }
