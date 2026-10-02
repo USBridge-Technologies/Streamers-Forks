@@ -1,0 +1,63 @@
+[submodule "sunshine/packaging/linux/flatpak/deps/flatpak-builder-tools"]
+	path = sunshine/packaging/linux/flatpak/deps/flatpak-builder-tools
+	url = https://github.com/flatpak/flatpak-builder-tools.git
+	branch = master
+[submodule "sunshine/third-party/Simple-Web-Server"]
+	path = sunshine/third-party/Simple-Web-Server
+	url = https://github.com/LizardByte-infrastructure/Simple-Web-Server.git
+	branch = master
+[submodule "sunshine/third-party/TPCircularBuffer"]
+	path = sunshine/third-party/TPCircularBuffer
+	url = https://github.com/michaeltyson/TPCircularBuffer.git
+	branch = master
+[submodule "sunshine/third-party/ViGEmClient"]
+	path = sunshine/third-party/ViGEmClient
+	url = https://github.com/LizardByte/Virtual-Gamepad-Emulation-Client.git
+	branch = master
+[submodule "sunshine/third-party/build-deps"]
+	path = sunshine/third-party/build-deps
+	url = https://github.com/LizardByte/build-deps.git
+	branch = master
+[submodule "sunshine/third-party/dockle"]
+	path = sunshine/third-party/dockle
+	url = https://github.com/LizardByte/dockle.git
+	branch = master
+[submodule "sunshine/third-party/glad"]
+	path = sunshine/third-party/glad
+	url = https://github.com/Dav1dde/glad.git
+[submodule "sunshine/third-party/libdisplaydevice"]
+	path = sunshine/third-party/libdisplaydevice
+	url = https://github.com/LizardByte/libdisplaydevice.git
+	branch = master
+[submodule "sunshine/third-party/libvirtualhid"]
+	path = sunshine/third-party/libvirtualhid
+	url = https://github.com/LizardByte/libvirtualhid.git
+	branch = master
+[submodule "sunshine/third-party/lizardbyte-common"]
+	path = sunshine/third-party/lizardbyte-common
+	url = https://github.com/LizardByte/lizardbyte-common.git
+	branch = master
+[submodule "sunshine/third-party/moonlight-common-c"]
+	path = sunshine/third-party/moonlight-common-c
+	url = https://github.com/moonlight-stream/moonlight-common-c.git
+	branch = master
+[submodule "sunshine/third-party/nvapi"]
+	path = sunshine/third-party/nvapi
+	url = https://github.com/NVIDIA/nvapi.git
+	branch = main
+[submodule "sunshine/third-party/plasma-wayland-protocols"]
+	path = sunshine/third-party/plasma-wayland-protocols
+	url = https://github.com/KDE/plasma-wayland-protocols.git
+	branch = master
+[submodule "sunshine/third-party/tray"]
+	path = sunshine/third-party/tray
+	url = https://github.com/LizardByte/tray.git
+	branch = master
+[submodule "sunshine/third-party/wayland-protocols"]
+	path = sunshine/third-party/wayland-protocols
+	url = https://github.com/LizardByte-infrastructure/wayland-protocols.git
+	branch = main
+[submodule "sunshine/third-party/wlr-protocols"]
+	path = sunshine/third-party/wlr-protocols
+	url = https://github.com/LizardByte-infrastructure/wlr-protocols.git
+	branch = master
