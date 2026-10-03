@@ -1,0 +1,97 @@
+---
+name: Punktfunk Release
+
+# Builds the punktfunk fork in punktfunk/ for Linux x86_64: punktfunk-host and
+# its PyroWave encode worker, with the encoder features upstream's own Linux
+# packages ship (packaging/debian/build-deb.sh). Without `nvenc` the host has
+# no NVENC and falls back to VAAPI, which an NVIDIA box doesn't have: every
+# session then dies at "open video encoder ... vaInitialize failed".
+# Manual only, like the Sunshine workflow; without a tag it is a build test.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.42.0.usbridge.1); empty = build only'
+        required: false
+
+jobs:
+  build-linux:
+    name: Linux x86_64
+    defaults:
+      run:
+        working-directory: punktfunk
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same packages as upstream's ci/rust-ci-noble.Dockerfile (the image its
+      # .deb is built in); libva and CUDA are dlopen'd, so neither is needed.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev pkg-config cmake git \
+            libdrm-dev libpipewire-0.3-dev libwayland-dev libxkbcommon-dev \
+            libgl-dev libegl-dev libgbm-dev libvulkan-dev
+
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: punktfunk
+
+      - name: Build host and encode worker
+        run: |
+          cargo build --release --locked \
+            --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
+            -p punktfunk-host -p punktfunk-encode-worker
+
+      - name: Verify NVENC was compiled in
+        run: |
+          strings target/release/punktfunk-host | grep -qE "NvEncodeAPICreateInstance|libnvidia-encode"
+          echo "NVENC path compiled into punktfunk-host"
+
+      - name: Package tarball
+        run: |
+          mkdir -p artifacts
+          ./target/release/punktfunk-host --version | tee artifacts/VERSION
+          tar -czf artifacts/punktfunk-host-Linux-x86_64.tar.gz \
+            -C target/release punktfunk-host punktfunk-encode-worker
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: punktfunk-host-Linux-x86_64.tar.gz
+          path: punktfunk/artifacts/punktfunk-host-Linux-x86_64.tar.gz
+
+  release:
+    name: Create Release
+    needs: [build-linux]
+    if: github.event.inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "punktfunk ${{ github.event.inputs.tag }} (usbridge fork)"
+          body: |
+            punktfunk-host fork by usbridge, Linux x86_64, built with NVENC and
+            Vulkan encode: USB devices handed to the USBridge USB broker, and
+            PyroWave on the GameStream plane for a USBridge client.
+          files: artifacts/punktfunk-host-Linux-x86_64.tar.gz
