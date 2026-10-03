@@ -1,9 +1,11 @@
 ---
 name: Punktfunk Release
 
-# Builds the punktfunk fork in punktfunk/ for Linux x86_64: punktfunk-host and
-# its PyroWave encode worker, with the encoder features upstream's own Linux
-# packages ship (packaging/debian/build-deb.sh). Without `nvenc` the host has
+# Builds the punktfunk fork in punktfunk/: on Linux x86_64 punktfunk-host and
+# its PyroWave encode worker with the encoder features upstream's own Linux
+# packages ship (packaging/debian/build-deb.sh); on Windows x64 the bare
+# punktfunk-host.exe with upstream's installer features (nvenc,qsv; AMF needs
+# none) -- not the installer, so no virtual-display/input drivers. Without `nvenc` the host has
 # no NVENC and falls back to VAAPI, which an NVIDIA box doesn't have: every
 # session then dies at "open video encoder ... vaInitialize failed".
 # Manual only, like the Sunshine workflow; without a tag it is a build test.
@@ -14,10 +16,19 @@ on:
       tag:
         description: 'Release tag (e.g. v0.42.0.usbridge.1); empty = build only'
         required: false
+      platform:
+        description: 'What to build'
+        type: choice
+        options:
+          - all
+          - linux
+          - windows
+        default: all
 
 jobs:
   build-linux:
     name: Linux x86_64
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
     defaults:
       run:
         working-directory: punktfunk
@@ -70,10 +81,60 @@ jobs:
           name: punktfunk-host-Linux-x86_64.tar.gz
           path: punktfunk/artifacts/punktfunk-host-Linux-x86_64.tar.gz
 
+  build-windows:
+    name: Windows x64
+    if: inputs.platform == 'all' || inputs.platform == 'windows'
+    defaults:
+      run:
+        working-directory: punktfunk
+        shell: pwsh
+    runs-on: windows-latest
+    env:
+      # Short target dir: the CMake-from-source crates (aws-lc, opus) hit
+      # MAX_PATH under the workspace path (upstream windows-host.yml).
+      CARGO_TARGET_DIR: C:\t
+      # audiopus_sys' vendored opus declares cmake_minimum_required < 3.5,
+      # which CMake 4.x refuses.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain
+          if ($LASTEXITCODE) { rustup toolchain install }
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: punktfunk -> C:\t
+
+      - name: Build host
+        run: |
+          cargo build --release --locked -p punktfunk-host --features nvenc,qsv --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { throw "host build" }
+
+      - name: Package zip
+        run: |
+          $exe = "C:\t\x86_64-pc-windows-msvc\release\punktfunk-host.exe"
+          & $exe --version
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Compress-Archive -Path $exe -DestinationPath artifacts/punktfunk-host-Windows-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: punktfunk-host-Windows-x64.zip
+          path: punktfunk/artifacts/punktfunk-host-Windows-x64.zip
+
   release:
     name: Create Release
-    needs: [build-linux]
-    if: github.event.inputs.tag != ''
+    needs: [build-linux, build-windows]
+    # A platform left out is "skipped", which is fine; a failed one is not.
+    if: ${{ !cancelled() && !failure() && inputs.tag != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -91,7 +152,12 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: "punktfunk ${{ github.event.inputs.tag }} (usbridge fork)"
           body: |
-            punktfunk-host fork by usbridge, Linux x86_64, built with NVENC and
-            Vulkan encode: USB devices handed to the USBridge USB broker, and
-            PyroWave on the GameStream plane for a USBridge client.
-          files: artifacts/punktfunk-host-Linux-x86_64.tar.gz
+            punktfunk-host fork by usbridge: USB devices handed to the USBridge
+            USB broker, and PyroWave on the GameStream plane for a USBridge
+            client. Linux x86_64 (host + encode worker, NVENC + Vulkan encode)
+            and Windows x64 (punktfunk-host.exe, NVENC + QSV + AMF; no
+            installer or drivers), as built in this run.
+          files: |
+            artifacts/punktfunk-host-Linux-x86_64.tar.gz
+            artifacts/punktfunk-host-Windows-x64.zip
+          fail_on_unmatched_files: false

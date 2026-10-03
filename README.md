@@ -61,10 +61,12 @@ repository's `.gitmodules`:
 
 Built in GitHub Actions only, never on a dev box: `sunshine-release.yml`
 (Linux, Windows, macOS) and `punktfunk-release.yml` (Linux x86_64 host and
-encode worker, with NVENC). Both are manual; give them a tag to publish a
-release, leave it empty for a build-only test. From Actions -> the workflow ->
-Run workflow, or from a terminal:
+encode worker with NVENC; Windows x64 `punktfunk-host.exe`, no installer).
+Both are manual: pick a platform (`all` by default) and give a tag to publish
+a release, or leave the tag empty for a build-only test. From Actions -> the
+workflow -> Run workflow, or from a terminal:
 
-    scripts/release.sh punktfunk v0.42.0.usbridge.2
-    scripts/release.sh sunshine v2026.1003.1.usbridge
-    scripts/release.sh punktfunk        # build only
+    scripts/release.sh punktfunk v0.42.0.usbridge.2            # all platforms
+    scripts/release.sh punktfunk v0.42.0.usbridge.2 windows
+    scripts/release.sh sunshine v2026.1003.1.usbridge linux
+    scripts/release.sh punktfunk "" windows                    # build only

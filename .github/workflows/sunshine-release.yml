@@ -12,10 +12,20 @@ on:
       tag:
         description: 'Release tag (e.g. v2026.1002.usbridge); empty = build only'
         required: false
+      platform:
+        description: 'What to build'
+        type: choice
+        options:
+          - all
+          - linux
+          - windows
+          - macos
+        default: all
 
 jobs:
   build-macos:
     name: macOS ${{ matrix.arch }}
+    if: inputs.platform == 'all' || inputs.platform == 'macos'
     defaults:
       run:
         working-directory: sunshine
@@ -80,6 +90,7 @@ jobs:
 
   build-windows:
     name: Windows x86_64
+    if: inputs.platform == 'all' || inputs.platform == 'windows'
     defaults:
       run:
         working-directory: sunshine
@@ -145,6 +156,7 @@ jobs:
 
   build-linux:
     name: Linux x86_64
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
     defaults:
       run:
         working-directory: sunshine
@@ -303,8 +315,9 @@ jobs:
     name: Create Release
     needs: [build-macos, build-windows, build-linux]
     # A plain workflow_dispatch on a branch (no tag input) is a CI-only test
-    # build: don't turn the branch name into a release tag.
-    if: github.event.inputs.tag != ''
+    # build: don't turn the branch name into a release tag. A platform left
+    # out is "skipped", which is fine; a failed one is not.
+    if: ${{ !cancelled() && !failure() && inputs.tag != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
