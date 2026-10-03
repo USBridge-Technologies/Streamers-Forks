@@ -57,5 +57,14 @@ repository's `.gitmodules`:
         -DSUNSHINE_ENABLE_VULKAN=OFF -DSUNSHINE_ENABLE_TRAY=OFF
     cmake --build sunshine/build
 
-Releases for the agent are built by `.github/workflows/sunshine-release.yml`
-(manual; give it a tag to publish).
+## Releases
+
+Built in GitHub Actions only, never on a dev box: `sunshine-release.yml`
+(Linux, Windows, macOS) and `punktfunk-release.yml` (Linux x86_64 host and
+encode worker, with NVENC). Both are manual; give them a tag to publish a
+release, leave it empty for a build-only test. From Actions -> the workflow ->
+Run workflow, or from a terminal:
+
+    scripts/release.sh punktfunk v0.42.0.usbridge.2
+    scripts/release.sh sunshine v2026.1003.1.usbridge
+    scripts/release.sh punktfunk        # build only
