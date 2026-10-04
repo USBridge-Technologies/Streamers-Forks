@@ -522,11 +522,39 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Needed for scripts/sign_release_manifest.go below -- download-artifact
+      # alone doesn't check out the repo's own source. Must run BEFORE
+      # Download all artifacts: actions/checkout's default clean=true runs
+      # `git clean -ffdx` first, which would otherwise delete the
+      # just-downloaded artifacts/ directory right back out again.
+      - uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      # Signs a manifest of every staged asset's SHA-256 with
+      # USBridge-Remote's AGENT_UPDATE_ED25519_PRIVATE_KEY (this repo's own
+      # copy of that secret -- see sign_release_manifest.go's own doc
+      # comment for why it deliberately reuses that keypair instead of
+      # minting a new one). agent/scripts/fetch_sunshine.sh verifies this
+      # before trusting a downloaded asset's SHA-256, same tamper-evidence
+      # pattern as itsme228/rust-shine's own release manifest.
+      - name: Sign release manifest
+        env:
+          AGENT_UPDATE_ED25519_PRIVATE_KEY: ${{ secrets.AGENT_UPDATE_ED25519_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          go run scripts/sign_release_manifest.go \
+            -version "${{ inputs.tag }}" -dir artifacts \
+            -manifest-out artifacts/manifest.json \
+            -sig-out artifacts/manifest.json.sig
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -554,4 +582,6 @@ jobs:
             artifacts/Sunshine-Linux-x86_64.tar.gz
             artifacts/punktfunk-host-Linux-x86_64.tar.gz
             artifacts/punktfunk-host-Windows-x64.zip
+            artifacts/manifest.json
+            artifacts/manifest.json.sig
           fail_on_unmatched_files: false
