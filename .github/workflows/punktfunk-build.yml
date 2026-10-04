@@ -1,0 +1,117 @@
+---
+name: Punktfunk Build
+
+# Called by release-all.yml. Split out from release-all.yml's job list into
+# its own reusable workflow for the same reason as sunshine-build.yml: the
+# Actions run graph groups a called workflow's jobs under one "Punktfunk
+# Build" node instead of scattering them flat alongside Sunshine's own jobs.
+# No macOS build (Linux/Windows only), and neither platform signs its binary
+# (matching rust-shine's own release workflow, which also ships
+# usbridge-streamer-windows-x86_64.zip unsigned).
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: 'all, linux, windows, or none'
+        required: true
+        type: string
+
+jobs:
+  linux:
+    name: Linux x86_64
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
+    defaults:
+      run:
+        working-directory: punktfunk
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev pkg-config cmake git \
+            libdrm-dev libpipewire-0.3-dev libwayland-dev libxkbcommon-dev \
+            libgl-dev libegl-dev libgbm-dev libvulkan-dev
+
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: punktfunk
+
+      - name: Build host and encode worker
+        run: |
+          cargo build --release --locked \
+            --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
+            -p punktfunk-host -p punktfunk-encode-worker
+
+      - name: Verify NVENC was compiled in
+        run: |
+          strings target/release/punktfunk-host | grep -qE "NvEncodeAPICreateInstance|libnvidia-encode"
+          echo "NVENC path compiled into punktfunk-host"
+
+      - name: Package tarball
+        run: |
+          mkdir -p artifacts
+          ./target/release/punktfunk-host --version | tee artifacts/VERSION
+          tar -czf artifacts/punktfunk-host-Linux-x86_64.tar.gz \
+            -C target/release punktfunk-host punktfunk-encode-worker
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: punktfunk-host-Linux-x86_64.tar.gz
+          path: punktfunk/artifacts/punktfunk-host-Linux-x86_64.tar.gz
+
+  windows:
+    name: Windows x64
+    if: inputs.platform == 'all' || inputs.platform == 'windows'
+    defaults:
+      run:
+        working-directory: punktfunk
+        shell: pwsh
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: C:\t
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain
+          if ($LASTEXITCODE) { rustup toolchain install }
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: punktfunk -> C:\t
+
+      - name: Build host
+        run: |
+          cargo build --release --locked -p punktfunk-host --features nvenc,qsv --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { throw "host build" }
+
+      - name: Package zip
+        run: |
+          $exe = "C:\t\x86_64-pc-windows-msvc\release\punktfunk-host.exe"
+          & $exe --version
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Compress-Archive -Path $exe -DestinationPath artifacts/punktfunk-host-Windows-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: punktfunk-host-Windows-x64.zip
+          path: punktfunk/artifacts/punktfunk-host-Windows-x64.zip

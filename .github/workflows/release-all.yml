@@ -1,32 +1,32 @@
 ---
 name: Release All Forks
 
-# Builds Sunshine (sunshine/) and Punktfunk (punktfunk/) together and
-# publishes every platform's assets under ONE GitHub release/tag, instead of
-# the two separate per-fork workflows (sunshine-release.yml,
-# punktfunk-release.yml) each cutting their own release. That separation is
-# exactly what broke usbridge_agent's build once before: GitHub's
-# /releases/latest pointer follows whichever release was PUBLISHED most
-# recently, with no regard for which fork it belongs to, so a Punktfunk-only
-# release outranked the last Sunshine release and every macOS/Linux/Windows
-# agent build silently fell back to a 10-30+ min Sunshine source build
-# (USBridge-Remote's agent/scripts/fetch_sunshine.sh had to be hardened to
-# scan the releases list for the newest release that actually carries the
-# wanted asset, rather than trust /releases/latest, to recover from this).
-# One shared tag for both forks' assets makes that class of bug impossible
-# going forward, as long as releases keep coming from this workflow.
+# Builds Sunshine and Punktfunk together and publishes every platform's
+# assets under ONE GitHub release/tag, instead of the two separate per-fork
+# workflows (sunshine-release.yml, punktfunk-release.yml) each cutting their
+# own release. That separation is exactly what broke usbridge_agent's build
+# once before: GitHub's /releases/latest pointer follows whichever release
+# was PUBLISHED most recently, with no regard for which fork it belongs to,
+# so a Punktfunk-only release outranked the last Sunshine release and every
+# macOS/Linux/Windows agent build silently fell back to a 10-30+ min
+# Sunshine source build (USBridge-Remote's agent/scripts/fetch_sunshine.sh
+# had to be hardened to scan the releases list for the newest release that
+# actually carries the wanted asset, rather than trust /releases/latest, to
+# recover from this). One shared tag for both forks' assets makes that
+# class of bug impossible going forward, as long as releases keep coming
+# from this workflow.
+#
+# The actual build logic lives in two reusable workflows,
+# sunshine-build.yml and punktfunk-build.yml -- this file just dispatches
+# both and creates the combined release. That split also keeps the Actions
+# run graph readable: a called workflow renders as one collapsible node, so
+# the graph shows "Sunshine Build" (3 platforms inside) and "Punktfunk
+# Build" (2 platforms inside) converging into "release", instead of 5 flat
+# top-level jobs with no visual grouping.
 #
 # Manual only, same reasoning as the two per-fork workflows: this repo holds
 # several forks, so a tag push alone can't say what to release. Without a
 # tag this is a combined build test and publishes nothing.
-#
-# macOS Sunshine signing/notarization: see sunshine-release.yml's
-# build-macos job for the full secret-naming rationale (same 5 secrets as
-# itsme228/rust-shine: APPLE_ID, APPLE_TEAM_ID, BUILD_CERTIFICATE_BASE64,
-# P12_PASSWORD, NOTARIZATION_PASSWORD). Punktfunk has no macOS build
-# (Linux/Windows only, same as punktfunk-release.yml), and neither fork signs
-# its Windows binary (matching rust-shine's own release workflow, which also
-# ships usbridge-streamer-windows-x86_64.zip unsigned).
 
 on:
   workflow_dispatch:
@@ -55,469 +55,33 @@ on:
         default: all
 
 jobs:
-  # See sunshine-release.yml's build-macos job for the full comment on why
-  # this signs/notarizes and where the secrets come from -- kept in sync
-  # with that job intentionally; this one differs only in its `if:` (reads
-  # sunshine_platform here) and artifact-name prefix (sunshine- vs the
-  # sibling workflow's bare name) so both workflows' uploads never collide
-  # if ever run in the same GitHub Actions run context.
-  sunshine-macos:
-    name: Sunshine macOS ${{ matrix.arch }}
-    if: inputs.sunshine_platform == 'all' || inputs.sunshine_platform == 'macos'
-    defaults:
-      run:
-        working-directory: sunshine
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-14
-            artifact: Sunshine-macOS-arm64.dmg
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+  sunshine:
+    name: Sunshine Build
+    uses: ./.github/workflows/sunshine-build.yml
+    with:
+      tag: ${{ inputs.tag }}
+      platform: ${{ inputs.sunshine_platform }}
+    secrets: inherit
 
-      - name: Import macOS signing certificate into a temporary keychain
-        if: inputs.tag != ''
-        env:
-          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
-          KEYCHAIN_PATH="$RUNNER_TEMP/sunshine-signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
-
-          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          security import "$CERT_PATH" -P "$P12_PASSWORD" -A \
-            -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          security list-keychain -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
-          security default-keychain -s "$KEYCHAIN_PATH"
-
-          rm -f "$CERT_PATH"
-          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-
-      - name: Select Xcode 16.2
-        run: sudo xcode-select --switch /Applications/Xcode_16.2.app
-
-      - name: Install dependencies
-        run: |
-          brew install --quiet \
-            cmake \
-            node \
-            pkgconf \
-            icu4c@78 \
-            miniupnpc \
-            openssl@3 \
-            opus
-
-      - name: Configure
-        run: |
-          cmake \
-            -B build \
-            -S . \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_DOCS=OFF \
-            -DICU_ROOT="$(brew --prefix icu4c@78)" \
-            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
-            -DOpus_ROOT_DIR="$(brew --prefix opus)" \
-            -DSUNSHINE_ENABLE_TRAY=OFF \
-            -DSUNSHINE_PUBLISHER_NAME="usbridge_agent" \
-            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/itsme228/usbridge_agent" \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues" \
-            -DAPPLE_CODESIGN_IDENTITY="Developer ID Application"
-
-      - name: Build
-        run: cmake --build build -j "$(sysctl -n hw.ncpu)"
-
-      - name: Package DMG
-        env:
-          SHOULD_SIGN: ${{ inputs.tag != '' }}
-        run: |
-          cd build
-          cpack -G DragNDrop --config CPackConfig.cmake
-          mkdir -p ../artifacts
-          cp cpack_artifacts/Sunshine.dmg "../artifacts/${{ matrix.artifact }}"
-
-      - name: Verify Developer ID signature (fail if ad-hoc/unsigned)
-        if: inputs.tag != ''
-        run: |
-          set -euo pipefail
-          APP="build/Sunshine.app"
-
-          echo "== codesign -dv =="
-          if ! CODESIGN_INFO="$(codesign -dv --verbose=4 "$APP" 2>&1)"; then
-            echo "$CODESIGN_INFO"
-            echo "::error::Sunshine.app is not signed or the signature is invalid"
-            exit 1
-          fi
-          echo "$CODESIGN_INFO"
-
-          if echo "$CODESIGN_INFO" | grep -q "^Signature=adhoc"; then
-            echo "::error::Sunshine.app is ad-hoc signed -- check BUILD_CERTIFICATE_BASE64/P12_PASSWORD repo secrets"
-            exit 1
-          fi
-          if ! echo "$CODESIGN_INFO" | grep -q "Authority=Developer ID Application"; then
-            echo "::error::Authority=Developer ID Application not found in signature -- wrong cert imported"
-            exit 1
-          fi
-          echo "== codesign --verify --deep --strict =="
-          codesign --verify --deep --strict --verbose=2 "$APP"
-          echo "✓ Sunshine.app is signed with a real Developer ID Application identity."
-
-      - name: Notarize DMG
-        if: inputs.tag != ''
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_NOTARIZATION_PASSWORD: ${{ secrets.NOTARIZATION_PASSWORD }}
-        run: |
-          set -euo pipefail
-          dmg="artifacts/${{ matrix.artifact }}"
-
-          submit_json="$(xcrun notarytool submit "$dmg" \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_NOTARIZATION_PASSWORD" --output-format json --wait --timeout 15m)"
-          echo "$submit_json"
-          status="$(echo "$submit_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
-          if [ "$status" != "Accepted" ]; then
-            id="$(echo "$submit_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-            xcrun notarytool log "$id" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_NOTARIZATION_PASSWORD" 2>/dev/null || true
-            echo "::error::Notarization did not succeed (status: $status)"
-            exit 1
-          fi
-
-          xcrun stapler staple -v "$dmg"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: sunshine/artifacts/${{ matrix.artifact }}
-
-      - name: Remove temporary keychain
-        if: always() && inputs.tag != ''
-        run: |
-          [ -n "${KEYCHAIN_PATH:-}" ] && security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/build_certificate.p12"
-
-  sunshine-windows:
-    name: Sunshine Windows x86_64
-    if: inputs.sunshine_platform == 'all' || inputs.sunshine_platform == 'windows'
-    defaults:
-      run:
-        working-directory: sunshine
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Setup MSYS2
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-boost
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-cppwinrt
-            mingw-w64-ucrt-x86_64-curl-winssl
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-MinHook
-            mingw-w64-ucrt-x86_64-miniupnpc
-            mingw-w64-ucrt-x86_64-nlohmann-json
-            mingw-w64-ucrt-x86_64-nodejs
-            mingw-w64-ucrt-x86_64-onevpl
-            mingw-w64-ucrt-x86_64-openssl
-            mingw-w64-ucrt-x86_64-opus
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-toolchain
-
-      - name: Configure
-        shell: msys2 {0}
-        run: |
-          cmake \
-            -B build \
-            -S . \
-            -G "MinGW Makefiles" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_DOCS=OFF \
-            -DSUNSHINE_ENABLE_TRAY=OFF \
-            -DSUNSHINE_PUBLISHER_NAME="usbridge_agent" \
-            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/itsme228/usbridge_agent" \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues"
-
-      - name: Build
-        shell: msys2 {0}
-        run: cmake --build build -j "$(nproc)"
-
-      - name: Package ZIP
-        shell: msys2 {0}
-        run: |
-          cd build
-          cpack -G ZIP --config CPackConfig.cmake
-          mkdir -p ../artifacts
-          cp cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-x86_64-portable.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Sunshine-Windows-x86_64-portable.zip
-          path: sunshine/artifacts/Sunshine-Windows-x86_64-portable.zip
-
-  sunshine-linux:
-    name: Sunshine Linux x86_64
-    if: inputs.sunshine_platform == 'all' || inputs.sunshine_platform == 'linux'
-    defaults:
-      run:
-        working-directory: sunshine
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install cmake 4.x from Kitware
-        run: |
-          wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc \
-            | gpg --dearmor \
-            | sudo tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null
-          sudo apt-add-repository -y \
-            "deb https://apt.kitware.com/ubuntu/ $(lsb_release -cs) main"
-          sudo apt-get update -qq
-          sudo apt-get install -y cmake
-
-      - name: Install build dependencies
-        run: |
-          sudo add-apt-repository universe -y
-          sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            build-essential gcc-14 g++-14 pkg-config nodejs npm \
-            libssl-dev libevdev-dev libopus-dev libpulse-dev \
-            libcurl4-openssl-dev libgbm-dev libnuma-dev \
-            libpipewire-0.3-dev libsystemd-dev libnotify-dev \
-            libx11-dev libxrandr-dev libxfixes-dev libxtst-dev \
-            libxcb-shm0-dev libxcb-xfixes0-dev libxcb1-dev \
-            libdrm-dev libcap-dev libudev-dev libwayland-dev \
-            libminiupnpc-dev libva-dev libvulkan-dev \
-            qtbase5-dev libqt5svg5-dev glslang-tools
-
-      - name: Install CUDA toolkit
-        env:
-          CUDA_VERSION: "12.9.1"
-          CUDA_BUILD: "575.57.08"
-        run: |
-          url="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/cuda_${CUDA_VERSION}_${CUDA_BUILD}_linux.run"
-          wget -q --max-redirect=0 -O "$RUNNER_TEMP/cuda.run" "$url"
-          sudo sh "$RUNNER_TEMP/cuda.run" --silent --toolkit --toolkitpath="$RUNNER_TEMP/cuda" \
-            --no-opengl-libs --no-man-page --no-drm
-          rm -f "$RUNNER_TEMP/cuda.run"
-          "$RUNNER_TEMP/cuda/bin/nvcc" --version
-
-      - name: Configure
-        env:
-          CC: gcc-14
-          CXX: g++-14
-        run: |
-          cmake -B build -S . \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_DOCS=OFF \
-            -DSUNSHINE_BUILD_APPIMAGE=ON \
-            -DSUNSHINE_ENABLE_CUDA=ON \
-            -DSUNSHINE_ENABLE_VULKAN=OFF \
-            -DCUDA_FAIL_ON_MISSING=ON \
-            -DCMAKE_CUDA_COMPILER:PATH="$RUNNER_TEMP/cuda/bin/nvcc" \
-            -DCMAKE_CUDA_HOST_COMPILER=g++-14 \
-            -DSUNSHINE_ENABLE_TRAY=OFF \
-            -DSUNSHINE_PUBLISHER_NAME="usbridge_agent" \
-            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/itsme228/usbridge_agent" \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues"
-
-      - name: Build
-        run: cmake --build build -j "$(nproc)"
-
-      - name: Verify CUDA support was compiled in
-        run: |
-          grep -q "SUNSHINE_BUILD_CUDA" build/CMakeFiles/sunshine.dir/flags.make
-          find build -name 'cuda.cu.o' | grep -q .
-          echo "CUDA path compiled into sunshine"
-
-      - name: Verify Vulkan encoder was left out
-        run: |
-          if grep -q "SUNSHINE_BUILD_VULKAN" build/CMakeFiles/sunshine.dir/flags.make; then
-            echo "::error::Vulkan encoder must not be built (it segfaults on stream start)"
-            exit 1
-          fi
-
-      - name: Install to staging and package tarball
-        run: |
-          DESTDIR=staging cmake --install build --prefix /usr
-
-          curl -fL --progress-bar -o /tmp/linuxdeploy-x86_64.AppImage \
-            "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
-          chmod +x /tmp/linuxdeploy-x86_64.AppImage
-
-          desktop_file="$(find staging/usr/share/applications -name '*.desktop' | head -1)"
-
-          ARCH=x86_64 /tmp/linuxdeploy-x86_64.AppImage \
-            --appimage-extract-and-run \
-            --appdir staging \
-            --executable staging/usr/bin/sunshine \
-            --icon-file sunshine.png \
-            --desktop-file "$desktop_file" \
-            --exclude-library="libva.so*" \
-            --exclude-library="libva-drm.so*"
-
-          missing_libs="$(ldd staging/usr/bin/sunshine 2>/dev/null | awk '/not found/ {print $1}')"
-          if [[ -n "$missing_libs" ]]; then
-            echo "::error::sunshine binary still missing shared libraries after bundling: $missing_libs"
-            exit 1
-          fi
-
-          mkdir -p artifacts
-          tar -czf artifacts/Sunshine-Linux-x86_64.tar.gz -C staging .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Sunshine-Linux-x86_64.tar.gz
-          path: sunshine/artifacts/Sunshine-Linux-x86_64.tar.gz
-
-  punktfunk-linux:
-    name: Punktfunk Linux x86_64
-    if: inputs.punktfunk_platform == 'all' || inputs.punktfunk_platform == 'linux'
-    defaults:
-      run:
-        working-directory: punktfunk
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang libclang-dev pkg-config cmake git \
-            libdrm-dev libpipewire-0.3-dev libwayland-dev libxkbcommon-dev \
-            libgl-dev libegl-dev libgbm-dev libvulkan-dev
-
-      - name: Install Rust (rust-toolchain.toml)
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustc --version
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: punktfunk
-
-      - name: Build host and encode worker
-        run: |
-          cargo build --release --locked \
-            --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-            -p punktfunk-host -p punktfunk-encode-worker
-
-      - name: Verify NVENC was compiled in
-        run: |
-          strings target/release/punktfunk-host | grep -qE "NvEncodeAPICreateInstance|libnvidia-encode"
-          echo "NVENC path compiled into punktfunk-host"
-
-      - name: Package tarball
-        run: |
-          mkdir -p artifacts
-          ./target/release/punktfunk-host --version | tee artifacts/VERSION
-          tar -czf artifacts/punktfunk-host-Linux-x86_64.tar.gz \
-            -C target/release punktfunk-host punktfunk-encode-worker
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: punktfunk-host-Linux-x86_64.tar.gz
-          path: punktfunk/artifacts/punktfunk-host-Linux-x86_64.tar.gz
-
-  punktfunk-windows:
-    name: Punktfunk Windows x64
-    if: inputs.punktfunk_platform == 'all' || inputs.punktfunk_platform == 'windows'
-    defaults:
-      run:
-        working-directory: punktfunk
-        shell: pwsh
-    runs-on: windows-latest
-    env:
-      CARGO_TARGET_DIR: C:\t
-      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      LIBCLANG_PATH: C:\Program Files\LLVM\bin
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust (rust-toolchain.toml)
-        run: |
-          rustup show active-toolchain
-          if ($LASTEXITCODE) { rustup toolchain install }
-          rustc --version
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: punktfunk -> C:\t
-
-      - name: Build host
-        run: |
-          cargo build --release --locked -p punktfunk-host --features nvenc,qsv --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE) { throw "host build" }
-
-      - name: Package zip
-        run: |
-          $exe = "C:\t\x86_64-pc-windows-msvc\release\punktfunk-host.exe"
-          & $exe --version
-          New-Item -ItemType Directory -Force artifacts | Out-Null
-          Compress-Archive -Path $exe -DestinationPath artifacts/punktfunk-host-Windows-x64.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: punktfunk-host-Windows-x64.zip
-          path: punktfunk/artifacts/punktfunk-host-Windows-x64.zip
+  punktfunk:
+    name: Punktfunk Build
+    uses: ./.github/workflows/punktfunk-build.yml
+    with:
+      platform: ${{ inputs.punktfunk_platform }}
 
   release:
     name: Create combined release
-    needs:
-      - sunshine-macos
-      - sunshine-windows
-      - sunshine-linux
-      - punktfunk-linux
-      - punktfunk-windows
-    # Each platform input left at "none"/unset is "skipped", which is fine;
-    # a failed one is not. See resolve-version-less sibling workflows for
-    # the same `!cancelled() && !failure()` + explicit per-dependency result
-    # check rationale -- `always()` alone would let this run even after
-    # every build job got cancelled outright.
+    needs: [sunshine, punktfunk]
+    # A failed or cancelled build blocks the release; "skipped" can't
+    # actually happen here (sunshine/punktfunk always run, their inner jobs
+    # are what skip per-platform) but is kept for symmetry with the inner
+    # workflows' own result checks. `always()` alone would let this run
+    # even after both got cancelled outright -- check each dependency's own
+    # result explicitly instead.
     if: >-
       ${{ always() && inputs.tag != '' &&
-          (needs.sunshine-macos.result == 'success' || needs.sunshine-macos.result == 'skipped') &&
-          (needs.sunshine-windows.result == 'success' || needs.sunshine-windows.result == 'skipped') &&
-          (needs.sunshine-linux.result == 'success' || needs.sunshine-linux.result == 'skipped') &&
-          (needs.punktfunk-linux.result == 'success' || needs.punktfunk-linux.result == 'skipped') &&
-          (needs.punktfunk-windows.result == 'success' || needs.punktfunk-windows.result == 'skipped') }}
+          (needs.sunshine.result == 'success' || needs.sunshine.result == 'skipped') &&
+          (needs.punktfunk.result == 'success' || needs.punktfunk.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

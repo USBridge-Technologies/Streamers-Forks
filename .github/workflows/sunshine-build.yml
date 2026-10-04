@@ -1,69 +1,56 @@
 ---
-name: Sunshine Release
+name: Sunshine Build
 
-# Builds the Sunshine fork in sunshine/ (the workflow it was built with in
-# itsme228/Sunshine, run from that directory). Manual only: this repository
-# holds several forks, so a tag push does not say which one to release.
-# Without a tag it is a build test and publishes nothing.
+# Called by release-all.yml (and reusable from sunshine-release.yml later if
+# that one ever gets folded in too). Splitting Sunshine's 3 platform builds
+# into their own reusable workflow — rather than 3 top-level jobs in
+# release-all.yml — makes the Actions run graph group them under one
+# "Sunshine Build" node instead of scattering macOS/Windows/Linux flat
+# alongside Punktfunk's own jobs.
+#
+# macOS signing/notarization: same 5 secrets as itsme228/rust-shine's
+# release-usbridge-streamer.yml (APPLE_ID, APPLE_TEAM_ID,
+# BUILD_CERTIFICATE_BASE64, P12_PASSWORD, NOTARIZATION_PASSWORD), this
+# repo's own copies of the values. Signing itself is driven by the fork's
+# own existing CMake hooks (cmake/packaging/macos.cmake's
+# APPLE_CODESIGN_IDENTITY cache var + SHOULD_SIGN env, already upstream in
+# LizardByte/Sunshine). Only runs when `tag` is set — a plain build-test
+# dispatch stays ad-hoc signed and skips notarization, so test runs don't
+# burn Apple's notarization quota. No single-entry `strategy.matrix` here:
+# there's exactly one macOS target (arm64), so a matrix just adds a nesting
+# level to the run graph for no reason.
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       tag:
-        description: 'Release tag (e.g. v2026.1002.usbridge); empty = build only'
+        description: 'Release tag being built; empty = build only (stays ad-hoc signed, no notarization)'
         required: false
+        type: string
       platform:
-        description: 'What to build'
-        type: choice
-        options:
-          - all
-          - linux
-          - windows
-          - macos
-        default: all
+        description: 'all, linux, windows, macos, or none'
+        required: true
+        type: string
+    secrets:
+      BUILD_CERTIFICATE_BASE64:
+        required: false
+      P12_PASSWORD:
+        required: false
+      APPLE_ID:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      NOTARIZATION_PASSWORD:
+        required: false
 
 jobs:
-  # Signed + notarized with the exact same secret NAMES as
-  # itsme228/rust-shine's release-usbridge-streamer.yml (APPLE_ID,
-  # APPLE_TEAM_ID, BUILD_CERTIFICATE_BASE64, P12_PASSWORD,
-  # NOTARIZATION_PASSWORD) -- this repo's own copies of the values, set via:
-  #   gh secret set APPLE_ID                --repo USBridge-Technologies/Streamers-Forks
-  #   gh secret set APPLE_TEAM_ID            --repo USBridge-Technologies/Streamers-Forks
-  #   gh secret set BUILD_CERTIFICATE_BASE64 --repo USBridge-Technologies/Streamers-Forks
-  #   gh secret set P12_PASSWORD             --repo USBridge-Technologies/Streamers-Forks
-  #   gh secret set NOTARIZATION_PASSWORD    --repo USBridge-Technologies/Streamers-Forks
-  #
-  # Signing itself is driven by the fork's own existing CMake hooks
-  # (cmake/packaging/macos.cmake's APPLE_CODESIGN_IDENTITY cache var +
-  # SHOULD_SIGN env, already upstream in LizardByte/Sunshine -- it signs every
-  # bundled dylib/framework before signing the .app itself, so there's no
-  # need to reimplement that with a bare `codesign --deep` the way
-  # USBridge-Remote's own build_macos.sh does for a DMG it merely re-stages).
-  # Only runs when cutting an actual release (inputs.tag set) -- a plain
-  # build-test dispatch stays ad-hoc signed and skips notarization entirely,
-  # so CI test runs don't burn Apple's notarization quota.
-  #
-  # This matters beyond Gatekeeper: usbridge_agent is moving from bundling
-  # Sunshine at build time to the agent fetching a streamer fork at runtime
-  # only once it's picked in the UI (no more build-time `codesign --deep`
-  # re-sign of a staged Sunshine.app pulling it under the agent bundle's own
-  # seal) -- so this release's own signature is now the only one a user's
-  # Gatekeeper ever sees, on every future update too, same reasoning as
-  # rust-shine's own build-macos job comment.
-  build-macos:
-    name: macOS ${{ matrix.arch }}
+  macos:
+    name: macOS arm64
     if: inputs.platform == 'all' || inputs.platform == 'macos'
     defaults:
       run:
         working-directory: sunshine
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-14
-            artifact: Sunshine-macOS-arm64.dmg
+    runs-on: macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -130,7 +117,7 @@ jobs:
             -DAPPLE_CODESIGN_IDENTITY="Developer ID Application"
 
       - name: Build
-        run: cmake --build build -j $(sysctl -n hw.ncpu)
+        run: cmake --build build -j "$(sysctl -n hw.ncpu)"
 
       - name: Package DMG
         env:
@@ -139,7 +126,7 @@ jobs:
           cd build
           cpack -G DragNDrop --config CPackConfig.cmake
           mkdir -p ../artifacts
-          cp cpack_artifacts/Sunshine.dmg "../artifacts/${{ matrix.artifact }}"
+          cp cpack_artifacts/Sunshine.dmg ../artifacts/Sunshine-macOS-arm64.dmg
 
       - name: Verify Developer ID signature (fail if ad-hoc/unsigned)
         if: inputs.tag != ''
@@ -156,7 +143,7 @@ jobs:
           MOUNT_POINT="$(mktemp -d)"
           cleanup() { hdiutil detach -quiet "$MOUNT_POINT" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
-          echo "y" | hdiutil attach -nobrowse -mountpoint "$MOUNT_POINT" "artifacts/${{ matrix.artifact }}" >/dev/null
+          echo "y" | hdiutil attach -nobrowse -mountpoint "$MOUNT_POINT" artifacts/Sunshine-macOS-arm64.dmg >/dev/null
 
           APP="$(find "$MOUNT_POINT" -maxdepth 1 -iname "*.app" | head -1)"
           if [[ -z "$APP" ]]; then
@@ -192,7 +179,7 @@ jobs:
           APPLE_NOTARIZATION_PASSWORD: ${{ secrets.NOTARIZATION_PASSWORD }}
         run: |
           set -euo pipefail
-          dmg="artifacts/${{ matrix.artifact }}"
+          dmg="artifacts/Sunshine-macOS-arm64.dmg"
 
           submit_json="$(xcrun notarytool submit "$dmg" \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
@@ -211,8 +198,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: sunshine/artifacts/${{ matrix.artifact }}
+          name: Sunshine-macOS-arm64.dmg
+          path: sunshine/artifacts/Sunshine-macOS-arm64.dmg
 
       - name: Remove temporary keychain
         if: always() && inputs.tag != ''
@@ -220,7 +207,7 @@ jobs:
           [ -n "${KEYCHAIN_PATH:-}" ] && security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/build_certificate.p12"
 
-  build-windows:
+  windows:
     name: Windows x86_64
     if: inputs.platform == 'all' || inputs.platform == 'windows'
     defaults:
@@ -270,7 +257,7 @@ jobs:
 
       - name: Build
         shell: msys2 {0}
-        run: cmake --build build -j $(nproc)
+        run: cmake --build build -j "$(nproc)"
 
       - name: Package ZIP
         shell: msys2 {0}
@@ -286,7 +273,7 @@ jobs:
           name: Sunshine-Windows-x86_64-portable.zip
           path: sunshine/artifacts/Sunshine-Windows-x86_64-portable.zip
 
-  build-linux:
+  linux:
     name: Linux x86_64
     if: inputs.platform == 'all' || inputs.platform == 'linux'
     defaults:
@@ -325,13 +312,6 @@ jobs:
             libminiupnpc-dev libva-dev libvulkan-dev \
             qtbase5-dev libqt5svg5-dev glslang-tools
 
-      # CUDA toolkit (compile-time only: nvcc + headers + static cudart). Without
-      # it SUNSHINE_BUILD_CUDA is never defined and the Linux build silently
-      # loses the CUDA/NVENC zero-copy path ("Attempting to use NVENC without
-      # CUDA support. Reverting back to GPU -> RAM -> GPU"). 12.9 is the newest
-      # 12.x: still builds sm_50+ kernels (13.x drops < sm_75) and supports
-      # gcc-14 as host compiler. Nothing from the toolkit ships in the tarball;
-      # libcuda.so comes from the host's NVIDIA driver at runtime.
       - name: Install CUDA toolkit
         env:
           CUDA_VERSION: "12.9.1"
@@ -364,7 +344,7 @@ jobs:
             -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues"
 
       - name: Build
-        run: cmake --build build -j $(nproc)
+        run: cmake --build build -j "$(nproc)"
 
       - name: Verify CUDA support was compiled in
         run: |
@@ -383,42 +363,12 @@ jobs:
         run: |
           DESTDIR=staging cmake --install build --prefix /usr
 
-          # Bundle every shared library the sunshine binary needs into
-          # staging/usr/lib and patch its RPATH to $ORIGIN/../lib, so the
-          # tarball is fully self-contained. usbridge_agent's Linux AppImage
-          # build copies this staging tree as-is and relies on usr/lib
-          # already carrying Sunshine's runtime deps (e.g.
-          # libminiupnpc.so.17) — the host AppImage users run on has no
-          # guarantee of matching system packages.
           curl -fL --progress-bar -o /tmp/linuxdeploy-x86_64.AppImage \
             "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
           chmod +x /tmp/linuxdeploy-x86_64.AppImage
 
-          # `cmake --install` installs a .desktop file with Icon=sunshine
-          # (see packaging/linux/AppImage/*.desktop) that linuxdeploy
-          # auto-detects and tries to deploy to the AppDir root — same as
-          # upstream's own AppImage packaging in .github/workflows/ci-linux.yml,
-          # which feeds linuxdeploy the matching icon/desktop file explicitly
-          # instead of letting it guess. Do the same here.
           desktop_file="$(find staging/usr/share/applications -name '*.desktop' | head -1)"
 
-          # GH-hosted runners don't reliably have a working FUSE mount for
-          # AppImages to self-mount via; --appimage-extract-and-run makes the
-          # AppImage runtime extract itself to a temp dir and exec from there
-          # instead, sidestepping FUSE entirely.
-          #
-          # libva/libva-drm must NOT be bundled. linuxdeploy's built-in
-          # excludelist already knows to leave libGL/libEGL/libdrm etc. on
-          # the host because they have to match the host's own GPU driver
-          # stack -- but it predates VAAPI being common and doesn't cover
-          # libva. Bundling it anyway pulls in Ubuntu 22.04's ancient libva
-          # (VA-API interface ~1.14), which can't resolve the
-          # __vaDriverInit_1_2x symbol newer host VAAPI drivers export
-          # (e.g. current intel-media-va-driver), so hardware encoding
-          # silently falls back to software on every up-to-date host. libva
-          # is loaded at runtime and is always present alongside a
-          # functioning VAAPI stack, so excluding it just means we rely on
-          # the host's copy, same as we already do for libGL/libdrm.
           ARCH=x86_64 /tmp/linuxdeploy-x86_64.AppImage \
             --appimage-extract-and-run \
             --appdir staging \
@@ -442,40 +392,3 @@ jobs:
         with:
           name: Sunshine-Linux-x86_64.tar.gz
           path: sunshine/artifacts/Sunshine-Linux-x86_64.tar.gz
-
-  release:
-    name: Create Release
-    needs: [build-macos, build-windows, build-linux]
-    # A plain workflow_dispatch on a branch (no tag input) is a CI-only test
-    # build: don't turn the branch name into a release tag. A platform left
-    # out is "skipped", which is fine; a failed one is not.
-    if: ${{ !cancelled() && !failure() && inputs.tag != '' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Determine tag
-        id: tag
-        run: |
-          echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: "Sunshine ${{ steps.tag.outputs.tag }} (usbridge fork)"
-          body: |
-            Sunshine fork by usbridge: `web_bind_address` config option, and
-            USB devices handed to the USBridge USB broker (a tablet sent over
-            the stream; gamepads on Windows).
-          files: |
-            artifacts/Sunshine-macOS-arm64.dmg
-            artifacts/Sunshine-Windows-x86_64-portable.zip
-            artifacts/Sunshine-Linux-x86_64.tar.gz
-          fail_on_unmatched_files: false
