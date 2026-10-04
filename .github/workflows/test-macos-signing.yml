@@ -1,0 +1,87 @@
+---
+name: Test macOS Signing
+
+# Cheap smoke test for the 5 Apple code-signing secrets (APPLE_ID,
+# APPLE_TEAM_ID, BUILD_CERTIFICATE_BASE64, P12_PASSWORD,
+# NOTARIZATION_PASSWORD) -- signs and notarizes a trivial "hello world"
+# binary instead of a full ~10 min Sunshine build, so a secret typo or
+# expired app-specific password surfaces in ~1 minute instead of after a
+# long build. Not part of any release; workflow_dispatch only, never
+# publishes anything.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - name: Import macOS signing certificate into a temporary keychain
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/test-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Build a trivial test binary
+        run: |
+          echo 'int main(void) { return 0; }' > hello.c
+          clang -o hello hello.c
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          codesign --force --sign "Developer ID Application" --options runtime --timestamp hello
+          CODESIGN_INFO="$(codesign -dv --verbose=4 hello 2>&1)"
+          echo "$CODESIGN_INFO"
+          if echo "$CODESIGN_INFO" | grep -q "^Signature=adhoc"; then
+            echo "::error::ad-hoc signed -- BUILD_CERTIFICATE_BASE64/P12_PASSWORD problem"
+            exit 1
+          fi
+          if ! echo "$CODESIGN_INFO" | grep -q "Authority=Developer ID Application"; then
+            echo "::error::no Developer ID Application authority in signature"
+            exit 1
+          fi
+          codesign --verify --strict --verbose=2 hello
+          echo "signing OK"
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARIZATION_PASSWORD: ${{ secrets.NOTARIZATION_PASSWORD }}
+        run: |
+          set -euo pipefail
+          zip -j hello.zip hello
+          submit_json="$(xcrun notarytool submit hello.zip \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_NOTARIZATION_PASSWORD" --output-format json --wait --timeout 15m)"
+          echo "$submit_json"
+          status="$(echo "$submit_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
+          if [ "$status" != "Accepted" ]; then
+            id="$(echo "$submit_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+            xcrun notarytool log "$id" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_NOTARIZATION_PASSWORD" 2>/dev/null || true
+            echo "::error::notarization did not succeed (status: $status)"
+            exit 1
+          fi
+          echo "notarization OK -- all 5 secrets are valid and working"
+
+      - name: Remove temporary keychain
+        if: always()
+        run: |
+          [ -n "${KEYCHAIN_PATH:-}" ] && security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/build_certificate.p12"

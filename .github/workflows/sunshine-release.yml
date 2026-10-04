@@ -126,43 +126,51 @@ jobs:
             -DSUNSHINE_ENABLE_TRAY=OFF \
             -DSUNSHINE_PUBLISHER_NAME="usbridge_agent" \
             -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/itsme228/usbridge_agent" \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues" \
-            -DAPPLE_CODESIGN_IDENTITY="Developer ID Application"
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues"
 
       - name: Build
         run: cmake --build build -j $(sysctl -n hw.ncpu)
 
+      # No -DAPPLE_CODESIGN_IDENTITY/SHOULD_SIGN here -- cpack's own
+      # install(CODE) signing hook (cmake/packaging/macos.cmake) signs too
+      # early in its own packaging sequence: something installs/touches
+      # Contents/Resources/assets/web/*.json AFTER that script signs the
+      # bundle, which invalidates the resource seal ("a sealed resource is
+      # missing or invalid", confirmed live and reproduced locally with the
+      # real cert). cpack here just produces an (effectively unsigned)
+      # staging DMG; we sign for real in the next step, after cpack is
+      # completely done touching the bundle.
       - name: Package DMG
-        env:
-          SHOULD_SIGN: ${{ inputs.tag != '' }}
         run: |
           cd build
           cpack -G DragNDrop --config CPackConfig.cmake
           mkdir -p ../artifacts
           cp cpack_artifacts/Sunshine.dmg "../artifacts/${{ matrix.artifact }}"
 
-      - name: Verify Developer ID signature (fail if ad-hoc/unsigned)
+      - name: Sign, verify, and re-package the DMG
         if: inputs.tag != ''
         run: |
           set -euo pipefail
-          # build/Sunshine.app is the bundle `cmake --build` dropped straight
-          # into the build tree -- cpack's install(CODE) signing script (see
-          # cmake/packaging/macos.cmake) signs a SEPARATE copy it stages
-          # under DESTDIR inside its own _CPack_Packages tree and packages
-          # THAT into the DMG, so build/Sunshine.app never carries the real
-          # signature (just the ad-hoc one arm64's linker always adds).
-          # Verify the actual shipped artifact instead: mount the DMG cpack
-          # just produced and check the .app inside it.
+          SRC_DMG="artifacts/${{ matrix.artifact }}"
+          STAGE="$(mktemp -d)"
           MOUNT_POINT="$(mktemp -d)"
           cleanup() { hdiutil detach -quiet "$MOUNT_POINT" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
-          echo "y" | hdiutil attach -nobrowse -mountpoint "$MOUNT_POINT" "artifacts/${{ matrix.artifact }}" >/dev/null
 
-          APP="$(find "$MOUNT_POINT" -maxdepth 1 -iname "*.app" | head -1)"
-          if [[ -z "$APP" ]]; then
+          echo "y" | hdiutil attach -nobrowse -mountpoint "$MOUNT_POINT" "$SRC_DMG" >/dev/null
+          APP_NAME="$(basename "$(find "$MOUNT_POINT" -maxdepth 1 -iname "*.app" | head -1)")"
+          if [[ -z "$APP_NAME" ]]; then
             echo "::error::no .app found inside the built DMG"
             exit 1
           fi
+          cp -R "$MOUNT_POINT/$APP_NAME" "$STAGE/$APP_NAME"
+          cleanup
+          trap - EXIT
+
+          APP="$STAGE/$APP_NAME"
+          codesign --force --deep --sign "Developer ID Application" \
+            --options runtime --entitlements src_assets/macos/entitlements.plist \
+            --timestamp "$APP"
 
           echo "== codesign -dv =="
           if ! CODESIGN_INFO="$(codesign -dv --verbose=4 "$APP" 2>&1)"; then
@@ -171,7 +179,6 @@ jobs:
             exit 1
           fi
           echo "$CODESIGN_INFO"
-
           if echo "$CODESIGN_INFO" | grep -q "^Signature=adhoc"; then
             echo "::error::Sunshine.app is ad-hoc signed -- check BUILD_CERTIFICATE_BASE64/P12_PASSWORD repo secrets"
             exit 1
@@ -183,6 +190,10 @@ jobs:
           echo "== codesign --verify --deep --strict =="
           codesign --verify --deep --strict --verbose=2 "$APP"
           echo "✓ Sunshine.app is signed with a real Developer ID Application identity."
+
+          ln -sf /Applications "$STAGE/Applications"
+          rm -f "$SRC_DMG"
+          hdiutil create -volname Sunshine -srcfolder "$STAGE" -ov -format UDZO "$SRC_DMG"
 
       - name: Notarize DMG
         if: inputs.tag != ''
