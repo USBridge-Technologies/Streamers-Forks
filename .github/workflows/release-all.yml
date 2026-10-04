@@ -1,58 +1,69 @@
 ---
-name: Sunshine Release
+name: Release All Forks
 
-# Builds the Sunshine fork in sunshine/ (the workflow it was built with in
-# itsme228/Sunshine, run from that directory). Manual only: this repository
-# holds several forks, so a tag push does not say which one to release.
-# Without a tag it is a build test and publishes nothing.
+# Builds Sunshine (sunshine/) and Punktfunk (punktfunk/) together and
+# publishes every platform's assets under ONE GitHub release/tag, instead of
+# the two separate per-fork workflows (sunshine-release.yml,
+# punktfunk-release.yml) each cutting their own release. That separation is
+# exactly what broke usbridge_agent's build once before: GitHub's
+# /releases/latest pointer follows whichever release was PUBLISHED most
+# recently, with no regard for which fork it belongs to, so a Punktfunk-only
+# release outranked the last Sunshine release and every macOS/Linux/Windows
+# agent build silently fell back to a 10-30+ min Sunshine source build
+# (USBridge-Remote's agent/scripts/fetch_sunshine.sh had to be hardened to
+# scan the releases list for the newest release that actually carries the
+# wanted asset, rather than trust /releases/latest, to recover from this).
+# One shared tag for both forks' assets makes that class of bug impossible
+# going forward, as long as releases keep coming from this workflow.
+#
+# Manual only, same reasoning as the two per-fork workflows: this repo holds
+# several forks, so a tag push alone can't say what to release. Without a
+# tag this is a combined build test and publishes nothing.
+#
+# macOS Sunshine signing/notarization: see sunshine-release.yml's
+# build-macos job for the full secret-naming rationale (same 5 secrets as
+# itsme228/rust-shine: APPLE_ID, APPLE_TEAM_ID, BUILD_CERTIFICATE_BASE64,
+# P12_PASSWORD, NOTARIZATION_PASSWORD). Punktfunk has no macOS build
+# (Linux/Windows only, same as punktfunk-release.yml), and neither fork signs
+# its Windows binary (matching rust-shine's own release workflow, which also
+# ships usbridge-streamer-windows-x86_64.zip unsigned).
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v2026.1002.usbridge); empty = build only'
+        description: 'Release tag (e.g. v2026.1010.usbridge); empty = build only, no release'
         required: false
-      platform:
-        description: 'What to build'
+      sunshine_platform:
+        description: 'Sunshine: what to build'
         type: choice
         options:
           - all
           - linux
           - windows
           - macos
+          - none
+        default: all
+      punktfunk_platform:
+        description: 'Punktfunk: what to build'
+        type: choice
+        options:
+          - all
+          - linux
+          - windows
+          - none
         default: all
 
 jobs:
-  # Signed + notarized with the exact same secret NAMES as
-  # itsme228/rust-shine's release-usbridge-streamer.yml (APPLE_ID,
-  # APPLE_TEAM_ID, BUILD_CERTIFICATE_BASE64, P12_PASSWORD,
-  # NOTARIZATION_PASSWORD) -- this repo's own copies of the values, set via:
-  #   gh secret set APPLE_ID                --repo USBridge-Technologies/Streamers-Forks
-  #   gh secret set APPLE_TEAM_ID            --repo USBridge-Technologies/Streamers-Forks
-  #   gh secret set BUILD_CERTIFICATE_BASE64 --repo USBridge-Technologies/Streamers-Forks
-  #   gh secret set P12_PASSWORD             --repo USBridge-Technologies/Streamers-Forks
-  #   gh secret set NOTARIZATION_PASSWORD    --repo USBridge-Technologies/Streamers-Forks
-  #
-  # Signing itself is driven by the fork's own existing CMake hooks
-  # (cmake/packaging/macos.cmake's APPLE_CODESIGN_IDENTITY cache var +
-  # SHOULD_SIGN env, already upstream in LizardByte/Sunshine -- it signs every
-  # bundled dylib/framework before signing the .app itself, so there's no
-  # need to reimplement that with a bare `codesign --deep` the way
-  # USBridge-Remote's own build_macos.sh does for a DMG it merely re-stages).
-  # Only runs when cutting an actual release (inputs.tag set) -- a plain
-  # build-test dispatch stays ad-hoc signed and skips notarization entirely,
-  # so CI test runs don't burn Apple's notarization quota.
-  #
-  # This matters beyond Gatekeeper: usbridge_agent is moving from bundling
-  # Sunshine at build time to the agent fetching a streamer fork at runtime
-  # only once it's picked in the UI (no more build-time `codesign --deep`
-  # re-sign of a staged Sunshine.app pulling it under the agent bundle's own
-  # seal) -- so this release's own signature is now the only one a user's
-  # Gatekeeper ever sees, on every future update too, same reasoning as
-  # rust-shine's own build-macos job comment.
-  build-macos:
-    name: macOS ${{ matrix.arch }}
-    if: inputs.platform == 'all' || inputs.platform == 'macos'
+  # See sunshine-release.yml's build-macos job for the full comment on why
+  # this signs/notarizes and where the secrets come from -- kept in sync
+  # with that job intentionally; this one differs only in its `if:` (reads
+  # sunshine_platform here) and artifact-name prefix (sunshine- vs the
+  # sibling workflow's bare name) so both workflows' uploads never collide
+  # if ever run in the same GitHub Actions run context.
+  sunshine-macos:
+    name: Sunshine macOS ${{ matrix.arch }}
+    if: inputs.sunshine_platform == 'all' || inputs.sunshine_platform == 'macos'
     defaults:
       run:
         working-directory: sunshine
@@ -130,7 +141,7 @@ jobs:
             -DAPPLE_CODESIGN_IDENTITY="Developer ID Application"
 
       - name: Build
-        run: cmake --build build -j $(sysctl -n hw.ncpu)
+        run: cmake --build build -j "$(sysctl -n hw.ncpu)"
 
       - name: Package DMG
         env:
@@ -203,9 +214,9 @@ jobs:
           [ -n "${KEYCHAIN_PATH:-}" ] && security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/build_certificate.p12"
 
-  build-windows:
-    name: Windows x86_64
-    if: inputs.platform == 'all' || inputs.platform == 'windows'
+  sunshine-windows:
+    name: Sunshine Windows x86_64
+    if: inputs.sunshine_platform == 'all' || inputs.sunshine_platform == 'windows'
     defaults:
       run:
         working-directory: sunshine
@@ -253,7 +264,7 @@ jobs:
 
       - name: Build
         shell: msys2 {0}
-        run: cmake --build build -j $(nproc)
+        run: cmake --build build -j "$(nproc)"
 
       - name: Package ZIP
         shell: msys2 {0}
@@ -269,9 +280,9 @@ jobs:
           name: Sunshine-Windows-x86_64-portable.zip
           path: sunshine/artifacts/Sunshine-Windows-x86_64-portable.zip
 
-  build-linux:
-    name: Linux x86_64
-    if: inputs.platform == 'all' || inputs.platform == 'linux'
+  sunshine-linux:
+    name: Sunshine Linux x86_64
+    if: inputs.sunshine_platform == 'all' || inputs.sunshine_platform == 'linux'
     defaults:
       run:
         working-directory: sunshine
@@ -308,13 +319,6 @@ jobs:
             libminiupnpc-dev libva-dev libvulkan-dev \
             qtbase5-dev libqt5svg5-dev glslang-tools
 
-      # CUDA toolkit (compile-time only: nvcc + headers + static cudart). Without
-      # it SUNSHINE_BUILD_CUDA is never defined and the Linux build silently
-      # loses the CUDA/NVENC zero-copy path ("Attempting to use NVENC without
-      # CUDA support. Reverting back to GPU -> RAM -> GPU"). 12.9 is the newest
-      # 12.x: still builds sm_50+ kernels (13.x drops < sm_75) and supports
-      # gcc-14 as host compiler. Nothing from the toolkit ships in the tarball;
-      # libcuda.so comes from the host's NVIDIA driver at runtime.
       - name: Install CUDA toolkit
         env:
           CUDA_VERSION: "12.9.1"
@@ -347,7 +351,7 @@ jobs:
             -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues"
 
       - name: Build
-        run: cmake --build build -j $(nproc)
+        run: cmake --build build -j "$(nproc)"
 
       - name: Verify CUDA support was compiled in
         run: |
@@ -366,42 +370,12 @@ jobs:
         run: |
           DESTDIR=staging cmake --install build --prefix /usr
 
-          # Bundle every shared library the sunshine binary needs into
-          # staging/usr/lib and patch its RPATH to $ORIGIN/../lib, so the
-          # tarball is fully self-contained. usbridge_agent's Linux AppImage
-          # build copies this staging tree as-is and relies on usr/lib
-          # already carrying Sunshine's runtime deps (e.g.
-          # libminiupnpc.so.17) — the host AppImage users run on has no
-          # guarantee of matching system packages.
           curl -fL --progress-bar -o /tmp/linuxdeploy-x86_64.AppImage \
             "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
           chmod +x /tmp/linuxdeploy-x86_64.AppImage
 
-          # `cmake --install` installs a .desktop file with Icon=sunshine
-          # (see packaging/linux/AppImage/*.desktop) that linuxdeploy
-          # auto-detects and tries to deploy to the AppDir root — same as
-          # upstream's own AppImage packaging in .github/workflows/ci-linux.yml,
-          # which feeds linuxdeploy the matching icon/desktop file explicitly
-          # instead of letting it guess. Do the same here.
           desktop_file="$(find staging/usr/share/applications -name '*.desktop' | head -1)"
 
-          # GH-hosted runners don't reliably have a working FUSE mount for
-          # AppImages to self-mount via; --appimage-extract-and-run makes the
-          # AppImage runtime extract itself to a temp dir and exec from there
-          # instead, sidestepping FUSE entirely.
-          #
-          # libva/libva-drm must NOT be bundled. linuxdeploy's built-in
-          # excludelist already knows to leave libGL/libEGL/libdrm etc. on
-          # the host because they have to match the host's own GPU driver
-          # stack -- but it predates VAAPI being common and doesn't cover
-          # libva. Bundling it anyway pulls in Ubuntu 22.04's ancient libva
-          # (VA-API interface ~1.14), which can't resolve the
-          # __vaDriverInit_1_2x symbol newer host VAAPI drivers export
-          # (e.g. current intel-media-va-driver), so hardware encoding
-          # silently falls back to software on every up-to-date host. libva
-          # is loaded at runtime and is always present alongside a
-          # functioning VAAPI stack, so excluding it just means we rely on
-          # the host's copy, same as we already do for libGL/libdrm.
           ARCH=x86_64 /tmp/linuxdeploy-x86_64.AppImage \
             --appimage-extract-and-run \
             --appdir staging \
@@ -426,13 +400,124 @@ jobs:
           name: Sunshine-Linux-x86_64.tar.gz
           path: sunshine/artifacts/Sunshine-Linux-x86_64.tar.gz
 
+  punktfunk-linux:
+    name: Punktfunk Linux x86_64
+    if: inputs.punktfunk_platform == 'all' || inputs.punktfunk_platform == 'linux'
+    defaults:
+      run:
+        working-directory: punktfunk
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev pkg-config cmake git \
+            libdrm-dev libpipewire-0.3-dev libwayland-dev libxkbcommon-dev \
+            libgl-dev libegl-dev libgbm-dev libvulkan-dev
+
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: punktfunk
+
+      - name: Build host and encode worker
+        run: |
+          cargo build --release --locked \
+            --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
+            -p punktfunk-host -p punktfunk-encode-worker
+
+      - name: Verify NVENC was compiled in
+        run: |
+          strings target/release/punktfunk-host | grep -qE "NvEncodeAPICreateInstance|libnvidia-encode"
+          echo "NVENC path compiled into punktfunk-host"
+
+      - name: Package tarball
+        run: |
+          mkdir -p artifacts
+          ./target/release/punktfunk-host --version | tee artifacts/VERSION
+          tar -czf artifacts/punktfunk-host-Linux-x86_64.tar.gz \
+            -C target/release punktfunk-host punktfunk-encode-worker
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: punktfunk-host-Linux-x86_64.tar.gz
+          path: punktfunk/artifacts/punktfunk-host-Linux-x86_64.tar.gz
+
+  punktfunk-windows:
+    name: Punktfunk Windows x64
+    if: inputs.punktfunk_platform == 'all' || inputs.punktfunk_platform == 'windows'
+    defaults:
+      run:
+        working-directory: punktfunk
+        shell: pwsh
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: C:\t
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain
+          if ($LASTEXITCODE) { rustup toolchain install }
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: punktfunk -> C:\t
+
+      - name: Build host
+        run: |
+          cargo build --release --locked -p punktfunk-host --features nvenc,qsv --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { throw "host build" }
+
+      - name: Package zip
+        run: |
+          $exe = "C:\t\x86_64-pc-windows-msvc\release\punktfunk-host.exe"
+          & $exe --version
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Compress-Archive -Path $exe -DestinationPath artifacts/punktfunk-host-Windows-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: punktfunk-host-Windows-x64.zip
+          path: punktfunk/artifacts/punktfunk-host-Windows-x64.zip
+
   release:
-    name: Create Release
-    needs: [build-macos, build-windows, build-linux]
-    # A plain workflow_dispatch on a branch (no tag input) is a CI-only test
-    # build: don't turn the branch name into a release tag. A platform left
-    # out is "skipped", which is fine; a failed one is not.
-    if: ${{ !cancelled() && !failure() && inputs.tag != '' }}
+    name: Create combined release
+    needs:
+      - sunshine-macos
+      - sunshine-windows
+      - sunshine-linux
+      - punktfunk-linux
+      - punktfunk-windows
+    # Each platform input left at "none"/unset is "skipped", which is fine;
+    # a failed one is not. See resolve-version-less sibling workflows for
+    # the same `!cancelled() && !failure()` + explicit per-dependency result
+    # check rationale -- `always()` alone would let this run even after
+    # every build job got cancelled outright.
+    if: >-
+      ${{ always() && inputs.tag != '' &&
+          (needs.sunshine-macos.result == 'success' || needs.sunshine-macos.result == 'skipped') &&
+          (needs.sunshine-windows.result == 'success' || needs.sunshine-windows.result == 'skipped') &&
+          (needs.sunshine-linux.result == 'success' || needs.sunshine-linux.result == 'skipped') &&
+          (needs.punktfunk-linux.result == 'success' || needs.punktfunk-linux.result == 'skipped') &&
+          (needs.punktfunk-windows.result == 'success' || needs.punktfunk-windows.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -443,22 +528,30 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Determine tag
-        id: tag
-        run: |
-          echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: "Sunshine ${{ steps.tag.outputs.tag }} (usbridge fork)"
+          tag_name: ${{ inputs.tag }}
+          name: "Streamers ${{ inputs.tag }} (Sunshine + Punktfunk, usbridge forks)"
           body: |
-            Sunshine fork by usbridge: `web_bind_address` config option, and
-            USB devices handed to the USBridge USB broker (a tablet sent over
-            the stream; gamepads on Windows).
+            Combined release of both usbridge streamer forks under one tag, so
+            agent/scripts/fetch_sunshine.sh (and any future punktfunk fetch
+            script) always finds a release that carries every asset it needs,
+            regardless of which fork's release happened to publish last.
+
+            Sunshine fork: `web_bind_address` config option, USB devices handed
+            to the USBridge USB broker (a tablet sent over the stream; gamepads
+            on Windows). macOS build is Developer-ID-signed and notarized.
+
+            Punktfunk fork: USB devices handed to the USBridge USB broker, and
+            PyroWave on the GameStream plane for a USBridge client. Linux
+            x86_64 (host + encode worker, NVENC + Vulkan encode) and Windows
+            x64 (punktfunk-host.exe, NVENC + QSV + AMF; no installer or
+            drivers). No macOS build.
           files: |
             artifacts/Sunshine-macOS-arm64.dmg
             artifacts/Sunshine-Windows-x86_64-portable.zip
             artifacts/Sunshine-Linux-x86_64.tar.gz
+            artifacts/punktfunk-host-Linux-x86_64.tar.gz
+            artifacts/punktfunk-host-Windows-x64.zip
           fail_on_unmatched_files: false
