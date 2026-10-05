@@ -373,6 +373,10 @@ pub fn remove_device(instance_id: &str) -> std::io::Result<()> {
 /// `(OI)(CI)(RX)` so the tray can read non-secret config. Hard-coded SIDs; never fatal.
 #[cfg(windows)]
 fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool, users_read: bool) {
+    if !is_under_program_data(dir) {
+        tracing::debug!(dir = %dir.display(), "config dir is outside %ProgramData% -- keeping its inherited ACL");
+        return;
+    }
     let icacls = system32("icacls.exe");
     // Re-own to Administrators first: an owner keeps WRITE_DAC.
     // `deep` (once per dir per process) also re-owns contents; directory-only
@@ -421,6 +425,30 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool, users_read: 
             "config-dir DACL hardening did not fully succeed — a local user may be able to plant config files"
         ),
     }
+}
+
+/// USBridge: whether `dir` is in `%ProgramData%`, the dir a SYSTEM service shares with the
+/// user, which is what [`restrict_dir_to_system_admins`] hardens.
+///
+/// A launcher may instead hand the host a dir in the user's own profile with
+/// `PUNKTFUNK_CONFIG_DIR` (the USBridge agent uses `%APPDATA%\usbridge-agent\punktfunk`) and
+/// run it unelevated. That dir is already private to the user through its inherited ACL.
+/// Re-ACLing it to SYSTEM/Administrators locked the user, and so the host itself, out of it:
+/// the next write (`native-key.pem`) failed with "Access is denied" and the host exited.
+/// Unknown `%ProgramData%` keeps the hardening.
+#[cfg(windows)]
+fn is_under_program_data(dir: &std::path::Path) -> bool {
+    let Some(program_data) = std::env::var_os("ProgramData").filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let norm = |p: &std::path::Path| {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+    };
+    let base = norm(std::path::Path::new(&program_data));
+    let dir = norm(dir);
+    dir.len() >= base.len() && dir[..base.len()] == base[..]
 }
 
 /// Unix: create and re-chmod 0600 so it is never group/world-readable.
@@ -586,6 +614,16 @@ fn restrict_to_system_admins(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn only_program_data_dirs_get_the_service_dacl() {
+        let pd = std::env::var("ProgramData").expect("ProgramData is set on Windows");
+        assert!(is_under_program_data(&PathBuf::from(&pd).join("punktfunk")));
+        assert!(is_under_program_data(&PathBuf::from(pd.to_uppercase()).join("punktfunk")));
+        let appdata = std::env::var("APPDATA").expect("APPDATA is set on Windows");
+        assert!(!is_under_program_data(&PathBuf::from(appdata).join("usbridge-agent").join("punktfunk")));
+    }
 
     #[test]
     fn env_file_reads_host_env_as_the_service_does() {

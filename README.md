@@ -40,6 +40,15 @@ tablet) and, on Windows, gamepads. See
 `punktfunk/crates/punktfunk-host/src/gamestream/usbridge.rs`. Without
 `USBRIDGE_USB_BROKER_CONTROL` in its environment the host behaves as upstream.
 
+On Windows, upstream re-ACLs its config dir for the `%ProgramData%` dir a
+SYSTEM service shares with the user: full control for SYSTEM and
+Administrators only, read-only for Users. The agent instead runs the host
+unelevated, with `PUNKTFUNK_CONFIG_DIR` in the user's own `%APPDATA%`, so that
+DACL locked the host out of its own dir. Its first write
+(`native-key.pem`) failed with "Access is denied" and it exited. The fork
+hardens only dirs under `%ProgramData%`
+(`punktfunk/crates/pf-paths/src/lib.rs`, `is_under_program_data`).
+
 Build (Linux):
 
     cd punktfunk
