@@ -19,13 +19,21 @@ pub enum CaptureBackend {
     /// host runs as SYSTEM in the interactive console session, so it captures
     /// the secure desktop too.
     IddPush,
+    /// USBridge, Windows: DXGI Desktop Duplication of the shared MttVDD virtual monitor
+    /// (`pf_vdisplay::mttvdd`), encoded by the host's own encoders (NVENC/AMF/QSV/MF) --
+    /// no pf-vdisplay driver. Used whenever MttVDD is installed.
+    DxgiDup,
 }
 
 impl CaptureBackend {
     /// Shared by [`SessionPlan::resolve`] and the standalone callers (GameStream / spike).
     pub fn resolve() -> Self {
         if cfg!(target_os = "windows") {
-            CaptureBackend::IddPush
+            if pf_vdisplay::windows_uses_mttvdd() {
+                CaptureBackend::DxgiDup
+            } else {
+                CaptureBackend::IddPush
+            }
         } else {
             CaptureBackend::Portal
         }

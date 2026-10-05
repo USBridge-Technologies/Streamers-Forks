@@ -711,6 +711,10 @@ pub use linux::gnome_hdr_monitor_active;
 #[cfg(target_os = "windows")]
 #[path = "windows/synthetic_nv12.rs"]
 pub mod synthetic_nv12;
+// USBridge: DXGI Desktop Duplication of the shared MttVDD virtual monitor.
+#[cfg(target_os = "windows")]
+#[path = "windows/dxgi_dup.rs"]
+mod dxgi_dup;
 
 /// Linux xdg-ScreenCast portal capturer for a client-sized monitor. `anchored`
 /// inherits a RemoteDesktop grant headlessly. Pass `want_hdr` only when the
@@ -806,6 +810,28 @@ pub fn open_direct_output(
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
     linux::WlCapturer::open(output_name, keepalive, policy)
         .map(|c| Box::new(c) as Box<dyn Capturer>)
+}
+
+/// USBridge: DXGI Desktop Duplication capturer on an existing monitor (the MttVDD virtual
+/// monitor, a target with `wudf_pid == 0`). BGRA frames for the host encoders. On failure
+/// `keepalive` is handed back.
+#[cfg(target_os = "windows")]
+pub fn open_dxgi_dup(
+    target: pf_frame::dxgi::WinCaptureTarget,
+    keepalive: Box<dyn Send>,
+) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
+    // `open` consumes the keepalive only on success; keep a way to hand it back.
+    let mut keep = Some(keepalive);
+    let target_c = target.clone();
+    match dxgi_dup::DxgiDupCapturer::open(target, Box::new(())) {
+        Ok(mut c) => {
+            // Swap the placeholder for the real lease now that the capture is open.
+            let _ = c.take_keepalive();
+            c.set_keepalive(keep.take().unwrap());
+            Ok(Box::new(c) as Box<dyn Capturer>)
+        }
+        Err(e) => Err((e.context(format!("DXGI duplication of {}", target_c.gdi_name)), keep.take().unwrap())),
+    }
 }
 
 /// Windows IDD direct-push capturer on a pf-vdisplay target. `sender` delivers

@@ -414,8 +414,13 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
     #[cfg(target_os = "windows")]
     {
-        // Sole backend is the IddCx driver, whatever `compositor` says.
         let _ = compositor;
+        // USBridge: MttVDD, the virtual monitor every USBridge streamer on Windows shares,
+        // when it is installed; pf-vdisplay only otherwise (see `windows_uses_mttvdd`).
+        if windows_uses_mttvdd() {
+            return Ok(Box::new(mttvdd::MttvddDisplay::new()));
+        }
+        // Sole backend is the IddCx driver, whatever `compositor` says.
         // `ensure_available` waits out a D0 re-register (wake-from-sleep) and
         // reloads a hostless-zombie adapter (devnode present, interface gone).
         // `.context` appends; a replacement "not installed" hid mid-resume.
@@ -465,6 +470,9 @@ pub fn probe(compositor: Compositor) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let _ = compositor;
+        if windows_uses_mttvdd() {
+            return Ok(());
+        }
         driver::probe()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -854,6 +862,29 @@ mod mutter;
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/pf_vdisplay.rs"]
 pub mod driver;
+
+// USBridge: the shared MttVDD virtual monitor (DXGI-duplicated by the host) instead of
+// pf-vdisplay. `vdisplay/windows/mttvdd.rs`.
+#[cfg(target_os = "windows")]
+#[path = "vdisplay/windows/mttvdd.rs"]
+pub mod mttvdd;
+
+/// USBridge: whether Windows sessions use the MttVDD monitor (captured with DXGI Desktop
+/// Duplication) rather than pf-vdisplay's IDD push. Yes whenever MttVDD is installed, so
+/// every USBridge streamer shares one virtual display driver; `USBRIDGE_VDISPLAY=pf` forces
+/// pf-vdisplay.
+#[cfg(target_os = "windows")]
+pub fn windows_uses_mttvdd() -> bool {
+    if std::env::var("USBRIDGE_VDISPLAY").is_ok_and(|v| v.eq_ignore_ascii_case("pf")) {
+        return false;
+    }
+    mttvdd::is_installed()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn windows_uses_mttvdd() -> bool {
+    false
+}
 
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/wlroots.rs"]

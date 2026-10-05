@@ -371,6 +371,12 @@ pub fn capture_virtual_output(
     )));
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
+    // USBridge: the MttVDD monitor has no driver ring to share (`wudf_pid == 0`): duplicate
+    // it with DXGI and let the host encoders take the BGRA frames.
+    if target.wudf_pid == 0 {
+        return pf_capture::open_dxgi_dup(target, keep)
+            .map_err(|(e, _keep)| e.context("DXGI duplication capture open (MttVDD)"));
+    }
     // Resolve the pf-vdisplay control device once and wrap its cursor IOCTLs for the
     // IDD-push capturer. This is the one host reach into `crate::vdisplay` the capturer
     // would otherwise make.
