@@ -49,6 +49,46 @@ DACL locked the host out of its own dir. Its first write
 hardens only dirs under `%ProgramData%`
 (`punktfunk/crates/pf-paths/src/lib.rs`, `is_under_program_data`).
 
+### Windows video: the shared MttVDD monitor, no pf-vdisplay driver
+
+On Windows, upstream streams only from its own IddCx driver, `pf-vdisplay`. That
+driver creates the virtual monitor and also encodes inside WUDFHost, so the host
+must run as a SYSTEM service, and the driver needs an elevated install plus its
+own certificate. The fork uses the virtual monitor every USBridge streamer
+shares instead: MttVDD (VirtualDrivers' Virtual Display Driver, which RustShine
+uses too). That is one driver for all streamers, with the host running as the
+user.
+
+The pieces:
+
+- `pf-vdisplay/src/vdisplay/windows/mttvdd.rs` handles the monitor, ported from
+  rust-shine's `virtual-display`:
+  - attaches MttVDD in the mode closest to the client's (`SetDisplayConfig`);
+  - makes it the primary display;
+  - on session end, restores the old primary and detaches it.
+- `pf-capture/src/windows/dxgi_dup.rs` captures it with DXGI Desktop
+  Duplication into BGRA D3D11 textures:
+  - the pointer is blended in (`CursorBlendPass`);
+  - `wait_arrival` lets the encode loop follow the desktop's presents.
+- `pf-encode/src/select/windows.rs` opens the host's own NVENC / AMF / QSV /
+  Media Foundation encoder for those frames; upstream refused here.
+- `punktfunk-host` has `CaptureBackend::DxgiDup`, picked whenever MttVDD is
+  installed. `USBRIDGE_VDISPLAY=pf` goes back to pf-vdisplay.
+
+The monitor has to be primary for 120 Hz: on a hybrid laptop, DWM composes at the
+primary display's refresh, so a 120 Hz virtual monitor next to a 60 Hz primary
+panel gets 60 frames a second. `USBRIDGE_VDD_PRIMARY=0` keeps the physical
+primary anyway.
+
+Measured on a Radeon 780M + RTX 3090 laptop at 2560x1600 HEVC, host side, 60 s
+per run, with a D3D11 vsync animation on the virtual monitor:
+
+| | fork on MttVDD | upstream on pf-vdisplay |
+|---|---|---|
+| 120 fps: frames sent / unique per s | 118.7 / 117.2 | 119.0 / 119.0 |
+| 60 fps: frames sent / unique per s | 60.3 / 60.0 | 60.4 / 60.4 |
+| capture, slowest per second (median) | 0.27 ms | 0.6 ms |
+
 Build (Linux):
 
     cd punktfunk

@@ -21,14 +21,13 @@ use pf_frame::{FrameOrigin, Provenance};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::core::Interface;
-use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
     D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
+    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
@@ -81,6 +80,8 @@ pub struct DxgiDupCapturer {
     source_seq: u64,
     start: Instant,
     keepalive: Option<Box<dyn Send>>,
+    /// A frame `wait_arrival` acquired, for the next `try_latest` (a duplication cannot peek).
+    pending: Option<CapturedFrame>,
 }
 
 // SAFETY: `make_device` omits `SINGLETHREADED`; D3D11/DXGI COM refcounts are interlocked.
@@ -88,43 +89,41 @@ pub struct DxgiDupCapturer {
 // context and the duplication are never used concurrently.
 unsafe impl Send for DxgiDupCapturer {}
 
-fn unpack_luid(luid: i64) -> LUID {
-    LUID {
-        LowPart: luid as u32,
-        HighPart: (luid >> 32) as i32,
-    }
-}
-
 fn wide_eq(raw: &[u16], name: &str) -> bool {
     let len = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
     String::from_utf16_lossy(&raw[..len]).eq_ignore_ascii_case(name)
 }
 
-/// Device on the output's adapter plus a duplication of that output.
+/// Device on the adapter DXGI lists the output under, plus a duplication of that output.
+///
+/// Found by GDI name across every adapter, not by `target.adapter_luid`: that is the CCD
+/// path's adapter, which for an IddCx monitor is the virtual driver's own adapter, while
+/// DXGI lists the output under the GPU that renders it (the RTX 3090 on the test laptop).
 fn open_dup(
     target: &pf_frame::dxgi::WinCaptureTarget,
 ) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutputDuplication)> {
-    let adapter = pf_frame::dxgi::adapter_by_luid(Some(unpack_luid(target.adapter_luid)))
-        .ok_or_else(|| anyhow!("no DXGI adapter with the virtual monitor's LUID"))?;
     // SAFETY: COM calls on owned interfaces; every out value is checked.
     unsafe {
-        let (device, context) = make_device(&adapter).context("D3D11 device for duplication")?;
-        let mut i = 0;
-        loop {
-            let output = adapter
-                .EnumOutputs(i)
-                .map_err(|_| anyhow!("{} is not an output of its adapter", target.gdi_name))?;
-            let desc = output.GetDesc()?;
-            if wide_eq(&desc.DeviceName, &target.gdi_name) {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
+        let mut a = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(a) {
+            a += 1;
+            let mut o = 0;
+            while let Ok(output) = adapter.EnumOutputs(o) {
+                o += 1;
+                if !wide_eq(&output.GetDesc()?.DeviceName, &target.gdi_name) {
+                    continue;
+                }
+                let (device, context) = make_device(&adapter).context("D3D11 device for duplication")?;
                 let output1: IDXGIOutput1 = output.cast()?;
                 let dup = output1
                     .DuplicateOutput(&device)
                     .with_context(|| format!("DuplicateOutput({})", target.gdi_name))?;
                 return Ok((device, context, dup));
             }
-            i += 1;
         }
     }
+    bail!("no DXGI adapter lists {} as an output", target.gdi_name)
 }
 
 fn make_texture(device: &ID3D11Device, w: u32, h: u32, format: DXGI_FORMAT) -> Result<ID3D11Texture2D> {
@@ -245,6 +244,7 @@ impl DxgiDupCapturer {
             source_seq: 0,
             start: Instant::now(),
             keepalive: Some(keepalive),
+            pending: None,
         })
     }
 
@@ -276,6 +276,7 @@ impl DxgiDupCapturer {
         self.height = mode.Height;
         self.format = mode.Format;
         self.last = None;
+        self.pending = None;
         self.source_seq = 0;
         self.device = device;
         self.context = context;
@@ -391,6 +392,9 @@ impl Capturer for DxgiDupCapturer {
     /// The next new frame, waiting up to `budget`; past that a repeat of the newest one
     /// when there is one (a static desktop presents nothing).
     fn next_frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
+        if let Some(f) = self.pending.take() {
+            return Ok(f);
+        }
         let deadline = Instant::now() + budget;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -406,9 +410,33 @@ impl Capturer for DxgiDupCapturer {
         }
     }
 
+    /// The encode loop then follows the desktop's presents instead of its own tick, whose
+    /// phase drifts against vsync: on a fixed 120 Hz tick about a sixth of the 120 new images
+    /// a second arrived two per tick and only the newest was sent (measured: 99 unique/s).
+    fn supports_arrival_wait(&self) -> bool {
+        true
+    }
+
+    fn wait_arrival(&mut self, deadline: Instant) {
+        while self.pending.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            match self.acquire(left.as_millis().clamp(1, 100) as u32) {
+                Ok(Some(f)) => self.pending = Some(f),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "DXGI duplication wait failed");
+                    return;
+                }
+            }
+        }
+    }
+
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        // Drain to the newest frame without waiting.
-        let mut newest = None;
+        // The parked frame, or anything newer, without waiting.
+        let mut newest = self.pending.take();
         while let Some(f) = self.acquire(0)? {
             newest = Some(f);
         }
