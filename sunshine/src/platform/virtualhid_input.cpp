@@ -1042,7 +1042,6 @@ namespace platf {
   virtualhid::client_context_t &virtualhid::get_client_context(client_input_t *input) {
     return static_cast<client_input_raw_t *>(input)->virtualhid;
   }
-#endif
 
   void move_mouse(input_t &input, int deltaX, int deltaY) {
     virtualhid::move_mouse(virtualhid::get_input_context(input), deltaX, deltaY);
@@ -1080,7 +1079,6 @@ namespace platf {
     virtualhid::pen_update(virtualhid::get_client_context(input), touch_port, pen);
   }
 
-#ifndef _WIN32
   int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue) {
     return virtualhid::alloc_gamepad(virtualhid::get_input_context(input), id, metadata, std::move(feedback_queue));
   }

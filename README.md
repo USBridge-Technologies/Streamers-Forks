@@ -49,8 +49,24 @@ Build (Linux):
 
 The fork that used to live in `itsme228/Sunshine` (`web_bind_address`,
 `usbridgeDisplayCursor`, no Vulkan encoder), plus the USB broker bridge in
-`sunshine/src/usbridge.cpp`. Its submodules are registered in this
-repository's `.gitmodules`:
+`sunshine/src/usbridge.cpp`.
+
+On Windows the fork has no libvirtualhid, so it needs no Virtual HID Driver,
+no libvirtualhid broker service and no license:
+
+- keyboard and mouse use `SendInput`;
+- touch and pen use synthetic pointer devices (Windows 10 1809+);
+- gamepads under the USBridge agent are the USB broker's Xbox 360 pads on
+  usbip-win2;
+- ViGEmBus is only a fallback for Sunshine running without the agent.
+
+See `sunshine/src/platform/windows/input.cpp`. Only libvirtualhid's
+platform-neutral core is compiled there, with its "no backend" and "no
+license" stubs (`sunshine/cmake/compile_definitions/common.cmake`), so the
+shared config and web UI code builds unchanged. Linux and macOS keep upstream
+libvirtualhid.
+
+Its submodules are registered in this repository's `.gitmodules`:
 
     git submodule update --init --recursive
     cmake -B sunshine/build -S sunshine -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF \

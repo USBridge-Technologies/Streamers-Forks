@@ -868,6 +868,8 @@ TEST_F(VirtualHidDeviceTest, TranslatesPenButtonsToolsAndTransitions) {
   platf::virtualhid::pen_update(*client(), viewport, pen);
 }
 
+#ifndef _WIN32
+// The USBridge fork's Windows input does not go through libvirtualhid.
 TEST_F(VirtualHidDeviceTest, PlatformWrappersForwardToVirtualHidContext) {
   auto platform_input = platf::input();
   ASSERT_TRUE(platform_input);
@@ -947,3 +949,4 @@ TEST_F(VirtualHidDeviceTest, PlatformWrappersForwardToVirtualHidContext) {
   platf::pen_update(platform_client.get(), viewport, {LI_TOUCH_EVENT_HOVER, LI_TOOL_TYPE_PEN, 0, LI_TILT_UNKNOWN, LI_ROT_UNKNOWN, 0.25F, 0.5F, 0.5F, 0.0F, 0.0F});
   EXPECT_EQ(platform_client_context.pen->last_submitted_tool().tool, lvh::PenToolType::pen);
 }
+#endif

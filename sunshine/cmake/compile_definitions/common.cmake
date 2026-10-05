@@ -68,7 +68,30 @@ elseif(UNIX)
 endif()
 
 # libvirtualhid
-add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libvirtualhid")
+if(WIN32)
+    # USBridge fork: no Virtual HID Driver on Windows. src/platform/windows/input.cpp injects
+    # keyboard, mouse, touch and pen with Win32 APIs, and gamepads are the USBridge USB broker's
+    # (usbip-win2). Only libvirtualhid's platform-neutral core is built, with its "no backend" and
+    # "no license" stubs, so the shared config/web UI code still compiles; nothing talks to the
+    # driver, its broker service or the license server.
+    set(LIBVIRTUALHID_SRC "${CMAKE_SOURCE_DIR}/third-party/libvirtualhid/src")
+    add_library(libvirtualhid STATIC
+            "${LIBVIRTUALHID_SRC}/core/backend.cpp"
+            "${LIBVIRTUALHID_SRC}/core/gamepad_adapter.cpp"
+            "${LIBVIRTUALHID_SRC}/core/profiles.cpp"
+            "${LIBVIRTUALHID_SRC}/core/report.cpp"
+            "${LIBVIRTUALHID_SRC}/core/runtime.cpp"
+            "${LIBVIRTUALHID_SRC}/core/types.cpp"
+            "${LIBVIRTUALHID_SRC}/platform/license_unavailable.cpp"
+            "${LIBVIRTUALHID_SRC}/platform/unsupported_backend.cpp")
+    add_library(libvirtualhid::libvirtualhid ALIAS libvirtualhid)
+    target_include_directories(libvirtualhid
+            PUBLIC "${LIBVIRTUALHID_SRC}/include"
+            PRIVATE "${LIBVIRTUALHID_SRC}")
+    target_compile_features(libvirtualhid PUBLIC cxx_std_23)
+else()
+    add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libvirtualhid")
+endif()
 list(APPEND SUNSHINE_EXTERNAL_LIBRARIES libvirtualhid::libvirtualhid)
 list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/virtualhid_input.h"

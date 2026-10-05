@@ -2350,9 +2350,12 @@ namespace input {
         key_press_repeat_id = nullptr;
         reset_mouse_buttons();
         reset_keyboard_keys();
+#ifndef _WIN32
+        // Windows has no libvirtualhid devices to recreate (src/platform/windows/input.cpp).
         auto &context = platf::virtualhid::get_input_context(platf_input);
         context.refresh_keyboard();
         context.refresh_mouse();
+#endif
       }
     });
   }

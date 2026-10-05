@@ -56,6 +56,8 @@ namespace {
     return packet;
   }
 
+#ifndef _WIN32
+  // The USBridge fork's Windows input has no libvirtualhid context to swap a fake backend into.
   /**
    * @brief Fixture that installs a fake global virtual input backend.
    */
@@ -113,6 +115,7 @@ namespace {
     lvh::Runtime *runtime_ = nullptr;  ///< Fake runtime installed in the global input backend.
     config::input_t original_input_;  ///< Input configuration restored after each test.
   };
+#endif
 }  // namespace
 
 TEST(InputPacketValidationTest, RejectsEveryBufferShorterThanTheHeader) {
@@ -207,6 +210,7 @@ TEST(InputPacketValidationTest, PreservesUnknownPacketHandlingWithinDeclaredBoun
   EXPECT_TRUE(input::testing::is_valid_input_packet(packet));
 }
 
+#ifndef _WIN32
 TEST_F(InputGamepadSessionTest, RejectsMalformedBatchablePacketsAtQueueIngress) {
   ASSERT_FALSE(task_pool.running());
   const std::shared_ptr<input::input_t> empty_input;
@@ -297,3 +301,4 @@ TEST_F(InputGamepadSessionTest, RefreshesSharedVirtualInputAfterLicenseStateChan
   EXPECT_NE(context().mouse->device_id(), original_mouse_id);
   EXPECT_EQ(runtime().active_device_count(), active_devices);
 }
+#endif
