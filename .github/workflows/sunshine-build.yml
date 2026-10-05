@@ -254,10 +254,18 @@ jobs:
             mingw-w64-ucrt-x86_64-opus
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-toolchain
+            git
 
+      # cmake/dependencies/ffmpeg.cmake picks the FFmpeg build matching the
+      # pinned third-party/build-deps tag with `git describe`. Without git in
+      # the MSYS2 shell it silently fell back to build-deps' *latest* release,
+      # which broke the link once build-deps v2026.1004 started needing
+      # libswresample/libopus. Fail instead of drifting.
       - name: Configure
         shell: msys2 {0}
         run: |
+          set -o pipefail
+          git config --global --add safe.directory '*'
           cmake \
             -B build \
             -S . \
@@ -267,7 +275,12 @@ jobs:
             -DSUNSHINE_ENABLE_TRAY=OFF \
             -DSUNSHINE_PUBLISHER_NAME="usbridge_agent" \
             -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/itsme228/usbridge_agent" \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues"
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues" \
+            | tee configure.log
+          if ! grep -q "Using FFmpeg from build-deps tag" configure.log; then
+            echo "::error::FFmpeg was not pinned to the build-deps submodule tag"
+            exit 1
+          fi
 
       - name: Build
         shell: msys2 {0}
