@@ -11,8 +11,8 @@
  *   the broker rebuilds the device on a virtual USB port so the native driver binds. Offered to
  *   the client with `FEATURE_FLAG_RAW_HID`.
  * - **Gamepads**: each controller becomes a virtual Xbox 360 pad on a USB/IP port. The default
- *   on Windows, where the agent installs usbip-win2 and no ViGEmBus; `USBRIDGE_PAD_BRIDGE=1|0`
- *   overrides either way.
+ *   on Windows, where this is the only way the fork builds pads (no libvirtualhid driver, no
+ *   ViGEmBus, see src/platform/windows/input.cpp); `USBRIDGE_PAD_BRIDGE=1|0` overrides it.
  *
  * Without the variable nothing here runs and nothing is advertised.
  */

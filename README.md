@@ -23,8 +23,9 @@ them on USB/IP ports:
 - a raw HID device the USBridge client sends over the control stream
   (`LiSendRawHidEvent`, a tablet), offered to the client with the
   `LI_FF_USBRIDGE_RAW_HID` feature flag;
-- on Windows, gamepads, as Xbox 360 controllers on usbip-win2
-  (`USBRIDGE_PAD_BRIDGE=1|0` forces either way).
+- on Windows, gamepads, as Xbox 360 controllers on usbip-win2 (Sunshine
+  has no other way to build them there, see below; elsewhere
+  `USBRIDGE_PAD_BRIDGE=1` turns this on).
 
 Plain USB/IP passthrough of a device needs nothing from the host: the broker
 does it alone. Without the variable both hosts behave as upstream. The agent
@@ -51,20 +52,47 @@ The fork that used to live in `itsme228/Sunshine` (`web_bind_address`,
 `usbridgeDisplayCursor`, no Vulkan encoder), plus the USB broker bridge in
 `sunshine/src/usbridge.cpp`.
 
-On Windows the fork has no libvirtualhid, so it needs no Virtual HID Driver,
-no libvirtualhid broker service and no license:
+### Windows: signed usbip-win2 only, no libvirtualhid, no ViGEmBus
 
-- keyboard and mouse use `SendInput`;
-- touch and pen use synthetic pointer devices (Windows 10 1809+);
-- gamepads under the USBridge agent are the USB broker's Xbox 360 pads on
-  usbip-win2;
-- ViGEmBus is only a fallback for Sunshine running without the agent.
+Upstream Sunshine on Windows needs third-party input drivers: libvirtualhid's
+Virtual HID Driver, with its broker service and a paid license, or the
+retired ViGEmBus. The fork drops both. On Windows the only driver involved
+is usbip-win2, which is signed and already installed by the USBridge agent:
 
-See `sunshine/src/platform/windows/input.cpp`. Only libvirtualhid's
-platform-neutral core is compiled there, with its "no backend" and "no
-license" stubs (`sunshine/cmake/compile_definitions/common.cmake`), so the
-shared config and web UI code builds unchanged. Linux and macOS keep upstream
-libvirtualhid.
+| Input | Upstream | Fork |
+|---|---|---|
+| Keyboard, mouse | libvirtualhid driver (licensed), `SendInput` fallback | `SendInput` |
+| Touch, pen | libvirtualhid | synthetic pointer devices (Windows 10 1809+) |
+| Gamepads | libvirtualhid driver (licensed) or ViGEmBus | USBridge USB broker: Xbox 360 pads on usbip-win2 |
+| Tablets, other HID devices from a USBridge client | -- | USBridge USB broker on usbip-win2 |
+
+Where the code is:
+
+- `sunshine/src/platform/windows/input.cpp` holds the Windows input.
+- `sunshine/src/usbridge.cpp` holds the broker bridge.
+
+What was removed and what stays:
+
+- `third-party/ViGEmClient` is no longer built, and its submodule is gone.
+- Of libvirtualhid, only the platform-neutral core is compiled on Windows,
+  with its "no backend" and "no license" stubs
+  (`sunshine/cmake/compile_definitions/common.cmake`). This keeps the shared
+  config and web UI code building unchanged. Nothing opens the driver, its
+  broker service or the license server.
+
+Without the USBridge agent (no `USBRIDGE_USB_BROKER_CONTROL`), Sunshine on
+Windows has no gamepads. Keyboard, mouse, touch and pen work as before.
+
+### Linux and macOS
+
+These keep upstream libvirtualhid for keyboard, mouse and gamepads (uinput or
+uhid on Linux; no driver and no license on either). Tablets and other HID
+devices from a USBridge client still go to the USB broker:
+
+- on Linux, through vhci-hcd;
+- on macOS, through the USBridge USB/IP dongle.
+
+### Build
 
 Its submodules are registered in this repository's `.gitmodules`:
 
