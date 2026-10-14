@@ -68,6 +68,7 @@ var knownAssets = []string{
 	"Sunshine-Linux-x86_64.tar.gz",
 	"punktfunk-host-Linux-x86_64.tar.gz",
 	"punktfunk-host-Windows-x64.zip",
+	"Vibepollo-Windows-x86_64-portable.zip",
 }
 
 func main() {
