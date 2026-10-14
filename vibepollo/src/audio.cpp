@@ -1,0 +1,545 @@
+/**
+ * @file src/audio.cpp
+ * @brief Definitions for audio capture and encoding.
+ */
+#include <algorithm>
+#include <mutex>
+#include <thread>
+
+// lib includes
+#include <opus/opus_multistream.h>
+
+// local includes
+#include "audio.h"
+#include "audio_lifecycle_policy.h"
+#include "audio_lifecycle_state.h"
+#include "audio_policy.h"
+#include "config.h"
+#include "globals.h"
+#include "logging.h"
+#include "platform/common.h"
+#include "process.h"
+#include "thread_safe.h"
+#include "utility.h"
+#include "webrtc_stream.h"
+
+namespace audio {
+  using namespace std::literals;
+  using opus_t = util::safe_ptr<OpusMSEncoder, opus_multistream_encoder_destroy>;
+  using sample_queue_t = std::shared_ptr<safe::queue_t<std::vector<float>>>;
+
+  static int start_audio_control(audio_ctx_t &ctx);
+  static void stop_audio_control(audio_ctx_t &);
+  static void apply_surround_params(opus_stream_config_t &stream, const stream_params_t &params);
+
+#if defined(_WIN32) || defined(__linux__)
+  struct retained_audio_t {
+    std::unique_ptr<platf::audio_control_t> control;
+    platf::sink_t sink;
+    bool restore_sink {false};
+  };
+
+  lifecycle::state_t<retained_audio_t> audio_state;
+
+  void restore_audio_control(audio_ctx_t &ctx) {
+    if (!ctx.restore_sink || !ctx.control) {
+      return;
+    }
+
+    const std::string &sink = ctx.sink.host.empty() ? config::audio.sink : ctx.sink.host;
+    if (!sink.empty()) {
+      ctx.control->restore_sink(sink);
+    }
+    ctx.control->reset_default_device(sink);
+  }
+
+  bool retain_audio_control(audio_ctx_t &ctx) {
+    if (lifecycle::final_owner_release_action(
+          ctx.restore_sink,
+          proc::proc.current_app_id() > 0,
+          audio_state.terminal_pending()
+        ) != lifecycle::release_action_e::retain) {
+      return false;
+    }
+
+    retained_audio_t value {
+      std::move(ctx.control),
+      std::move(ctx.sink),
+      ctx.restore_sink,
+    };
+    if (audio_state.retain(value, proc::proc.current_app_id() > 0)) {
+      return true;
+    }
+
+    ctx.control = std::move(value.control);
+    ctx.sink = std::move(value.sink);
+    return false;
+  }
+
+  bool reclaim_retained_audio(audio_ctx_t &ctx) {
+    audio_state.wait_for_restore();
+    if (lifecycle::can_reclaim_retained_audio(
+          true,
+          proc::proc.current_app_id() > 0,
+          audio_state.terminal_pending()
+        ) == false) {
+      return false;
+    }
+
+    retained_audio_t value;
+    if (!audio_state.reclaim(value, proc::proc.current_app_id() > 0)) {
+      return false;
+    }
+
+    ctx.control = std::move(value.control);
+    ctx.sink = std::move(value.sink);
+    ctx.restore_sink = value.restore_sink;
+    // The retained control is still assigned to the streaming sink. Mark the
+    // handoff as already assigned so reconnect does not write the default roles
+    // again before opening its microphone.
+    ctx.sink_flag->store(true, std::memory_order_release);
+    return true;
+  }
+
+  void release_retained_audio() {
+    auto retained = audio_state.begin_terminal();
+    if (!retained) {
+      return;
+    }
+
+    audio_ctx_t ctx;
+    ctx.control = std::move(retained->control);
+    ctx.sink = std::move(retained->sink);
+    ctx.restore_sink = retained->restore_sink;
+    if (ctx.restore_sink) {
+      BOOST_LOG(info) << "Restoring retained audio state after terminal app end."sv;
+    }
+    auto restore_completion = util::fail_guard([&]() {
+      audio_state.complete_terminal_restore();
+    });
+    restore_audio_control(ctx);
+  }
+#endif
+
+  int map_stream(int channels, bool quality);
+
+  constexpr auto SAMPLE_RATE = 48000;
+
+  // NOTE: If you adjust the bitrates listed here, make sure to update the
+  // corresponding bitrate adjustment logic in rtsp_stream::cmd_announce()
+  opus_stream_config_t stream_configs[MAX_STREAM_CONFIG] {
+    {
+      SAMPLE_RATE,
+      2,
+      1,
+      1,
+      platf::speaker::map_stereo,
+      96000,
+    },
+    {
+      SAMPLE_RATE,
+      2,
+      1,
+      1,
+      platf::speaker::map_stereo,
+      512000,
+    },
+    {
+      SAMPLE_RATE,
+      6,
+      4,
+      2,
+      platf::speaker::map_surround51,
+      256000,
+    },
+    {
+      SAMPLE_RATE,
+      6,
+      6,
+      0,
+      platf::speaker::map_surround51,
+      1536000,
+    },
+    {
+      SAMPLE_RATE,
+      8,
+      5,
+      3,
+      platf::speaker::map_surround71,
+      450000,
+    },
+    {
+      SAMPLE_RATE,
+      8,
+      8,
+      0,
+      platf::speaker::map_surround71,
+      2048000,
+    },
+  };
+
+  void encodeThread(sample_queue_t samples, config_t config, void *channel_data) {
+    auto packets = mail::man->queue<packet_t>(mail::audio_packets);
+    auto stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
+    if (config.flags[config_t::CUSTOM_SURROUND_PARAMS]) {
+      apply_surround_params(stream, config.customStreamParams);
+    }
+
+    // Encoding takes place on this thread
+    platf::set_thread_name("audio::encode");
+    platf::adjust_thread_priority(platf::thread_priority_e::high);
+
+    opus_t opus {opus_multistream_encoder_create(
+      stream.sampleRate,
+      stream.channelCount,
+      stream.streams,
+      stream.coupledStreams,
+      stream.mapping,
+      OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+      nullptr
+    )};
+
+    opus_multistream_encoder_ctl(opus.get(), OPUS_SET_BITRATE(stream.bitrate));
+    opus_multistream_encoder_ctl(opus.get(), OPUS_SET_VBR(0));
+
+    BOOST_LOG(info) << "Opus initialized: "sv << stream.sampleRate / 1000 << " kHz, "sv
+                    << stream.channelCount << " channels, "sv
+                    << stream.bitrate / 1000 << " kbps (total), LOWDELAY"sv;
+
+    auto frame_size = config.packetDuration * stream.sampleRate / 1000;
+    while (auto sample = samples->pop()) {
+      buffer_t packet {1400};
+
+      if (webrtc_stream::has_active_sessions() && channel_data == nullptr) {
+        webrtc_stream::submit_audio_frame(*sample, stream.sampleRate, stream.channelCount, frame_size);
+      }
+
+      int bytes = opus_multistream_encode_float(opus.get(), sample->data(), frame_size, std::begin(packet), (opus_int32) packet.size());
+      if (bytes < 0) {
+        BOOST_LOG(error) << "Couldn't encode audio: "sv << opus_strerror(bytes);
+        packets->stop();
+
+        return;
+      }
+
+      packet.fake_resize(bytes);
+      packets->raise(channel_data, std::move(packet));
+    }
+  }
+
+  void capture(safe::mail_t mail, config_t config, void *channel_data) {
+    auto shutdown_event = mail->event<bool>(mail::shutdown);
+    if (!config::audio.stream || config.input_only) {
+      shutdown_event->view();
+      return;
+    }
+    auto stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
+    if (config.flags[config_t::CUSTOM_SURROUND_PARAMS]) {
+      apply_surround_params(stream, config.customStreamParams);
+    }
+
+    auto ref = get_audio_ctx_ref();
+    if (!ref) {
+      return;
+    }
+
+    audio_owner_acquired();
+    auto owner_release = util::fail_guard([]() {
+      audio_owner_released();
+    });
+
+    auto init_failure_fg = util::fail_guard([&shutdown_event]() {
+      BOOST_LOG(error) << "Unable to initialize audio capture. The stream will not have audio."sv;
+
+      // Wait for shutdown to be signalled if we fail init.
+      // This allows streaming to continue without audio.
+      shutdown_event->view();
+      return;
+    });
+
+    auto &control = ref->control;
+    if (!control) {
+      return;
+    }
+
+    // Order of priority:
+    // 1. Virtual sink
+    // 2. Audio sink
+    // 3. Host
+    policy::sink_catalog_t sinks {ref->sink.host, std::nullopt, std::nullopt, std::nullopt};
+    if (ref->sink.null) {
+      sinks.stereo = ref->sink.null->stereo;
+      sinks.surround51 = ref->sink.null->surround51;
+      sinks.surround71 = ref->sink.null->surround71;
+    }
+    const auto sink = policy::select_stream_sink(
+      sinks,
+      config::audio.sink,
+      config::audio.virtual_sink,
+      stream.channelCount,
+      config.flags[config_t::HOST_AUDIO]
+    );
+
+    BOOST_LOG(info) << "Selected audio sink: "sv << sink;
+
+    // Only the first to start a session may change the default sink
+    if (!ref->sink_flag->exchange(true, std::memory_order_acquire)) {
+#ifdef _WIN32
+      if (policy::capture_sink_without_routing(config::audio.sink_capture_only, config::audio.sink, config::audio.virtual_sink, sink)) {
+        // Pin capture even if this endpoint is currently the default. Later
+        // default changes must not redirect capture or require restoration.
+        if (control->set_capture_sink(sink)) {
+          return;
+        }
+      } else
+#endif
+      {
+        // If the selected sink is different than the current one, change sinks.
+        ref->restore_sink = ref->sink.host != sink;
+        if (ref->restore_sink) {
+          if (control->set_sink(sink)) {
+            return;
+          }
+        }
+      }
+    }
+
+    auto frame_size = config.packetDuration * stream.sampleRate / 1000;
+    bool host_audio = config.flags[config_t::HOST_AUDIO];
+    bool continuous_audio = config.flags[config_t::CONTINUOUS_AUDIO];
+    auto mic = control->microphone(stream.mapping, stream.channelCount, stream.sampleRate, frame_size, continuous_audio, host_audio);
+    if (!mic) {
+      return;
+    }
+
+    // Audio is initialized, so we don't want to print the failure message
+    init_failure_fg.disable();
+
+    // Capture takes place on this thread
+    platf::adjust_thread_priority(platf::thread_priority_e::critical);
+
+    std::shared_ptr<sample_queue_t::element_type> samples;
+    std::thread thread;
+    if (!config.bypass_opus) {
+      samples = std::make_shared<sample_queue_t::element_type>(30);
+      thread = std::thread {encodeThread, samples, config, channel_data};
+    }
+
+    auto fg = util::fail_guard([&]() {
+      if (samples) {
+        samples->stop();
+        if (thread.joinable()) {
+          thread.join();
+        }
+      }
+
+      shutdown_event->view();
+    });
+
+    int samples_per_frame = frame_size * stream.channelCount;
+
+    while (!shutdown_event->peek()) {
+      std::vector<float> sample_buffer;
+      sample_buffer.resize(samples_per_frame);
+
+      auto status = mic->sample(sample_buffer);
+      policy::sample_status_e policy_status;
+      switch (status) {
+        case platf::capture_e::ok:
+          policy_status = policy::sample_status_e::ok;
+          break;
+        case platf::capture_e::timeout:
+          policy_status = policy::sample_status_e::timeout;
+          break;
+        case platf::capture_e::reinit:
+          policy_status = config::audio.auto_capture ?
+                            policy::sample_status_e::reinitialize :
+                            policy::sample_status_e::timeout;
+          break;
+        case platf::capture_e::interrupted:
+          policy_status = policy::sample_status_e::interrupted;
+          break;
+        case platf::capture_e::error:
+          policy_status = policy::sample_status_e::error;
+          break;
+      }
+      const auto action = policy::sample_action(policy_status);
+      switch (action) {
+        case policy::sample_action_e::emit:
+          break;
+        case policy::sample_action_e::retry:
+          continue;
+        case policy::sample_action_e::reacquire:
+          BOOST_LOG(info) << "Reinitializing audio capture"sv;
+          mic.reset();
+          do {
+            mic = control->microphone(stream.mapping, stream.channelCount, stream.sampleRate, frame_size, continuous_audio, host_audio);
+            if (!mic) {
+              BOOST_LOG(warning) << "Couldn't re-initialize audio input"sv;
+            }
+          } while (!mic && !shutdown_event->view(5s));
+          continue;
+        case policy::sample_action_e::stop:
+          return;
+      }
+
+      if (config.bypass_opus) {
+        if (channel_data == nullptr) {
+          webrtc_stream::submit_audio_frame(sample_buffer, stream.sampleRate, stream.channelCount, frame_size);
+        }
+      } else {
+        samples->raise(std::move(sample_buffer));
+      }
+    }
+  }
+
+  audio_ctx_ref_t get_audio_ctx_ref() {
+    static auto control_shared {safe::make_shared<audio_ctx_t>(start_audio_control, stop_audio_control)};
+    return control_shared.ref();
+  }
+
+  void app_termination_requested() {
+#if defined(_WIN32) || defined(__linux__)
+    release_retained_audio();
+#endif
+  }
+
+  void app_started() {
+#if defined(_WIN32) || defined(__linux__)
+    audio_state.app_started();
+#endif
+  }
+
+  void audio_owner_acquired() {
+#if defined(_WIN32) || defined(__linux__)
+    audio_state.owner_acquired();
+#endif
+  }
+
+  void audio_owner_released() {
+#if defined(_WIN32) || defined(__linux__)
+    audio_state.owner_released();
+#endif
+  }
+
+  bool is_audio_ctx_sink_available(const audio_ctx_t &ctx) {
+    if (!ctx.control) {
+      return false;
+    }
+
+    const std::string &sink = ctx.sink.host.empty() ? config::audio.sink : ctx.sink.host;
+    if (sink.empty()) {
+      return false;
+    }
+
+    return ctx.control->is_sink_available(sink);
+  }
+
+  int map_stream(int channels, bool quality) {
+    return policy::stream_index(channels, quality);
+  }
+
+  int start_audio_control(audio_ctx_t &ctx) {
+    auto fg = util::fail_guard([]() {
+      BOOST_LOG(warning) << "There will be no audio"sv;
+    });
+
+    ctx.sink_flag = std::make_unique<std::atomic_bool>(false);
+
+#if defined(_WIN32) || defined(__linux__)
+    audio_state.wait_for_restore();
+    if (reclaim_retained_audio(ctx)) {
+      BOOST_LOG(info) << "Audio retained for resumable app; reclaimed on reconnect."sv;
+      fg.disable();
+      return 0;
+    }
+#endif
+
+    // The default sink has not been replaced yet.
+    ctx.restore_sink = false;
+
+    if (!(ctx.control = platf::audio_control())) {
+      return 0;
+    }
+
+    auto sink = ctx.control->sink_info();
+    if (!sink) {
+      // Let the calling code know it failed
+      ctx.control.reset();
+      return 0;
+    }
+
+    ctx.sink = std::move(*sink);
+
+    fg.disable();
+    return 0;
+  }
+
+  void stop_audio_control(audio_ctx_t &ctx) {
+    if (!ctx.restore_sink) {
+      return;
+    }
+
+#if defined(_WIN32) || defined(__linux__)
+    if (retain_audio_control(ctx)) {
+      BOOST_LOG(info) << "Audio retained for resumable app after final transport owner ended."sv;
+      return;
+    }
+
+    BOOST_LOG(info) << "Restoring audio state after terminal app end."sv;
+    restore_audio_control(ctx);
+    return;
+#else
+    const auto release_action = lifecycle::final_owner_release_action(
+      ctx.restore_sink,
+      false,
+      false
+    );
+
+    if (release_action != lifecycle::release_action_e::restore) {
+      return;
+    }
+
+    // restore audio-sink if applicable
+    if (!ctx.restore_sink) {
+      return;
+    }
+
+    // Change back to the host sink, unless there was none
+    const std::string &sink = ctx.sink.host.empty() ? config::audio.sink : ctx.sink.host;
+    if (!sink.empty()) {
+      // Best effort, it's allowed to fail. Windows restores the endpoint
+      // captured for each role instead of applying the console sink to all of
+      // them.
+      ctx.control->restore_sink(sink);
+    }
+
+    // Ensure Steam Streaming Speakers aren't left as the default device.
+    // If the original device is temporarily unavailable (e.g., DisplayPort audio
+    // reconnecting after virtual display teardown), the platform layer can keep
+    // retrying that exact device in the background after moving away from Steam.
+    ctx.control->reset_default_device(sink);
+#endif
+  }
+
+  void apply_surround_params(opus_stream_config_t &stream, const stream_params_t &params) {
+    policy::stream_layout_t base {
+      stream.channelCount,
+      stream.streams,
+      stream.coupledStreams,
+      {}
+    };
+    policy::stream_layout_t custom {
+      params.channelCount,
+      params.streams,
+      params.coupledStreams,
+      {}
+    };
+    std::copy_n(params.mapping, custom.mapping.size(), custom.mapping.begin());
+    const auto selected = policy::apply_custom_layout(base, custom);
+    stream.channelCount = selected.channels;
+    stream.streams = selected.streams;
+    stream.coupledStreams = selected.coupled_streams;
+    stream.mapping = params.mapping;
+  }
+}  // namespace audio

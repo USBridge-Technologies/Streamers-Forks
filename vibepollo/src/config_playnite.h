@@ -1,0 +1,81 @@
+/**
+ * @file src/config_playnite.h
+ * @brief Playnite integration configuration.
+ */
+#pragma once
+
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace config {
+
+  struct id_name_t {
+    std::string id;
+    std::string name;
+  };
+
+  struct playnite_t {
+    // Keep the legacy Windows default enabled; Linux does not parse/start
+    // Playnite and exposes it as unavailable in the Steam provider status.
+    bool enabled = true;
+    bool auto_sync = true;  // enable automatic sync from Playnite
+    bool sync_all_installed = false;  // include every installed game regardless of filters
+    int recent_games = 10;  // N most recent games
+    // If > 0, only treat games whose last played time is within this many days
+    // as "recent" for the purposes of recent-based auto-sync selection.
+    int recent_max_age_days = 30;  // 0 = no age limit
+    // Runtime: category names to sync (matched against game.categories)
+    std::vector<std::string> sync_categories;
+    // Persisted/meta: selected categories with id+name (for offline labeling)
+    std::vector<id_name_t> sync_categories_meta;
+    // Runtime: category names to exclude from sync
+    std::vector<std::string> exclude_categories;
+    // Persisted/meta: excluded categories with id+name (for offline labeling)
+    std::vector<id_name_t> exclude_categories_meta;
+    // Runtime: plugin IDs to include from sync
+    std::vector<std::string> sync_plugins;
+    // Persisted/meta: included plugins with id+name (for offline labeling)
+    std::vector<id_name_t> sync_plugins_meta;
+    // Runtime: plugin IDs to exclude from sync (Playnite library plugin GUIDs)
+    std::vector<std::string> exclude_plugins;
+    // Persisted/meta: excluded plugins with id+name (for offline labeling)
+    std::vector<id_name_t> exclude_plugins_meta;
+
+    // Runtime: excluded Playnite game IDs
+    std::vector<std::string> exclude_games;
+    // Persisted/meta: excluded games with id+name (for offline labeling)
+    std::vector<id_name_t> exclude_games_meta;
+
+    // Auto-delete TTL for unplayed auto-synced apps (days). If > 0, an
+    // auto-synced app that has not been launched from Playnite within this
+    // many days of being added by auto-sync will be automatically removed.
+    // 0 = remove immediately when it falls out of the selected set.
+    int autosync_delete_after_days = 14;
+    // When true, automatically remove auto-synced apps whose games become
+    // uninstalled in Playnite.
+    bool autosync_remove_uninstalled = true;
+
+    // When true, only purge auto-synced games that no longer qualify
+    // if there is a qualifying replacement to fill the slot. When false,
+    // always purge games that no longer qualify, even if it leaves fewer
+    // than the configured recent slots.
+    bool autosync_require_replacement = true;
+
+    // Optional executable directory for installations without a working URI association.
+    std::string install_dir;
+
+    // When enabled, Sunshine maintains a "Playnite (Fullscreen)" entry in apps.json
+    // that launches Playnite in fullscreen/desktop mode via the helper.
+    bool fullscreen_entry_enabled = false;
+  };
+
+  extern playnite_t playnite;
+
+  // Parse and consume Playnite-related values without touching process-global
+  // configuration or external Playnite/application state.
+  playnite_t parse_playnite(std::unordered_map<std::string, std::string> &vars);
+
+  // Consume Playnite-related config vars from the provided map.
+  void apply_playnite(std::unordered_map<std::string, std::string> &vars);
+}  // namespace config

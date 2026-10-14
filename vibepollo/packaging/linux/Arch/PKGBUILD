@@ -1,0 +1,232 @@
+# Edit on GitHub: https://github.com/Nonary/Vibepollo/blob/master/packaging/linux/Arch/PKGBUILD
+# Reference: https://wiki.archlinux.org/title/PKGBUILD
+
+## options
+: "${_use_cuda:=detect}" # nvenc
+
+: "${_commit:=@GITHUB_COMMIT@}"
+
+pkgname='vibepollo'
+pkgver=@SUNSHINE_ARCH_PKGVER@@SUNSHINE_SUB_VERSION@
+pkgrel=1
+pkgdesc="@PROJECT_DESCRIPTION@"
+arch=('x86_64' 'aarch64')
+url=@PROJECT_HOMEPAGE_URL@
+license=('GPL-3.0-only')
+install=vibepollo.install
+
+# CUDA 12.9 supports GCC through 14 and retains GTX 10-series support.
+_gcc_version=14
+_versioned_gcc=true
+
+_gcc_dep_suffix=""
+_gcc_env_suffix=""
+if [ "${_versioned_gcc}" == true ]; then
+  _gcc_dep_suffix="${_gcc_version}"
+  _gcc_env_suffix="-${_gcc_version}"
+fi
+
+depends=(
+  'avahi'
+  'curl'
+  'dkms'
+  'iproute2'
+  'jq'
+  'kmod'
+  'libayatana-appindicator'
+  'libcap'
+  'libdrm'
+  'libevdev'
+  'libkscreen'
+  'libmfx'
+  'libnotify'
+  'libpipewire'
+  'libpulse'
+  'libva'
+  'libx11'
+  'libxcb'
+  'libxfixes'
+  'libxrandr'
+  'libxtst'
+  'make'
+  'miniupnpc'
+  'mokutil>=0.7.2'
+  'numactl'
+  'openssl'
+  'opus'
+  'python>=3.9'
+  'socat'
+  'udev'
+  'util-linux'
+  'vulkan-icd-loader'
+  'wayland-utils'
+  'xorg-xdpyinfo'
+)
+
+makedepends=(
+  'appstream'
+  'appstream-glib'
+  'cmake'
+  'desktop-file-utils'
+  "gcc${_gcc_dep_suffix}"
+  'git'
+  'make'
+  'ninja'
+  'nodejs'
+  'npm'
+  'python-jinja'  # required by the glad OpenGL/EGL loader generator
+  'shaderc'
+)
+
+optdepends=(
+  'intel-media-driver: Intel GPU encoding support'
+  'libva-mesa-driver: AMD GPU encoding support'
+  'linux-cachyos-headers: build the virtual-display module for the standard CachyOS kernel'
+  'linux-cachyos-lts-headers: build the virtual-display module for the CachyOS LTS kernel'
+  'linux-headers: build the virtual-display module for the standard Arch kernel'
+  'linux-lts-headers: build the virtual-display module for the Arch LTS kernel'
+  'linux-zen-headers: build the virtual-display module for the Arch zen kernel'
+  'plasma-workspace: KDE Plasma Wayland desktop that the machine host streams'
+  'shim-signed: provide a signed shim boot chain for MOK trust on strict Secure Boot systems'
+)
+
+provides=('sunshine')
+conflicts=('sunshine')
+
+source=("$pkgname::git+@GITHUB_CLONE_URL@#commit=${_commit}")
+sha256sums=('SKIP')
+
+# Options Handling
+if [[ "${_use_cuda::1}" == "d" ]] && pacman -Qi cuda &> /dev/null; then
+  _use_cuda=true
+fi
+
+if [[ "${_use_cuda::1}" == "t" ]]; then
+  # The pinned CUDA installer requires the libxml2.so.2 ABI.
+  makedepends+=('libxml2-legacy')
+  # Build-only toolkit: never follow Arch's rolling CUDA package (13+ drops Pascal).
+  source_x86_64=("cuda-x86_64.run::https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_575.57.08_linux.run")
+  sha256sums_x86_64=('0f6d806ddd87230d2adbe8a6006a9d20144fdbda9de2d6acc677daa5d036417a')
+  source_aarch64=("cuda-aarch64.run::https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_575.57.08_linux_sbsa.run")
+  sha256sums_aarch64=('64f47ab791a76b6889702425e0755385f5fa216c5a9f061875c7deed5f08cdb6')
+  noextract=('cuda-x86_64.run' 'cuda-aarch64.run')
+  # NVENC and NvFBC are loaded at runtime from the driver's libnvidia-encode /
+  # libnvidia-fbc, so the toolkit is a build-time need only.
+  optdepends+=(
+    'nvidia-utils: Nvidia GPU encoding (NVENC) and pre-login streaming'
+    'nvidia-modprobe: initialize Nvidia devices for pre-login streaming'
+  )
+fi
+
+# Ensure makedepends and optdepends are sorted
+if [ -n "${makedepends+x}" ]; then
+  mapfile -t tmp_array < <(printf '%s\n' "${makedepends[@]}" | sort)
+  makedepends=("${tmp_array[@]}")
+  unset tmp_array
+fi
+
+if [ -n "${optdepends+x}" ]; then
+  mapfile -t tmp_array < <(printf '%s\n' "${optdepends[@]}" | sort)
+  optdepends=("${tmp_array[@]}")
+  unset tmp_array
+fi
+
+prepare() {
+    cd "$pkgname"
+    if [[ -n "${_validation_expected_tree:-}" ]]; then
+      [[ $(git rev-parse HEAD) == "${_commit}" ]] || { echo 'Extracted source commit mismatch.' >&2; return 1; }
+      [[ $(git rev-parse 'HEAD^{tree}') == "${_validation_expected_tree}" ]] || { echo 'Extracted source tree mismatch.' >&2; return 1; }
+    fi
+    git -c submodule.fetchJobs="${BUILD_JOBS:-2}" submodule update --recursive --init --depth 1
+    if [[ "${_use_cuda::1}" == "t" ]]; then
+      bash scripts/prepare-linux-cuda.sh "${srcdir}/cuda-${CARCH}.run" \
+        "${srcdir}/cuda" "packaging/linux/patches/${CARCH}/cuda-12-math_functions.patch"
+    fi
+}
+
+build() {
+    export BRANCH="@GITHUB_BRANCH@"
+    export BUILD_VERSION="@BUILD_VERSION@"
+    export COMMIT="${_commit}"
+
+    export CC="gcc${_gcc_env_suffix}"
+    export CXX="g++${_gcc_env_suffix}"
+
+    export CFLAGS="${CFLAGS/-Werror=format-security/}"
+    export CXXFLAGS="${CXXFLAGS/-Werror=format-security/}"
+
+    export MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
+
+    local _cmake_options=(
+      -S "$pkgname"
+      -B build
+      -G Ninja
+      -Wno-dev
+      -D BUILD_DOCS=OFF
+      -D BUILD_WERROR=ON
+      -D CMAKE_INSTALL_PREFIX=/usr
+      -D SUNSHINE_EXECUTABLE_PATH=/usr/bin/vibepollo
+      -D SUNSHINE_ASSETS_DIR="share/vibepollo"
+      -D SUNSHINE_PUBLISHER_NAME='Nonary'
+      -D SUNSHINE_PUBLISHER_WEBSITE='https://github.com/Nonary/Vibepollo'
+      -D SUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/Nonary/Vibepollo/issues'
+    )
+
+    if [[ "${_use_cuda::1}" != "t" ]]; then
+      _cmake_options+=(-DSUNSHINE_ENABLE_CUDA=OFF -DCUDA_FAIL_ON_MISSING=OFF)
+    else
+      _cmake_options+=(
+        -DSUNSHINE_ENABLE_CUDA=ON
+        -DSUNSHINE_REQUIRE_CUDA_PASCAL=ON
+        "-DCMAKE_CUDA_COMPILER=${srcdir}/cuda/bin/nvcc"
+        "-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++${_gcc_env_suffix}"
+      )
+    fi
+
+    if [[ -n "${CCACHE_DIR:-}" ]]; then
+      _cmake_options+=(
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+      )
+    fi
+
+    _cmake_options+=(-DBUILD_TESTS="${_build_tests:-ON}")
+
+    if [[ "${_build_tests:-ON}" != "OFF" ]]; then
+      mkdir -p build/.cmake/api/v1/query
+      touch build/.cmake/api/v1/query/codemodel-v2
+    fi
+    cmake "${_cmake_options[@]}"
+
+    appstreamcli validate "build/io.github.Nonary.vibepollo.metainfo.xml"
+    appstream-util validate "build/io.github.Nonary.vibepollo.metainfo.xml"
+    desktop-file-validate "build/io.github.Nonary.vibepollo.desktop"
+    desktop-file-validate "build/io.github.Nonary.vibepollo.terminal.desktop"
+
+    if [[ "${_build_tests:-ON}" != "OFF" ]]; then
+      # Compile all configured components before expensive host/CUDA compilation.
+      # File API discovers new test targets; final full build and CTest still run.
+      python3 "$srcdir/$pkgname/scripts/build-linux-component-tests.py" build
+    fi
+
+    cmake --build build
+}
+
+check() {
+    cd "${srcdir}/build"
+    ./vibepollo --version
+    if [[ "${_use_cuda::1}" == "t" ]]; then
+      # Verify the final binary actually contains native Pascal device code.
+      "${srcdir}/cuda/bin/cuobjdump" --list-elf ./vibepollo > cuda-device-code.txt
+      grep -q 'sm_61\.' cuda-device-code.txt
+    fi
+    if [[ "${_build_tests:-ON}" != "OFF" ]]; then
+      ctest --test-dir . --output-on-failure --no-tests=error -j2
+    fi
+}
+
+package() {
+    export MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
+    DESTDIR="$pkgdir" cmake --install build
+}

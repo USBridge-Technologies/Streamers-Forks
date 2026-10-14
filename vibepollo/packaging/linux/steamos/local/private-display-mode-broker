@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# SteamOS entry point for the shared root-owned connector lease protocol.
+# Both scripts are verified immutable siblings in the installed /opt bundle.
+set -uo pipefail
+
+broker_directory=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
+source "$broker_directory/vibeshine-vkms"
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

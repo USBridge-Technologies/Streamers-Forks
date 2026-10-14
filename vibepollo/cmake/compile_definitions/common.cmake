@@ -1,0 +1,318 @@
+# common compile definitions
+# this file will also load platform specific definitions
+
+list(APPEND SUNSHINE_COMPILE_OPTIONS -Wall -Wno-sign-compare)
+# Wall - enable all warnings
+# Werror - treat warnings as errors
+# Wno-maybe-uninitialized/Wno-uninitialized - disable warnings for maybe uninitialized variables
+# Wno-sign-compare - disable warnings for signed/unsigned comparisons
+# Wno-restrict - disable warnings for memory overlap
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC specific compile options
+
+    # GCC 12 and higher will complain about maybe-uninitialized
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
+        list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-maybe-uninitialized)
+
+        # Disable the bogus warning that may prevent compilation (only for GCC 12).
+        # See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105651.
+        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+            list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-restrict)
+        endif()
+    endif()
+
+    # GCC 15 will complain about uninitialized variables in some cases (Simple-Web-Server)
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
+        list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-uninitialized)
+    endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # Clang specific compile options
+
+    # Clang doesn't actually complain about this this, so disabling for now
+    # list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-uninitialized)
+endif()
+if(BUILD_WERROR)
+    list(APPEND SUNSHINE_COMPILE_OPTIONS -Werror)
+endif()
+
+# setup assets directory
+if(NOT SUNSHINE_ASSETS_DIR)
+    set(SUNSHINE_ASSETS_DIR "assets")
+endif()
+
+# platform specific compile definitions
+if(WIN32)
+    include(${CMAKE_MODULE_PATH}/compile_definitions/windows.cmake)
+elseif(UNIX)
+    include(${CMAKE_MODULE_PATH}/compile_definitions/unix.cmake)
+
+    if(APPLE)
+        include(${CMAKE_MODULE_PATH}/compile_definitions/macos.cmake)
+    else()
+        include(${CMAKE_MODULE_PATH}/compile_definitions/linux.cmake)
+    endif()
+endif()
+
+include_directories(BEFORE SYSTEM "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include")
+file(GLOB NVENC_SOURCES CONFIGURE_DEPENDS "src/nvenc/*.cpp" "src/nvenc/*.h")
+list(APPEND PLATFORM_TARGET_FILES ${NVENC_SOURCES})
+
+set(SUNSHINE_TARGET_FILES
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Rtsp.h"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/RtspParser.c"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Video.h"
+        "${CMAKE_SOURCE_DIR}/third-party/tray/src/tray.h"
+        "${CMAKE_SOURCE_DIR}/src/upnp.cpp"
+        "${CMAKE_SOURCE_DIR}/src/upnp.h"
+        "${CMAKE_SOURCE_DIR}/src/cbs.cpp"
+        "${CMAKE_SOURCE_DIR}/src/utility.h"
+        "${CMAKE_SOURCE_DIR}/src/uuid.h"
+        "${CMAKE_SOURCE_DIR}/src/config.h"
+        "${CMAKE_SOURCE_DIR}/src/config.cpp"
+        "${CMAKE_SOURCE_DIR}/src/display_device.h"
+        "${CMAKE_SOURCE_DIR}/src/display_device.cpp"
+        "${CMAKE_SOURCE_DIR}/src/display_device_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/display_helper_builder.h"
+        "${CMAKE_SOURCE_DIR}/src/display_helper_builder.cpp"
+        "${CMAKE_SOURCE_DIR}/src/entry_handler.cpp"
+        "${CMAKE_SOURCE_DIR}/src/entry_handler.h"
+        "${CMAKE_SOURCE_DIR}/src/entry_metadata.cpp"
+        "${CMAKE_SOURCE_DIR}/src/entry_metadata.h"
+        "${CMAKE_SOURCE_DIR}/src/file_handler.cpp"
+        "${CMAKE_SOURCE_DIR}/src/file_handler_core.cpp"
+        "${CMAKE_SOURCE_DIR}/src/file_handler.h"
+        "${CMAKE_SOURCE_DIR}/src/globals.cpp"
+        "${CMAKE_SOURCE_DIR}/src/globals.h"
+        "${CMAKE_SOURCE_DIR}/src/logging.cpp"
+        "${CMAKE_SOURCE_DIR}/src/logging.h"
+        "${CMAKE_SOURCE_DIR}/src/logging_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/logging_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/main.cpp"
+        "${CMAKE_SOURCE_DIR}/src/main.h"
+        "${CMAKE_SOURCE_DIR}/src/update.cpp"
+        "${CMAKE_SOURCE_DIR}/src/update.h"
+        "${CMAKE_SOURCE_DIR}/src/crypto.cpp"
+        "${CMAKE_SOURCE_DIR}/src/crypto.h"
+        "${CMAKE_SOURCE_DIR}/src/http_pairing_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/http_pairing_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/remote_session.cpp"
+        "${CMAKE_SOURCE_DIR}/src/remote_session.h"
+        "${CMAKE_SOURCE_DIR}/src/rtsp_pending_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/rtsp_pending_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/remote_display_topology.cpp"
+        "${CMAKE_SOURCE_DIR}/src/remote_display_topology.h"
+        "${CMAKE_SOURCE_DIR}/src/nvhttp.cpp"
+        "${CMAKE_SOURCE_DIR}/src/nvhttp.h"
+        "${CMAKE_SOURCE_DIR}/src/httpcommon.cpp"
+        "${CMAKE_SOURCE_DIR}/src/http_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/httpcommon.h"
+        "${CMAKE_SOURCE_DIR}/src/confighttp.cpp"
+        "${CMAKE_SOURCE_DIR}/src/config_http_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/confighttp_playnite.cpp"
+        "${CMAKE_SOURCE_DIR}/src/confighttp_steam.cpp"
+        "${CMAKE_SOURCE_DIR}/src/confighttp_lutris.cpp"
+        "${CMAKE_SOURCE_DIR}/src/confighttp_rtss.cpp"
+        "${CMAKE_SOURCE_DIR}/src/confighttp.h"
+        "${CMAKE_SOURCE_DIR}/src/webrtc_stream.cpp"
+        "${CMAKE_SOURCE_DIR}/src/webrtc_stream.h"
+        "${CMAKE_SOURCE_DIR}/src/rtsp.cpp"
+        "${CMAKE_SOURCE_DIR}/src/rtsp.h"
+        "${CMAKE_SOURCE_DIR}/src/stream.cpp"
+        "${CMAKE_SOURCE_DIR}/src/stream_protocol.cpp"
+        "${CMAKE_SOURCE_DIR}/src/stream.h"
+        "${CMAKE_SOURCE_DIR}/src/video.cpp"
+        "${CMAKE_SOURCE_DIR}/src/video_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/video.h"
+        "${CMAKE_SOURCE_DIR}/src/video_colorspace.cpp"
+        "${CMAKE_SOURCE_DIR}/src/video_colorspace.h"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave_host.cpp"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave_host.h"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave_protocol.h"
+        "${CMAKE_SOURCE_DIR}/src/input.cpp"
+        "${CMAKE_SOURCE_DIR}/src/input.h"
+        "${CMAKE_SOURCE_DIR}/src/input_validation_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/input_validation_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/mouse_input.cpp"
+        "${CMAKE_SOURCE_DIR}/src/mouse_input.h"
+        "${CMAKE_SOURCE_DIR}/src/audio.cpp"
+        "${CMAKE_SOURCE_DIR}/src/audio.h"
+        "${CMAKE_SOURCE_DIR}/src/audio_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/audio_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/common.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/common_services.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/common_services.h"
+        "${CMAKE_SOURCE_DIR}/src/app_catalog_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/app_catalog_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/steam_integration.cpp"
+        "${CMAKE_SOURCE_DIR}/src/steam_integration.h"
+        "${CMAKE_SOURCE_DIR}/src/steam_artwork.cpp"
+        "${CMAKE_SOURCE_DIR}/src/steam_artwork.h"
+        "${CMAKE_SOURCE_DIR}/src/steam_sync_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/steam_sync_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/steam_auto_sync.cpp"
+        "${CMAKE_SOURCE_DIR}/src/steam_auto_sync.h"
+        "${CMAKE_SOURCE_DIR}/src/steam_auto_sync_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/steam_auto_sync_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/managed_app_focus.cpp"
+        "${CMAKE_SOURCE_DIR}/src/steam_process_tracker.cpp"
+        "${CMAKE_SOURCE_DIR}/src/steam_process_tracker.h"
+        "${CMAKE_SOURCE_DIR}/src/lutris_integration.cpp"
+        "${CMAKE_SOURCE_DIR}/src/lutris_integration.h"
+        "${CMAKE_SOURCE_DIR}/src/lutris_artwork.cpp"
+        "${CMAKE_SOURCE_DIR}/src/lutris_artwork.h"
+        "${CMAKE_SOURCE_DIR}/src/lutris_sync_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/lutris_sync_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/lutris_auto_sync.cpp"
+        "${CMAKE_SOURCE_DIR}/src/lutris_auto_sync.h"
+        "${CMAKE_SOURCE_DIR}/src/config_steam.cpp"
+        "${CMAKE_SOURCE_DIR}/src/config_steam.h"
+        "${CMAKE_SOURCE_DIR}/src/config_lutris.cpp"
+        "${CMAKE_SOURCE_DIR}/src/config_lutris.h"
+        "${CMAKE_SOURCE_DIR}/src/app_framegen_config.cpp"
+        "${CMAKE_SOURCE_DIR}/src/app_framegen_config.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/smooth_motion_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/deferred_action.h"
+        "${CMAKE_SOURCE_DIR}/src/process.cpp"
+        "${CMAKE_SOURCE_DIR}/src/process.h"
+        "${CMAKE_SOURCE_DIR}/src/boost_process_shim.cpp"
+        "${CMAKE_SOURCE_DIR}/src/boost_process_shim.h"
+        "${CMAKE_SOURCE_DIR}/src/network.cpp"
+        "${CMAKE_SOURCE_DIR}/src/network.h"
+        "${CMAKE_SOURCE_DIR}/src/network_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/network_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/move_by_copy.h"
+        "${CMAKE_SOURCE_DIR}/src/system_tray.cpp"
+        "${CMAKE_SOURCE_DIR}/src/system_tray.h"
+        "${CMAKE_SOURCE_DIR}/src/task_pool.h"
+        "${CMAKE_SOURCE_DIR}/src/thread_pool.h"
+        "${CMAKE_SOURCE_DIR}/src/thread_safe.h"
+        "${CMAKE_SOURCE_DIR}/src/sync.h"
+        "${CMAKE_SOURCE_DIR}/src/round_robin.h"
+        "${CMAKE_SOURCE_DIR}/src/stat_trackers.h"
+        "${CMAKE_SOURCE_DIR}/src/stat_trackers.cpp"
+        "${CMAKE_SOURCE_DIR}/src/rswrapper.h"
+        "${CMAKE_SOURCE_DIR}/src/rswrapper.c"
+        "${CMAKE_SOURCE_DIR}/src/http_auth.cpp"
+        "${CMAKE_SOURCE_DIR}/src/http_auth_request_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/state_storage.cpp"
+        "${CMAKE_SOURCE_DIR}/src/state_storage.h"
+        "${CMAKE_SOURCE_DIR}/src/state_storage_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/state_storage_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history_sampler.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history_sampler.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history_storage.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history_storage.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history_storage_diagnostics.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history_storage_diagnostics.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history_policy.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history_writer.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history_writer.h"
+        "${CMAKE_SOURCE_DIR}/src/host_stats.cpp"
+        "${CMAKE_SOURCE_DIR}/src/host_stats.h"
+        "${CMAKE_SOURCE_DIR}/src/host_stats_service.cpp"
+        "${CMAKE_SOURCE_DIR}/src/host_stats_service.h"
+        "${CMAKE_SOURCE_DIR}/src/host_stats_types.h"
+        ${PLATFORM_TARGET_FILES})
+
+if(NOT SUNSHINE_ASSETS_DIR_DEF)
+    set(SUNSHINE_ASSETS_DIR_DEF "${SUNSHINE_ASSETS_DIR}")
+endif()
+list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_ASSETS_DIR="${SUNSHINE_ASSETS_DIR_DEF}")
+
+list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_TRAY=${SUNSHINE_TRAY})
+
+# Publisher metadata
+list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_NAME="${SUNSHINE_PUBLISHER_NAME}")
+list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_WEBSITE="${SUNSHINE_PUBLISHER_WEBSITE}")
+list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_ISSUE_URL="${SUNSHINE_PUBLISHER_ISSUE_URL}")
+list(APPEND SUNSHINE_DEFINITIONS SETUP_AV_LOGGING="1")
+list(APPEND SUNSHINE_DEFINITIONS SETUP_LIBDISPLAYDEVICE_LOGGING="1")
+
+include_directories(BEFORE "${CMAKE_SOURCE_DIR}")
+
+set(SUNSHINE_FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIRS})
+
+# Minimal FFmpeg bundles used by Vibepollo intentionally omit still-image
+# codecs. Windows packages must include the image libraries so Steam covers
+# can always be converted to client-compatible PNGs.
+if(WIN32)
+    # The Windows executable is linked statically; do not select DLL import
+    # libraries whose runtime DLLs are not part of the installer payload.
+    set(_steam_artwork_library_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a .lib)
+    # Existing build trees may still cache the DLL import libraries selected
+    # before static linking was required. find_package does not re-search them.
+    foreach(_artwork_library_cache IN ITEMS
+            PNG_LIBRARY_RELEASE PNG_LIBRARY_DEBUG
+            JPEG_LIBRARY_RELEASE JPEG_LIBRARY_DEBUG STEAM_ARTWORK_WEBP_LIBRARY)
+        if("${${_artwork_library_cache}}" MATCHES "\\.dll\\.a$")
+            unset(${_artwork_library_cache} CACHE)
+            unset(${_artwork_library_cache})
+        endif()
+    endforeach()
+    unset(_artwork_library_cache)
+    find_package(PNG REQUIRED)
+    find_package(JPEG REQUIRED)
+    find_library(STEAM_ARTWORK_WEBP_LIBRARY NAMES webp REQUIRED)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_steam_artwork_library_suffixes}")
+    unset(_steam_artwork_library_suffixes)
+else()
+    find_package(PNG QUIET)
+    find_package(JPEG QUIET)
+    find_library(STEAM_ARTWORK_WEBP_LIBRARY NAMES webp)
+endif()
+if(PNG_FOUND AND JPEG_FOUND AND STEAM_ARTWORK_WEBP_LIBRARY)
+    list(APPEND SUNSHINE_DEFINITIONS VIBEPOLLO_STEAM_ARTWORK_IMAGE_LIBS=1)
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES PNG::PNG JPEG::JPEG ${STEAM_ARTWORK_WEBP_LIBRARY})
+    set(STEAM_ARTWORK_TEST_DEFINITIONS VIBEPOLLO_STEAM_ARTWORK_IMAGE_LIBS=1)
+    set(STEAM_ARTWORK_TEST_LIBRARIES PNG::PNG JPEG::JPEG ${STEAM_ARTWORK_WEBP_LIBRARY})
+endif()
+# Enable the bounded official Steam CDN fallback in the application target.
+# Focused component tests intentionally omit this definition and inject their
+# own byte fetcher, so they never require network access.
+list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_STEAM_ARTWORK_NETWORK=1)
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # The prepared FFmpeg headers must win over MSYS2's system FFmpeg headers
+    # (which can be older and lack macros like AV_HAS_ATTRIBUTE used by the
+    # bundled internal headers). Use -isystem with -iquote-style precedence so
+    # they are searched before /ucrt64/include.
+    set(SUNSHINE_FFMPEG_INCLUDE_DIRS "")
+    foreach(ffmpeg_dir IN LISTS FFMPEG_INCLUDE_DIRS)
+        add_compile_options("-isystem" "${ffmpeg_dir}")
+    endforeach()
+endif()
+
+include_directories(
+        BEFORE
+        SYSTEM
+        "${CMAKE_SOURCE_DIR}/third-party"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet/include"
+        "${CMAKE_SOURCE_DIR}/third-party/nanors"
+        "${CMAKE_SOURCE_DIR}/third-party/nanors/deps/obl"
+        ${WEBRTC_INCLUDE_DIRS}
+        ${SQLITE3_INCLUDE_DIRS}
+        ${SUNSHINE_FFMPEG_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIR}
+        ${Opus_INCLUDE_DIR}
+        ${Boost_INCLUDE_DIRS}  # has to be the last, or we get runtime error on macOS ffmpeg encoder
+)
+
+list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
+        ${MINIUPNP_LIBRARIES}
+        ${CMAKE_THREAD_LIBS_INIT}
+        ${SQLITE3_LIBRARIES}
+        enet
+        libdisplaydevice::display_device
+        libvirtualdisplay::driver
+        nlohmann_json::nlohmann_json
+        ${Opus_LIBRARY}
+        ${FFMPEG_LIBRARIES}
+        ${Boost_LIBRARIES}
+        ${OPENSSL_LIBRARIES}
+        ${PLATFORM_LIBRARIES})
