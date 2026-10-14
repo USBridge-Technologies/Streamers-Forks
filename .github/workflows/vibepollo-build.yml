@@ -43,6 +43,7 @@ jobs:
           update: true
           install: >-
             git
+            zip
             mingw-w64-ucrt-x86_64-boost
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-cppwinrt
@@ -107,7 +108,7 @@ jobs:
             cp "$dll" "$out/"
           done
           test -f "$out/sunshine.exe"
-          ( cd artifacts && 7z a -tzip Vibepollo-Windows-x86_64-portable.zip Vibepollo )
+          ( cd artifacts && zip -qr Vibepollo-Windows-x86_64-portable.zip Vibepollo )
           ls -la artifacts
 
       - name: Upload artifact
