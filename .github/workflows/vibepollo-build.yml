@@ -67,6 +67,10 @@ jobs:
         run: |
           set -o pipefail
           git config --global --add safe.directory '*'
+          # The fork carries no upstream tags, so version resolution would land on 0.0.0, which
+          # Vibepollo's cmake refuses for a release build. Pin the upstream release the snapshot
+          # follows, with the commit as build metadata.
+          export BUILD_VERSION="2.0.1+usbridge.$(git rev-parse --short HEAD)"
           cmake -B build -S . -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTS=OFF \
