@@ -1106,6 +1106,7 @@ namespace config {
     47989,  // Base port number
     "ipv4",  // Address family
     {},  // Bind address
+    {},  // Web bind address (admin UI override)
     (platf::appdata() / default_log_filename).string(),  // log file
     true,  // notify_pre_releases
     false,  // legacy_ordering
