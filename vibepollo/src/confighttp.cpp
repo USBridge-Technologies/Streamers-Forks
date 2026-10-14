@@ -6378,7 +6378,11 @@ namespace confighttp {
     register_api_route("^/api/auth/sessions$", "GET", listSessions);
     register_api_route("^/api/auth/sessions/([A-Fa-f0-9]+)$", "DELETE", revokeSession);
     server.config.reuse_address = true;
-    server.config.address = net::get_bind_address(address_family);
+    // usbridge: web_bind_address overrides bind_address for the admin UI only
+    // (the agent sets "127.0.0.1" so the UI is never reachable off the host).
+    server.config.address = config::sunshine.web_bind_address.empty()
+      ? net::get_bind_address(address_family)
+      : config::sunshine.web_bind_address;
     server.config.port = port_https;
 
     auto accept_and_run = [&](auto *server) {

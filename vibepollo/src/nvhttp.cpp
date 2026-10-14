@@ -2885,6 +2885,15 @@ namespace nvhttp {
 
         launch_session->host_audio = host_audio;
 
+        // usbridge: the client's "Show Mouse" setting, sent on every /launch
+        // and /resume so a session starts with the cursor exactly as the user
+        // chose (display_cursor is otherwise process-global). Absent from stock
+        // Moonlight clients: left unchanged then.
+        if (const auto cursor = get_arg(args, "usbridgeDisplayCursor", ""); !cursor.empty()) {
+          display_cursor = cursor == "1" || cursor == "true";
+          BOOST_LOG(info) << "Client set display cursor: "sv << (display_cursor ? "shown"sv : "hidden"sv);
+        }
+
         // Encrypted RTSP is enabled with client reported corever >= 1
         auto corever = util::from_view(get_arg(args, "corever", "0"));
         if (corever >= 1) {

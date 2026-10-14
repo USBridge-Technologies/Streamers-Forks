@@ -42,6 +42,7 @@
 #ifdef __linux__
   #include "lutris_auto_sync.h"
 #endif
+#include "usbridge.h"
 #include "webrtc_stream.h"
 #ifdef _WIN32
   #include <shobjidl.h>
@@ -272,6 +273,12 @@ WINAPI BOOL ConsoleCtrlHandler(DWORD type) {
 #endif
 
 int main(int argc, char *argv[]) {
+  // usbridge: the USBridge agent asks whether this build hands devices to its USB broker.
+  if (argc > 1 && std::string_view {argv[1]} == "--usbridge-bridge") {
+    std::cout << usbridge::PROBE_LINE << std::endl;
+    return 0;
+  }
+
 #ifdef __linux__
   #ifdef SUNSHINE_BUILD_STEAMOS
   if (platf::linux_cli::command(argc, argv)) {
