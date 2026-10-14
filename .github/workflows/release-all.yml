@@ -53,6 +53,14 @@ on:
           - windows
           - none
         default: all
+      vibepollo_platform:
+        description: 'Vibepollo: what to build'
+        type: choice
+        options:
+          - all
+          - windows
+          - none
+        default: all
 
 jobs:
   sunshine:
@@ -69,9 +77,15 @@ jobs:
     with:
       platform: ${{ inputs.punktfunk_platform }}
 
+  vibepollo:
+    name: Vibepollo Build
+    uses: ./.github/workflows/vibepollo-build.yml
+    with:
+      platform: ${{ inputs.vibepollo_platform }}
+
   release:
     name: Create combined release
-    needs: [sunshine, punktfunk]
+    needs: [sunshine, punktfunk, vibepollo]
     # A failed or cancelled build blocks the release; "skipped" can't
     # actually happen here (sunshine/punktfunk always run, their inner jobs
     # are what skip per-platform) but is kept for symmetry with the inner
@@ -81,7 +95,8 @@ jobs:
     if: >-
       ${{ always() && inputs.tag != '' &&
           (needs.sunshine.result == 'success' || needs.sunshine.result == 'skipped') &&
-          (needs.punktfunk.result == 'success' || needs.punktfunk.result == 'skipped') }}
+          (needs.punktfunk.result == 'success' || needs.punktfunk.result == 'skipped') &&
+          (needs.vibepollo.result == 'success' || needs.vibepollo.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -124,7 +139,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
-          name: "Streamers ${{ inputs.tag }} (Sunshine + Punktfunk, usbridge forks)"
+          name: "Streamers ${{ inputs.tag }} (Sunshine + Punktfunk + Vibepollo, usbridge forks)"
           body: |
             Combined release of both usbridge streamer forks under one tag, so
             agent/scripts/fetch_sunshine.sh (and any future punktfunk fetch
@@ -140,12 +155,17 @@ jobs:
             x86_64 (host + encode worker, NVENC + Vulkan encode) and Windows
             x64 (punktfunk-host.exe, NVENC + QSV + AMF; no installer or
             drivers). No macOS build.
+
+            Vibepollo fork (Nonary/Vibepollo): USB devices handed to the USBridge USB
+            broker (gamepads, raw HID), web_bind_address, the client's cursor setting.
+            Windows x64 portable zip; no virtual display driver or Playnite plugin.
           files: |
             artifacts/Sunshine-macOS-arm64.dmg
             artifacts/Sunshine-Windows-x86_64-portable.zip
             artifacts/Sunshine-Linux-x86_64.tar.gz
             artifacts/punktfunk-host-Linux-x86_64.tar.gz
             artifacts/punktfunk-host-Windows-x64.zip
+            artifacts/Vibepollo-Windows-x86_64-portable.zip
             artifacts/manifest.json
             artifacts/manifest.json.sig
           fail_on_unmatched_files: false
