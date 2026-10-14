@@ -1,0 +1,97 @@
+# Publisher Metadata
+set(SUNSHINE_PUBLISHER_NAME "Nonary"
+        CACHE STRING "The name of the publisher (not developer) of the application.")
+set(SUNSHINE_PUBLISHER_WEBSITE "https://github.com/Nonary/Vibepollo"
+        CACHE STRING "The URL of the publisher's website.")
+set(SUNSHINE_PUBLISHER_ISSUE_URL "https://github.com/Nonary/Vibepollo/issues"
+        CACHE STRING "The URL of the publisher's support site or issue tracker.
+        If you provide a modified version of Sunshine, we kindly request that you use your own url.")
+
+option(BUILD_DOCS "Build documentation" OFF)
+option(BUILD_TESTS "Build unit tests." ON)
+option(BUILD_WERROR "Enable -Werror flag." OFF)
+
+# if this option is set, the build will exit after configuring special package configuration files
+option(SUNSHINE_CONFIGURE_ONLY "Configure special files only, then exit." OFF)
+
+option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." ON)
+option(SUNSHINE_ENABLE_WEBRTC "Enable WebRTC streaming support (Windows only)." OFF)
+
+# PyroWave GPU encoders are available on Windows and Linux.
+if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    option(SUNSHINE_ENABLE_PYROWAVE "Enable the PyroWave video codec." ON)
+else()
+    option(SUNSHINE_ENABLE_PYROWAVE "Enable the PyroWave video codec." OFF)
+endif()
+
+option(SUNSHINE_SYSTEM_VULKAN_HEADERS "Use system installation of vulkan-headers rather than the submodule." OFF)
+option(SUNSHINE_SYSTEM_WAYLAND_PROTOCOLS "Use system installation of wayland-protocols rather than the submodule." OFF)
+
+if(APPLE)
+    option(BOOST_USE_STATIC "Use static boost libraries." OFF)
+else()
+    option(BOOST_USE_STATIC "Use static boost libraries." ON)
+endif()
+
+option(CUDA_FAIL_ON_MISSING "Fail the build if CUDA is not found." ON)
+option(SUNSHINE_REQUIRE_CUDA_PASCAL "Require Pascal-compatible CUDA for release packages" OFF)
+option(CUDA_INHERIT_COMPILE_OPTIONS
+        "When building CUDA code, inherit compile options from the the main project. You may want to disable this if
+        your IDE throws errors about unknown flags after running cmake." ON)
+
+if(UNIX)
+    option(SUNSHINE_BUILD_HOMEBREW
+            "Enable a Homebrew build." OFF)
+    option(SUNSHINE_CONFIGURE_HOMEBREW
+            "Configure Homebrew formula. Recommended to use with SUNSHINE_CONFIGURE_ONLY" OFF)
+endif()
+
+if(APPLE)
+    option(SUNSHINE_CONFIGURE_PORTFILE
+            "Configure macOS Portfile. Recommended to use with SUNSHINE_CONFIGURE_ONLY" OFF)
+elseif(UNIX)  # Linux
+    option(SUNSHINE_BUILD_STEAMOS "Build a relocatable SteamOS user bundle." OFF)
+    if(SUNSHINE_BUILD_STEAMOS)
+        if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            message(FATAL_ERROR "The SteamOS bundle requires Linux")
+        endif()
+        if(SUNSHINE_BUILD_APPIMAGE OR SUNSHINE_BUILD_FLATPAK OR SUNSHINE_CONFIGURE_PKGBUILD)
+            message(FATAL_ERROR "The SteamOS bundle cannot be combined with other packaging profiles")
+        endif()
+        # These defaults apply only to a fresh build directory. An explicit
+        # backend choice remains available for other Gamescope hardware.
+        option(SUNSHINE_ENABLE_CUDA "Enable cuda specific code." OFF)
+        option(SUNSHINE_ENABLE_DRM "Enable KMS grab if available." OFF)
+        set(SUNSHINE_ASSETS_DIR "share/vibepollo")
+    endif()
+    option(SUNSHINE_BUILD_APPIMAGE
+            "Enable an AppImage build." OFF)
+    option(SUNSHINE_BUILD_FLATPAK
+            "Enable a Flatpak build." OFF)
+    option(SUNSHINE_CONFIGURE_PKGBUILD
+            "Configure files required for AUR. Recommended to use with SUNSHINE_CONFIGURE_ONLY" OFF)
+    option(SUNSHINE_CONFIGURE_FLATPAK_MAN
+            "Configure manifest file required for Flatpak build. Recommended to use with SUNSHINE_CONFIGURE_ONLY" OFF)
+
+    # Linux capture methods
+    option(SUNSHINE_ENABLE_CUDA
+            "Enable cuda specific code." ON)
+    option(SUNSHINE_ENABLE_DRM
+            "Enable KMS grab if available." ON)
+    option(SUNSHINE_ENABLE_VAAPI
+            "Enable building vaapi specific code." ON)
+    option(SUNSHINE_ENABLE_VULKAN
+            "Enable Vulkan video encoding." ON)
+    option(SUNSHINE_ENABLE_WAYLAND
+            "Enable building wayland specific code." ON)
+    option(SUNSHINE_ENABLE_X11
+            "Enable X11 grab if available." ON)
+    option(SUNSHINE_ENABLE_KWIN
+            "Enable KWin ScreenCast grab if available" ON)
+    option(SUNSHINE_ENABLE_PORTAL
+            "Enable XDG portal grab if available" ON)
+    option(SUNSHINE_ENABLE_GAMESCOPE "Enable Gamescope PipeWire capture" ${SUNSHINE_ENABLE_WAYLAND})
+    if(SUNSHINE_BUILD_STEAMOS AND NOT SUNSHINE_ENABLE_GAMESCOPE)
+        message(FATAL_ERROR "The SteamOS bundle requires Gamescope capture")
+    endif()
+endif()

@@ -1,0 +1,5078 @@
+# Configuration
+
+@admonition{ Host authority | @htmlonly
+By providing the host authority (URI + port), you can easily open each configuration option in the config UI.
+<br>
+<script src="configuration.js"></script>
+<strong>Host authority: </strong> <input type="text" id="host-authority" value="localhost:47990">
+@endhtmlonly
+}
+
+Sunshine will work with the default settings for most users. In some cases you may want to configure Sunshine further.
+
+The default location for the configuration file is listed below. You can use another location if you
+choose, by passing in the full configuration file path as the first argument when you start Sunshine.
+
+**Example**
+```bash
+sunshine ~/sunshine_config.conf
+```
+
+The default location of the `apps.json` is the same as the configuration file. You can use a custom
+location by modifying the configuration file.
+
+**Default Config Directory**
+
+| OS      | Location                                        |
+|---------|-------------------------------------------------|
+| Docker  | @code{}/config@endcode                          |
+| FreeBSD | @code{}~/.config/sunshine@endcode               |
+| Linux (native package) | @code{}/var/lib/vibepollo@endcode |
+| Linux (standalone) | @code{}~/.config/vibepollo@endcode (or `$XDG_CONFIG_HOME/vibepollo`) |
+| macOS   | @code{}~/.config/sunshine@endcode               |
+| Windows | @code{}%ProgramFiles%\\Sunshine\\config@endcode |
+
+Native Linux packages share one machine profile across the login screen and desktop.
+Edit settings through the Web UI; use `vibepollo paths` to locate files and
+`sudo vibepollo logs` for diagnostics. Package upgrades import the selected desktop
+user's legacy `~/.config/vibepollo` profile once and preserve existing machine settings.
+
+Although it is recommended to use the configuration UI, it is possible manually configure Sunshine by
+editing the `conf` file in a text editor. Use the examples as reference.
+
+## General
+
+### locale
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The locale used for Sunshine's user interface.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            en
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            locale = en
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="20">Choices</td>
+        <td>bg</td>
+        <td>Bulgarian</td>
+    </tr>
+    <tr>
+        <td>cs</td>
+        <td>Czech</td>
+    </tr>
+    <tr>
+        <td>de</td>
+        <td>German</td>
+    </tr>
+    <tr>
+        <td>en</td>
+        <td>English</td>
+    </tr>
+    <tr>
+        <td>en_GB</td>
+        <td>English (UK)</td>
+    </tr>
+    <tr>
+        <td>en_US</td>
+        <td>English (United States)</td>
+    </tr>
+    <tr>
+        <td>es</td>
+        <td>Spanish</td>
+    </tr>
+    <tr>
+        <td>fr</td>
+        <td>French</td>
+    </tr>
+    <tr>
+        <td>it</td>
+        <td>Italian</td>
+    </tr>
+    <tr>
+        <td>ja</td>
+        <td>Japanese</td>
+    </tr>
+    <tr>
+        <td>ko</td>
+        <td>Korean</td>
+    </tr>
+    <tr>
+        <td>pl</td>
+        <td>Polish</td>
+    </tr>
+    <tr>
+        <td>pt</td>
+        <td>Portuguese</td>
+    </tr>
+    <tr>
+        <td>pt_BR</td>
+        <td>Portuguese (Brazilian)</td>
+    </tr>
+    <tr>
+        <td>ru</td>
+        <td>Russian</td>
+    </tr>
+    <tr>
+        <td>sv</td>
+        <td>Swedish</td>
+    </tr>
+    <tr>
+        <td>tr</td>
+        <td>Turkish</td>
+    </tr>
+    <tr>
+        <td>uk</td>
+        <td>Ukranian</td>
+    </tr>
+    <tr>
+        <td>zh</td>
+        <td>Chinese (Simplified)</td>
+    </tr>
+    <tr>
+        <td>zh_TW</td>
+        <td>Chinese (Traditional)</td>
+    </tr>
+</table>
+
+### sunshine_name
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The name displayed by Moonlight.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">PC hostname</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            sunshine_name = Sunshine
+            @endcode</td>
+    </tr>
+</table>
+
+### min_log_level
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The minimum log level printed to standard out.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            info
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            min_log_level = info
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="7">Choices</td>
+        <td>verbose</td>
+        <td>All logging message.
+            @attention{This may negatively affect streaming performance.}</td>
+    </tr>
+    <tr>
+        <td>debug</td>
+        <td>Debug log messages and higher.
+            @attention{This may negatively affect streaming performance.}</td>
+    </tr>
+    <tr>
+        <td>info</td>
+        <td>Informational log messages and higher.</td>
+    </tr>
+    <tr>
+        <td>warning</td>
+        <td>Warning log messages and higher.</td>
+    </tr>
+    <tr>
+        <td>error</td>
+        <td>Error log messages and higher.</td>
+    </tr>
+    <tr>
+        <td>fatal</td>
+        <td>Only fatal log messages.</td>
+    </tr>
+    <tr>
+        <td>none</td>
+        <td>No log messages.</td>
+    </tr>
+</table>
+
+### global_prep_cmd
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            A list of commands to be run before/after all applications.
+            If any of the prep-commands fail, starting the application is aborted.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            []
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            global_prep_cmd = [{"do":"nircmd.exe setdisplay 1280 720 32 144","elevated":true,"undo":"nircmd.exe setdisplay 2560 1440 32 144"}]
+            @endcode</td>
+    </tr>
+</table>
+
+### notify_pre_releases
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Whether to be notified of new pre-release versions of Sunshine.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            notify_pre_releases = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### update_check_interval
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Interval in seconds between automatic checks for new Sunshine releases. Set to 0 to disable periodic checking.
+            Checks are date-based: Sunshine compares its build date to the latest release (and pre-releases if enabled) and notifies when a newer build is available.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            86400
+            @endcode (24 hours)</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            update_check_interval = 14400
+            @endcode</td>
+    </tr>
+</table>
+
+### system_tray
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Show icon in system tray and display desktop notifications.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            system_tray = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+<!-- The update command mechanism was removed. Sunshine now only notifies about updates. -->
+
+## Input
+
+### controller
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Whether to allow controller input from the client.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            controller = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### gamepad
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The type of gamepad to emulate on the host.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            gamepad = auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="11">Choices</td>
+        <td>ds4</td>
+        <td>DualShock 4 controller (PS4)
+            @note{This option applies to Windows and Linux. On Linux it uses UHID and includes
+            rumble, the touchpad, motion sensors, battery reporting, and the lightbar.}</td>
+    </tr>
+    <tr>
+        <td>ds5</td>
+        <td>DualShock 5 controller (PS5)
+            @note{This option applies to FreeBSD and Linux only.}</td>
+    </tr>
+    <tr>
+        <td>switch</td>
+        <td>Switch Pro controller
+            @note{This option applies to FreeBSD and Linux only.}</td>
+    </tr>
+    <tr>
+        <td>vhf</td>
+        <td>Vibepollo's own virtual gamepad driver, instead of ViGEmBus, choosing the controller
+            automatically
+            @note{This option applies to Windows only and requires the Vibepollo virtual gamepad
+            driver to be installed. It presents a DualSense to clients that report a PlayStation
+            controller, or when motion_as_ds4 or touchpad_as_ds4 applies, and an Xbox Series
+            controller otherwise. On an older driver it falls back to a generic HID pad that
+            publishes the DirectInput Physical Interface Device report set, so force feedback still
+            works in DirectInput games.}</td>
+    </tr>
+    <tr>
+        <td>vhf_switch</td>
+        <td>Switch Pro Controller on Vibepollo's own virtual gamepad driver
+            @note{This option applies to Windows only and requires the Vibepollo virtual gamepad
+            driver to be installed. Includes motion sensors, battery reporting, rumble, and the
+            Capture button. This controller has no analog triggers, so trigger travel is reported
+            as ZL and ZR presses, and it has no touchpad.}</td>
+    </tr>
+    <tr>
+        <td>vhf_xbox</td>
+        <td>Xbox Series controller on Vibepollo's own virtual gamepad driver
+            @note{This option applies to Windows only and requires the Vibepollo virtual gamepad
+            driver to be installed. Along with vhf_xbox_one, this is a virtual gamepad option
+            Windows places on the XInput path, so it is one of the two that games supporting only
+            XInput can see. It has rumble and impulse triggers, but no touchpad, motion, or
+            battery reporting.}</td>
+    </tr>
+    <tr>
+        <td>vhf_xbox_one</td>
+        <td>Xbox One controller on Vibepollo's own virtual gamepad driver
+            @note{This option applies to Windows only and requires the Vibepollo virtual gamepad
+            driver to be installed. It reaches the XInput path the same way vhf_xbox does, and is
+            recognised by Windows on its own product ID rather than a generic one, which can help
+            with software that identifies controllers by generation. It is otherwise identical to
+            vhf_xbox except that an Xbox One pad has no Share button.}</td>
+    </tr>
+    <tr>
+        <td>vhf_ds4</td>
+        <td>DualShock 4 on Vibepollo's own virtual gamepad driver
+            @note{This option applies to Windows only and requires the Vibepollo virtual gamepad
+            driver to be installed. Includes the touchpad, motion sensors, battery reporting, and
+            the lightbar.}</td>
+    </tr>
+    <tr>
+        <td>vhf_ds5</td>
+        <td>DualSense on Vibepollo's own virtual gamepad driver
+            @note{This option applies to Windows only and requires the Vibepollo virtual gamepad
+            driver to be installed. Includes the touchpad, motion sensors, battery reporting, the
+            lightbar, the player and microphone LEDs, and the adaptive triggers.}</td>
+    </tr>
+    <tr>
+        <td>usbip_ds5</td>
+        <td>Wired USB DualSense with a Windows controller audio endpoint for waveform haptics
+            @note{This option applies to Windows only and requires the optional
+            DualSense USB audio and haptics installer component. It uses the
+            Microsoft-signed usbip-win2 transport to expose a composite USB DualSense
+            with HID and audio interfaces. Compatible native games can send waveform
+            haptics through a Moonlight client implementing the waveform extension.
+            The physical client connection does not change this wired USB identity.
+            This selection reports an error when the transport
+            is unavailable. See [Windows DualSense waveform haptics](windows-dualsense-haptics.md)
+            for setup and validation.}</td>
+    </tr>
+    <tr>
+        <td>x360</td>
+        <td>Xbox 360 controller
+            @note{This option applies to Windows only.}</td>
+    </tr>
+    <tr>
+        <td>xone</td>
+        <td>Xbox One controller
+            @note{This option applies to FreeBSD and Linux only.}</td>
+    </tr>
+</table>
+
+### ds4_back_as_touchpad_click
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allow Select/Back inputs to also trigger DS4 touchpad click. Useful for clients looking to
+            emulate touchpad click on Xinput devices.
+            @hint{Only applies when gamepad is set to ds4 manually. Unused in other gamepad modes.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            ds4_back_as_touchpad_click = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### motion_as_ds4
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            If a client reports that a connected gamepad has motion sensor support, emulate it on the
+            host as a DS4 controller.
+            <br>
+            <br>
+            When disabled, motion sensors will not be taken into account during gamepad type selection.
+            @hint{Only applies when gamepad is set to auto.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            motion_as_ds4 = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### touchpad_as_ds4
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            If a client reports that a connected gamepad has a touchpad, emulate it on the host
+            as a DS4 controller.
+            <br>
+            <br>
+            When disabled, touchpad presence will not be taken into account during gamepad type selection.
+            @hint{Only applies when gamepad is set to auto.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            touchpad_as_ds4 = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### back_button_timeout
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            If the Back/Select button is held down for the specified number of milliseconds,
+            a Home/Guide button press is emulated.
+            @tip{If back_button_timeout < 0, then the Home/Guide button will not be emulated.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            -1
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            back_button_timeout = 2000
+            @endcode</td>
+    </tr>
+</table>
+
+### keyboard
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Whether to allow keyboard input from the client.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            keyboard = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### key_repeat_delay
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The initial delay, in milliseconds, before repeating keys. Controls how fast keys will
+            repeat themselves.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            500
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            key_repeat_delay = 500
+            @endcode</td>
+    </tr>
+</table>
+
+### key_repeat_frequency
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            How often keys repeat every second.
+            @tip{This configurable option supports decimals.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            24.9
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            key_repeat_frequency = 24.9
+            @endcode</td>
+    </tr>
+</table>
+
+### always_send_scancodes
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sending scancodes enhances compatibility with games and apps but may result in incorrect keyboard input
+            from certain clients that aren't using a US English keyboard layout.
+            <br>
+            <br>
+            Enable if keyboard input is not working at all in certain applications.
+            <br>
+            <br>
+            Disable if keys on the client are generating the wrong input on the host.
+            @caution{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            always_send_scancodes = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### key_rightalt_to_key_win
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">It may be possible that you cannot send the Windows Key from Moonlight directly. In those cases it may be useful to
+            make Sunshine think the Right Alt key is the Windows key.
+            </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            key_rightalt_to_key_win = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### mouse
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Whether to allow mouse input from the client.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mouse = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### high_resolution_scrolling
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            When enabled, Sunshine will pass through high resolution scroll events from Moonlight clients.
+            <br>
+            This can be useful to disable for older applications that scroll too fast with high resolution scroll
+            events.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            high_resolution_scrolling = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### native_pen_touch
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            When enabled, Sunshine will pass through native pen/touch events from Moonlight clients.
+            <br>
+            This can be useful to disable for older applications without native pen/touch support.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            native_pen_touch = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### keybindings
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sometimes it may be useful to map keybindings. Wayland won't allow clients to capture the Win Key
+            for example.
+            @tip{See [virtual key codes](https://docs.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes)}
+            @hint{keybindings needs to have a multiple of two elements.}
+            @note{This option is not available in the UI. A PR would be welcome.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            [
+              0x10, 0xA0,
+              0x11, 0xA2,
+              0x12, 0xA4
+            ]
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            keybindings = [
+              0x10, 0xA0,
+              0x11, 0xA2,
+              0x12, 0xA4,
+              0x4A, 0x4B
+            ]
+            @endcode</td>
+    </tr>
+</table>
+
+### ds5_inputtino_randomize_mac
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Randomize the MAC-Address for the generated virtual controller.
+            @hint{Only applies on linux for gamepads created as PS5-style controllers}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            ds5_inputtino_randomize_mac = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### dualsense_haptics_gain
+
+Strength control for native DualSense waveform haptics streamed from Windows
+or Linux. Default: `1.0`. Allowed range: `0.0` to `4.0`.
+
+Use `1.5` for a gentle boost, `2.0` for a stronger boost, or `0.0` to mute
+waveform haptics. Above `1.0`, the quieter active actuator sets the requested
+amplification. Both actuators receive the same increase in normalized peak
+strength, preserving the gap between their peaks within each 5 ms packet.
+For example, peaks of 20% and 90% can become 30% and 100% while keeping their
+70 percentage point gap. Available headroom limits the shared lift; a full-scale
+peak leaves both actuators unchanged. Silent actuators remain silent.
+
+Each channel's waveform is scaled linearly within the packet, preserving its
+shape and zero crossings without hard clipping or adding a sample offset.
+The strongest recent peak remains the headroom reference for 100 ms, then
+releases over 200 ms, retaining contrast when a quieter effect follows a strong
+one. Increases in lift ease over 20 ms; reductions apply immediately when
+headroom shrinks. Smoothing is independent per controller. Brief silent gaps
+retain recent peak history; 100 ms of silence, sequence gaps, packet gaps over
+50 ms, or strength changes reset it. No packets are buffered
+and no playback latency is added.
+
+This preserves the measured peak-strength gap between actuator channels, not
+the differences between individual game effects already mixed into one channel.
+Recent peak history helps preserve contrast across nearby effects, but future
+peaks cannot be predicted and exact gaps across time are not guaranteed. 16-bit
+rounding can change the measured gap by about one sample. At `1.0`, the signal is unchanged; below `1.0`, it is
+attenuated linearly. Ordinary rumble and adaptive triggers are unaffected.
+Requires a client and controller with waveform haptics support.
+
+```ini
+dualsense_haptics_gain = 1.5
+```
+
+### proton_dualsense_compatibility
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Supply native DualSense audio compatibility defaults to Proton games launched during streaming,
+            including games started inside an already-running Steam client. Sets
+            <code>PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE=1</code> and
+            <code>PROTON_SONY_WINDOWS_DEVICE_NAMES=1</code> unless the game explicitly overrides them.
+            Independent of HDR and frame limiting. Requires a Proton build implementing these options
+            and a game with native DualSense support. Reconnect the stream and relaunch the game after changing this option.
+            @hint{Only applies on Linux. Without an active stream, the Proton hook is inert.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            proton_dualsense_compatibility = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+## Audio/Video
+
+### audio_sink
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The name of the audio sink used for audio loopback.
+            @tip{To find the name of the audio sink follow these instructions.
+            <br>
+            <br>
+            **FreeBSD/Linux + pulseaudio:**
+            <br>
+            @code{}
+            pacmd list-sinks | grep "name:"
+            @endcode
+            <br>
+            <br>
+            **FreeBSD/Linux + pipewire:**
+            <br>
+            @code{}
+            pactl info | grep Source
+            # in some causes you'd need to use the `Sink` device, if `Source` doesn't work, so try:
+            pactl info | grep Sink
+            @endcode
+            <br>
+            <br>
+            **macOS:**
+            <br>
+            Sunshine can only access microphones on macOS due to system limitations.
+            To stream system audio use
+            [Soundflower](https://github.com/mattingalls/Soundflower) or
+            [BlackHole](https://github.com/ExistentialAudio/BlackHole).
+            <br>
+            <br>
+            **Windows:**
+            <br>
+            Enter the following command in command prompt or PowerShell.
+            @code{}
+            %ProgramFiles%\Sunshine\tools\audio-info.exe
+            @endcode
+            If you have multiple audio devices with identical names, use the Device ID instead.
+            }
+            @attention{If you want to mute the host speakers, use
+            [virtual_sink](#virtual_sink) instead.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Sunshine will select the default audio device.</td>
+    </tr>
+    <tr>
+        <td>Example (FreeBSD/Linux)</td>
+        <td colspan="2">@code{}
+            audio_sink = alsa_output.pci-0000_09_00.3.analog-stereo
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example (macOS)</td>
+        <td colspan="2">@code{}
+            audio_sink = BlackHole 2ch
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example (Windows)</td>
+        <td colspan="2">@code{}
+            audio_sink = Speakers (High Definition Audio Device)
+            @endcode</td>
+    </tr>
+</table>
+
+### audio_sink_capture_only
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            On Windows, capture the explicitly selected [audio_sink](#audio_sink)
+            without changing any default output device. Route the desired application's
+            audio to that device in Windows before connecting. Capture stays on that
+            endpoint if the Windows default changes during the stream.
+            <br>
+            Requires a non-empty audio_sink. Virtual sink selection still takes precedence:
+            leave virtual_sink empty and enable host audio in the client if you have an
+            automatically detected virtual audio device. Other platforms ignore this option.
+            When disabled, selecting an Audio Sink retains the existing behavior of switching
+            Windows default outputs for the stream and restoring them afterward.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">disabled</td>
+    </tr>
+    <tr>
+        <td>Example (Windows)</td>
+        <td colspan="2">@code{}
+            audio_sink = Speakers (High Definition Audio Device)
+            audio_sink_capture_only = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### virtual_sink
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The audio device that's virtual, like Steam Streaming Speakers. This allows Sunshine to stream audio,
+            while muting the speakers.
+            @tip{See [audio_sink](#audio_sink)!}
+            @tip{These are some options for virtual sound devices.
+            * Stream Streaming Speakers (Linux, macOS, Windows)
+              * Steam must be installed.
+              * Enable [install_steam_audio_drivers](#install_steam_audio_drivers)
+                or use Steam Remote Play at least once to install the drivers.
+            * [Virtual Audio Cable](https://vb-audio.com/Cable) (macOS, Windows)
+            }
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">n/a</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            virtual_sink = Steam Streaming Speakers
+            @endcode</td>
+    </tr>
+</table>
+
+### install_steam_audio_drivers
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Installs the Steam Streaming Speakers driver (if Steam is installed) to support surround sound and muting
+            host audio.
+            @note{This option is only supported on Windows.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            install_steam_audio_drivers = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### stream_audio
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Whether to stream audio or not. Disabling this can be useful for streaming headless displays as second monitors.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            stream_audio = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### adapter_name
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Select the video card you want to stream.
+            @tip{To find the appropriate values follow these instructions.
+            <br>
+            <br>
+            **FreeBSD/Linux + VA-API:**
+            <br>
+            Unlike with AMD AMF encoders and *nvenc*, it doesn't matter if video encoding is done on a different GPU.
+            @code{}
+            ls /dev/dri/renderD*  # to find all devices capable of VAAPI
+            # replace ``renderD129`` with the device from above to list the name and capabilities of the device
+            vainfo --display drm --device /dev/dri/renderD129 | \
+              grep -E "((VAProfileH264High|VAProfileHEVCMain|VAProfileHEVCMain10).*VAEntrypointEncSlice)|Driver version"
+            @endcode
+            To be supported by Sunshine, it needs to have at the very minimum:
+            `VAProfileH264High   : VAEntrypointEncSlice`
+            <br>
+            <br>
+            **Windows:**
+            <br>
+            Select the adapter in the web interface so Vibepollo can save both
+            its display name and persistent Windows device identity. For
+            manually authored configurations, use the following command in
+            command prompt or PowerShell to list adapter descriptions.
+            @code{}
+            %ProgramFiles%\Sunshine\tools\dxgi-info.exe
+            @endcode
+            For hybrid graphics systems, DXGI reports the outputs are connected to whichever graphics
+            adapter that the application is configured to use, so it's not a reliable indicator of how the
+            display is physically connected.
+            <br>
+            <br>
+            Once an adapter is selected, capture stays pinned to it. If that GPU currently has no display
+            attached (for example a TV that is powered off), Vibepollo does **not** fall back to another
+            GPU; it treats the host as displayless and creates the virtual display on the selected adapter.
+            }
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Sunshine will select the default video card.</td>
+    </tr>
+    <tr>
+        <td>Example (FreeBSD/Linux)</td>
+        <td colspan="2">@code{}
+            adapter_name = /dev/dri/renderD128
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example (Windows)</td>
+        <td colspan="2">@code{}
+            adapter_name = Radeon RX 580 Series
+            @endcode</td>
+    </tr>
+</table>
+
+### adapter_pnp_id
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Windows-only persistent PnP identity paired with `adapter_name`.
+            The web interface records this value automatically when an adapter
+            is selected, allowing adapters with identical descriptions to
+            remain distinct across restarts and enumeration-order changes.
+            The same identity selects the render adapter when Vibepollo creates
+            a virtual display fallback.
+            Do not configure this key by itself. If it is omitted,
+            `adapter_name` retains its legacy description-only behavior.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Unset.</td>
+    </tr>
+    <tr>
+        <td>Example (Windows)</td>
+        <td colspan="2">@code{}
+            adapter_name = Radeon RX 580 Series
+            adapter_pnp_id = PCI\VEN_1002&DEV_67DF&SUBSYS_00000000&REV_E7
+            @endcode</td>
+    </tr>
+</table>
+
+### output_name
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Select the display number you want to stream.
+            @tip{To find the appropriate values follow these instructions.
+            <br>
+            <br>
+            **FreeBSD/Linux:**
+            <br>
+            During Sunshine startup, you should see the list of detected displays:
+            @code{}
+            Info: Detecting displays
+            Info: Detected display: DVI-D-0 (id: 0) connected: false
+            Info: Detected display: HDMI-0 (id: 1) connected: true
+            Info: Detected display: DP-0 (id: 2) connected: true
+            Info: Detected display: DP-1 (id: 3) connected: false
+            Info: Detected display: DVI-D-1 (id: 4) connected: false
+            @endcode
+            You need to use the id value inside the parenthesis, e.g. `1`.
+            <br>
+            <br>
+            **macOS:**
+            <br>
+            During Sunshine startup, you should see the list of detected displays:
+            @code{}
+            Info: Detecting displays
+            Info: Detected display: Monitor-0 (id: 3) connected: true
+            Info: Detected display: Monitor-1 (id: 2) connected: true
+            @endcode
+            You need to use the id value inside the parenthesis, e.g. `3`.
+            <br>
+            <br>
+            **Windows:**
+            <br>
+            During Sunshine startup, you should see the list of detected displays:
+            @code{}
+            Info: Currently available display devices:
+            [
+              {
+                "device_id": "{64243705-4020-5895-b923-adc862c3457e}",
+                "display_name": "",
+                "friendly_name": "IDD HDR",
+                "info": null
+              },
+              {
+                "device_id": "{77f67f3e-754f-5d31-af64-ee037e18100a}",
+                "display_name": "",
+                "friendly_name": "SunshineHDR",
+                "info": null
+              },
+              {
+                "device_id": "{daeac860-f4db-5208-b1f5-cf59444fb768}",
+                "display_name": "\\\\.\\DISPLAY1",
+                "friendly_name": "ROG PG279Q",
+                "info": {
+                  "hdr_state": null,
+                  "origin_point": {
+                    "x": 0,
+                    "y": 0
+                  },
+                  "primary": true,
+                  "refresh_rate": {
+                    "type": "rational",
+                    "value": {
+                      "denominator": 1000,
+                      "numerator": 119998
+                    }
+                  },
+                  "resolution": {
+                    "height": 1440,
+                    "width": 2560
+                  },
+                  "resolution_scale": {
+                    "type": "rational",
+                    "value": {
+                      "denominator": 100,
+                      "numerator": 100
+                    }
+                  }
+                }
+              }
+            ]
+            @endcode
+            You need to use the `device_id` value.
+            }
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Sunshine will select the default display.</td>
+    </tr>
+    <tr>
+        <td>Example (FreeBSD/Linux)</td>
+        <td colspan="2">@code{}
+            output_name = 0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example (macOS)</td>
+        <td colspan="2">@code{}
+            output_name = 3
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example (Windows)</td>
+        <td colspan="2">@code{}
+            output_name = {daeac860-f4db-5208-b1f5-cf59444fb768}
+            @endcode</td>
+    </tr>
+</table>
+
+### virtual_display_mode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Select which display Sunshine should prepare before streaming. When set to one of the virtual options, Sunshine will manage a virtual display instead of relying on your physical monitor.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            per_client
+            @endcode
+            On Windows 10 hosts the default is <code>disabled</code> (physical display) instead, because the
+            Windows 11 capture features the virtual-display pipeline relies on (WGC frame-generation capture
+            at 4x refresh) are unavailable there. An explicit value always wins.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            virtual_display_mode = shared
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>disabled</td>
+        <td>Use the physical display selected via <code>output_name</code>.</td>
+    </tr>
+    <tr>
+        <td>per_client</td>
+        <td>Create a dedicated virtual display per client connection.</td>
+    </tr>
+    <tr>
+        <td>shared</td>
+        <td>Reuse a single virtual display for all clients. Faster reconnects, but only one virtual layout is maintained.</td>
+    </tr>
+</table>
+
+### virtual_display_outputs
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Linux-only list of DRM connector names reserved for private streaming displays.
+            Separate names with commas, or provide a JSON string array. Leave this empty to
+            auto-discover outputs created by the packaged <code>vibeshine-vkms.service</code>.
+            The Linux DRM driver, connector broker, and service assets are supplied by the
+            bundled <code>libvirtualdisplay</code> dependency.
+            Explicit connector names are useful for a forced-EDID or hardware dummy output.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Empty (auto-discover the managed VKMS pool)</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            virtual_display_outputs = Virtual-1, Virtual-2
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Linux setup</td>
+        <td colspan="2">@code{}
+            sudo vibepollo driver install
+            sudo systemctl enable --now vibeshine-vkms.service
+            @endcode
+            Native packages and <code>vibeshine-drm-setup.service</code> attempt this installation
+            automatically; use the first command to install or retry it manually. The privileged
+            helper always uses the fixed, root-owned
+            <code>/usr/libexec/vibeshine</code> path, independent of the application install prefix.
+            Replacing the module file does not replace a module already loaded by the compositor.
+            Compare <code>modinfo -F version vibeshine_drm</code> with
+            <code>cat /sys/module/vibeshine_drm/version</code> and reboot before testing when they differ.
+            The module supports Linux 6.16 or newer and exposes eight independent virtual connectors
+            with a deterministic HDR10 EDID, BT.2020/PQ metadata, 8-16 bits per component, and
+            10-bit RGB plane formats. Vibepollo enables one only for a stream, applies the requested
+            mode, layout, and HDR state through KScreen, captures that exact connector, and restores
+            the prior topology afterward.
+            KDE Plasma/KWin and <code>kscreen-doctor</code> are required for managed topology.
+            Vibepollo uses direct DRM/KMS capture for managed HDR output so the 10-bit scanout reaches
+            the encoder. The custom driver also notifies capture after completed presentation changes and
+            exports the exact pinned primary-plane DMA-BUF for that sequence. Sparse changes are captured
+            immediately, while faster changes are coalesced to the stream's requested maximum frame rate
+            without re-querying KMS state. Managed outputs expose no cursor or overlay planes, so KWin
+            composites the complete monitor image into that primary framebuffer. An older module without
+            this ABI is rejected rather than polled. KWin ScreenCast remains the recommended compositor
+            capture path for SDR.
+            <br><br>
+            If the custom module cannot be built or loaded (including on older kernels or when
+            the kernel rejects an untrusted module signature), managed virtual displays remain unavailable.
+            Vibepollo deliberately does not fall back to CPU-backed stock <code>vkms</code> scanout.
+            Arch Linux and CachyOS packages use DKMS to sign future rebuilds with a persistent local
+            key and verify the embedded signer before accepting the module. Stock Arch and CachyOS
+            kernels need no separate signing step: accepting the normal package-install confirmation
+            is enough, including with Secure Boot through Limine or systemd-boot. Only a custom kernel
+            that enforces trusted module signatures requires shim. The package installation detects
+            this and launches the one-time signing-key authorization prompt automatically; reboot and
+            approve the pending firmware confirmations once. Future updates remain automatic. Install
+            the matching kernel headers before retrying a failed module build.
+        </td>
+    </tr>
+</table>
+
+### virtual_display_layout
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Controls how the virtual display is positioned relative to your physical monitors whenever <code>virtual_display_mode</code> is not <code>disabled</code>.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            exclusive
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            virtual_display_layout = extended_primary_isolated
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="5">Choices</td>
+        <td>exclusive</td>
+        <td>Deactivate every other monitor so only the virtual display remains visible.</td>
+    </tr>
+    <tr>
+        <td>extended</td>
+        <td>Keep all existing monitors active and simply add the virtual display as another screen.</td>
+    </tr>
+    <tr>
+        <td>extended_primary</td>
+        <td>Extend the desktop while promoting the virtual display to be the primary monitor.</td>
+    </tr>
+    <tr>
+        <td>extended_isolated</td>
+        <td>Extend the desktop but move the virtual display far away in the coordinate space so the mouse cannot accidentally reach it.</td>
+    </tr>
+    <tr>
+        <td>extended_primary_isolated</td>
+        <td>Combine the primary + isolated behaviors: the virtual display becomes primary while remaining far away from the physical monitors.</td>
+    </tr>
+</table>
+
+On Windows, non-isolated extended application streams preserve Windows'
+relative monitor arrangement. Per-client directions can be saved under
+**Devices → Arrange client displays**. The editor supports left, right, above, below,
+alignment and gap, plus **Preserve / manual**. A saved direction or explicit
+manual rule takes precedence over isolated positioning for that client.
+`dd_configuration_option = verify_only` verifies the existing extended target
+and preserves topology and positions; use an automatic preparation option to
+apply a saved direction. Shared displays use the application layout.
+
+### virtual_display_max_clients
+
+Maximum paired-client identities that may own virtual displays at once, from
+`1` to `8`. The default is `4`; set `virtual_display_max_clients = 6` to allow
+six clients. Normal game streams and Remote Monitor share one slot when they
+belong to the same paired client. Retained or retryable displays still own a
+slot until explicitly released. Lowering the setting does not unplug existing
+owners; it prevents new identities until usage falls below the limit.
+
+The Windows driver supports eight temporary per-client displays, independently
+of the permanent-display setting. Linux also clamps this limit to configured
+outputs actually present in its managed kernel pool. New Linux pools provision
+eight outputs. An existing four-output pool is preserved during updates; reboot
+or safely reprovision the pool with the host and compositor stopped before
+requesting more than four clients. The topology editor reports the effective
+limit. Arbitrarily many displays are not supported.
+
+### remote_monitor_mute_audio
+
+Do not capture or transmit host audio for Remote Monitor sessions. Video and
+input continue normally. The default is `false`.
+
+### remote_monitor_disconnect_on_stream_end
+
+Release a client's owned Remote Monitor display when its RTSP stream ends. The
+default is `false`, which retains the display identity and requested topology
+after transport loss so that the paired client can Resume it.
+
+### remote_monitor_disconnect_on_client_disconnect
+
+Release a retained Remote Monitor when the paired client explicitly
+disconnects. The default is `false`.
+
+### remote_monitor_terminate_on_first_request
+
+Allow an additional paired client to terminate the active game with its first
+Terminate request. The original game client is unaffected. The default is
+`false`.
+
+### remote_monitor_confirm_app_replacement
+
+Protect a running app while Vibepollo advertises the host as available for
+warning-free Remote Input and Remote Monitor attachment. Selecting a different
+normal app is rejected once and temporarily advertises the running app as
+resumable to that paired client, allowing Moonlight to show its native close-app
+warning on the next attempt. The confirmation window is 60 seconds. Disable
+this option to replace the running app immediately. The default is `true`.
+
+### dd_configuration_option
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Perform mandatory verification and additional configuration for the display device.
+            @note{Applies to Windows and to Linux private displays managed through KScreen.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            verify_only
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_configuration_option = ensure_only_display
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="5">Choices</td>
+        <td>disabled</td>
+        <td>Perform no additional configuration (disables all `dd_` configuration options).</td>
+    </tr>
+    <tr>
+        <td>verify_only</td>
+        <td>Verify that display is active only (this is a mandatory step without any extra steps to verify display state).</td>
+    </tr>
+    <tr>
+        <td>ensure_active</td>
+        <td>Activate the display if it's currently inactive.</td>
+    </tr>
+    <tr>
+        <td>ensure_primary</td>
+        <td>Activate the display if it's currently inactive and make it primary.</td>
+    </tr>
+    <tr>
+        <td>ensure_only_display</td>
+        <td>Activate the display if it's currently inactive and disable all others.</td>
+    </tr>
+</table>
+
+### dd_resolution_option
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Perform additional resolution configuration for the display device.
+            @note{"Optimize game settings" must be enabled in Moonlight for this option to work.}
+            @note{On Linux, this applies to private displays managed through KScreen.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}auto@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_resolution_option = manual
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>disabled</td>
+        <td>Perform no additional configuration.</td>
+    </tr>
+    <tr>
+        <td>auto</td>
+        <td>Change resolution to the requested resolution from the client.</td>
+    </tr>
+    <tr>
+        <td>manual</td>
+        <td>Change resolution to the user specified one (set via [dd_manual_resolution](#dd_manual_resolution)).</td>
+    </tr>
+</table>
+
+### dd_manual_resolution
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Specify manual resolution to be used.
+            @note{[dd_resolution_option](#dd_resolution_option) must be set to `manual`}
+            @note{On Linux, this applies to private displays managed through KScreen.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">n/a</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_manual_resolution = 1920x1080
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_refresh_rate_option
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Perform additional refresh rate configuration for the display device.
+            @note{On Linux, this applies to private displays managed through KScreen.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}auto@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_refresh_rate_option = manual
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="4">Choices</td>
+        <td>disabled</td>
+        <td>Perform no additional configuration.</td>
+    </tr>
+    <tr>
+        <td>auto</td>
+        <td>Change refresh rate to the requested FPS value from the client.</td>
+    </tr>
+    <tr>
+        <td>manual</td>
+        <td>Change refresh rate to the user specified one (set via [dd_manual_refresh_rate](#dd_manual_refresh_rate)).</td>
+    </tr>
+    <tr>
+        <td>prefer_highest</td>
+        <td>Prefer the highest available refresh rate for the selected resolution. Recommended when using a virtual display + RTSS to minimize VSYNC engagement on hosts with global VSYNC enabled and G-SYNC with ULLM.</td>
+    </tr>
+</table>
+
+### dd_manual_refresh_rate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Specify manual refresh rate to be used.
+            @note{[dd_refresh_rate_option](#dd_refresh_rate_option) must be set to `manual`}
+            @note{On Linux, this applies to private displays managed through KScreen.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">n/a</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_manual_resolution = 120
+            dd_manual_resolution = 59.95
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_hdr_option
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Perform additional HDR configuration for the display device.
+            @note{On Linux 6.16 or newer, the managed <code>vibeshine_drm</code> output supplied by <code>libvirtualdisplay</code> advertises GPU-attached HDR10 and 10-bit formats. Managed display creation fails if that driver is unavailable rather than using CPU-backed stock VKMS.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}auto@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_hdr_option = disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="2">Choices</td>
+        <td>disabled</td>
+        <td>Perform no additional configuration.</td>
+    </tr>
+    <tr>
+        <td>auto</td>
+        <td>Change HDR to the requested state from the client if the display supports it.</td>
+    </tr>
+</table>
+
+### dd_hdr_request_override
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Override the HDR request coming from the client.
+            @note{Linux applies this to private displays managed through KScreen.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}auto@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_hdr_request_override = force_on
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>auto</td>
+        <td>Respect the client-requested HDR state.</td>
+    </tr>
+    <tr>
+        <td>force_on</td>
+        <td>Always request HDR on, regardless of client settings.</td>
+    </tr>
+    <tr>
+        <td>force_off</td>
+        <td>Always request HDR off, regardless of client settings.</td>
+    </tr>
+</table>
+
+### dd_config_revert_delay
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Additional delay in milliseconds to wait before reverting configuration when the app has been closed or the last session terminated.
+            Main purpose is to provide a smoother transition when quickly switching between apps.
+            @note{On Linux, this delay also governs restoration of the physical desktop.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}3000@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_config_revert_delay = 1500
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_config_revert_on_disconnect
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            When enabled, display configuration is reverted upon disconnect of all clients instead of app close or last session termination.
+            This can be useful for returning to physical usage of the host machine without closing the active app.
+            @warning{Some applications may not function properly when display configuration is changed while active.}
+            @note{On Linux, this restores the physical desktop and releases the private display.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}disabled@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_config_revert_on_disconnect = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_always_restore_from_golden
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Always attempt to restore the saved golden snapshot before using session snapshots.
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}false@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_always_restore_from_golden = true
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_display_helper_engine
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Engine used to apply and restore display settings.
+            In automatic mode the new v2 state-machine engine runs on pre-release builds only;
+            stable releases keep the legacy engine unless you opt in with @code{}v2@endcode.
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Choices</td>
+        <td colspan="2">@code{}auto@endcode, @code{}v2@endcode, @code{}legacy@endcode</td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}auto@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_display_helper_engine = v2
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_snapshot_exclude_devices
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Comma-separated list or JSON array of display device identifiers to ignore when saving display snapshots.<br>
+            Excluded devices are removed from session and golden snapshots so Sunshine will not restore to transient or dummy displays.<br>
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}[]@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_snapshot_exclude_devices = ["{de9bb7e2-186e-505b-9e93-f48793333810}", "\\\\.\\DISPLAY3"]
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Notes</td>
+        <td colspan="2">
+            Keep at least one display unexcluded so snapshots remain valid.<br>
+            Device IDs accept the GUID reported by `/api/display-devices` (preferred) or the `\\.\DISPLAYX` name.<br>
+            Ideal when using both a virtual display and a physical dummy plug so restores skip the dummy plug.
+        </td>
+    </tr>
+</table>
+
+### dd_snapshot_restore_hotkey
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+              Keyboard shortcut key that restores the display snapshot and tears down any virtual displays.
+              <br>
+              Useful for forcing virtual displays off and restoring snapshots when Sunshine is paused or stuck.
+              The modifier keys for this hotkey are configured separately via dd_snapshot_restore_hotkey_modifiers.
+              Accepts function keys (F1-F24), letters, digits, or a virtual-key code.
+              @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_snapshot_restore_hotkey = F12
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_snapshot_restore_hotkey = 0x7B
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_snapshot_restore_hotkey_modifiers
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+              Modifier keys for the snapshot restore hotkey.
+              <br>
+              Accepts a delimiter-separated list (e.g., ctrl+alt+shift, ctrl|shift, win, none).
+              Supported tokens: ctrl/control, alt, shift, win/windows/meta, none/off/disabled.
+              @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{ctrl+alt+shift}@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_snapshot_restore_hotkey_modifiers = ctrl+alt
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_snapshot_restore_hotkey_modifiers = none
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_use_sunshine_virtual_display_driver
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            When enabled, Vibepollo uses the Vibepollo Display Driver for virtual display streams. Disable this to switch back to the bundled SudoVDA rollback driver.
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}true@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_use_sunshine_virtual_display_driver = true
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_activate_virtual_display
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            When enabled, Sunshine activates the virtual display driver and makes it the only active display during stream startup.
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}false@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_activate_virtual_display = true
+            @endcode</td>
+    </tr>
+</table>
+
+### dd_mode_remapping
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Remap the requested resolution and FPS to another display mode.<br>
+            Depending on the [dd_resolution_option](#dd_resolution_option) and
+            [dd_refresh_rate_option](#dd_refresh_rate_option) values, the following mapping
+            groups are available:
+            <ul>
+                <li>`mixed` - both options are set to `auto`.</li>
+                <li>
+                  `resolution_only` - only [dd_resolution_option](#dd_resolution_option) is set to `auto`.
+                </li>
+                <li>
+                  `refresh_rate_only` - only [dd_refresh_rate_option](#dd_refresh_rate_option) is set to `auto`.
+                </li>
+            </ul>
+            For each of those groups, a list of fields can be configured to perform remapping:
+            <ul>
+                <li>
+                  `requested_resolution` - resolution that needs to be matched in order to use this remapping entry.
+                </li>
+                <li>`requested_fps` - FPS that needs to be matched in order to use this remapping entry.</li>
+                <li>`final_resolution` - resolution value to be used if the entry was matched.</li>
+                <li>`final_refresh_rate` - refresh rate value to be used if the entry was matched.</li>
+            </ul>
+            If `requested_*` field is left empty, it will match <b>everything</b>.<br>
+            If `final_*` field is left empty, the original value will not be remapped and either a requested, manual
+            or current value is used. However, at least one `final_*` must be set, otherwise the entry is considered
+            invalid.<br>
+            @note{"Optimize game settings" must be enabled on client side for ANY entry with `resolution`
+            field to be considered.}
+            @note{First entry to be matched in the list is the one that will be used.}
+            @tip{`requested_resolution` and `final_resolution` can be omitted for `refresh_rate_only` group.}
+            @tip{`requested_fps` and `final_refresh_rate` can be omitted for `resolution_only` group.}
+            @note{Linux applies remapped modes to private displays managed through KScreen.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            dd_mode_remapping = {
+              "mixed": [],
+              "resolution_only": [],
+              "refresh_rate_only": []
+            }
+            @endcode
+        </td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_mode_remapping = {
+              "mixed": [
+                {
+                  "requested_fps": "60",
+                  "final_refresh_rate": "119.95",
+                  "requested_resolution": "1920x1080",
+                  "final_resolution": "2560x1440"
+                },
+                {
+                  "requested_fps": "60",
+                  "final_refresh_rate": "120",
+                  "requested_resolution": "",
+                  "final_resolution": ""
+                }
+              ],
+              "resolution_only": [
+                {
+                  "requested_resolution": "1920x1080",
+                  "final_resolution": "2560x1440"
+                }
+              ],
+              "refresh_rate_only": [
+                {
+                  "requested_fps": "60",
+                  "final_refresh_rate": "119.95"
+                }
+              ]
+            }@endcode
+        </td>
+    </tr>
+</table>
+
+### dd_wa_dummy_plug_hdr10
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Forces Windows to run the capture output at 30&nbsp;Hz with HDR enabled so physical HDMI dummy plugs expose 10-bit colour.<br>
+            Sunshine also keeps the "Disable VSYNC" override engaged to ensure the driver profile disables VSYNC during streams.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}false@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_wa_dummy_plug_hdr10 = true
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Notes</td>
+        <td colspan="2">
+            Only enable this when using a physical dummy plug that needs the 10-bit HDR workaround.<br>
+            The workaround applies to directly launched applications only; Desktop streams keep their normal refresh rate so everyday use remains smooth.<br>
+            See the @hyperlink{https://github.com/Nonary/documentation/wiki/DummyPlugs#enabling-10-bit-color-on-dummy-plugs-at-high-resolutions}{Dummy Plugs guide} for full setup details.
+        </td>
+    </tr>
+</table>
+
+### max_bitrate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The maximum bitrate (in Kbps) that Sunshine will encode the stream at. If set to 0, it will always use the bitrate requested by Moonlight.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            max_bitrate = 5000
+            @endcode</td>
+    </tr>
+</table>
+
+### minimum_fps_target
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sunshine tries to save bandwidth when content on screen is static or a low framerate. Because many clients expect a constant stream of video frames, a certain amount of duplicate frames are sent when this happens. This setting controls the lowest effective framerate a stream can reach.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>0</td>
+        <td>Use half the stream's FPS as the minimum target.</td>
+    </tr>
+    <tr>
+        <td>1-1000</td>
+        <td>Specify your own value. The real minimum may differ from this value.</td>
+    </tr>
+</table>
+
+## Network
+
+### upnp
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sunshine will attempt to open ports for streaming over the internet.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            upnp = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### address_family
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Set the address family that Sunshine will use.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            ipv4
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            address_family = both
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="2">Choices</td>
+        <td>ipv4</td>
+        <td>IPv4 only</td>
+    </tr>
+    <tr>
+        <td>both</td>
+        <td>IPv4+IPv6</td>
+    </tr>
+</table>
+
+### bind_address
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Set the IP address to bind Sunshine to. This is useful when you have multiple network interfaces
+            and want to restrict Sunshine to a specific one. If not set, Sunshine will bind to all available
+            interfaces (0.0.0.0 for IPv4 or :: for IPv6).
+            <br><br>
+            <strong>Note:</strong> The address must be valid for the system and must match the address family
+            being used. When using IPv6, you can specify an IPv6 address even with address_family set to "both".
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            (empty - bind to all interfaces)
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example (IPv4)</td>
+        <td colspan="2">@code{}
+            bind_address = 192.168.1.100
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example (IPv6)</td>
+        <td colspan="2">@code{}
+            bind_address = 2001:db8::1
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example (Loopback)</td>
+        <td colspan="2">@code{}
+            bind_address = 127.0.0.1
+            @endcode</td>
+    </tr>
+</table>
+
+### port
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Set the family of ports used by Sunshine.
+            Changing this value will offset other ports as shown in config UI.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            47989
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">1029-65514</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            port = 47989
+            @endcode</td>
+    </tr>
+</table>
+
+### origin_web_ui_allowed
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The origin of the remote endpoint address that is not denied for HTTPS Web UI.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            lan
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            origin_web_ui_allowed = lan
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>pc</td>
+        <td>Only localhost may access the web ui</td>
+    </tr>
+    <tr>
+        <td>lan</td>
+        <td>Only LAN devices may access the web ui</td>
+    </tr>
+    <tr>
+        <td>wan</td>
+        <td>Anyone may access the web ui</td>
+    </tr>
+</table>
+
+### csrf_allowed_origins
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Comma-separated list of additional allowed origins for CSRF protection. These origins will be
+            appended to the default allowed origins (localhost variants and the configured web UI port).
+            Requests from allowed origins can access state-changing API endpoints without CSRF tokens.
+            <br><br>
+            @attention{Only add origins you trust. Each origin must be a complete URL prefix
+            including protocol and host (e.g., https://example.com). Port numbers are optional.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            (empty - uses built-in defaults: https://localhost, https://127.0.0.1, https://[::1],
+            with configured UI port variants)
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            csrf_allowed_origins = https://myapp.local,https://custom.domain.com
+            @endcode</td>
+    </tr>
+</table>
+
+### external_ip
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            If no external IP address is given, Sunshine will attempt to automatically detect external ip-address.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Automatic</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            external_ip = 123.456.789.12
+            @endcode</td>
+    </tr>
+</table>
+
+### lan_encryption_mode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            This determines when encryption will be used when streaming over your local network.
+            @warning{Encryption can reduce streaming performance, particularly on less powerful hosts and clients.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lan_encryption_mode = 0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>0</td>
+        <td>encryption will not be used</td>
+    </tr>
+    <tr>
+        <td>1</td>
+        <td>encryption will be used if the client supports it</td>
+    </tr>
+    <tr>
+        <td>2</td>
+        <td>encryption is mandatory and unencrypted connections are rejected</td>
+    </tr>
+</table>
+
+### wan_encryption_mode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            This determines when encryption will be used when streaming over the Internet.
+            @warning{Encryption can reduce streaming performance, particularly on less powerful hosts and clients.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            1
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            wan_encryption_mode = 1
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>0</td>
+        <td>encryption will not be used</td>
+    </tr>
+    <tr>
+        <td>1</td>
+        <td>encryption will be used if the client supports it</td>
+    </tr>
+    <tr>
+        <td>2</td>
+        <td>encryption is mandatory and unencrypted connections are rejected</td>
+    </tr>
+</table>
+
+### ping_timeout
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            How long to wait, in milliseconds, for data from Moonlight before shutting down the stream.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            10000
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            ping_timeout = 10000
+            @endcode</td>
+    </tr>
+</table>
+
+### video_max_batch_size_kb
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Maximum size in KiB for each outgoing video send batch.
+            The default is 64 KiB.
+            Lower values can improve stream stability on cheaper switches, routers, and Wi-Fi hardware by reducing burst size,
+            but at the cost of less than 1 ms of additional host-side delay.
+            PyroWave resolves its send batch size automatically and ignores this setting.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            64
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Choices</td>
+        <td colspan="2">16, 32, 64</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            video_max_batch_size_kb = 32
+            @endcode</td>
+    </tr>
+</table>
+
+## Config Files
+
+### file_apps
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The application configuration file path. The file contains a JSON formatted list of applications that
+            can be started by Moonlight.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            apps.json
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_apps = apps.json
+            @endcode</td>
+    </tr>
+</table>
+
+### credentials_file
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The file where user credentials for the UI are stored.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            sunshine_state.json
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            credentials_file = sunshine_state.json
+            @endcode</td>
+    </tr>
+</table>
+
+### session_token_ttl_seconds
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Web UI session timeout in seconds. Determines how long a login session remains valid before re-authentication is required.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            7200
+            @endcode (2 hours)
+        </td>
+    </tr>
+    <tr>
+        <td>Notes</td>
+        <td colspan="2">
+            For higher security on shared systems, reduce this value (e.g. 3600 for 1 hour). Minimum is 1 second.
+        </td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            session_token_ttl_seconds = 3600
+            @endcode</td>
+    </tr>
+</table>
+
+### remember_me_refresh_token_ttl_seconds
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Time-to-live for remember-me refresh tokens, in seconds.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}604800@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            remember_me_refresh_token_ttl_seconds = 259200
+            @endcode</td>
+    </tr>
+</table>
+
+### log_path
+
+<table>
+    <tr>
+    <td>Description</td>
+        <td colspan="2">
+            Determines where Sunshine stores log sessions. When this value points to a file (the default),
+            Sunshine keeps a rolling <code>logs</code> folder next to that file and keeps the last 30 sessions,
+            each capped at about 10 MiB by rolling ~2MB log files. Pointing to a directory stores the
+            <code>logs</code> folder at the specified location.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            sunshine.log
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            log_path = sunshine.log
+            @endcode</td>
+    </tr>
+</table>
+
+### pkey
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The private key used for the web UI and Moonlight client pairing. For best compatibility,
+            this should be an RSA-2048 private key.
+            @warning{Not all Moonlight clients support ECDSA keys or RSA key lengths other than 2048 bits.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            credentials/cakey.pem
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pkey = /dir/pkey.pem
+            @endcode</td>
+    </tr>
+</table>
+
+### cert
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The certificate used for the web UI and Moonlight client pairing. For best compatibility,
+            this should have an RSA-2048 public key.
+            @warning{Not all Moonlight clients support ECDSA keys or RSA key lengths other than 2048 bits.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            credentials/cacert.pem
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            cert = /dir/cert.pem
+            @endcode</td>
+    </tr>
+</table>
+
+### file_state
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The file where current state of Sunshine is stored.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            sunshine_state.json
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_state = sunshine_state.json
+            @endcode</td>
+    </tr>
+</table>
+
+### vibeshine_file_state
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The file used by new Vibepollo features to persist web authentication tokens and notification state.
+            If left unset, it defaults to <code>vibeshine_state.json</code> in the same directory as other Vibepollo data.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            vibeshine_state.json
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            vibeshine_file_state = vibeshine_state.json
+            @endcode</td>
+    </tr>
+</table>
+
+## Advanced
+
+### fec_percentage
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Percentage of error correcting packets per data packet in each video frame.
+            PyroWave ignores this setting; its parity is controlled by `pyrowave_critical_fec_percentage`.
+            @warning{Higher values can correct for more network packet loss,
+            but at the cost of increasing bandwidth usage.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            20
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">1-255</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            fec_percentage = 20
+            @endcode</td>
+    </tr>
+</table>
+
+### pyrowave_critical_fec_percentage
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Percentage of error correcting packets for the packets that carry the coarsest wavelet level of a
+            PyroWave frame, the first few percent of it. The client cannot decode a frame if any of these
+            packets remain missing after recovery. Protection requires record framing with shard alignment
+            and a value greater than 0, and adds at least 2 error correcting packets when the critical data
+            and parity fit in one FEC block. Length-prefixed frames and unaligned record frames receive no
+            parity; see [PyroWave protocol](pyrowave-protocol.md) for the packet-size requirements.
+            With record framing and a value greater than 0, encoded image size
+            is capped at the encoder bitrate divided by negotiated FPS. At sustained frame rates below negotiated FPS,
+            mostly unchanged pictures also receive adaptive protection for finer detail, using only unused
+            bitrate and available FEC block space. Detail parity follows the cadence shortfall, up to 50%,
+            independently of this setting's critical-packet rate. This targets flicker caused by packet loss;
+            it cannot correct encoder quantization shimmer.
+            `fec_percentage` does not apply to PyroWave. 0 disables both kinds of protection, removes the
+            cap of one negotiated frame's bitrate allowance, and allows frames up to about 5.5 MB instead
+            of 4.1 MB with 1392-byte packets. Frames remain bounded by elapsed-time bitrate allowance
+            and transport capacity.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            20
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-255</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pyrowave_critical_fec_percentage = 50
+            @endcode</td>
+    </tr>
+</table>
+
+### qp
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Quantization Parameter. Some devices don't support Constant Bit Rate. For those devices, QP is used instead.
+            @warning{Higher value means more compression, but less quality.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            28
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            qp = 28
+            @endcode</td>
+    </tr>
+</table>
+
+### min_threads
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Minimum number of CPU threads used for encoding.
+            @note{Increasing the value slightly reduces encoding efficiency, but the tradeoff is usually worth it to
+            gain the use of more CPU cores for encoding. The ideal value is the lowest value that can reliably encode
+            at your desired streaming settings on your hardware.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            2
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            min_threads = 2
+            @endcode</td>
+    </tr>
+</table>
+
+### hevc_mode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allows the client to request HEVC Main or HEVC Main10 video streams.
+            @warning{HEVC is more CPU-intensive to encode, so enabling this may reduce performance when using software
+            encoding.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            hevc_mode = 2
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="4">Choices</td>
+        <td>0</td>
+        <td>advertise support for HEVC based on encoder capabilities (recommended)</td>
+    </tr>
+    <tr>
+        <td>1</td>
+        <td>do not advertise support for HEVC</td>
+    </tr>
+    <tr>
+        <td>2</td>
+        <td>advertise support for HEVC Main profile</td>
+    </tr>
+    <tr>
+        <td>3</td>
+        <td>advertise support for HEVC Main and Main10 (HDR) profiles</td>
+    </tr>
+</table>
+
+### av1_mode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allows the client to request AV1 Main 8-bit or 10-bit video streams.
+            @warning{AV1 is more CPU-intensive to encode, so enabling this may reduce performance when using software
+            encoding.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            av1_mode = 2
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="4">Choices</td>
+        <td>0</td>
+        <td>advertise support for AV1 based on encoder capabilities (recommended)</td>
+    </tr>
+    <tr>
+        <td>1</td>
+        <td>do not advertise support for AV1</td>
+    </tr>
+    <tr>
+        <td>2</td>
+        <td>advertise support for AV1 Main 8-bit profile</td>
+    </tr>
+    <tr>
+        <td>3</td>
+        <td>advertise support for AV1 Main 8-bit and 10-bit (HDR) profiles</td>
+    </tr>
+</table>
+
+### pyrowave
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allows PyroWave-capable clients (such as the Nonary Moonlight fork) to request PyroWave, an
+            intra-only GPU wavelet codec. Every frame is coded on its own in well under a millisecond, so a lost
+            frame never needs a keyframe, but a clean picture needs hundreds of Mbps; use it on wired LANs only.
+            It is advertised only when the GPU can run the PyroWave Vulkan encoder. Windows uses Direct3D 11
+            interop; Linux imports explicit-modifier RGB DMA-BUF capture frames (including KMS) and also
+            supports BGRA system-memory capture. Linux preserves scaling, cursor composition, and the
+            negotiated color matrix/range for 8/10-bit and 4:2:0/4:4:4 profiles. CUDA-only NvFBC capture
+            is not supported. The client's bitrate setting supplies the requested bandwidth budget;
+            at session setup the host subtracts allowances for audio, packet overhead, and control traffic
+            to set the encoder bitrate. Critical packets use
+            `pyrowave_critical_fec_percentage`; `fec_percentage` does not apply.
+            See [PyroWave protocol](pyrowave-protocol.md).
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pyrowave = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### capture
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Force specific screen capture method.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Automatic<br>
+            Sunshine will use the first capture method available in the order of the table below</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            capture = kms
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="10">Choices</td>
+        <td>gamescope</td>
+        <td>Capture the Gamescope compositor's main output through PipeWire in SDR.
+            Automatically preferred when Gamescope is available. Supports downscaling
+            within the physical output. HDR requires the version-matched Vibepollo Gamescope
+            capture patch and a working Main10 hardware encoder; stock Gamescope remains SDR.
+            Independent virtual modes are unavailable.
+            @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>nvfbc</td>
+        <td>Use NVIDIA Frame Buffer Capture to capture direct to GPU memory. This is usually the fastest method for
+            NVIDIA cards. NvFBC does not have native Wayland support and does not work with XWayland.
+            @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>wlr</td>
+        <td>Capture for wlroots based Wayland compositors via wlr-screencopy-unstable-v1. It is possible to capture
+            virtual displays in e.g. Hyprland using this method.
+            @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>kms</td>
+        <td>DRM/KMS screen capture from the kernel. This requires that Sunshine has `cap_sys_admin` capability.
+            Managed Linux private HDR sessions use this path automatically to preserve 10-bit scanout,
+            even when KWin is selected globally for SDR capture.
+            With the <code>vibeshine_drm</code> presentation ABI, capture is change-driven, imports the exact
+            pinned DMA-BUF associated with each completed sequence, and coalesces bursts to the
+            client-requested maximum frame rate. Ordinary KMS drivers retain fixed-rate polling; older
+            <code>vibeshine_drm</code> modules without the frame-export ABI are rejected.
+            @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>kwin</td>
+        <td>Capture with KDE/KWin Wayland compositor via KDE screencasting. This is recommended for
+            managed private displays in SDR; managed HDR sessions switch to direct DRM/KMS capture.
+            @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>portal</td>
+        <td>Capture a selected Wayland display through the XDG Desktop Portal and PipeWire.
+            @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>x11</td>
+        <td>Uses XCB. This is the slowest and most CPU intensive so should be avoided if possible.
+            @note{Applies to FreeBSD and Linux only.}</td>
+    </tr>
+    <tr>
+        <td>ddx</td>
+        <td>Use DirectX Desktop Duplication API to capture the display. This is well-supported on Windows machines.
+            @note{Applies to Windows only.}</td>
+    </tr>
+    <tr>
+        <td>wgc</td>
+        <td>Use Windows.Graphics.Capture to capture the display. Captures at a variable rate.
+            @note{Windows only.}
+            @note{NVIDIA Ultra Low Latency Mode (ULLM) can hurt performance; avoid this by either using a monitor whose refresh rate exceeds the stream and capping FPS to stop ULLM from engaging, or simply disable Low Latency Mode in the driver.}
+            @tip{On NVIDIA cards, selecting this option will resolve stream freezes caused by high VRAM utilization.}</td>
+    </tr>
+    <tr>
+        <td>wgcc</td>
+        <td>Use Windows.Graphics.Capture to capture the display. Captures at a constant rate.
+            @note{Windows only.}
+            @note{NVIDIA Ultra Low Latency Mode (ULLM) can hurt performance; avoid this by either using a monitor whose refresh rate exceeds the stream and capping FPS to stop ULLM from engaging, or simply disable Low Latency Mode in the driver.}
+            @tip{On NVIDIA cards, selecting this option will resolve stream freezes caused by high VRAM utilization.}</td>
+    </tr>
+</table>
+
+### lossless_scaling_path
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Path to the LosslessScaling.exe executable used for frame generation or upscaling.
+            If empty, Sunshine will attempt to auto-detect common installation locations.
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lossless_scaling_path = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Lossless Scaling\\LosslessScaling.exe"
+            @endcode</td>
+    </tr>
+</table>
+
+### encoder
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Force a specific encoder.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Sunshine will use the first encoder that is available.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            encoder = nvenc
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="8">Choices</td>
+        <td>nvenc</td>
+        <td>For NVIDIA graphics cards. Uses Vibepollo's native NVENC implementation on Windows and
+            on CUDA-enabled Linux builds. On Linux it is tried first during automatic selection.</td>
+    </tr>
+    <tr>
+        <td>nvenc_legacy</td>
+        <td>Legacy FFmpeg-based NVIDIA NVENC encoder. Select this explicitly on Linux to roll back
+            from the native implementation. Existing @code{}nvenc_experimental@endcode settings
+            are accepted as a compatibility alias for @code{}nvenc@endcode.
+            @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>quicksync</td>
+        <td>For Intel graphics cards</td>
+    </tr>
+    <tr>
+        <td>amdvce_ffmpeg</td>
+        <td>Legacy FFmpeg-based AMD AMF encoder. Select this explicitly to preserve legacy
+            encoding. Automatic selection prefers native AMF on Windows.
+            @note{Existing configurations using @code{}amdvce_legacy@endcode are accepted as
+            a compatibility alias for @code{}amdvce_ffmpeg@endcode. The former native
+            @code{}amdvce@endcode value is accepted as an alias for
+            @code{}amdvce_experimental@endcode.}</td>
+    </tr>
+    <tr>
+        <td>amdvce_experimental</td>
+        <td>Native AMD AMF encoder, preferred by automatic selection on Windows. The historical
+            name remains compatible with existing settings. Explicit selection fails closed.
+            With automatic selection, a confirmed encoder creation or initialization failure
+            permits one FFmpeg AMF rollback per stream after native cleanup completes. Codec,
+            bit depth, chroma and HDR remain unchanged. Unsupported requested formats, explicit
+            native options, intra refresh, unsupported decoder reference limits, capture/conversion errors, cancellation, contention
+            and unsafe driver timeouts do not trigger rollback. The next stream retries native
+            initialization; a failed rollback ends the stream.
+            @note{Applies to Windows only.}</td>
+    </tr>
+    <tr>
+        <td>vaapi</td>
+        <td>Use VA-API (AMD, Intel)</td>
+    </tr>
+    <tr>
+        <td>vulkan</td>
+        <td>Use Vulkan encoder (AMD, Intel, NVIDIA).
+            @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>software</td>
+        <td>Encoding occurs on the CPU</td>
+    </tr>
+</table>
+
+## Frame Limiter
+
+These options integrate with Proton and MangoHUD on Linux and RTSS or NVIDIA Control Panel on Windows to
+manage frame pacing and related behavior during a stream.
+They appear in the Frame Limiter section of the settings UI.
+
+### frame_limiter_enable
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Enable the frame limiter integration for streams.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}disabled@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            frame_limiter_enable = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### frame_limiter_provider
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Select the frame limiter provider to use during streams.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}auto@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            frame_limiter_provider = mangohud
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="7">Choices</td>
+        <td>auto</td>
+        <td>On Linux, use Proton's DXVK/VKD3D limiter and present the MangoHUD overlay. On Windows, prefer RTSS when available and otherwise fall back to NVIDIA Control Panel.</td>
+    </tr>
+    <tr>
+        <td>mangohud</td>
+        <td>Use MangoHUD on Linux. Vibepollo enables it for launched games and supplies the stream-derived FPS limit.</td>
+    </tr>
+    <tr>
+        <td>mangohud-proton</td>
+        <td>Use Proton's DXVK/VKD3D limiter for managed Steam games and external Proton launches and keep the MangoHUD overlay visible. This limiter supports frame-generated output.</td>
+    </tr>
+    <tr>
+        <td>proton</td>
+        <td>Use Proton's DXVK/VKD3D limiter for managed Steam games and external Proton launches without presenting MangoHUD. This limiter supports frame-generated output.</td>
+    </tr>
+    <tr>
+        <td>rtss</td>
+        <td>Use RivaTuner Statistics Server when installed.</td>
+    </tr>
+    <tr>
+        <td>nvidia-control-panel</td>
+        <td>Force NVIDIA Control Panel based frame limiting.</td>
+    </tr>
+    <tr>
+        <td>none</td>
+        <td>Disable all frame limiter providers.</td>
+    </tr>
+</table>
+
+On native Linux, an active stream also prepares launch hooks in writable Proton
+installations discovered through Steam. This applies the selected Proton or
+MangoHUD provider to games started from Steam or another launcher, even when the
+game is not a Vibepollo application. Existing `user_settings.py` code and file
+permissions are preserved. The hook is inert when no stream is active and after
+host shutdown; it does not persist an FPS limit in Proton's configuration.
+
+These are launch-time renderer settings: start the game after the stream connects.
+A game already running retains its previous settings until restarted, including
+when the stream ends. Read-only Proton installations, native Linux games launched
+outside Vibepollo, and containers with a separate network namespace are not
+covered by this Proton hook. Native games launched by Vibepollo retain the
+existing MangoHUD integration. Newly installed Proton versions in known libraries
+are detected during the stream. The host log reports hook readiness or failure.
+
+### frame_limiter_fps_limit
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Optional FPS limit to apply while streaming. MangoHUD and RTSS support fractional values
+            with up to three decimal places; NVIDIA Control Panel rounds them to the nearest whole FPS.
+            Set to 0 to use a client display-mode override when present, otherwise the stream's requested FPS.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}0@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            frame_limiter_fps_limit = 59.94
+            @endcode</td>
+    </tr>
+</table>
+
+### mangohud_limiter_method
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Linux-only timing used when <code>frame_limiter_provider = mangohud</code>.
+            <code>early</code> waits before presentation for smoother pacing at the cost of
+            more latency. <code>late</code> waits after presentation for lower latency, but
+            cannot limit frame-generated output. The Proton limiter supports frame generation.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}late@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mangohud_limiter_method = early
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="2">Choices</td>
+        <td>early</td><td>Smoother frame pacing with more latency.</td>
+    </tr>
+    <tr><td>late</td><td>Lower latency; does not limit frame-generated output.</td></tr>
+</table>
+
+### mangohud_preset
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Linux-only MangoHUD metrics and layout preset used for games launched during a stream.
+            Use <code>custom</code> to retain the metrics from the user's MangoHud configuration,
+            or select one of MangoHud's standard built-in presets.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}custom@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mangohud_preset = 3
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="5">Choices</td>
+        <td>custom</td><td>Use the metrics and layout from the user's MangoHud configuration.</td>
+    </tr>
+    <tr><td>1</td><td>FPS only.</td></tr>
+    <tr><td>2</td><td>Horizontal.</td></tr>
+    <tr><td>3</td><td>Extended.</td></tr>
+    <tr><td>4</td><td>Detailed.</td></tr>
+</table>
+
+### mangohud_always_show_graph
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Linux-only option that keeps the MangoHud overlay visible and enables its live
+            frame-time graph for every managed game launch.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}disabled@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mangohud_always_show_graph = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### frame_limiter_auto_virtual_framegen
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Controls how fast the virtual display refreshes, which decides how soon each game frame is captured. Windows only hands Vibeshine a new frame when it redraws the display, so on a display that refreshes at the stream rate a frame that finishes just after a redraw waits up to a whole refresh before capture, and frames reach the client unevenly. A faster virtual display captures each frame closer to when the game drew it. None of the modes change the stream FPS or bandwidth, and all but @code{}disabled@endcode cap games to the stream rate.
+            <br>
+            @code{}vrr@endcode requests a fixed 1000 Hz virtual display whatever the stream rate, reducing the delay between game presentation and capture for clients with VRR pacing. On Windows 10 and Windows 11 before 24H2, refresh is capped at the maximum allowed by the OS's 1 MHz horizontal scan-frequency limit for the selected resolution (about 462.962 Hz at 3840x2160). Manual refresh settings and matching FPS-to-refresh mappings take precedence over the automatic capture policy, subject to this OS limit; mapping rules match the requested stream FPS. @code{}enabled@endcode keeps the display at 4x the stream rate and captures at most 2x the stream rate on the desktop. @code{}legacy@endcode uses a fixed 2x refresh, as older versions did. @code{}disabled@endcode leaves the display at the stream rate and turns off the matching game cap. Existing boolean values remain compatible: true maps to enabled and false maps to disabled.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}enabled@endcode</td>
+    </tr>
+    <tr>
+        <td>Examples</td>
+        <td colspan="2">@code{}
+            frame_limiter_auto_virtual_framegen = vrr
+            frame_limiter_auto_virtual_framegen = disabled
+            frame_limiter_auto_virtual_framegen = legacy
+            @endcode</td>
+    </tr>
+</table>
+
+### rtss_install_path
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Full path to the RTSS install directory. If empty, Sunshine will attempt to auto-detect it.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            rtss_install_path = "C:\\Program Files (x86)\\RivaTuner Statistics Server"
+            @endcode</td>
+    </tr>
+</table>
+
+### rtss_frame_limit_type
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            RTSS sync limiter mode used when applying frame limits. Virtual-display streams use NVIDIA Reflex automatically unless
+            @code{}rtss_allow_virtual_display_override@endcode is enabled. An explicit per-app or per-client RTSS mode override still takes precedence.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}async@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            rtss_frame_limit_type = "front edge sync"
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="4">Choices</td>
+        <td>async</td>
+        <td>Asynchronous limiter (default).</td>
+    </tr>
+    <tr>
+        <td>front edge sync</td>
+        <td>Front edge sync limiter.</td>
+    </tr>
+    <tr>
+        <td>back edge sync</td>
+        <td>Back edge sync limiter.</td>
+    </tr>
+    <tr>
+        <td>nvidia reflex</td>
+        <td>NVIDIA Reflex sync limiter (when supported).</td>
+    </tr>
+</table>
+
+### rtss_allow_virtual_display_override
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allows @code{}rtss_frame_limit_type@endcode to replace the automatic NVIDIA Reflex mode for virtual-display streams.
+            Keep this disabled unless you accept the trade-off: Async, Front-edge Sync, Back-edge Sync, or any other non-Reflex
+            mode can cause massive latency when a game uses DLSS Frame Generation. Mark a game as @code{}Frame generation ->
+            Game provided@endcode to keep Reflex for that app. Explicit per-app or per-client RTSS mode overrides remain authoritative.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}disabled@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            rtss_allow_virtual_display_override = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### frame_limiter_disable_vsync
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Forces the NVIDIA driver VSYNC setting to Off for the Sunshine profile while streaming. Sunshine restores the previous VSYNC setting when streaming stops.
+            <br><br>
+            Use this when you globally enable VSYNC in the driver but need Sunshine sessions to run without it. This option no longer changes Ultra Low Latency Mode or pre-rendered frames.
+            <br><br>
+            When NVIDIA-specific overrides are unavailable, Sunshine falls back to forcing the active display to its highest available refresh rate during streams to minimize VSYNC engagement.
+            <br><br>
+            <b>Notes</b>:
+            <ul>
+                <li>Windows only; uses NVIDIA NvAPI overrides when available and relies on the Sunshine display helper for refresh-rate fallbacks.</li>
+                <li>Automatically enabled when the Dummy Plug HDR workaround is active.</li>
+                <li>On non-NVIDIA GPUs, the refresh-rate fallback acts as a best-effort VSYNC mitigation.</li>
+            </ul>
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}disabled@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            frame_limiter_disable_vsync = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+@note{Legacy configurations may still use @code{rtss_disable_vsync_ullm}. Sunshine continues to accept the old key and maps it to @code{frame_limiter_disable_vsync}.}
+
+## NVIDIA NVENC Encoder
+
+The options in this section are shared by both NVENC implementations. On Linux, @code{nvenc} talks
+directly to the NVIDIA Video Codec SDK and is preferred during automatic probing, while
+@code{nvenc_legacy} uses FFmpeg as a rollback path.
+
+### nvenc_preset
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            NVENC encoder performance preset.
+            Higher numbers improve compression (quality at given bitrate) at the cost of increased encoding latency.
+            Recommended to change only when limited by network or decoder, otherwise similar effect can be accomplished
+            by increasing bitrate.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            1
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_preset = 1
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="7">Choices</td>
+        <td>1</td>
+        <td>P1 (fastest, default)</td>
+    </tr>
+    <tr>
+        <td>2</td>
+        <td>P2</td>
+    </tr>
+    <tr>
+        <td>3</td>
+        <td>P3</td>
+    </tr>
+    <tr>
+        <td>4</td>
+        <td>P4 (balanced quality)</td>
+    </tr>
+    <tr>
+        <td>5</td>
+        <td>P5</td>
+    </tr>
+    <tr>
+        <td>6</td>
+        <td>P6</td>
+    </tr>
+    <tr>
+        <td>7</td>
+        <td>P7 (slowest)</td>
+    </tr>
+</table>
+
+### nvenc_twopass
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Enable two-pass mode in NVENC encoder.
+            This allows to detect more motion vectors, better distribute bitrate across the frame and more strictly
+            adhere to bitrate limits. Disabling it is not recommended since this can lead to occasional bitrate
+            overshoot and subsequent packet loss.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            quarter_res
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_twopass = quarter_res
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>disabled</td>
+        <td>One pass (fastest)</td>
+    </tr>
+    <tr>
+        <td>quarter_res</td>
+        <td>Two passes, first pass at quarter resolution (faster)</td>
+    </tr>
+    <tr>
+        <td>full_res</td>
+        <td>Two passes, first pass at full resolution (slower)</td>
+    </tr>
+</table>
+
+### nvenc_spatial_aq
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Assign higher QP values to flat regions of the video.
+            Recommended to enable when streaming at lower bitrates.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+            @warning{Enabling this option may reduce performance.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_spatial_aq = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_vbv_increase
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Single-frame VBV/HRD percentage increase.
+            By default Sunshine uses single-frame VBV/HRD, which means any encoded video frame size is not expected to
+            exceed requested bitrate divided by requested frame rate. Relaxing this restriction can be beneficial and
+            act as low-latency variable bitrate, but may also lead to packet loss if the network doesn't have buffer
+            headroom to handle bitrate spikes. Maximum accepted value is 400, which corresponds to 5x increased
+            encoded video frame upper size limit.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+            @warning{Can lead to network packet loss.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-400</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_vbv_increase = 0
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_split_encode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Controls NVENC split-frame encoding for supported HEVC or AV1 sessions.
+            NVIDIA drivers already enable split-frame encoding automatically for many 4K-and-above workloads.
+            Set this to enabled when you want the same behavior at lower resolutions too, such as 2560x1440 at 120 Hz.
+            Set it to disabled to prevent split-frame encoding even when the driver would normally use it automatically.
+            @note{Applies to NVENC HEVC or AV1 only. H.264 does not use split-frame encoding.}
+            @note{Requires NVENC API 12.1 or newer.}
+            @note{On Linux, both the legacy FFmpeg @code{nvenc_legacy} encoder and the native
+            @code{nvenc} encoder honor the configured auto, enabled, or disabled mode.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Possible Values</td>
+        <td colspan="2">@code{}
+            auto
+            enabled
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_split_encode = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_realtime_hags
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Use realtime gpu scheduling priority in NVENC when hardware accelerated gpu scheduling (HAGS) is enabled
+            in Windows. Currently, NVIDIA drivers may freeze in encoder when HAGS is enabled, realtime priority is used
+            and VRAM utilization is close to maximum. Disabling this option lowers the priority to high, sidestepping
+            the freeze at the cost of reduced capture performance when the GPU is heavily loaded.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+            @note{Applies to Windows only.}
+            @tip{Changing the capture method to Windows.Graphics.Capture also resolves this problem without any additional changes.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_realtime_hags = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_latency_over_power
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Adaptive P-State algorithm which NVIDIA drivers employ doesn't work well with low latency streaming,
+            so Sunshine requests high power mode explicitly.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+            @warning{Disabling this is not recommended since this can lead to significantly increased encoding latency.}
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_latency_over_power = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_opengl_vulkan_on_dxgi
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sunshine can't capture fullscreen OpenGL and Vulkan programs at full frame rate unless they present on
+            top of DXGI. With this option enabled Sunshine changes global Vulkan/OpenGL present method to
+            "Prefer layered on DXGI Swapchain". This is system-wide setting that is reverted on Sunshine program exit.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_opengl_vulkan_on_dxgi = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_h264_cavlc
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Prefer CAVLC entropy coding over CABAC in H.264 when using NVENC.
+            CAVLC is outdated and needs around 10% more bitrate for same quality, but provides slightly faster
+            decoding when using software decoder.
+            @note{This option only applies when using H.264 format with the
+            NVENC [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_h264_cavlc = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+## Intel QuickSync Encoder
+
+### qsv_preset
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The encoder preset to use.
+            @note{This option only applies when using quicksync [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+               <td>Default</td>
+        <td colspan="2">@code{}
+            medium
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            qsv_preset = medium
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="7">Choices</td>
+        <td>veryfast</td>
+        <td>fastest (lowest quality)</td>
+    </tr>
+    <tr>
+        <td>faster</td>
+        <td>faster (lower quality)</td>
+    </tr>
+    <tr>
+        <td>fast</td>
+        <td>fast (low quality)</td>
+    </tr>
+    <tr>
+        <td>medium</td>
+        <td>medium (default)</td>
+    </tr>
+    <tr>
+        <td>slow</td>
+        <td>slow (good quality)</td>
+    </tr>
+    <tr>
+        <td>slower</td>
+        <td>slower (better quality)</td>
+    </tr>
+    <tr>
+        <td>veryslow</td>
+        <td>slowest (best quality)</td>
+    </tr>
+</table>
+
+### qsv_coder
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The entropy encoding to use.
+            @note{This option only applies when using H.264 with the quicksync
+            [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            qsv_coder = auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>auto</td>
+        <td>let ffmpeg decide</td>
+    </tr>
+    <tr>
+        <td>cabac</td>
+        <td>context adaptive binary arithmetic coding - higher quality</td>
+    </tr>
+    <tr>
+        <td>cavlc</td>
+        <td>context adaptive variable-length coding - faster decode</td>
+    </tr>
+</table>
+
+### qsv_slow_hevc
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            This options enables use of HEVC on older Intel GPUs that only support low power encoding for H.264.
+            @note{This option only applies when using quicksync [encoder](#encoder).}
+            @caution{Streaming performance may be significantly reduced when this option is enabled.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            qsv_slow_hevc = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+## AMD AMF Encoder
+
+@note{HDR (HEVC Main10) encoding through AMF requires the AMF runtime shipped with Adrenalin 23.30
+or newer, which reports AMF 1.4.32. FFmpeg refuses 10-bit P010 surfaces on any older runtime, so HDR
+is not offered to clients even though Vibepollo's own AMF check only needs 1.4.23. Update your
+graphics drivers if HDR is unavailable on an AMD GPU. This limitation applies to the
+@code{amdvce_ffmpeg} encoder only; the experimental native @code{amdvce_experimental} encoder talks to AMF
+directly and is not subject to FFmpeg's 10-bit refusal. Vibepollo carries one narrow exception for the
+FFmpeg-based encoder: on a Radeon Pro 5500 XT (PCI @code{1002:7340}) running AMF 1.4.31.x, it presents 1.4.32 to
+FFmpeg for the duration of codec validation so HEVC Main10 is not refused. The exception is applied
+automatically, has no configuration option, and does not apply to any other adapter. The detected AMF
+runtime version is written to the log on every AMD HDR HEVC attempt (search for
+@code{AMF Main10 override}).}
+
+### amd_usage
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The encoder usage profile is used to set the base set of encoding parameters.
+            @note{This option applies to the AMD [encoders](#encoder).}
+            @note{The other AMF options that follow will override a subset of the settings applied by your usage
+            profile, but there are hidden parameters set in usage profiles that cannot be overridden elsewhere.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            ultralowlatency
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_usage = ultralowlatency
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="5">Choices</td>
+        <td>transcoding</td>
+        <td>transcoding (slowest)</td>
+    </tr>
+    <tr>
+        <td>webcam</td>
+        <td>webcam (slow)</td>
+    </tr>
+    <tr>
+        <td>lowlatency_high_quality</td>
+        <td>low latency, high quality (fast)</td>
+    </tr>
+    <tr>
+        <td>lowlatency</td>
+        <td>low latency (faster)</td>
+    </tr>
+    <tr>
+        <td>ultralowlatency</td>
+        <td>ultra low latency (fastest)</td>
+    </tr>
+</table>
+
+### amd_rc
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The encoder rate control.
+            @note{This option applies to the AMD [encoders](#encoder).}
+            @warning{The `vbr_latency` option generally works best, but some bitrate overshoots may still occur.
+            Enabling HRD allows all bitrate based rate controls to better constrain peak bitrate, but may result in
+            encoding artifacts depending on your card.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            vbr_latency
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_rc = vbr_latency
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="7">Choices</td>
+        <td>cqp</td>
+        <td>constant qp mode</td>
+    </tr>
+    <tr>
+        <td>cbr</td>
+        <td>constant bitrate</td>
+    </tr>
+    <tr>
+        <td>vbr_latency</td>
+        <td>variable bitrate, latency constrained</td>
+    </tr>
+    <tr>
+        <td>vbr_peak</td>
+        <td>variable bitrate, peak constrained</td>
+    </tr>
+    <tr>
+        <td>qvbr</td>
+        <td>quality-defined variable bitrate (see amd_qvbr_quality_level)</td>
+    </tr>
+    <tr>
+        <td>hqvbr</td>
+        <td>high quality variable bitrate</td>
+    </tr>
+    <tr>
+        <td>hqcbr</td>
+        <td>high quality constant bitrate</td>
+    </tr>
+</table>
+
+### amd_qvbr_quality_level
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The target quality level used by the `qvbr` rate control method, where 1 is the lowest quality and 51
+            is the highest. Higher values spend more bits to preserve quality.
+            @note{This option only applies to AMD [encoders](#encoder) with `amd_rc` set to `qvbr`. Native `amdvce_experimental` automatically enables PreAnalysis with a one-frame low-latency lookahead for `qvbr`, `hqvbr`, and `hqcbr`.}
+            @note{Leave this at `0` to keep the encoder default.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">1-51 (0 to use the encoder default)</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_qvbr_quality_level = 18
+            @endcode</td>
+    </tr>
+</table>
+
+### amd_enforce_hrd
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Enable Hypothetical Reference Decoder (HRD) enforcement to help constrain the target bitrate.
+            @note{This option applies to the AMD [encoders](#encoder).}
+            @warning{HRD is known to cause encoding artifacts or negatively affect encoding quality on certain cards.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_enforce_hrd = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### amd_quality
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The quality profile controls the tradeoff between speed and quality of encoding.
+            Speed is the default to prioritize low latency. Existing explicit selections are preserved.
+            `auto` leaves the quality property unset so the selected AMF usage preset can choose it.
+            @note{This option applies to the AMD [encoders](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            speed
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_quality = speed
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="4">Choices</td>
+        <td>auto</td>
+        <td>follow the selected AMF usage preset</td>
+    </tr>
+    <tr>
+        <td>speed</td>
+        <td>prefer speed</td>
+    </tr>
+    <tr>
+        <td>balanced</td>
+        <td>balanced</td>
+    </tr>
+    <tr>
+        <td>quality</td>
+        <td>prefer quality</td>
+    </tr>
+</table>
+
+### amd_preanalysis
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Preanalysis can increase encoding quality at the cost of latency. Native `amdvce_experimental` uses a one-frame
+            low-latency lookahead; it is enabled automatically by `qvbr`, `hqvbr`, and `hqcbr`. The setting is
+            also forwarded to `amdvce_ffmpeg`.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_preanalysis = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### amd_vbaq
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Variance Based Adaptive Quantization (VBAQ) can increase subjective visual quality by prioritizing
+            allocation of more bits to smooth areas compared to more textured areas.
+            `auto` leaves the property unset so the selected AMF usage preset can choose it. VBAQ is enabled
+            by default.
+            @note{This option applies to the AMD [encoders](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_vbaq = enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>auto</td>
+        <td>follow the selected AMF usage preset</td>
+    </tr>
+    <tr>
+        <td>enabled</td>
+        <td>enable VBAQ</td>
+    </tr>
+    <tr>
+        <td>disabled</td>
+        <td>disable VBAQ</td>
+    </tr>
+</table>
+
+### amd_coder
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The entropy encoding to use.
+            @note{This option only applies when using H.264 with an AMD [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_coder = auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>auto</td>
+        <td>leave the encoder default</td>
+    </tr>
+    <tr>
+        <td>cabac</td>
+        <td>context adaptive binary arithmetic coding - faster decode</td>
+    </tr>
+    <tr>
+        <td>cavlc</td>
+        <td>context adaptive variable-length coding - higher quality</td>
+    </tr>
+</table>
+
+### amd_av1_screen_content
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Enable AV1 screen-content coding tools, which can improve efficiency and text/UI clarity for desktop and
+            screen-heavy content.
+            @note{AV1 only. This option only applies to the native amdvce_experimental [encoder](#encoder) (not amdvce_ffmpeg).}
+            @note{Leave at `auto` to use the driver default.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_av1_screen_content = enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>auto</td>
+        <td>leave the driver default</td>
+    </tr>
+    <tr>
+        <td>enabled</td>
+        <td>force screen-content tools on</td>
+    </tr>
+    <tr>
+        <td>disabled</td>
+        <td>force screen-content tools off</td>
+    </tr>
+</table>
+
+### amd_av1_tiles
+
+Experimental AV1 tile-count override for the native `amdvce_experimental` encoder only. Set this in `sunshine.conf`.
+
+| Value | Behavior |
+| --- | --- |
+| `0` (default) | Preserve the client's tile/slice request and the usage-preset default. |
+| `1`, `2`, `4` | Request this many AV1 tiles, overriding the client request. |
+
+Example: `amd_av1_tiles = 2`. Reconnect the stream after changing this setting.
+Invalid values fall back to `0`. This does not affect H.264, HEVC or `amdvce_ffmpeg`.
+
+AMF may adjust the requested tile count for its supported layout. The session log reports the request and
+the driver-reported count **after encoder initialization**; these are not a bitstream inspection or proof
+of multi-engine split-frame encoding. The split-frame hint is likewise only a driver recommendation.
+More tiles are not guaranteed to improve latency and can trade compression efficiency for parallelism.
+See [AMD's AV1 tile documentation](https://github.com/GPUOpen-LibrariesAndSDKs/AMF/blob/master/amf/doc/AMF_Video_Encode_AV1_API.md)
+and [AMD's split-frame explanation](https://github.com/GPUOpen-LibrariesAndSDKs/AMF/issues/585#issuecomment-3755732553).
+
+For a controlled comparison, repeat the same scene with `1`, `2` and `4` at identical resolution, FPS,
+bitrate and HDR settings. Check the reported tile count, image quality, dropped frames and latency
+distribution, not only a single maximum. Restore `0` if there is no repeatable benefit.
+
+### amd_av1_latency_mode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            AV1 encoding-latency tier. Lower tiers finish each frame faster at the cost of higher power draw.
+            @note{AV1 only. This option only applies to the native amdvce_experimental [encoder](#encoder) (not amdvce_ffmpeg).}
+            @note{Leave at `auto` to use the driver default.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            amd_av1_latency_mode = lowest
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="5">Choices</td>
+        <td>auto</td>
+        <td>leave the driver default</td>
+    </tr>
+    <tr>
+        <td>none</td>
+        <td>balance latency and power</td>
+    </tr>
+    <tr>
+        <td>power_saving</td>
+        <td>real-time with lower power</td>
+    </tr>
+    <tr>
+        <td>realtime</td>
+        <td>real-time</td>
+    </tr>
+    <tr>
+        <td>lowest</td>
+        <td>lowest latency (highest power)</td>
+    </tr>
+</table>
+
+## VideoToolbox Encoder
+
+### vt_coder
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The entropy encoding to use.
+            @note{This option only applies when using macOS.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            vt_coder = auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>auto</td>
+        <td>let ffmpeg decide</td>
+    </tr>
+    <tr>
+        <td>cabac</td>
+        <td>context adaptive binary arithmetic coding - faster decode</td>
+    </tr>
+    <tr>
+        <td>cavlc</td>
+        <td>context adaptive variable-length coding - higher quality</td>
+    </tr>
+</table>
+
+### vt_software
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Force Video Toolbox to use software encoding.
+            @note{This option only applies when using macOS.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            vt_software = auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="4">Choices</td>
+        <td>auto</td>
+        <td>let ffmpeg decide</td>
+    </tr>
+    <tr>
+        <td>disabled</td>
+        <td>disable software encoding</td>
+    </tr>
+    <tr>
+        <td>allowed</td>
+        <td>allow software encoding</td>
+    </tr>
+    <tr>
+        <td>forced</td>
+        <td>force software encoding</td>
+    </tr>
+</table>
+
+### vt_realtime
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Realtime encoding.
+            @note{This option only applies when using macOS.}
+            @warning{Disabling realtime encoding might result in a delayed frame encoding or frame drop.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            vt_realtime = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+## VA-API Encoder
+
+### vaapi_strict_rc_buffer
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Enabling this option can avoid dropped frames over the network during scene changes, but video quality may
+            be reduced during motion.
+            @note{This option only applies for H.264 and HEVC when using VA-API [encoder](#encoder) on AMD GPUs.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            vaapi_strict_rc_buffer = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+## Vulkan Encoder
+
+### vk_tune
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Encoder tuning preset. Low latency modes reduce encoding delay at the cost of quality.
+            @note{This option only applies when using Vulkan [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            2
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            vk_tune = 1
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Options</td>
+        <td>0 (default)</td>
+        <td>Let the driver decide</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td>1 (hq)</td>
+        <td>High Quality</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td>2 (ll)</td>
+        <td>Low Latency</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td>3 (ull)</td>
+        <td>Ultra Low Latency</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td>4 (lossless)</td>
+        <td>Lossless</td>
+    </tr>
+</table>
+
+### vk_rc_mode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Rate control mode for encoding. Auto lets the driver decide.
+            @note{This option only applies when using Vulkan [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            2
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            vk_rc_mode = 4
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Options</td>
+        <td>0</td>
+        <td>Auto (driver decides)</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td>1</td>
+        <td>CQP (Constant QP)</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td>2</td>
+        <td>CBR (Constant Bitrate)</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td>4</td>
+        <td>VBR (Variable Bitrate)</td>
+    </tr>
+</table>
+
+## Software Encoder
+
+### sw_preset
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The encoder preset to use.
+            @note{This option only applies when using software [encoder](#encoder).}
+            @note{From [FFmpeg](https://trac.ffmpeg.org/wiki/Encode/H.264#preset).
+            <br>
+            <br>
+            A preset is a collection of options that will provide a certain encoding speed to compression ratio. A slower
+            preset will provide better compression (compression is quality per filesize). This means that, for example, if
+            you target a certain file size or constant bit rate, you will achieve better quality with a slower preset.
+            Similarly, for constant quality encoding, you will simply save bitrate by choosing a slower preset.
+            <br>
+            <br>
+            Use the slowest preset that you have patience for.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            superfast
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            sw_preset = superfast
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="9">Choices</td>
+        <td>ultrafast</td>
+        <td>fastest</td>
+    </tr>
+    <tr>
+        <td>superfast</td>
+        <td></td>
+    </tr>
+    <tr>
+        <td>veryfast</td>
+        <td></td>
+    </tr>
+    <tr>
+        <td>faster</td>
+        <td></td>
+    </tr>
+    <tr>
+        <td>fast</td>
+        <td></td>
+    </tr>
+    <tr>
+        <td>medium</td>
+        <td></td>
+    </tr>
+    <tr>
+        <td>slow</td>
+        <td></td>
+    </tr>
+    <tr>
+        <td>slower</td>
+        <td></td>
+    </tr>
+    <tr>
+        <td>veryslow</td>
+        <td>slowest</td>
+    </tr>
+</table>
+
+### sw_tune
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The tuning preset to use.
+            @note{This option only applies when using software [encoder](#encoder).}
+            @note{From [FFmpeg](https://trac.ffmpeg.org/wiki/Encode/H.264#preset).
+            <br>
+            <br>
+            You can optionally use -tune to change settings based upon the specifics of your input.
+            }
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            zerolatency
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            sw_tune = zerolatency
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="6">Choices</td>
+        <td>film</td>
+        <td>use for high quality movie content; lowers deblocking</td>
+    </tr>
+    <tr>
+        <td>animation</td>
+        <td>good for cartoons; uses higher deblocking and more reference frames</td>
+    </tr>
+    <tr>
+        <td>grain</td>
+        <td>preserves the grain structure in old, grainy film material</td>
+    </tr>
+    <tr>
+        <td>stillimage</td>
+        <td>good for slideshow-like content</td>
+    </tr>
+    <tr>
+        <td>fastdecode</td>
+        <td>allows faster decoding by disabling certain filters</td>
+    </tr>
+<tr>
+        <td>zerolatency</td>
+        <td>good for fast encoding and low-latency streaming</td>
+    </tr>
+</table>
+
+## Steam Integration
+
+### steam_enabled
+
+Enables local Steam library discovery, synchronization, and launch support. Disabled by default on all platforms; it can be combined with `playnite_enabled` or used by itself.
+
+Default: `false`
+
+### steam_auto_sync
+
+Synchronizes the games selected by the Steam policy into `apps.json` when
+configuration is applied and checks for manifest, local play-history, library,
+metadata, and artwork changes every 30 seconds while Vibepollo is running.
+Steam-managed entries use stable Steam IDs; manual and Playnite-managed entries
+are preserved.
+
+Default: `false`
+
+### steam_sync_all_installed
+
+Synchronizes every installed Steam game. Disable this to use the recent-game
+count and age policy instead.
+
+Default: `false`
+
+### steam_recent_games
+
+Maximum number of installed games to synchronize, ordered by Steam's local
+`LastPlayed` timestamp, when `steam_sync_all_installed` is disabled. Set to `0`
+to disable recent-game synchronization. Exclusions and tool filtering apply
+before the limit.
+
+Default: `10`
+
+### steam_recent_max_age_days
+
+Excludes games last played more than this many days ago from recent-game
+synchronization. Set to `0` for no age limit.
+
+Default: `30`
+
+### steam_autosync_remove_uninstalled
+
+When enabled, Steam-managed entries whose installed manifest disappears are
+removed during synchronization. Manual and Playnite-managed entries are never
+removed by this provider. Recent-only synchronization always removes managed
+games that leave the selected recent set so the configured limit remains
+effective.
+
+Default: `true`
+
+### steam_exclude_games
+
+JSON array of Steam app IDs (or objects containing `id` and optional `name`) to
+exclude from Steam synchronization. A legacy comma-separated list is accepted
+as well. Object names are used only when no ID is supplied, so a game rename
+cannot accidentally exclude a different app. Example:
+
+`steam_exclude_games = [{"id":"228980","name":"Steamworks Common Redistributables"},{"id":"570"}]`
+
+Steam compatibility/runtime/tool manifests are also excluded by default based
+on their manifest type and known runtime IDs. Set `steam_include_tools = true`
+to import those records intentionally.
+
+### steam_include_tools
+
+Includes Steam manifests marked as tools, runtimes, configuration, DLC, music,
+or video. This is intended for users who deliberately want those records in
+their catalog.
+
+Default: `false`
+
+The manual application picker shows installed, importable Steam games by
+default, matching the Playnite picker. Vibepollo also reads Steam's local user
+play-history and `appinfo.vdf` caches to rank installed games for recent-game
+synchronization without requiring a Steam Web API key or a public profile.
+
+## Lutris Integration
+
+### lutris_enabled
+
+Enables local Lutris library discovery, synchronization, and launch support on
+Linux. Steam remains enabled independently and is authoritative for Steam games.
+
+Default: `true` on Linux
+
+### lutris_auto_sync
+
+Synchronizes installed Lutris games into `apps.json` when configuration is
+applied and checks the Lutris database every 30 seconds.
+
+Default: `true`
+
+### lutris_autosync_remove_uninstalled
+
+Removes Lutris-managed applications when their installed record disappears.
+Manual, Steam-managed, and Playnite-managed entries are preserved.
+
+Default: `true`
+
+### lutris_exclude_games
+
+JSON array of Lutris numeric game IDs, or objects containing `id` and optional
+`name`, to exclude from synchronization. A legacy comma-separated list is also
+accepted.
+
+### lutris_include_steam
+
+Includes Lutris records backed by Steam. This is disabled by default because
+the direct Steam provider has richer metadata and lifecycle information. If
+enabled, a direct Steam entry with the same Steam app ID wins, so duplicate
+catalog entries are not created.
+
+Default: `false`
+
+## Playnite Integration
+
+### playnite_install_dir
+
+Optional host directory containing `Playnite.DesktopApp.exe`. Use the Playnite directory picker under Integrations when automatic detection cannot find the installation, then save before installing the plugin. This setting also supplies the executable location for game and fullscreen launches. Installed copies retain their extensions in the user's RoamingAppData; portable copies use `Extensions` inside the selected directory. Clear the setting to restore automatic detection.
+
+Default: empty (automatic detection)
+
+### playnite_enabled
+
+Enables Playnite library synchronization and launch support on Windows. Disable this setting to use Steam by itself, or leave both providers enabled to combine their catalogs. Playnite is unavailable on Linux.
+
+Default: `true` on Windows
+
+### playnite_sync_all_installed
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            When set to <code>true</code>, Sunshine synchronises every installed Playnite game into
+            <code>apps.json</code>, in addition to any recent or category-based selections.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}false@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}playnite_sync_all_installed = true@endcode</td>
+    </tr>
+</table>
+
+### playnite_autosync_remove_uninstalled
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            Controls whether Sunshine removes auto-synced games when they are uninstalled in Playnite.
+            Set to <code>true</code> to drop entries immediately when Playnite reports them as uninstalled.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}true@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}playnite_autosync_remove_uninstalled = false@endcode</td>
+    </tr>
+</table>
+
+### playnite_sync_plugins
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            List of Playnite library plugin IDs whose installed games should always be auto-synced.
+            Accepts a JSON array of objects with <code>id</code>/<code>name</code> pairs or a comma-separated list of plugin IDs.
+            Any installed game originating from the listed plugins is included even if it is not in the recent list.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}
+playnite_sync_plugins = [
+  {"id": "CB91DFC9-B977-43BF-8E70-55F46E410FAB", "name": "Steam"},
+  "83DD83A4-0CF7-49FB-9138-8547F6B60C18"
+]
+@endcode</td>
+    </tr>
+</table>
+
+### playnite_exclude_categories
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            List of Playnite categories to omit from Sunshine's auto-sync. Accepts a JSON array of objects
+            with <code>id</code>/<code>name</code> pairs or a comma-separated list of category names. Any
+            game tagged with one of these categories is skipped even if it matches recent-activity or
+            inclusion-category rules.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}
+playnite_exclude_categories = ["Steam", {"id": "deck", "name": "Steam Deck"}]
+@endcode</td>
+    </tr>
+</table>
+
+## Advanced runtime and recovery options
+
+### amd_ltr_frames
+
+Sets the number of long-term reference frames used by the experimental native AMD encoder. Leave this at the automatic default unless a client or driver-specific recovery workflow requires a fixed value.
+
+### amd_input_queue_size
+
+Sets the experimental native AMD encoder's driver input capacity. This is not the number of frames Vibepollo permits to accumulate: the native encoder independently keeps the smallest pipeline depth demonstrated by the runtime and drops a newer stale capture rather than growing that backlog. Leave this at `0` for the driver default unless hardware testing shows a benefit. A positive explicit value overrides VRR low-latency queue selection; values as small as `1` can starve drivers that retain several startup surfaces, while `4` is the safer low-latency tuning point.
+
+### amd_smart_access_video
+
+Controls SmartAccess Video for the experimental native AMD encoder when the installed AMF runtime exposes that capability. Use `auto` to leave the driver default unchanged.
+
+### amd_lowlatency_mode
+
+Controls the experimental native AMD encoder's low-latency mode. Use `auto` to leave the driver default unchanged.
+
+### amd_high_motion_quality_boost
+
+Controls high-motion quality boost for the experimental native AMD encoder. Use `auto` to leave the driver default unchanged.
+
+### dd_paused_virtual_display_timeout_secs
+
+Sets how long a paused virtual display may remain ready before the display helper releases it. Set `0` to disable the timeout.
+
+### dd_virtual_display_scale
+
+Sets the virtual-display scale override. The default, `0` (Retain), keeps your chosen scale for future streams. On Windows, connect to the virtual display and choose **Scale** in **Settings > System > Display**; subsequent streams using that virtual display retain your choice. Choose an explicit percentage to change desktop scaling without changing the requested pixel resolution. On Windows, scaling is applied through the DPI setter without changing the virtual monitor's reported physical size. The optional `-1` setting chooses a scale based on resolution.
+
+### dd_wa_hdr_toggle
+
+Enables the display-helper HDR-toggle workaround for display stacks that require an explicit HDR transition.
+
+### dd_wa_hdr_toggle_delay
+
+Sets the delay, in milliseconds, used by the display-helper HDR-toggle workaround.
+
+### lossless_scaling_legacy_auto_detect
+
+Enables legacy automatic discovery of Lossless Scaling when no explicit `lossless_scaling_path` is configured.
+
+### realtime_stats_enabled
+
+Enables collection of the host and session statistics shown by the real-time statistics view.
+
+### realtime_stats_poll_interval_ms
+
+Sets the real-time statistics polling interval in milliseconds. Lower values refresh the dashboard more frequently.
+
+### rtx_hdr
+
+Enables RTX HDR processing when the active NVIDIA environment supports it.
+
+### rtx_hdr_force_sdr
+
+Forces the source display to remain SDR while RTX HDR performs the SDR-to-HDR conversion.
+
+### rtx_hdr_sdr_brightness
+
+Sets the RTX HDR SDR brightness control.
+
+### rtx_hdr_contrast
+
+Sets the RTX HDR contrast control.
+
+### rtx_hdr_saturation
+
+Sets the RTX HDR saturation control.
+
+### rtx_hdr_middle_gray
+
+Sets the RTX HDR middle-gray control.
+
+### rtx_hdr_peak_brightness
+
+Sets the RTX HDR peak-brightness control.
+
+### session_history_enabled
+
+Enables persistent session-history recording.
+
+### session_history_ttl_days
+
+Sets the number of days to retain session-history records. Set `0` to retain records until another configured limit removes them.
+
+### session_history_db_size_limit_mb
+
+Sets the maximum on-disk size, in MiB, of the session-history database before older records are pruned.
+
+### vulkan_hdr_layer
+
+Enables the Vulkan HDR layer used by the display stack when HDR Vulkan capture support is available.
+
+### wayland_hdr_compatibility
+
+Enables KDE Plasma Wayland HDR environment compatibility for games launched during a resolved HDR stream. This does not force HDR and does not override SDR stream outcomes.
+
+### wgc_pacing_smoothing
+
+Enables WGC pacing smoothing so capture re-anchors to the pacing grid instead of raw frame-arrival timing.
+
+### auto_capture_sink
+
+Automatically selects the audio capture sink when no explicit virtual sink is configured.
+
+### enable_discovery
+
+Controls whether Vibepollo advertises itself for local-network discovery.
+
+### enable_input_only_mode
+
+Allows clients to connect in input-only mode without starting a video stream.
+
+### enable_pairing
+
+Controls whether new clients may pair with this host.
+
+### envvar_compatibility_mode
+
+Enables compatibility handling for legacy environment-variable based integrations.
+
+### fallback_mode
+
+Sets the display mode used when the requested streaming mode cannot be applied.
+
+### forward_rumble
+
+Forwards controller rumble events to the emulated host gamepad.
+
+### global_state_cmd
+
+Configures commands that run when any application changes streaming state.
+
+### hide_tray_controls
+
+Hides the interactive controls in the system-tray menu.
+
+### ignore_encoder_probe_failure
+
+Allows streaming to continue when the encoder capability probe cannot complete.
+
+### keep_sink_default
+
+Keeps the selected audio sink as the system default while streaming.
+
+### legacy_ordering
+
+Enables legacy application ordering for clients and integrations that require it.
+
+### limit_framerate
+
+Limits capture and encoding to the requested stream frame rate.
+
+### nvenc_intra_refresh
+
+Uses NVIDIA intra refresh instead of full keyframes when supported.
+
+### nvenc_temporal_aq
+
+Enables NVIDIA temporal adaptive quantization when supported.
+
+### pacing_max_bitrate_kbps
+
+Sets the maximum bitrate, in Kbps, considered by the network pacing policy. Set `0` to use the automatic default.
+
+### packetsize
+
+Sets the maximum network packet size used for streaming. Set `0` to use the default behavior.
+
+<div class="section_buttons">
+
+| Previous          |                            Next |
+|:------------------|--------------------------------:|
+| [Legal](legal.md) | [App Examples](app_examples.md) |
+
+</div>
+
+<details style="display: none;">
+  <summary></summary>
+  [TOC]
+</details>
+
+## Managed application focus
+
+Focus policy is shared by managed Steam, Lutris and Playnite launches. Windows
+uses foreground window activation, Linux uses the selected KDE/KWin desktop
+session for both native Wayland and Xwayland games, and macOS activates the
+running game application. Manual applications and Desktop launches do not
+start automatic focus. A pending focus session is cancelled when its game
+session ends. Missing windows are retried until the timeout; only confirmed
+foreground activations consume the focus count.
+
+### app_focus_attempts
+
+Number of confirmed focus applications after launch, from 0 to 100. Default:
+`3`. Set to `0` to disable automatic focus.
+
+### app_focus_timeout_secs
+
+Total launch-time focus window in seconds, from 0 to 300. Default: `15`. Set to
+`0` to disable automatic focus.
+
+### app_focus_exit_on_first
+
+Stop after the first confirmed foreground activation. Default: `false`.
+
+The previous `playnite_focus_attempts`, `playnite_focus_timeout_secs` and
+`playnite_focus_exit_on_first` keys remain readable aliases. Explicit shared
+keys take precedence. The web interface removes the corresponding old key
+when saving a shared focus setting, including resetting it to its default.

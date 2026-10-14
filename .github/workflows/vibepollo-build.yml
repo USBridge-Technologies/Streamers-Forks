@@ -1,0 +1,113 @@
+---
+name: Vibepollo Build
+
+# Called by release-all.yml. Builds the Vibepollo fork in vibepollo/ (Nonary/Vibepollo plus the
+# USBridge changes: the USB broker bridge, web_bind_address, the client's cursor setting) into
+# the portable zip the USBridge agent downloads: Vibepollo-Windows-x86_64-portable.zip, all
+# files under one top directory, sunshine.exe at its root.
+#
+# Windows only. The Linux KMS launcher runs a root-owned copy of Sunshine's tree and has no
+# Vibepollo equivalent, so the agent offers Vibepollo on Windows only.
+#
+# What is left out: the WebRTC build (libwebrtc is a separate multi-hour build, the agent's
+# clients use GameStream), the Playnite .NET plugin, the virtual display driver and its
+# tooling (the agent installs MttVDD, the display driver every USBridge streamer shares;
+# Vibepollo runs with virtual_display_mode = disabled), the tests and the docs.
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: 'all, windows, or none'
+        required: true
+        type: string
+
+jobs:
+  windows:
+    name: Windows x86_64
+    if: inputs.platform == 'all' || inputs.platform == 'windows'
+    defaults:
+      run:
+        working-directory: vibepollo
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-libwebp
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-nodejs
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-tools
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          set -o pipefail
+          git config --global --add safe.directory '*'
+          cmake -B build -S . -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER=OFF \
+            -DBUILD_VIRTUALDISPLAY_PROBE=OFF \
+            -DBUILD_VIRTUALDISPLAY_TOOLS=OFF \
+            -DBUILD_VIRTUALDISPLAY_VULKAN_LAYER=OFF \
+            -DSUNSHINE_ENABLE_WEBRTC=OFF \
+            -DSUNSHINE_ASSETS_DIR=assets \
+            -DSUNSHINE_PUBLISHER_NAME="usbridge_agent" \
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/itsme228/usbridge_agent" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues"
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --target sunshine --parallel "$(nproc)"
+
+      # The layout the agent expects (forkrelease.PrepareVibepollo): sunshine.exe at the root of
+      # the single top directory, with assets\ and tools\ beside it and every non-system DLL the
+      # exe imports from MSYS2.
+      - name: Package ZIP
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          out=artifacts/Vibepollo
+          mkdir -p "$out/tools"
+          cp build/sunshine.exe "$out/"
+          cp -r build/assets "$out/assets"
+          for f in sunshine_display_helper.exe vibepollo_dualsense_haptics.exe vibepollo_dualsense_audio.dll; do
+            [ -f "build/tools/$f" ] && cp "build/tools/$f" "$out/tools/"
+          done
+          ldd build/sunshine.exe | awk '/ucrt64/ {print $3}' | sort -u | while read -r dll; do
+            cp "$dll" "$out/"
+          done
+          test -f "$out/sunshine.exe"
+          ( cd artifacts && 7z a -tzip Vibepollo-Windows-x86_64-portable.zip Vibepollo )
+          ls -la artifacts
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vibepollo-Windows-x86_64-portable.zip
+          path: vibepollo/artifacts/Vibepollo-Windows-x86_64-portable.zip

@@ -1,0 +1,1110 @@
+/**
+ * @file src/main.cpp
+ * @brief Definitions for the main entry point for Sunshine.
+ */
+// standard includes
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <codecvt>
+#include <condition_variable>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <system_error>
+#include <thread>
+
+// local includes
+#include "confighttp.h"
+#include "entry_handler.h"
+#include "globals.h"
+#include "host_stats.h"
+#include "httpcommon.h"
+#include "logging.h"
+#include "main.h"
+#include "nvhttp.h"
+#include "process.h"
+#include "rtsp.h"
+#include "system_tray.h"
+#include "update.h"
+#include "upnp.h"
+#include "version_compare.h"
+#include "uuid.h"
+#include "video.h"
+#include "session_history.h"
+#include "state_storage.h"
+#include "steam_auto_sync.h"
+#ifdef __linux__
+  #include "lutris_auto_sync.h"
+#endif
+#include "usbridge.h"
+#include "webrtc_stream.h"
+#ifdef _WIN32
+  #include <shobjidl.h>
+
+  #include "src/display_helper_integration.h"
+  #include "src/platform/windows/frame_limiter_nvcp.h"
+  #include "src/platform/windows/misc.h"
+  #include "src/platform/windows/playnite_integration.h"
+  #include "src/platform/windows/rtss_integration.h"
+  #include "src/platform/windows/startup_encoder_probe_policy.h"
+  #include "src/platform/windows/virtual_display.h"
+  #include "src/platform/windows/virtual_display_cleanup.h"
+#elif defined(__linux__)
+  #include "src/platform/linux/capability_sanitizer.h"
+  #include "src/platform/linux/maintenance_cli.h"
+  #include "src/platform/linux/private_display.h"
+  #include "src/platform/linux/display_backend.h"
+
+  #include <pthread.h>
+#endif
+
+#ifdef _WIN32
+  #include "platform/windows/misc.h"
+  #include "platform/windows/display_helper_integration.h"
+  #include "platform/windows/virtual_display.h"
+#endif
+
+#define PROBE_DISPLAY_UUID "38F72B96-B00C-4F21-8B6C-E1BFF1602B0E"
+
+extern "C" {
+#include "rswrapper.h"
+}
+
+using namespace std::literals;
+
+#ifndef __linux__
+std::map<int, std::function<void()>> signal_handlers;
+
+  #ifdef _WIN32
+    #define WIDEN_STRING_LITERAL_IMPL(value) L##value
+    #define WIDEN_STRING_LITERAL(value) WIDEN_STRING_LITERAL_IMPL(value)
+  #endif
+
+void on_signal_forwarder(int sig) {
+  signal_handlers.at(sig)();
+}
+
+template<class FN>
+void on_signal(int sig, FN &&fn) {
+  signal_handlers.emplace(sig, std::forward<FN>(fn));
+
+  std::signal(sig, on_signal_forwarder);
+}
+#endif
+
+namespace {
+  static_assert(std::atomic_bool::is_always_lock_free, "shutdown signal flag must be lock-free in a signal handler");
+
+  class shutdown_deadline_t {
+  public:
+    explicit shutdown_deadline_t(std::atomic_bool *signal_requested, bool supervised_machine_host):
+        signal_requested_ {signal_requested},
+        supervised_machine_host_ {supervised_machine_host} {
+      // The machine host runs under systemd with SendSIGKILL=no so that the
+      // display topology survives a stop. That makes this watchdog the only
+      // thing that can end a shutdown whose joins never return: without it a
+      // hung host outlives its unit, keeps the ports, and blocks every
+      // upgrade and restart until someone kills it by hand. The preserve
+      // request was already made when the signal arrived, so a forced exit
+      // after the deadline loses nothing that a graceful exit would keep.
+      try {
+        worker_ = std::jthread([this](std::stop_token) {
+          run();
+        });
+      } catch (const std::system_error &e) {
+        BOOST_LOG(error) << "Unable to create the shutdown deadline watchdog: " << e.what();
+      }
+    }
+
+    shutdown_deadline_t(const shutdown_deadline_t &) = delete;
+    shutdown_deadline_t &operator=(const shutdown_deadline_t &) = delete;
+
+    ~shutdown_deadline_t() {
+      complete();
+    }
+
+    void arm() {
+      if (!worker_.joinable()) {
+        return;
+      }
+      std::lock_guard lock {mutex_};
+      if (state_ == state_e::idle) {
+        state_ = state_e::armed;
+        cv_.notify_one();
+      }
+    }
+
+    void complete() {
+      {
+        std::lock_guard lock {mutex_};
+        if (state_ != state_e::firing) {
+          state_ = state_e::completed;
+        }
+        cv_.notify_one();
+      }
+
+      // This object is owned by main(), never by its worker. Joining here
+      // prevents a deadline thread from escaping into CRT/static teardown.
+      if (worker_.joinable()) {
+        worker_.join();
+      }
+    }
+
+  private:
+    enum class state_e {
+      idle,
+      armed,
+      completed,
+      firing,
+    };
+
+    void run() {
+      std::unique_lock lock {mutex_};
+      while (state_ == state_e::idle && (!signal_requested_ || !signal_requested_->load(std::memory_order_relaxed))) {
+        // The Linux signal-wait thread may publish shutdown before main reaches
+        // shutdown_event->view(). Poll the flag so that early startup remains
+        // covered without doing lock-taking work in asynchronous signal context.
+        cv_.wait_for(lock, std::chrono::milliseconds(50));
+      }
+      if (state_ == state_e::idle) {
+        state_ = state_e::armed;
+      }
+      if (state_ != state_e::armed) {
+        return;
+      }
+
+      // The machine host's unit allows 20 seconds for a stop; leave a margin so
+      // the forced exit lands before systemd gives up on the unit.
+      const auto deadline = supervised_machine_host_ ? std::chrono::seconds(15) : std::chrono::seconds(10);
+      if (cv_.wait_until(lock, std::chrono::steady_clock::now() + deadline, [this] {
+            return state_ != state_e::armed;
+          })) {
+        return;
+      }
+
+      // Completion and expiry serialize through mutex_. A recovered shutdown
+      // therefore cannot leave a stale timer behind to trap later.
+      state_ = state_e::firing;
+      lock.unlock();
+      if (supervised_machine_host_) {
+        // The deadline must be unconditional: even an asynchronous log sink
+        // can be blocked by the shutdown path that this watchdog protects.
+        std::_Exit(lifetime::desired_exit_code);
+      }
+      BOOST_LOG(fatal) << deadline.count() << " seconds passed, yet Vibepollo's still running: Forcing shutdown"sv;
+      lifetime::debug_trap();
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    state_e state_ {state_e::idle};
+    std::atomic_bool *signal_requested_ = nullptr;
+    bool supervised_machine_host_ = false;
+    std::jthread worker_;
+  };
+}  // namespace
+
+std::map<std::string_view, std::function<int(const char *name, int argc, char **argv)>> cmd_to_func {
+  {"creds"sv, [](const char *name, int argc, char **argv) {
+     return args::creds(name, argc, argv);
+   }},
+  {"help"sv, [](const char *name, int argc, char **argv) {
+     return args::help(name);
+   }},
+  {"version"sv, [](const char *name, int argc, char **argv) {
+     return args::version();
+   }},
+#ifdef _WIN32
+  {"restore-nvprefs-undo"sv, [](const char *name, int argc, char **argv) {
+     return args::restore_nvprefs_undo();
+   }},
+#endif
+};
+
+#ifdef _WIN32
+LRESULT CALLBACK SessionMonitorWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+  switch (uMsg) {
+    case WM_CLOSE:
+      DestroyWindow(hwnd);
+      return 0;
+    case WM_DESTROY:
+      PostQuitMessage(0);
+      return 0;
+    case WM_ENDSESSION:
+      {
+        if (!wParam) {
+          return 0;
+        }
+
+        // Trigger async shutdown so the message loop keeps pumping.
+        // When the main thread's cleanup guard runs, it will
+        // PostMessage(WM_CLOSE) to this window, which dispatches
+        // through the outer GetMessage loop → WM_CLOSE → DestroyWindow
+        // → WM_DESTROY → PostQuitMessage → GetMessage returns 0 →
+        // thread exits.
+        //
+        // Previously this called exit_sunshine(0, false) which blocked
+        // the thread in a sleep loop, starving the message pump.  That
+        // prevented WM_CLOSE from ever being processed, the join
+        // timed out, the thread was detached, and the still-running
+        // thread crashed during CRT atexit cleanup (abort/FAST_FAIL).
+        BOOST_LOG(info) << "Received WM_ENDSESSION"sv;
+        lifetime::exit_sunshine(0, true);
+        return 0;
+      }
+    default:
+      return DefWindowProc(hwnd, uMsg, wParam, lParam);
+  }
+}
+
+WINAPI BOOL ConsoleCtrlHandler(DWORD type) {
+  if (type == CTRL_CLOSE_EVENT) {
+    BOOST_LOG(info) << "Console closed handler called";
+    lifetime::exit_sunshine(0, false);
+  }
+  return FALSE;
+}
+#endif
+
+int main(int argc, char *argv[]) {
+  // usbridge: the USBridge agent asks whether this build hands devices to its USB broker.
+  if (argc > 1 && std::string_view {argv[1]} == "--usbridge-bridge") {
+    std::cout << usbridge::PROBE_LINE << std::endl;
+    return 0;
+  }
+
+#ifdef __linux__
+  #ifdef SUNSHINE_BUILD_STEAMOS
+  if (platf::linux_cli::command(argc, argv)) {
+    std::fputs("Vibepollo: native Linux maintenance commands are unavailable in the SteamOS user bundle.\n", stderr);
+    return 2;
+  }
+  #else
+  // Maintenance never enters host initialization. In particular, sudo must
+  // reach the root-owned administrative helper before the host-only capability
+  // policy rejects a root process. No configuration or logging is parsed here.
+  if (const auto result = platf::linux_cli::dispatch(argc, argv)) {
+    return *result;
+  }
+  #endif
+  if (!platf::linux_security::sanitize_startup_capabilities()) {
+    const int error_number = errno ? errno : EPERM;
+    std::fprintf(stderr, "Vibepollo: failed to sanitize Linux startup capabilities: %s\n",
+                 std::strerror(error_number));
+    return 1;
+  }
+  // Block termination before any worker or GPU resource can exist. Every
+  // subsequently created thread inherits this mask; one dedicated sigwait()
+  // thread consumes the signal synchronously in ordinary thread context.
+  sigset_t termination_signal_set;
+  sigemptyset(&termination_signal_set);
+  sigaddset(&termination_signal_set, SIGINT);
+  sigaddset(&termination_signal_set, SIGTERM);
+  if (const int error_number = pthread_sigmask(SIG_BLOCK, &termination_signal_set, nullptr); error_number != 0) {
+    std::fprintf(stderr, "Vibepollo: failed to block termination signals: %s\n", std::strerror(error_number));
+    return 1;
+  }
+  const char *machine_host_environment = std::getenv("VIBEPOLLO_MACHINE_HOST");
+  const bool supervised_machine_host =
+    machine_host_environment && machine_host_environment[0] == '1' &&
+    machine_host_environment[1] == '\0';
+#else
+  constexpr bool supervised_machine_host = false;
+#endif
+
+  lifetime::argv = argv;
+
+  // Staged packages must report their version before assets or a user profile
+  // exist. Keep this query independent of configuration and host startup.
+  if (argc == 2 && argv[1] == "--version"sv) {
+    std::printf("%s version: %s commit: %s\n", PROJECT_NAME, PROJECT_VERSION, PROJECT_VERSION_COMMIT);
+    return 0;
+  }
+
+#ifdef SUNSHINE_BUILD_STEAMOS
+  // Resolve assets from the executable's release, including launches outside
+  // the wrapper and upgrades which switch the "current" symlink underneath us.
+  std::error_code bundle_error;
+  const auto bundle_executable = std::filesystem::read_symlink("/proc/self/exe", bundle_error);
+  if (!bundle_error) {
+    std::filesystem::current_path(bundle_executable.parent_path().parent_path(), bundle_error);
+  }
+  if (bundle_error) {
+    std::fprintf(stderr, "Vibepollo: cannot resolve SteamOS bundle: %s\n", bundle_error.message().c_str());
+    return 1;
+  }
+#endif
+
+#ifdef _WIN32
+  // Avoid searching the PATH in case a user has configured their system insecurely
+  // by placing a user-writable directory in the system-wide PATH variable.
+  SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+  setlocale(LC_ALL, "C");
+#endif
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  // Use UTF-8 conversion for the default C++ locale (used by boost::log)
+  std::locale utf8_locale(std::locale(), new std::codecvt_utf8<wchar_t>);
+  std::locale::global(utf8_locale);
+  boost::filesystem::path::imbue(utf8_locale);
+#pragma GCC diagnostic pop
+
+  mail::man = std::make_shared<safe::mail_raw_t>();
+
+  // parse config file
+  if (config::parse(argc, argv)) {
+    return 0;
+  }
+
+  auto log_deinit_guard = logging::init(config::sunshine.min_log_level, config::sunshine.log_file);
+  if (!log_deinit_guard) {
+    BOOST_LOG(error) << "Logging failed to initialize"sv;
+  }
+
+#ifdef _WIN32
+  const auto app_user_model_id_status =
+    SetCurrentProcessExplicitAppUserModelID(WIDEN_STRING_LITERAL(PROJECT_APP_USER_MODEL_ID));
+  if (FAILED(app_user_model_id_status)) {
+    BOOST_LOG(warning) << "Failed to set explicit AppUserModelID; Windows may reuse legacy notification branding"sv;
+  }
+#endif
+
+#ifndef SUNSHINE_EXTERNAL_PROCESS
+  // Setup third-party library logging
+  logging::setup_av_logging(config::sunshine.min_log_level);
+  logging::setup_libdisplaydevice_logging(config::sunshine.min_log_level);
+#endif
+
+#ifdef __ANDROID__
+  // Setup Android-specific logging
+  logging::setup_android_logging();
+#endif
+
+  // logging can begin at this point
+  // if anything is logged prior to this point, it will appear in stdout, but not in the log viewer in the UI
+  // the version should be printed to the log before anything else
+  BOOST_LOG(info) << PROJECT_NAME << " version: " << PROJECT_VERSION << " commit: " << PROJECT_VERSION_COMMIT;
+#ifdef _WIN32
+  const auto windows_version = platf::query_windows_version();
+  BOOST_LOG(info) << "Windows version: product=" << windows_version.product_name
+                  << ", display_version=" << windows_version.display_version
+                  << ", build=" << windows_version.current_build;
+  if (windows_version.build_number.has_value() && *windows_version.build_number < 22000) {
+    BOOST_LOG(warning) << "Windows 10 detected; HDR will not work on the Vibepollo Virtual Display.";
+  }
+#endif
+  if (version_compare::is_prerelease_channel(PROJECT_VERSION)) {
+    BOOST_LOG(info) << "Prerelease build detected; default min_log_level is debug unless overridden.";
+  }
+  BOOST_LOG(info) << "Effective min_log_level=" << config::sunshine.min_log_level;
+
+  // Log publisher metadata
+  log_publisher_data();
+
+  // Log modified_config_settings
+  config::log_config_settings(config::modified_config_settings, false);
+  config::modified_config_settings.clear();
+
+#ifdef _WIN32
+  statefile::repair_config_permissions();
+#endif
+
+#ifdef _WIN32
+  platf::frame_limiter_nvcp::restore_pending_overrides();
+  platf::rtss_restore_pending_overrides();
+#endif
+
+  if (!config::sunshine.cmd.name.empty()) {
+    auto fn = cmd_to_func.find(config::sunshine.cmd.name);
+    if (fn == std::end(cmd_to_func)) {
+      BOOST_LOG(fatal) << "Unknown command: "sv << config::sunshine.cmd.name;
+
+      BOOST_LOG(info) << "Possible commands:"sv;
+      for (auto &[key, _] : cmd_to_func) {
+        BOOST_LOG(info) << '\t' << key;
+      }
+
+      return 7;
+    }
+
+    return fn->second(argv[0], config::sunshine.cmd.argc, config::sunshine.cmd.argv);
+  }
+
+  // Display configuration is managed by the external Windows helper; no in-process init.
+
+  // Construct the process-owned shutdown deadline before the session monitor.
+  // Its cleanup guard also runs on early startup returns, so it must be able
+  // to bound that join as well as the ordinary shutdown path below.
+  auto shutdown_event = mail::man->event<bool>(mail::shutdown);
+  std::atomic_bool shutdown_signal_requested {false};
+  shutdown_deadline_t shutdown_deadline {&shutdown_signal_requested, supervised_machine_host};
+
+#ifdef __linux__
+  std::atomic_bool termination_signal_monitor_stopping {false};
+  std::atomic_bool termination_signal_monitor_finished {false};
+  std::thread termination_signal_monitor;
+  try {
+    termination_signal_monitor = std::thread([&]() {
+      int signal_number = 0;
+      const int wait_error = sigwait(&termination_signal_set, &signal_number);
+      if (wait_error != 0) {
+        BOOST_LOG(error) << "Termination signal wait failed: " << std::strerror(wait_error);
+        shutdown_event->raise(true);
+        termination_signal_monitor_finished.store(true, std::memory_order_release);
+        return;
+      }
+      if (termination_signal_monitor_stopping.load(std::memory_order_acquire)) {
+        termination_signal_monitor_finished.store(true, std::memory_order_release);
+        return;
+      }
+      shutdown_signal_requested.store(true, std::memory_order_relaxed);
+      if (supervised_machine_host) {
+        platf::linux_private_display::request_process_shutdown_preserve();
+      }
+      BOOST_LOG(info) << (signal_number == SIGINT ? "Interrupt handler called"sv : "Terminate handler called"sv);
+      shutdown_event->raise(true);
+  #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+      if (config::sunshine.system_tray) {
+        system_tray::end_tray();
+      }
+  #endif
+      termination_signal_monitor_finished.store(true, std::memory_order_release);
+    });
+  } catch (const std::system_error &exception) {
+    BOOST_LOG(error) << "Unable to create the termination signal monitor: " << exception.what();
+    return 1;
+  }
+  auto stop_termination_signal_monitor = [&]() {
+    if (!termination_signal_monitor.joinable()) {
+      return;
+    }
+    termination_signal_monitor_stopping.store(true, std::memory_order_release);
+    if (!termination_signal_monitor_finished.load(std::memory_order_acquire)) {
+      const int wake_error = pthread_kill(termination_signal_monitor.native_handle(), SIGTERM);
+      if (wake_error != 0 && wake_error != ESRCH) {
+        BOOST_LOG(error) << "Unable to wake the termination signal monitor: " << std::strerror(wake_error);
+      }
+    }
+    termination_signal_monitor.join();
+  };
+  auto termination_signal_monitor_guard = util::fail_guard(stop_termination_signal_monitor);
+#endif
+
+#ifdef WIN32
+  // Modify relevant NVIDIA control panel settings if the system has corresponding gpu
+  if (nvprefs_instance.load()) {
+    // Restore global settings to the undo file left by improper termination of sunshine.exe
+    nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
+    // Modify application settings for sunshine.exe
+    nvprefs_instance.modify_application_profile();
+    // Modify global settings, undo file is produced in the process to restore after improper termination
+    nvprefs_instance.modify_global_profile();
+    // Unload dynamic library to survive driver re-installation
+    nvprefs_instance.unload();
+  }
+
+  // Wait as long as possible to terminate Sunshine.exe during logoff/shutdown
+  SetProcessShutdownParameters(0x100, SHUTDOWN_NORETRY);
+
+  // We must create a hidden window to receive shutdown notifications since we load gdi32.dll
+  std::promise<HWND> session_monitor_hwnd_promise;
+  auto session_monitor_hwnd_future = session_monitor_hwnd_promise.get_future().share();
+  std::promise<DWORD> session_monitor_thread_id_promise;
+  auto session_monitor_thread_id_future = session_monitor_thread_id_promise.get_future().share();
+  std::promise<void> session_monitor_join_thread_promise;
+  auto session_monitor_join_thread_future = session_monitor_join_thread_promise.get_future();
+
+  std::thread session_monitor_thread([&]() {
+    platf::set_thread_name("session_monitor");
+    session_monitor_join_thread_promise.set_value_at_thread_exit();
+
+    // Create a message queue immediately so shutdown can always fall back
+    // to PostThreadMessage(WM_QUIT), even if window creation fails.
+    MSG msg {};
+    PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE);
+    session_monitor_thread_id_promise.set_value(GetCurrentThreadId());
+
+    WNDCLASSA wnd_class {};
+    wnd_class.lpszClassName = "SunshineSessionMonitorClass";
+    wnd_class.lpfnWndProc = SessionMonitorWindowProc;
+    if (!RegisterClassA(&wnd_class)) {
+      session_monitor_hwnd_promise.set_value(nullptr);
+      BOOST_LOG(error) << "Failed to register session monitor window class"sv << std::endl;
+      return;
+    }
+
+    auto wnd = CreateWindowExA(
+      0,
+      wnd_class.lpszClassName,
+      "Sunshine Session Monitor Window",
+      0,
+      CW_USEDEFAULT,
+      CW_USEDEFAULT,
+      CW_USEDEFAULT,
+      CW_USEDEFAULT,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr
+    );
+
+    session_monitor_hwnd_promise.set_value(wnd);
+
+    if (!wnd) {
+      BOOST_LOG(error) << "Failed to create session monitor window"sv << std::endl;
+      return;
+    }
+
+    ShowWindow(wnd, SW_HIDE);
+
+    // Run the message loop for our window
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+      TranslateMessage(&msg);
+      DispatchMessage(&msg);
+    }
+  });
+
+  auto shutdown_session_monitor = [&]() {
+    if (!session_monitor_thread.joinable()) {
+      return;
+    }
+
+    // This cleanup guard covers early returns before shutdown_event->view().
+    // Arm the owned deadline before any potentially unbounded join so that a
+    // pathological message loop cannot hang process teardown indefinitely.
+    shutdown_deadline.arm();
+
+    auto request_session_monitor_shutdown = [&](bool force_quit_only) {
+      if (!force_quit_only) {
+        if (session_monitor_hwnd_future.wait_for(1s) == std::future_status::ready) {
+          if (HWND session_monitor_hwnd = session_monitor_hwnd_future.get()) {
+            if (PostMessage(session_monitor_hwnd, WM_CLOSE, 0, 0)) {
+              return true;
+            }
+
+            BOOST_LOG(warning) << "Failed to post WM_CLOSE to session monitor window: "sv << GetLastError();
+          } else {
+            BOOST_LOG(warning) << "Session monitor window was not created"sv;
+          }
+        } else {
+          BOOST_LOG(warning) << "session_monitor_hwnd_future reached timeout";
+        }
+      }
+
+      if (session_monitor_thread_id_future.wait_for(1s) != std::future_status::ready) {
+        BOOST_LOG(warning) << "session_monitor_thread_id_future reached timeout";
+        return false;
+      }
+
+      const DWORD session_monitor_thread_id = session_monitor_thread_id_future.get();
+      if (!session_monitor_thread_id) {
+        BOOST_LOG(warning) << "Session monitor thread id was not set"sv;
+        return false;
+      }
+
+      if (PostThreadMessage(session_monitor_thread_id, WM_QUIT, 0, 0)) {
+        return true;
+      }
+
+      BOOST_LOG(warning) << "Failed to post WM_QUIT to session monitor thread: "sv << GetLastError();
+      return false;
+    };
+
+    request_session_monitor_shutdown(false);
+
+    if (session_monitor_join_thread_future.wait_for(3s) == std::future_status::ready) {
+      session_monitor_thread.join();
+      return;
+    }
+
+    BOOST_LOG(warning) << "session_monitor_join_thread_future reached timeout";
+    request_session_monitor_shutdown(true);
+
+    // This thread owns a window/message queue and may access logging and
+    // process globals. It must never escape into CRT teardown. The shutdown
+    // deadline is armed before the normal call site below, so an unexpected
+    // stuck message loop is diagnosed instead of being detached unsafely.
+    if (session_monitor_join_thread_future.wait_for(5s) == std::future_status::ready) {
+      session_monitor_thread.join();
+    } else {
+      BOOST_LOG(error) << "session_monitor_thread still running after forced WM_QUIT; waiting for owned thread exit";
+      session_monitor_thread.join();
+    }
+  };
+
+  auto session_monitor_join_thread_guard = util::fail_guard([&]() {
+    shutdown_session_monitor();
+  });
+
+#endif
+
+  task_pool.start(1);
+
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+  // create tray thread and detach it if enabled in config
+  if (config::sunshine.system_tray) {
+    system_tray::run_tray();
+  }
+  // Schedule periodic update checks if configured
+  if (config::sunshine.update_check_interval_seconds > 0) {
+    // Trigger an immediate update check on startup so users don't wait
+    // a full interval before the first detection occurs.
+    update::trigger_check(true);
+
+    auto schedule_periodic = std::make_shared<std::function<void()>>();
+    *schedule_periodic = [schedule_periodic]() {
+      update::periodic();
+      if (config::sunshine.update_check_interval_seconds > 0) {
+        task_pool.pushDelayed(*schedule_periodic, std::chrono::seconds(config::sunshine.update_check_interval_seconds));
+      }
+    };
+    task_pool.pushDelayed(*schedule_periodic, std::chrono::seconds(config::sunshine.update_check_interval_seconds));
+  }
+#endif
+
+#ifndef __linux__
+  // Other platforms retain their native signal/control handlers. Linux has
+  // blocked these signals process-wide and consumes them synchronously above.
+  on_signal(SIGINT, [&shutdown_signal_requested, shutdown_event]() {
+    shutdown_signal_requested.store(true, std::memory_order_relaxed);
+    BOOST_LOG(info) << "Interrupt handler called"sv;
+
+    // Preserve Vibepollo's eager application cleanup; the owned deadline above
+    // replaces the detached task-pool watchdog that used to follow it.
+    proc::proc.terminate();
+    // Break out of the main loop
+    shutdown_event->raise(true);
+  #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+    if (config::sunshine.system_tray) {
+      system_tray::end_tray();
+    }
+  #endif
+  });
+
+  on_signal(SIGTERM, [&shutdown_signal_requested, shutdown_event]() {
+    shutdown_signal_requested.store(true, std::memory_order_relaxed);
+    BOOST_LOG(info) << "Terminate handler called"sv;
+
+    // Break out of the main loop
+    shutdown_event->raise(true);
+  #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+    if (config::sunshine.system_tray) {
+      system_tray::end_tray();
+    }
+  #endif
+  });
+#endif
+
+#ifdef _WIN32
+  // Terminate gracefully on Windows when console window is closed
+  SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+#endif
+
+  proc::refresh(config::stream.file_apps);
+
+  // If any of the following fail, we log an error and continue event though sunshine will not function correctly.
+  // This allows access to the UI to fix configuration problems or view the logs.
+
+  auto platf_deinit_guard = platf::init();
+  if (!platf_deinit_guard) {
+    BOOST_LOG(error) << "Platform failed to initialize"sv;
+  }
+
+#ifdef _WIN32
+  display_helper_integration::start_orphan_recovery_monitor();
+  auto orphan_recovery_monitor_guard = util::fail_guard([]() {
+    display_helper_integration::shutdown_orphan_recovery_monitor();
+  });
+#endif
+
+#ifdef __linux__
+  (void) platf::linux_display::backend().initialize();
+  auto linux_private_display_guard = util::fail_guard([supervised_machine_host]() {
+    if (supervised_machine_host) {
+      platf::linux_private_display::request_process_shutdown_preserve();
+      platf::linux_private_display::shutdown_restore_worker(false);
+      return;
+    }
+    (void) platf::linux_display::backend().revert();
+    platf::linux_private_display::shutdown_restore_worker(true);
+  });
+#endif
+
+  // Steam's catalog can change while the server is running. The watcher is
+  // started after logging/platform initialization and owns its shutdown
+  // thread independently of the task pool.
+  platf::steam::autosync::start();
+  auto steam_autosync_guard = util::fail_guard([]() {
+    platf::steam::autosync::stop();
+  });
+#ifdef __linux__
+  platf::lutris::autosync::start();
+  auto lutris_autosync_guard = util::fail_guard([]() {
+    platf::lutris::autosync::stop();
+  });
+#endif
+
+#ifdef _WIN32
+  // Reconcile the Vulkan HDR implicit-layer registration with the configured preference. This makes
+  // the Web UI toggle authoritative over the installer's unconditional registration and self-heals
+  // when the installer's (now best-effort) registration was skipped or failed. Only attempt when
+  // running as SYSTEM, since it writes HKLM; the call short-circuits when already in the desired state.
+  if (platf::is_running_as_system()) {
+    platf::set_vulkan_hdr_layer_enabled(config::video.dd.vulkan_hdr_layer);
+  }
+#endif
+
+  auto host_stats_deinit_guard = host_stats::start();
+
+  if (shutdown_event->peek()) {
+    return lifetime::desired_exit_code;
+  }
+
+  auto proc_deinit_guard = proc::init();
+  if (!proc_deinit_guard) {
+    BOOST_LOG(error) << "Proc failed to initialize"sv;
+  }
+
+  if (shutdown_event->peek()) {
+    return lifetime::desired_exit_code;
+  }
+
+  reed_solomon_init();
+  auto input_deinit_guard = input::init();
+
+  if (input::probe_gamepads()) {
+    BOOST_LOG(warning) << "No gamepad input is available"sv;
+  }
+
+#ifdef _WIN32
+  const auto has_startup_stream_activity = [] {
+    return rtsp_stream::has_pending_launch_or_startup() ||
+           rtsp_stream::session_count() != 0 ||
+           webrtc_stream::has_active_or_pending_sessions();
+  };
+#endif
+
+#ifdef _WIN32
+  bool startup_probe_succeeded = false;
+#endif
+  auto startup_probe = [&shutdown_event
+#ifdef _WIN32
+                        , &startup_probe_succeeded
+                        , &has_startup_stream_activity
+#endif
+  ]() {
+#ifdef _WIN32
+    constexpr unsigned int max_startup_probe_attempts = 2;
+    unsigned int attempts = 0;
+    std::optional<LUID> required_adapter_luid;
+    std::optional<video::encoder_probe_adapter_hint_lease_t> adapter_hint_lease;
+    if (config::video.virtual_display_mode != config::video_t::virtual_display_mode_e::disabled) {
+      const auto preferred_adapter = platf::resolve_preferred_render_adapter(
+        config::video.adapter_name,
+        config::video.adapter_pnp_id
+      );
+      if (preferred_adapter) {
+        required_adapter_luid = *preferred_adapter.luid;
+        adapter_hint_lease = video::set_pending_virtual_display_adapter_hint(*preferred_adapter.luid);
+      }
+    }
+    auto clear_adapter_hint = util::fail_guard([&adapter_hint_lease]() {
+      if (adapter_hint_lease) {
+        (void) video::clear_pending_virtual_display_adapter_hint(*adapter_hint_lease);
+      }
+    });
+
+    while (true) {
+      const video::startup_encoder_probe_policy::state state {
+        .cache_successful = video::has_successful_encoder_probe(),
+        .stream_active = has_startup_stream_activity(),
+        .shutting_down = shutdown_event->peek(),
+        .attempts = attempts,
+        .max_attempts = max_startup_probe_attempts,
+      };
+      if (state.cache_successful) {
+        startup_probe_succeeded = true;
+        BOOST_LOG(debug) << "Startup encoder probe skipped; a successful adapter-scoped cache already exists.";
+        return;
+      }
+      if (!video::startup_encoder_probe_policy::should_probe(state)) {
+        if (state.stream_active) {
+          BOOST_LOG(debug) << "Startup encoder probe stopped; a streaming session owns the runtime lifecycle.";
+        } else if (video::startup_encoder_probe_policy::terminal_failure(state)) {
+          BOOST_LOG(error) << "Startup encoder probing reached its terminal retry limit without a successful cache.";
+        }
+        return;
+      }
+
+      VDISPLAY::ensure_display_result encoder_probe_display_result {};
+      if (config::video.virtual_display_mode != config::video_t::virtual_display_mode_e::disabled) {
+        encoder_probe_display_result = VDISPLAY::ensure_display(required_adapter_luid);
+      }
+      auto cleanup_encoder_probe_display = util::fail_guard([&encoder_probe_display_result]() {
+        VDISPLAY::cleanup_ensure_display(encoder_probe_display_result);
+      });
+      if (required_adapter_luid && !encoder_probe_display_result.owns_temporary_probe_request()) {
+        BOOST_LOG(warning)
+          << "Startup could not acquire the temporary virtual-display lease; continuing with exact-adapter synthetic encoder validation.";
+      } else if (encoder_probe_display_result.owns_temporary_probe_request() &&
+                 !encoder_probe_display_result.ready_for_capture()) {
+        BOOST_LOG(info)
+          << "Startup temporary display is not published to capture yet; synthetic encoder validation does not wait for it.";
+      }
+
+      ++attempts;
+      if (!video::probe_encoders()) {
+        startup_probe_succeeded = true;
+        BOOST_LOG(info) << "Startup encoder probe produced a successful adapter-scoped cache.";
+        return;
+      }
+
+      const video::startup_encoder_probe_policy::state failed_state {
+        .cache_successful = video::has_successful_encoder_probe(),
+        .stream_active = has_startup_stream_activity(),
+        .shutting_down = shutdown_event->peek(),
+        .attempts = attempts,
+        .max_attempts = max_startup_probe_attempts,
+      };
+      if (video::startup_encoder_probe_policy::should_probe(failed_state)) {
+        BOOST_LOG(warning) << "Startup encoder probe failed; retrying without waiting for desktop publication (attempt "
+                           << (attempts + 1) << '/' << max_startup_probe_attempts << ").";
+        std::this_thread::sleep_for(250ms);
+      }
+    }
+#else
+    if (video::has_successful_encoder_probe()) {
+      return;
+    }
+    if (video::probe_encoders()) {
+      BOOST_LOG(error) << "Failed to probe encoders during startup.";
+    }
+#endif
+  };
+
+#ifdef _WIN32
+  auto startup_display_recovery = [&shutdown_event, &has_startup_stream_activity]() {
+    if (shutdown_event->peek() || has_startup_stream_activity() || VDISPLAY::has_retained_ensure_display()) {
+      return;
+    }
+    const auto virtual_displays = VDISPLAY::enumerateVirtualDisplays();
+    const bool has_active_virtual_display = std::any_of(
+      virtual_displays.begin(),
+      virtual_displays.end(),
+      [](const VDISPLAY::VirtualDisplayInfo &info) {
+        return info.is_active;
+      }
+    );
+    if (!has_active_virtual_display || shutdown_event->peek() || has_startup_stream_activity() ||
+        VDISPLAY::has_retained_ensure_display()) {
+      return;
+    }
+    BOOST_LOG(warning) << "Startup detected active virtual display(s) with no active stream session; running cleanup.";
+    (void) platf::virtual_display_cleanup::run("startup_recovery", config::video.dd.config_revert_on_disconnect);
+  };
+#endif
+
+  // Initialize session history in its own directory so database hardening never
+  // touches the shared config root that also contains credentials/pairing state.
+  {
+    std::filesystem::path state_path {config::nvhttp.file_state};
+    const auto config_dir = state_path.parent_path();
+    const auto history_dir = config_dir / "session_history";
+    const auto history_db = history_dir / "session_history.db";
+
+    // Best-effort alpha.1/alpha.2 migration: preserve any database that was
+    // created in the shared config root before the storage was isolated.
+    const auto legacy_history_db = config_dir / "session_history.db";
+    auto move_if_needed = [](const std::filesystem::path &from, const std::filesystem::path &to) -> bool {
+      std::error_code ec;
+      const bool from_exists = std::filesystem::exists(from, ec);
+      if (!from_exists || ec) {
+        return false;
+      }
+      ec.clear();
+      const bool to_exists = std::filesystem::exists(to, ec);
+      if (to_exists || ec) {
+        return false;
+      }
+
+      ec.clear();
+      std::filesystem::create_directories(to.parent_path(), ec);
+      if (ec) {
+        BOOST_LOG(warning) << "session_history: failed to create isolated history directory "
+                           << to.parent_path().string() << ": " << ec.message();
+        return false;
+      }
+
+      std::filesystem::rename(from, to, ec);
+      if (ec) {
+        BOOST_LOG(warning) << "session_history: failed to move legacy database file "
+                           << from.string() << " to " << to.string() << ": " << ec.message();
+        return false;
+      }
+
+      return true;
+    };
+    const bool migrated_main_db = move_if_needed(legacy_history_db, history_db);
+    if (migrated_main_db) {
+      move_if_needed(legacy_history_db.string() + "-wal", history_db.string() + "-wal");
+      move_if_needed(legacy_history_db.string() + "-shm", history_db.string() + "-shm");
+    }
+
+    session_history::init(history_db.string());
+  }
+  auto session_history_shutdown_guard = util::fail_guard([]() {
+    session_history::shutdown();
+  });
+
+  if (http::init()) {
+    BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
+
+#ifdef _WIN32
+    BOOST_LOG(fatal) << "To relaunch Apollo successfully, use the shortcut in the Start Menu. Do not run sunshine.exe manually."sv;
+    std::this_thread::sleep_for(10s);
+#endif
+
+    return -1;
+  }
+
+#ifdef _WIN32
+  // Start Playnite integration (IPC + handlers)
+  std::unique_ptr<platf::deinit_t> playnite_integration_guard;
+  if (config::playnite.enabled) {
+    playnite_integration_guard = platf::playnite::start();
+  }
+#endif
+
+  std::thread configThread {confighttp::start};
+
+  // Produce the capability cache before discovery can advertise the service
+  // or GameStream discovery/launch can observe it. The config UI remains
+  // available while the bounded synthetic probe runs.
+  startup_probe();
+  if (shutdown_event->peek()) {
+    configThread.join();
+    return lifetime::desired_exit_code;
+  }
+
+  std::unique_ptr<platf::deinit_t> mDNS;
+  auto sync_mDNS = std::async(std::launch::async, [&mDNS]() {
+    if (config::sunshine.enable_discovery) {
+      mDNS = platf::publish::start();
+    }
+  });
+
+  std::unique_ptr<platf::deinit_t> upnp_unmap;
+  auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
+    upnp_unmap = upnp::start();
+  });
+
+  // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
+  if (shutdown_event->peek()) {
+    configThread.join();
+    return lifetime::desired_exit_code;
+  }
+
+  std::thread httpThread {nvhttp::start};
+  std::thread rtspThread {rtsp_stream::start};
+
+#ifdef _WIN32
+  // Stale-display cleanup is separate from encoder validation and therefore
+  // runs only after the network listeners are available.
+  if (startup_probe_succeeded) {
+    startup_display_recovery();
+  } else {
+    BOOST_LOG(warning) << "Startup stale-display cleanup skipped because encoder validation did not produce a successful cache.";
+  }
+#endif
+
+#ifdef _WIN32
+  // If we're using the default port and GameStream is enabled, warn the user
+  if (config::sunshine.port == 47989 && is_gamestream_enabled()) {
+    BOOST_LOG(fatal) << "GameStream is still enabled in GeForce Experience! This *will* cause streaming problems with Apollo!"sv;
+    BOOST_LOG(fatal) << "Disable GameStream on the SHIELD tab in GeForce Experience or change the Port setting on the Advanced tab in the Apollo Web UI."sv;
+  }
+#endif
+
+  // Wait for shutdown
+  shutdown_event->view();
+#ifdef __linux__
+  if (supervised_machine_host) {
+    platf::linux_private_display::request_process_shutdown_preserve();
+  }
+  stop_termination_signal_monitor();
+  termination_signal_monitor_guard.disable();
+#endif
+  // The signal handler only wakes main; start the owned watchdog here so it
+  // never constructs threads or queues work from signal context.
+  shutdown_deadline.arm();
+
+#ifdef WIN32
+  // Join the hidden shutdown-notification window while the deadline watchdog
+  // is still armed. The guard remains for early-return paths only.
+  shutdown_session_monitor();
+  session_monitor_join_thread_guard.disable();
+#endif
+
+#ifdef _WIN32
+  // Stop the owned lock-screen virtual-output worker before recovery workers
+  // can publish more overrides. Both use configuration, the display helper,
+  // and mail, all of which remain live until these joins complete.
+  config::request_deferred_virtual_output_reapply_shutdown();
+  display_helper_integration::shutdown_orphan_recovery_monitor();
+  orphan_recovery_monitor_guard.disable();
+  VDISPLAY::request_virtual_display_recovery_shutdown();
+  config::join_deferred_virtual_output_reapply_worker();
+  VDISPLAY::join_virtual_display_recovery_monitors();
+#endif
+
+  httpThread.join();
+  configThread.join();
+  rtspThread.join();
+
+#ifdef __linux__
+  platf::lutris::autosync::stop();
+  lutris_autosync_guard.disable();
+#endif
+  platf::steam::autosync::stop();
+  steam_autosync_guard.disable();
+
+#ifdef _WIN32
+  // Full process shutdown cannot leave the paused-session watchdog running.
+  // If it survives past main(), CRT teardown can fast-fail while the helper
+  // watchdog thread is still unwinding.
+  display_helper_integration::stop_watchdog(true);
+
+  // The virtual display watchdog thread also lives in static storage.
+  // Ensure it is joined before CRT on-exit handlers destroy the thread object.
+  VDISPLAY::cleanup_retained_ensure_display();
+  VDISPLAY::closeVDisplayDevice();
+#endif
+
+  task_pool.stop();
+  task_pool.join();
+
+  // stop system tray
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+  system_tray::end_tray();
+#endif
+
+#ifdef WIN32
+  // Restore global NVIDIA control panel settings
+  if (nvprefs_instance.owning_undo_file() && nvprefs_instance.load()) {
+    nvprefs_instance.restore_global_profile();
+    nvprefs_instance.unload();
+  }
+#endif
+
+  session_history::shutdown();
+  session_history_shutdown_guard.disable();
+
+  return lifetime::desired_exit_code;
+}

@@ -1,0 +1,67 @@
+# load common dependencies
+# this file will also load platform specific dependencies
+
+# Resolve OpenSSL before subprojects run their own find_package(OpenSSL) calls.
+# This ensures a user-provided OPENSSL_ROOT_DIR is honored consistently.
+find_package(OpenSSL REQUIRED)
+
+# boost, this should be before Simple-Web-Server as it also depends on boost
+include(dependencies/Boost_Sunshine)
+
+# submodules
+# moonlight common library
+set(ENET_NO_INSTALL ON CACHE BOOL "Don't install any libraries built for enet")
+add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet")
+
+# web server
+add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/Simple-Web-Server")
+
+# libdisplaydevice
+add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libdisplaydevice")
+
+# libvirtualdisplay
+include(dependencies/libvirtualdisplay_source)
+set(BUILD_VIBESHINE_KWIN_GPU_BRIDGE ON CACHE BOOL
+        "Build the bundled libvirtualdisplay KWin GPU-association bridge" FORCE)
+add_subdirectory("${SUNSHINE_LIBVIRTUALDISPLAY_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/third-party/libvirtualdisplay")
+
+# common dependencies
+include("${CMAKE_MODULE_PATH}/dependencies/nlohmann_json.cmake")
+find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
+pkg_check_modules(CURL REQUIRED libcurl)
+
+# SQLite3 (session history persistence)
+pkg_check_modules(SQLITE3 REQUIRED sqlite3)
+
+# miniupnp
+pkg_check_modules(MINIUPNP miniupnpc REQUIRED)
+include_directories(SYSTEM ${MINIUPNP_INCLUDE_DIRS})
+
+# ffmpeg pre-compiled binaries
+include("${CMAKE_MODULE_PATH}/dependencies/ffmpeg.cmake")
+
+# Opus
+# Homebrew provides opus as a dynamic library only, so disable static linking for Homebrew builds
+if(SUNSHINE_BUILD_HOMEBREW)
+    set(OPUS_USE_STATIC OFF CACHE BOOL "Static linking for libopus")
+else()
+    set(OPUS_USE_STATIC ON CACHE BOOL "Static linking for libopus")
+endif()
+include("${CMAKE_MODULE_PATH}/dependencies/FindOpus.cmake")
+
+# platform specific dependencies
+if(WIN32)
+    include("${CMAKE_MODULE_PATH}/dependencies/windows.cmake")
+elseif(UNIX)
+    include("${CMAKE_MODULE_PATH}/dependencies/unix.cmake")
+
+    if(APPLE)
+        include("${CMAKE_MODULE_PATH}/dependencies/macos.cmake")
+    else()
+        include("${CMAKE_MODULE_PATH}/dependencies/linux.cmake")
+    endif()
+endif()
+
+# PyroWave codec library (optional)
+include("${CMAKE_MODULE_PATH}/dependencies/pyrowave.cmake")
