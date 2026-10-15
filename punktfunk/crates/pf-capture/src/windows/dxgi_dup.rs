@@ -30,6 +30,9 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
+use windows::Win32::System::StationsAndDesktops::{
+    OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DF_ALLOWOTHERACCOUNTHOOK,
+};
 
 const RING: usize = 4;
 
@@ -94,6 +97,30 @@ fn wide_eq(raw: &[u16], name: &str) -> bool {
     String::from_utf16_lossy(&raw[..len]).eq_ignore_ascii_case(name)
 }
 
+/// Moves the calling thread onto the desktop now receiving input before a duplication is
+/// made, as rust-shine's `capture-dxgi` does. `DuplicateOutput` duplicates the calling
+/// thread's desktop, and a thread keeps the one it started on. Under the USBridge agent the
+/// host runs as SYSTEM in the console session (`sessionlaunch.LaunchInActiveSession`); a
+/// duplication made off the input desktop gets `DXGI_ERROR_ACCESS_LOST` on every acquire,
+/// so the reopen loop spins and the first frame never comes. Best effort: if the desktop
+/// can't be opened the thread stays where it is and `DuplicateOutput` reports for itself.
+fn attach_input_desktop() {
+    // GENERIC_ALL, which the `windows` crate has no typed desktop constant for.
+    const GENERIC_ALL: DESKTOP_ACCESS_FLAGS = DESKTOP_ACCESS_FLAGS(0x1000_0000);
+    // SAFETY: plain Win32 calls; the handle stays open while the thread is on it, and the
+    // process exit reclaims it (closing it would undo the binding just made).
+    unsafe {
+        match OpenInputDesktop(DF_ALLOWOTHERACCOUNTHOOK, false, GENERIC_ALL) {
+            Ok(desk) => {
+                if let Err(e) = SetThreadDesktop(desk) {
+                    tracing::debug!(error = %e, "SetThreadDesktop failed -- duplicating this thread's desktop");
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "OpenInputDesktop failed -- duplicating this thread's desktop"),
+        }
+    }
+}
+
 /// Device on the adapter DXGI lists the output under, plus a duplication of that output.
 ///
 /// Found by GDI name across every adapter, not by `target.adapter_luid`: that is the CCD
@@ -102,6 +129,7 @@ fn wide_eq(raw: &[u16], name: &str) -> bool {
 fn open_dup(
     target: &pf_frame::dxgi::WinCaptureTarget,
 ) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutputDuplication)> {
+    attach_input_desktop();
     // SAFETY: COM calls on owned interfaces; every out value is checked.
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;

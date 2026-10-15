@@ -43,12 +43,32 @@ tablet) and, on Windows, gamepads. See
 
 On Windows, upstream re-ACLs its config dir for the `%ProgramData%` dir a
 SYSTEM service shares with the user: full control for SYSTEM and
-Administrators only, read-only for Users. The agent instead runs the host
-unelevated, with `PUNKTFUNK_CONFIG_DIR` in the user's own `%APPDATA%`, so that
-DACL locked the host out of its own dir. Its first write
-(`native-key.pem`) failed with "Access is denied" and it exited. The fork
-hardens only dirs under `%ProgramData%`
-(`punktfunk/crates/pf-paths/src/lib.rs`, `is_under_program_data`).
+Administrators only, read-only for Users. Run outside `%ProgramData%`, for
+example with `PUNKTFUNK_CONFIG_DIR` in a user's own `%APPDATA%`, that DACL
+locked the host out of its own dir. Its first write (`native-key.pem`) failed
+with "Access is denied" and it exited. The fork hardens only dirs under
+`%ProgramData%` (`punktfunk/crates/pf-paths/src/lib.rs`,
+`is_under_program_data`).
+
+### Windows: how the agent runs it
+
+The USBridge agent is a LocalSystem service in Session 0, which has no
+displays. It starts `punktfunk-host` the way it starts Sunshine, Vibepollo
+and RustShine: as SYSTEM in the active console session
+(`sessionlaunch.LaunchInActiveSession`), with the admin token,
+`PUNKTFUNK_CONFIG_DIR` and `USBRIDGE_USB_BROKER_CONTROL` in its environment.
+Run as a plain child of the service, the host was still in Session 0. It
+could not attach or capture the monitor, and clients got audio but "No video
+received from host".
+
+A SYSTEM process in the console session also has to move its capture thread
+onto the desktop receiving input before it duplicates the monitor.
+Otherwise every `AcquireNextFrame` returns `DXGI_ERROR_ACCESS_LOST`: the
+host reopened the duplication about 30 times in 2 s and the stream failed
+with "no frame within 2s". `dxgi_dup.rs` (`attach_input_desktop`) does what
+rust-shine's `capture-dxgi` does: before every `DuplicateOutput` it calls
+`OpenInputDesktop` and then `SetThreadDesktop`. That way capture also
+follows the lock screen and UAC prompts.
 
 ### Windows video: the shared MttVDD monitor, no pf-vdisplay driver
 
@@ -57,8 +77,8 @@ driver creates the virtual monitor and also encodes inside WUDFHost, so the host
 must run as a SYSTEM service, and the driver needs an elevated install plus its
 own certificate. The fork uses the virtual monitor every USBridge streamer
 shares instead: MttVDD (VirtualDrivers' Virtual Display Driver, which RustShine
-uses too). That is one driver for all streamers, with the host running as the
-user.
+uses too). That is one driver for all streamers, and the host needs no driver
+of its own.
 
 The pieces:
 
@@ -185,12 +205,30 @@ endpoints report it as never required, and its installer endpoint refuses.
 
 ## Releases
 
-Built in GitHub Actions only, never on a dev box: `sunshine-release.yml`
-(Linux, Windows, macOS) and `punktfunk-release.yml` (Linux x86_64 host and
-encode worker with NVENC; Windows x64 `punktfunk-host.exe`, no installer).
-Both are manual: pick a platform (`all` by default) and give a tag to publish
-a release, or leave the tag empty for a build-only test. From Actions -> the
-workflow -> Run workflow, or from a terminal:
+Built in GitHub Actions only, never on a dev box. The agent takes its streamers from
+releases of `release-all.yml` (Actions -> "Release All Forks"). That workflow builds all
+three forks and publishes them under one tag, with a signed `manifest.json` of every
+asset's SHA-256, because the agent refuses unsigned downloads. One tag for all three
+matters: GitHub's `/releases/latest` follows whichever release was published last,
+so a one-fork release would hide the others from the agent.
+
+| Fork | Assets |
+|---|---|
+| Sunshine (`sunshine-build.yml`) | Linux, Windows, macOS (Developer-ID-signed, notarized) |
+| Punktfunk (`punktfunk-build.yml`) | Linux x86_64 host and encode worker with NVENC; Windows x64 `punktfunk-host.exe`, no installer |
+| Vibepollo (`vibepollo-build.yml`) | Windows x64 portable zip |
+
+Each fork's platform is picked separately (`all` by default; `none` skips the fork). An
+empty tag builds and publishes nothing, which is how a change is tested:
+
+    gh workflow run release-all.yml -R USBridge-Technologies/Streamers-Forks --ref main \
+        -f tag=                                        # build only
+    gh workflow run release-all.yml -R USBridge-Technologies/Streamers-Forks --ref main \
+        -f tag=v2026.1015.usbridge                     # release
+
+The older per-fork workflows, `sunshine-release.yml` and `punktfunk-release.yml`, still
+work, but a release from one of them moves `/releases/latest` as described above. Only
+use them for build-only tests:
 
     scripts/release.sh punktfunk v0.42.0.usbridge.2            # all platforms
     scripts/release.sh punktfunk v0.42.0.usbridge.2 windows
