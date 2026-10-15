@@ -61,14 +61,24 @@ Run as a plain child of the service, the host was still in Session 0. It
 could not attach or capture the monitor, and clients got audio but "No video
 received from host".
 
-The host attaches MttVDD and makes it primary just before capture opens.
-DWM then rebuilds the desktop for a few seconds, and every duplication made
-meanwhile gets `DXGI_ERROR_ACCESS_LOST`. On a Windows 10 Intel UHD box the
-host reopened it about 30 times in 2 s. Upstream's 2 s first-frame wait ran
-out, the stream failed with "no frame within 2s", and the client showed "No
-video received from host". The same monitor, already attached, gives a frame
-at once. `dxgi_dup.rs` therefore waits up to 8 s for the first frame
-(`FIRST_FRAME_BUDGET`), still inside Moonlight's ~10 s limit.
+A monitor duplicated right after it is attached never gives a frame. The
+host attached MttVDD, made it primary and opened the duplication about 100 ms
+later. Every `AcquireNextFrame` then returned `DXGI_ERROR_ACCESS_LOST`, and the
+host reopened the duplication at once, again and again. On a Windows 10 Intel
+UHD box that was 300+ reopens in 8 s with no frame, and the client showed "No
+video received from host". The same monitor attached a second before the
+session gave frames at once. Waiting longer for the first frame did not help,
+and neither did attaching from another process. The fork does two things:
+
+- `mttvdd.rs` leaves a freshly attached monitor 1.5 s (`ATTACH_SETTLE`) before
+  capture opens;
+- `dxgi_dup.rs` backs off between reopens (25 ms per loss in a row, up to
+  500 ms) and waits up to 8 s for the first frame (`FIRST_FRAME_BUDGET`).
+
+With this, the box streams at once, with no reopen. On that box the only audio
+output is the monitor's HDMI. While the displays switch, that endpoint can
+vanish for a moment: one session in a few starts without sound ("no
+loopback-capturable render endpoint").
 
 Before every `DuplicateOutput`, the capture thread also binds to the desktop
 receiving input (`attach_input_desktop`, `OpenInputDesktop` +
