@@ -88,6 +88,7 @@
 #include "rtsp_pending_policy.h"
 #include "stream.h"
 #include "system_tray.h"
+#include "usbridge.h"
 #include "video.h"
 #include "webrtc_stream.h"
 #include "zwpad.h"
@@ -3442,7 +3443,9 @@ namespace nvhttp {
           std::lock_guard<std::mutex> lock(client_mutex);
           first_client = client_root.named_devices.empty();
         }
-        if (first_client) {
+        // usbridge: under the agent every client it pairs (its own PIN flow) is trusted
+        // fully, as on Sunshine; nobody is there to grant permissions in the web UI.
+        if (first_client || usbridge::under_agent()) {
           named_cert_p->perm = PERM::_all;
         } else {
           named_cert_p->perm = PERM::_default;

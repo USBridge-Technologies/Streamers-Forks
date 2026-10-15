@@ -228,6 +228,11 @@ namespace usbridge {
     return builds;
   }
 
+  bool under_agent() {
+    sockaddr_in addr {};
+    return broker_addr(addr);
+  }
+
   bool pads_via_broker() {
     static const bool enabled = [] {
       sockaddr_in addr {};

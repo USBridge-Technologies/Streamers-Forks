@@ -46,6 +46,13 @@ namespace usbridge {
   bool pads_via_broker();
 
   /**
+   * @brief Whether this host runs under the USBridge agent (it named the USB broker).
+   * The agent then owns pairing (a client it pairs gets every permission, as on Sunshine)
+   * and the displays (it attaches the shared MttVDD monitor; no display helper here).
+   */
+  bool under_agent();
+
+  /**
    * @brief Length of the frame the broker takes from a raw HID packet body.
    * @param body The packet after its header: `kind slot endpoint 0 total:LE16 offset:LE16 length:LE16 data`.
    * @param size Bytes available in `body`.
