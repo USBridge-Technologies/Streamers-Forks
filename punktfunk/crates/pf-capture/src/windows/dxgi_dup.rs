@@ -36,6 +36,13 @@ use windows::Win32::System::StationsAndDesktops::{
 
 const RING: usize = 4;
 
+/// How long the first frame may take. The host attaches MttVDD and makes it primary just
+/// before capture opens, and DWM goes on rebuilding the desktop for a few seconds: every
+/// duplication made meanwhile gets `DXGI_ERROR_ACCESS_LOST` (measured on a Windows 10 Intel
+/// UHD box: about 30 reopens in 2 s, with no frame). Already attached, the same monitor
+/// gives a frame at once. Moonlight gives up on a silent stream after about 10 s.
+const FIRST_FRAME_BUDGET: Duration = Duration::from_secs(8);
+
 /// The pointer as duplication reports it.
 #[derive(Default)]
 struct Pointer {
@@ -414,7 +421,8 @@ impl DxgiDupCapturer {
 
 impl Capturer for DxgiDupCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
-        self.next_frame_within(Duration::from_secs(2))
+        let budget = if self.last.is_none() { FIRST_FRAME_BUDGET } else { Duration::from_secs(2) };
+        self.next_frame_within(budget)
     }
 
     /// The next new frame, waiting up to `budget`; past that a repeat of the newest one

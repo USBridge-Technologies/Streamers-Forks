@@ -61,14 +61,20 @@ Run as a plain child of the service, the host was still in Session 0. It
 could not attach or capture the monitor, and clients got audio but "No video
 received from host".
 
-A SYSTEM process in the console session also has to move its capture thread
-onto the desktop receiving input before it duplicates the monitor.
-Otherwise every `AcquireNextFrame` returns `DXGI_ERROR_ACCESS_LOST`: the
-host reopened the duplication about 30 times in 2 s and the stream failed
-with "no frame within 2s". `dxgi_dup.rs` (`attach_input_desktop`) does what
-rust-shine's `capture-dxgi` does: before every `DuplicateOutput` it calls
-`OpenInputDesktop` and then `SetThreadDesktop`. That way capture also
-follows the lock screen and UAC prompts.
+The host attaches MttVDD and makes it primary just before capture opens.
+DWM then rebuilds the desktop for a few seconds, and every duplication made
+meanwhile gets `DXGI_ERROR_ACCESS_LOST`. On a Windows 10 Intel UHD box the
+host reopened it about 30 times in 2 s. Upstream's 2 s first-frame wait ran
+out, the stream failed with "no frame within 2s", and the client showed "No
+video received from host". The same monitor, already attached, gives a frame
+at once. `dxgi_dup.rs` therefore waits up to 8 s for the first frame
+(`FIRST_FRAME_BUDGET`), still inside Moonlight's ~10 s limit.
+
+Before every `DuplicateOutput`, the capture thread also binds to the desktop
+receiving input (`attach_input_desktop`, `OpenInputDesktop` +
+`SetThreadDesktop`), as rust-shine's `capture-dxgi` does. That keeps capture
+working through the lock screen and UAC prompts, which a SYSTEM host can
+reach.
 
 ### Windows video: the shared MttVDD monitor, no pf-vdisplay driver
 
