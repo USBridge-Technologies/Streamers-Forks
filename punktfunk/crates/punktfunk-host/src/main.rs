@@ -458,6 +458,11 @@ fn real_main() -> Result<()> {
         println!("punktfunk-host {}", crate::version::get());
         return Ok(());
     }
+    // USBridge: attach the MttVDD monitor for the parent host and exit (see `attach_in_helper`).
+    #[cfg(target_os = "windows")]
+    if args.first().map(String::as_str) == Some(pf_vdisplay::mttvdd::ATTACH_HELPER_ARG) {
+        std::process::exit(pf_vdisplay::mttvdd::attach_helper_main());
+    }
     // The USBridge agent asks whether this build hands devices to its USB broker.
     if args.first().map(String::as_str) == Some("usbridge-bridge") {
         println!("{}", gamestream::usbridge::PROBE_LINE);
