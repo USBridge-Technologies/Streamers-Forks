@@ -57,10 +57,6 @@
 	path = third-party/TPCircularBuffer
 	url = https://github.com/michaeltyson/TPCircularBuffer.git
 	branch = master
-[submodule "third-party/ViGEmClient"]
-	path = third-party/ViGEmClient
-	url = https://github.com/LizardByte/Virtual-Gamepad-Emulation-Client.git
-	branch = master
 [submodule "third-party/wayland-protocols"]
 	path = third-party/wayland-protocols
 	url = https://github.com/LizardByte-infrastructure/wayland-protocols.git

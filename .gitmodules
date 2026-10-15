@@ -116,10 +116,6 @@
 	path = vibepollo/third-party/TPCircularBuffer
 	url = https://github.com/michaeltyson/TPCircularBuffer.git
 	branch = master
-[submodule "vibepollo/third-party/ViGEmClient"]
-	path = vibepollo/third-party/ViGEmClient
-	url = https://github.com/LizardByte/Virtual-Gamepad-Emulation-Client.git
-	branch = master
 [submodule "vibepollo/third-party/wayland-protocols"]
 	path = vibepollo/third-party/wayland-protocols
 	url = https://github.com/LizardByte-infrastructure/wayland-protocols.git

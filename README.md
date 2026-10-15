@@ -7,6 +7,7 @@ directory each, with the USBridge changes on top of an upstream snapshot.
 |---|---|---|
 | `punktfunk/` | https://git.unom.io/unom/punktfunk | `6988e5c229ffc7d5c45ec472d24a24285959cdfb` (2026-10-02, 0.42.0) |
 | `sunshine/` | https://github.com/LizardByte/Sunshine | `4429acd026f7942115c58aeaa7d0ea50a33d0ca9` |
+| `vibepollo/` | https://github.com/Nonary/Vibepollo | `66e169c3` (2026-10-13) |
 
 Each directory keeps its upstream license. The first commit that adds a
 directory is the untouched upstream tree; later commits are the USBridge
@@ -132,6 +133,15 @@ What was removed and what stays:
 Without the USBridge agent (no `USBRIDGE_USB_BROKER_CONTROL`), Sunshine on
 Windows has no gamepads. Keyboard, mouse, touch and pen work as before.
 
+### Windows: the shared MttVDD monitor by name
+
+Sunshine has no virtual display of its own. The USBridge agent attaches the MttVDD
+monitor every USBridge streamer shares before Sunshine starts, and sets `output_name` to
+its friendly name, `VDD by MTT`. Upstream takes only libdisplaydevice's `device_id` there,
+which is derived from the EDID and the instance path, so the agent cannot compute it. The
+fork's `map_output_name` (`sunshine/src/display_device.cpp`) therefore also accepts a
+monitor's friendly name or GDI name (`\\.\DISPLAY5`), as Vibepollo does upstream.
+
 ### Linux and macOS
 
 These keep upstream libvirtualhid for keyboard, mouse and gamepads (uinput or
@@ -149,6 +159,29 @@ Its submodules are registered in this repository's `.gitmodules`:
     cmake -B sunshine/build -S sunshine -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF \
         -DSUNSHINE_ENABLE_VULKAN=OFF -DSUNSHINE_ENABLE_TRAY=OFF
     cmake --build sunshine/build
+
+## vibepollo
+
+Nonary's Vibepollo (Apollo/Sunshine fork, Windows only here) with the same USB broker
+bridge, `web_bind_address` and client cursor setting as the Sunshine fork
+(`vibepollo/src/usbridge.{h,cpp}`).
+
+Under the USBridge agent (`USBRIDGE_USB_BROKER_CONTROL` set, `usbridge::under_agent()`):
+
+- gamepads and raw HID devices go to the USB broker (usbip-win2);
+- the agent owns the displays: it attaches the shared MttVDD monitor and runs Vibepollo
+  with `virtual_display_mode = disabled`, and Vibepollo never starts its display helper
+  (launched as the user, it could not even read its exe in the SYSTEM profile);
+- a client the agent pairs gets every permission, as on Sunshine. Upstream gives only
+  the first client full access, and the rest get "view + list" until someone grants
+  more in the web UI.
+
+### No ViGEmBus
+
+The ViGEm client, its build entries and the `third-party/ViGEmClient` submodule are gone.
+Gamepads come from the USB broker under the agent; without it, only Vibepollo's own drivers
+remain (its VHF virtual gamepad driver, the DualSense over usbip-win2). The web UI's ViGEm
+endpoints report it as never required, and its installer endpoint refuses.
 
 ## Releases
 
