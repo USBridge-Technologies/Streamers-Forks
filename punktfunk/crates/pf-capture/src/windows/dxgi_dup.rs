@@ -92,6 +92,8 @@ pub struct DxgiDupCapturer {
     keepalive: Option<Box<dyn Send>>,
     /// A frame `wait_arrival` acquired, for the next `try_latest` (a duplication cannot peek).
     pending: Option<CapturedFrame>,
+    /// `DXGI_ERROR_ACCESS_LOST`s in a row, for the reopen backoff.
+    lost: u32,
 }
 
 // SAFETY: `make_device` omits `SINGLETHREADED`; D3D11/DXGI COM refcounts are interlocked.
@@ -280,6 +282,7 @@ impl DxgiDupCapturer {
             start: Instant::now(),
             keepalive: Some(keepalive),
             pending: None,
+            lost: 0,
         })
     }
 
@@ -378,11 +381,16 @@ impl DxgiDupCapturer {
             Ok(()) => {}
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                // Back off while the desktop is still changing: reopening at once, again and
+                // again, kept a freshly attached monitor from ever giving a frame.
+                self.lost += 1;
+                std::thread::sleep(Duration::from_millis((25 * u64::from(self.lost)).min(500)));
                 self.reopen()?;
                 return Ok(None);
             }
             Err(e) => return Err(anyhow!("AcquireNextFrame: {e}")),
         }
+        self.lost = 0;
         let result = (|| -> Result<Option<CapturedFrame>> {
             let pointer_changed = self.update_pointer(&info);
             let new_image = info.LastPresentTime != 0;

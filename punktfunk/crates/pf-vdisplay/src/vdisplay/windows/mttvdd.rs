@@ -55,6 +55,8 @@ use crate::Mode;
 const HARDWARE_ID: &str = "Root\\MttVDD";
 /// MttVDD's monitor in its target device path (`DISPLAY#MTT1337#...`).
 const TARGET_ID: &str = "MTT1337";
+/// How long a freshly attached monitor is left to settle before it is captured.
+const ATTACH_SETTLE: Duration = Duration::from_millis(1500);
 
 /// Whether the MttVDD adapter is installed (has a GDI source).
 pub fn is_installed() -> bool {
@@ -143,9 +145,12 @@ fn attach(want: Mode) -> Result<(Mode, pf_frame::dxgi::WinCaptureTarget)> {
         tracing::warn!(?want, got = ?mode, "MttVDD has no exact mode for the client -- using the closest");
     }
     if !source.attached {
-        if let Err(e) = attach_in_helper() {
-            tracing::warn!(error = %e, "MttVDD: attach helper failed -- attaching in this process");
-            attach_here()?;
+        let primary_before = current_primary();
+        attach_target(TARGET_ID).context("MttVDD attach")?;
+        if let Some(p) = primary_before {
+            if let Err(e) = move_origin_to(&p) {
+                tracing::warn!(error = %e, primary = %p, "MttVDD: couldn't keep the primary in place after attach");
+            }
         }
     }
     set_mode(&source.name, mode)?;
@@ -164,6 +169,12 @@ fn attach(want: Mode) -> Result<(Mode, pf_frame::dxgi::WinCaptureTarget)> {
     if want_primary() {
         make_primary(&name).context("make the MttVDD monitor primary")?;
     }
+    if !source.attached {
+        // A monitor duplicated right after it is attached keeps losing the duplication
+        // (DXGI_ERROR_ACCESS_LOST on every acquire, no frame in 8 s on a Windows 10 Intel UHD
+        // box); attached a second earlier, the same monitor gives frames at once.
+        std::thread::sleep(ATTACH_SETTLE);
+    }
     let path = active_paths()?
         .into_iter()
         .find(|p| source_gdi_name(p).is_some_and(|n| n.eq_ignore_ascii_case(&name)))
@@ -178,60 +189,6 @@ fn attach(want: Mode) -> Result<(Mode, pf_frame::dxgi::WinCaptureTarget)> {
     };
     tracing::info!(display = %name, ?mode, primary = want_primary(), "MttVDD virtual monitor attached");
     Ok((mode, target))
-}
-
-/// Argument that makes `punktfunk-host` attach the monitor and exit (`attach_helper_main`).
-pub const ATTACH_HELPER_ARG: &str = "mttvdd-attach";
-
-/// Attach the monitor, keeping the current primary at the origin.
-fn attach_here() -> Result<()> {
-    let primary_before = current_primary();
-    attach_target(TARGET_ID).context("MttVDD attach")?;
-    if let Some(p) = primary_before {
-        if let Err(e) = move_origin_to(&p) {
-            tracing::warn!(error = %e, primary = %p, "MttVDD: couldn't keep the primary in place after attach");
-        }
-    }
-    Ok(())
-}
-
-/// Attach from a short-lived copy of this exe. A process that attaches the monitor itself
-/// cannot duplicate it afterwards: on a Windows 10 Intel UHD box every `AcquireNextFrame`
-/// then returned `DXGI_ERROR_ACCESS_LOST` (hundreds of reopens in 8 s, no frame), while the
-/// same monitor attached by another process, even a second before, gave frames at once.
-/// The USBridge agent attaches it from a helper process for Sunshine for the same reason.
-fn attach_in_helper() -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let exe = std::env::current_exe().context("current exe")?;
-    let out = std::process::Command::new(exe)
-        .arg(ATTACH_HELPER_ARG)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .context("run the attach helper")?;
-    if !out.status.success() {
-        bail!("attach helper: {} {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(())
-}
-
-/// `punktfunk-host mttvdd-attach`: attach the monitor (if it isn't) and exit.
-pub fn attach_helper_main() -> i32 {
-    match find_source() {
-        None => {
-            eprintln!("MttVDD (Virtual Display Driver) is not installed");
-            1
-        }
-        Some(s) if s.attached => 0,
-        Some(_) => match attach_here() {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("{e:#}");
-                1
-            }
-        },
-    }
 }
 
 // ---- GDI ------------------------------------------------------------------------------
