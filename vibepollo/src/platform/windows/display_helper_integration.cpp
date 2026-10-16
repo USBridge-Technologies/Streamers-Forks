@@ -49,7 +49,6 @@
   #include "src/platform/windows/virtual_display.h"
   #include "src/platform/windows/virtual_display_cleanup.h"
   #include "src/process.h"
-  #include "src/usbridge.h"
   #include "src/remote_display_topology.h"
   #include "src/state_storage.h"
   #include "src/stream.h"
@@ -1517,12 +1516,6 @@ namespace {
     const std::function<bool()> &cancellation_predicate,
     const std::chrono::steady_clock::time_point operation_deadline,
     const bool shutdown_class_caller) {
-    // usbridge: under the agent the displays are the agent's (it attaches the shared
-    // MttVDD monitor). The helper is never wanted, and launched as the user it cannot
-    // even read its own exe in the SYSTEM profile the agent installs this host into.
-    if (usbridge::under_agent()) {
-      return false;
-    }
     if (!force_enable && !dd_feature_enabled()) {
       return false;
     }

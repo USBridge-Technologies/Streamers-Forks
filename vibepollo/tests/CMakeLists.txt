@@ -488,10 +488,24 @@ sunshine_register_component(NAME test_component_managed_app_focus TEST_SOURCE un
 sunshine_register_component(NAME test_component_config_playnite TEST_SOURCE test_config_playnite.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/config_playnite_parse.cpp"
     LINK_LIBRARIES nlohmann_json::nlohmann_json)
+set(STEAM_DISCOVERY_TEST_LIBRARIES "")
+if(WIN32)
+    set(STEAM_DISCOVERY_TEST_LIBRARIES advapi32 shell32 wtsapi32)
+endif()
 sunshine_register_component(NAME test_component_steam_integration TEST_SOURCE test_steam_integration.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/steam_integration.cpp"
                     "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/provider_scan_protocol.cpp"
-    LINK_LIBRARIES nlohmann_json::nlohmann_json)
+    LINK_LIBRARIES nlohmann_json::nlohmann_json ${STEAM_DISCOVERY_TEST_LIBRARIES})
+if(NOT WIN32)
+    # Run the production Windows token/session/registry adapter against a narrow
+    # API shim, without touching host identities, sessions or registry hives.
+    sunshine_register_component(NAME test_component_windows_steam_discovery
+        TEST_SOURCE unit/platform/windows/test_steam_discovery.cpp
+        PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/steam_integration.cpp"
+                        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/provider_scan_protocol.cpp"
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/support/windows_steam_api"
+        LINK_LIBRARIES nlohmann_json::nlohmann_json)
+endif()
 if(WIN32)
     # The static FFmpeg build uses BCrypt for its random seed provider.
     list(APPEND STEAM_ARTWORK_TEST_LIBRARIES bcrypt)
@@ -502,7 +516,7 @@ sunshine_register_component(NAME test_component_steam_artwork TEST_SOURCE test_s
                     "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/provider_scan_protocol.cpp"
     INCLUDE_DIRECTORIES ${FFMPEG_INCLUDE_DIRS}
     LINK_LIBRARIES nlohmann_json::nlohmann_json ${FFMPEG_LIBRARIES} ${STEAM_ARTWORK_TEST_LIBRARIES}
-                   ${SUNSHINE_TEST_FFMPEG_PLATFORM_LIBRARIES}
+                   ${SUNSHINE_TEST_FFMPEG_PLATFORM_LIBRARIES} ${STEAM_DISCOVERY_TEST_LIBRARIES}
     DEFINITIONS ${STEAM_ARTWORK_TEST_DEFINITIONS})
 sunshine_register_component(NAME test_component_config_steam TEST_SOURCE test_config_steam.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/config_steam.cpp"
@@ -511,14 +525,14 @@ sunshine_register_component(NAME test_component_steam_sync TEST_SOURCE test_stea
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/steam_sync_policy.cpp"
                     "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/steam_integration.cpp"
                     "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/provider_scan_protocol.cpp"
-    LINK_LIBRARIES nlohmann_json::nlohmann_json)
+    LINK_LIBRARIES nlohmann_json::nlohmann_json ${STEAM_DISCOVERY_TEST_LIBRARIES})
 sunshine_register_component(NAME test_component_steam_process_tracker TEST_SOURCE test_steam_process_tracker.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/steam_process_tracker.cpp")
 sunshine_register_component(NAME test_component_steam_auto_sync TEST_SOURCE test_steam_auto_sync.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/steam_auto_sync_policy.cpp"
                     "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/steam_integration.cpp"
                     "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/provider_scan_protocol.cpp"
-    LINK_LIBRARIES nlohmann_json::nlohmann_json)
+    LINK_LIBRARIES nlohmann_json::nlohmann_json ${STEAM_DISCOVERY_TEST_LIBRARIES})
 sunshine_register_component(NAME test_component_config_lutris TEST_SOURCE test_config_lutris.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/config_lutris.cpp"
     LINK_LIBRARIES nlohmann_json::nlohmann_json)
@@ -529,7 +543,7 @@ sunshine_register_component(NAME test_component_lutris_integration TEST_SOURCE t
                     "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/steam_artwork.cpp"
     INCLUDE_DIRECTORIES ${FFMPEG_INCLUDE_DIRS}
     LINK_LIBRARIES nlohmann_json::nlohmann_json ${SQLITE3_LIBRARIES} ${FFMPEG_LIBRARIES} ${STEAM_ARTWORK_TEST_LIBRARIES}
-                   ${SUNSHINE_TEST_FFMPEG_PLATFORM_LIBRARIES}
+                   ${SUNSHINE_TEST_FFMPEG_PLATFORM_LIBRARIES} ${STEAM_DISCOVERY_TEST_LIBRARIES}
     DEFINITIONS ${STEAM_ARTWORK_TEST_DEFINITIONS})
 sunshine_register_component(NAME test_component_lutris_sync TEST_SOURCE test_lutris_sync.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/lutris_sync_policy.cpp"
@@ -666,6 +680,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set_tests_properties(test_component_linux_steamos_replace_sunshine PROPERTIES LABELS "component")
     find_program(SUNSHINE_TEST_PYTHON_EXECUTABLE NAMES python3)
     if(SUNSHINE_TEST_PYTHON_EXECUTABLE)
+        add_test(NAME test_component_linux_kmsgrab_initialization
+            COMMAND "${SUNSHINE_TEST_PYTHON_EXECUTABLE}"
+                "${CMAKE_CURRENT_LIST_DIR}/unit/platform/linux/test_kmsgrab_initialization.py"
+                "${SUNSHINE_TEST_REPOSITORY_ROOT}" "${CMAKE_CXX_COMPILER}")
+        set_tests_properties(test_component_linux_kmsgrab_initialization PROPERTIES LABELS "component" TIMEOUT 30)
         add_test(NAME test_component_display_capture_admission
             COMMAND "${SUNSHINE_TEST_PYTHON_EXECUTABLE}"
                 "${CMAKE_CURRENT_LIST_DIR}/unit/test_display_capture_admission.py"
@@ -690,6 +709,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 "${CMAKE_CURRENT_LIST_DIR}/unit/test_recovery_status_liveness.py"
                 "${SUNSHINE_TEST_REPOSITORY_ROOT}" "${CMAKE_CXX_COMPILER}")
         set_tests_properties(test_component_recovery_status_liveness PROPERTIES LABELS "component")
+        add_test(NAME test_component_system_tray_shutdown
+            COMMAND "${SUNSHINE_TEST_PYTHON_EXECUTABLE}"
+                "${CMAKE_CURRENT_LIST_DIR}/unit/test_system_tray_shutdown.py"
+                "${SUNSHINE_TEST_REPOSITORY_ROOT}" "${CMAKE_CXX_COMPILER}")
+        set_tests_properties(test_component_system_tray_shutdown PROPERTIES LABELS "component" TIMEOUT 45)
         add_test(NAME test_component_recovery_event_notifications
             COMMAND "${SUNSHINE_TEST_PYTHON_EXECUTABLE}"
                 "${CMAKE_CURRENT_LIST_DIR}/unit/test_recovery_event_notifications.py"
@@ -957,6 +981,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND SUNSHINE_TEST_ENABLE_COMPONENT)
                     "${CMAKE_CURRENT_LIST_DIR}/unit/platform/linux/test_machine_locale.py"
                     "${SUNSHINE_TEST_REPOSITORY_ROOT}")
             set_tests_properties(test_component_linux_machine_locale PROPERTIES LABELS "component" TIMEOUT 30)
+            foreach(package_fixture IN ITEMS
+                    package_kill_mode package_metadata package_host_stop package_host_scope package_transaction_recovery package_postconfigure
+                    package_removal package_masked_host package_mask_ownership package_arch_guard package_force_backup installer_compat installer_ownership installer_real_guard installer_2_0_1 installer_hookdirs)
+                add_test(NAME "test_component_linux_${package_fixture}"
+                    COMMAND "${SUNSHINE_TEST_PYTHON_EXECUTABLE}"
+                        "${CMAKE_CURRENT_LIST_DIR}/unit/platform/linux/test_${package_fixture}.py"
+                        "${SUNSHINE_TEST_REPOSITORY_ROOT}" "vibepollo")
+                set_tests_properties("test_component_linux_${package_fixture}"
+                    PROPERTIES LABELS "component" TIMEOUT 240)
+            endforeach()
+            # Recovery exercises real subprocess publication/crash checkpoints.
+            set_tests_properties(test_component_linux_package_transaction_recovery
+                PROPERTIES TIMEOUT 600)
             add_test(NAME test_component_linux_profile_upgrade
                 COMMAND "${SUNSHINE_TEST_PYTHON_EXECUTABLE}"
                     "${CMAKE_CURRENT_LIST_DIR}/unit/platform/linux/test_profile_upgrade.py"
@@ -1167,12 +1204,25 @@ if(Python3_Interpreter_FOUND AND SUNSHINE_TEST_GXX)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/unit/test_display_policy_adapter.py")
     add_test(NAME regression_virtual_display_refresh
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/unit/test_virtual_display_refresh.py")
+    add_test(NAME regression_virtual_display_recovery_transport
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/unit/test_virtual_display_recovery_transport.py")
+    add_test(NAME regression_virtual_display_recovery_modes
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/unit/test_virtual_display_recovery_modes.py")
 endif()
 
 if(TARGET test_component_resource_locale_catalog)
     set_tests_properties(test_component_resource_locale_catalog PROPERTIES
         WORKING_DIRECTORY "${SUNSHINE_TEST_REPOSITORY_ROOT}")
 endif()
+# Compile extracted production AMF submission and delivery without a GPU.
+find_program(SUNSHINE_TEST_AMF_CXX NAMES g++)
+if(Python3_Interpreter_FOUND AND SUNSHINE_TEST_AMF_CXX)
+    add_test(NAME regression_amf_output_first_retry
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/unit/platform/windows/test_amf_output_first_retry.py"
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}" --compiler "${SUNSHINE_TEST_AMF_CXX}")
+endif()
+
 find_program(SUNSHINE_TEST_POWERSHELL NAMES pwsh powershell)
 if(SUNSHINE_TEST_POWERSHELL)
     add_test(NAME regression_windows_usbip_package

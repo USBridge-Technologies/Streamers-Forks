@@ -63,10 +63,9 @@ find_program(SUNSHINE_DOTNET_EXECUTABLE
         NAMES dotnet dotnet.exe
         HINTS "$ENV{DOTNET_ROOT}" "$ENV{ProgramFiles}/dotnet"
         DOC "Path to dotnet used to build the Playnite plugin")
-# usbridge: the Playnite plugin is optional. A streamer-only build (the USBridge agent's
-# portable zip) has no .NET SDK, so skip the plugin instead of failing configuration.
 if(NOT SUNSHINE_DOTNET_EXECUTABLE)
-    message(STATUS "dotnet was not found: the Playnite plugin is not built")
+    message(FATAL_ERROR
+            "dotnet was not found. Install the .NET SDK or set SUNSHINE_DOTNET_EXECUTABLE.")
 endif()
 set(SUNSHINE_PLAYNITE_PLUGIN_SOURCE_DIR
         "${CMAKE_SOURCE_DIR}/plugins/playnite/SunshinePlaynite")
@@ -111,10 +110,7 @@ add_custom_command(
         VERBATIM
 )
 add_custom_target(build_playnite_plugin DEPENDS ${SUNSHINE_PLAYNITE_PLUGIN_OUTPUT_FILES})
-if(SUNSHINE_DOTNET_EXECUTABLE)
-    add_dependencies(sunshine build_playnite_plugin)
-    set(SUNSHINE_PLAYNITE_PACKAGE_DEPENDENCY build_playnite_plugin)
-endif()
+add_dependencies(sunshine build_playnite_plugin)
 
 # Ensure the Windows display helper is built and staged under the Sunshine tools
 # directory so the runtime launcher can find it reliably.
@@ -168,7 +164,7 @@ endforeach()
 # Convenience target to build MSI via CPack (WiX)
 add_custom_target(package_msi
     COMMAND "${CMAKE_CPACK_COMMAND}" -G WIX -C "$<IF:$<CONFIG:>,${CMAKE_BUILD_TYPE},$<CONFIG>>"
-    DEPENDS ${SUNSHINE_WINDOWS_PACKAGED_TARGETS} ${SUNSHINE_PLAYNITE_PACKAGE_DEPENDENCY} build_uninstall_ui web_ui
+    DEPENDS ${SUNSHINE_WINDOWS_PACKAGED_TARGETS} build_playnite_plugin build_uninstall_ui web_ui
     COMMENT "Building MSI installer via CPack (WiX)"
 )
 

@@ -12,6 +12,7 @@ list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-misleading-indentation)
 # Disable warnings for Windows ARM64
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64")
     list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-dll-attribute-on-redeclaration)  # Boost
+    list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-unknown-warning-option)  # ViGEmClient
     list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-unused-variable)  # Boost
 endif()
 
@@ -36,6 +37,8 @@ file(GLOB NVPREFS_FILES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/platform/windows/nvprefs/*.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/nvprefs/*.h")
 
+# vigem
+include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include")
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party")
 
 # libvirtualgamepad: the control-protocol client for Vibepollo's own UMDF/VHF gamepad driver.
@@ -161,6 +164,11 @@ foreach(_sunshine_versioned_tool IN ITEMS
     endif()
 endforeach()
 unset(_sunshine_versioned_tool)
+
+# ViGEmBus version
+set(VIGEMBUS_PACKAGED_V "1.21.442")
+set(VIGEMBUS_PACKAGED_V_2 "${VIGEMBUS_PACKAGED_V}.0")
+list(APPEND SUNSHINE_DEFINITIONS VIGEMBUS_PACKAGED_VERSION="${VIGEMBUS_PACKAGED_V_2}")
 
 # NVIDIA TrueHDR (RTX HDR) SDR->HDR synthesis. The host code is SDK-free and loads the
 # MSVC-built shim (vibeshine_truehdr.dll, see tools/truehdr_shim) at runtime, so this is
@@ -290,6 +298,11 @@ set(PLATFORM_TARGET_FILES
         "${SUNSHINE_LIBVIRTUALGAMEPAD_SOURCE_DIR}/driver/src/dualsense.cpp"
         "${SUNSHINE_LIBVIRTUALGAMEPAD_INCLUDE_DIR}/libvirtualgamepad/client.h"
         "${SUNSHINE_LIBVIRTUALGAMEPAD_INCLUDE_DIR}/libvirtualgamepad/protocol.h"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Client.h"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Common.h"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Util.h"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/km/BusShared.h"
         # Native AMD AMF encoder (D3D11). AMF SDK headers are provided by the
         # bundled FFmpeg build-deps (include/AMF), so no extra dependency is
         # required - the runtime (amfrt64.dll) is loaded dynamically.

@@ -42,7 +42,6 @@
 #ifdef __linux__
   #include "lutris_auto_sync.h"
 #endif
-#include "usbridge.h"
 #include "webrtc_stream.h"
 #ifdef _WIN32
   #include <shobjidl.h>
@@ -273,12 +272,6 @@ WINAPI BOOL ConsoleCtrlHandler(DWORD type) {
 #endif
 
 int main(int argc, char *argv[]) {
-  // usbridge: the USBridge agent asks whether this build hands devices to its USB broker.
-  if (argc > 1 && std::string_view {argv[1]} == "--usbridge-bridge") {
-    std::cout << usbridge::PROBE_LINE << std::endl;
-    return 0;
-  }
-
 #ifdef __linux__
   #ifdef SUNSHINE_BUILD_STEAMOS
   if (platf::linux_cli::command(argc, argv)) {
@@ -648,10 +641,16 @@ int main(int argc, char *argv[]) {
   task_pool.start(1);
 
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-  // create tray thread and detach it if enabled in config
+  // Keep tray shutdown inside main's lifetime, including early startup returns.
   if (config::sunshine.system_tray) {
     system_tray::run_tray();
   }
+#ifdef _WIN32
+  auto tray_shutdown_guard = util::fail_guard([&shutdown_deadline]() {
+    shutdown_deadline.arm();
+    system_tray::end_tray();
+  });
+#endif
   // Schedule periodic update checks if configured
   if (config::sunshine.update_check_interval_seconds > 0) {
     // Trigger an immediate update check on startup so users don't wait
@@ -1093,6 +1092,9 @@ int main(int argc, char *argv[]) {
   // stop system tray
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
   system_tray::end_tray();
+#ifdef _WIN32
+  tray_shutdown_guard.disable();
+#endif
 #endif
 
 #ifdef WIN32

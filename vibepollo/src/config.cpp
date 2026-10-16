@@ -1106,7 +1106,6 @@ namespace config {
     47989,  // Base port number
     "ipv4",  // Address family
     {},  // Bind address
-    {},  // Web bind address (admin UI override)
     (platf::appdata() / default_log_filename).string(),  // log file
     true,  // notify_pre_releases
     false,  // legacy_ordering
@@ -2248,7 +2247,6 @@ namespace config {
 
     string_restricted_f(vars, "address_family", sunshine.address_family, {"ipv4"sv, "both"sv});
     string_f(vars, "bind_address", sunshine.bind_address);
-    string_f(vars, "web_bind_address", sunshine.web_bind_address);
 
     bool upnp = false;
     bool_f(vars, "upnp"s, upnp);
