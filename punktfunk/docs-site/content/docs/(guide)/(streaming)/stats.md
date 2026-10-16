@@ -150,7 +150,8 @@ everything.
 - **`audio buffer`** is decoded audio queued ahead of your speakers; **`a/v`** places it against the
   picture, positive meaning audio plays behind. The client steers towards zero.
 - **Device lines** only one platform measures: `present:` (Linux, Windows) names how frames reach
-  the screen (`mailbox`, `fifo`, …) and `vrr yes/no` once measured; `integrity:` (Linux, Windows)
+  the screen (`mailbox`, `fifo`, …) and `vrr yes/no` once measured — a stream at the panel's own rate,
+  or a whole fraction of it, proves nothing and keeps the last reading; `integrity:` (Linux, Windows)
   reports decode damage; `judder` and `coalesced` (Android) report cadence; `link latency` and
   `client queue` (Apple) report the display link and receive backlog; an LG TV shows its CPU and
   memory use.
@@ -173,7 +174,7 @@ screen, and `stats-json:` carries every figure as JSON. Parse the JSON; the text
 
 ## Recording a capture for a bug report
 
-The overlay only shows the last second. To record a whole run, use the **Performance** page in the
+The overlay only shows the last second. To record a whole run, use **Diagnostics** → **Performance** in the
 [web console](/docs/web-console):
 
 1. Press **Start capture**. Arming it costs the stream nothing.

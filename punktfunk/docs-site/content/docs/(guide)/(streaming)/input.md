@@ -39,16 +39,18 @@ host too until you capture again.
 | Disconnect | Ctrl+Alt+Shift+D | ⌃⌥⇧D | ⌃⌥⇧D | — |
 | Cycle the [stats overlay](/docs/stats) | Ctrl+Alt+Shift+S | ⌃⌥⇧S | ⌃⌥⇧S | — |
 | [Mute your microphone](#muting-your-microphone) | Ctrl+Alt+Shift+V | ⌃⌥⇧A | ⌃⌥⇧A | — |
-| Open the [quick-action dial](#the-quick-action-dial) | Ctrl+Alt+Shift+O | ⌃⌥⇧O | — | Ctrl+Alt+Shift+O |
+| Open the [quick-action dial](#the-quick-action-dial) | Ctrl+Alt+Shift+O | ⌃⌥⇧O | ⌃⌥⇧O | Ctrl+Alt+Shift+O |
 | Start or stop [clipboard sharing](/docs/clipboard) | — | ⌃⌥⇧C | ⌃⌥⇧C | — |
 | Fullscreen | F11 or Alt+Enter | ⌃⌘F | — | — |
 
-On an iPad only ⌃⌥⇧Q and ⌘⎋ always work while input is captured. If another shortcut doesn't
-respond, release input first.
+On an iPad, ⌘⎋ and every ⌃⌥⇧ shortcut work while input is captured.
 
 To see the list without a stream: **Keyboard Shortcuts** in the Linux client's main menu,
-**Shortcuts** on the Windows client's host list, or **About → Shortcuts** in the Apple apps'
-Settings. The macOS **Stream** menu lists them too.
+**Shortcuts** on the Windows client's host list, **Settings → About → Stream controls** on
+Android, or **About → Shortcuts** in the Apple apps' Settings. The macOS **Stream** menu lists
+them too. Each list covers the controller chords and touch gestures as well. With a pad alone,
+open the console's **Settings → About → Stream controls** (Linux, Windows, Steam Deck, Android
+and Apple).
 
 **macOS:** while input is captured, every other ⌘ chord goes to the host, ⌘Q included. Turn
 **Capture system shortcuts** off to keep them local. ⌘⎋ always stays with the Mac; press it,
@@ -65,8 +67,9 @@ for Alt+Tab. **Ctrl+Space** reaches the host from Android 13 on.
 
 ### Muting your microphone
 
-The mute lasts for the current stream and stops only the sending, so unmuting is instant. While
-muted, a **Microphone muted** badge shows over the stream, with the stats overlay on or off.
+The mute lasts for the current stream and stops only the sending, so unmuting is instant. Each
+switch shows **Microphone muted** or **Microphone live** over the stream for a few seconds, with
+the stats overlay on or off.
 
 - Keyboard: the shortcut in the [table above](#keyboard-shortcuts).
 - Controller on Android: **Select + Y**, or a DualSense's own **Mute** button.
@@ -124,8 +127,9 @@ Two advanced settings control this: **Guide button** and **Hold Select for guide
 If Steam or the Xbox Game Bar on your own device also watches the guide button, both react; turn
 that off on your device. On macOS and iOS 27 and newer, add Punktfunk to **Home Button
 Overrides** in the system's game controller settings; while the system keeps the button, Punktfunk's
-**Controllers** settings link there. The dial's **Guide button** and **Quick access menu** buttons send
-one tap each; **Quick access menu** needs a host whose virtual pad is a Steam controller. On a
+**Controllers** settings link there. The dial's **Guide button** and **Quick access menu** buttons press
+the host's pad for you. **Quick access menu** needs Steam on the host: it presses the pad's own
+button where the virtual pad has one, and Guide with A on every other pad. On a
 Deck, the Punktfunk panel's **Host menus** buttons do the same ([Steam Deck](/docs/steam-deck)).
 
 ## Mouse modes
@@ -195,7 +199,7 @@ Touch passthrough depends on the host:
 |---|---|
 | KDE Plasma, GNOME | Full multi-touch |
 | Windows 10 1809 and newer | Full multi-touch |
-| Sway, Hyprland and other wlroots compositors | Not supported: the client uses Trackpad and says so |
+| Sway, Hyprland, niri and other wlroots compositors | Not supported: the client uses Trackpad and says so |
 | gamescope | One finger, as an absolute pointer ([gamescope](/docs/gamescope)) |
 
 ## The quick-action dial
@@ -208,7 +212,7 @@ presets. Pick its six buttons under **Quick actions** in settings, or edit the d
 | Linux, Windows | **Ctrl+Alt+Shift+O**, a two-finger twist on a touchscreen |
 | macOS | **⌃⌥⇧O**, **Stream → Quick Actions** |
 | Android | **Back**, a two-finger twist, **Ctrl+Alt+Shift+O** |
-| iPhone, iPad | A two-finger twist, the corner button; in **Touch passthrough**, two fingers pulled in from a side edge |
+| iPhone, iPad | A two-finger twist, the corner button, **⌃⌥⇧O** on a keyboard; in **Touch passthrough**, two fingers pulled in from a side edge |
 | Apple TV | A short press of the remote's **Back** |
 | Any client, with a controller | **Select + A** |
 
@@ -229,13 +233,15 @@ What the dial can hold:
 | Group | Actions |
 |---|---|
 | Session | **End stream**, **End game** (a game this device launched, then the stream), **Disconnect, keep the game running** |
-| Input | **Touch mode**, **Keyboard**, **Virtual controller**, **Send text**, **Guide button**, **Quick access menu**, **Controller mouse** |
-| View · Audio | **Statistics**, **Swap screens** (dual-screen handhelds), **Microphone**, **Mute this stream** (this device only) |
+| Input | **Touch mode**, **Keyboard**, **Virtual controller**, **Send text**, **Guide button**, **Quick access menu**, **Controller mouse**, **Controller type** |
+| View · Audio | **Statistics**, **Screens** (dual-screen handhelds: the panel below, the picture below, or the picture across both), **Microphone**, **Mute this stream** (this device only) |
 | Host | **Sleep host**, **Restart host**, **Shut down host** ([Host power](/docs/host-power)) |
 | Shortcuts | Key combinations you add, such as Alt+F4 |
 
 A button a client can't serve is dimmed and says why. **Send text** works on Android against a
-host that takes typed text.
+host that takes typed text. **Controller type** works on the desktop clients: each press re-plugs
+your controllers as the next type (Automatic, Xbox 360, Xbox One, DualSense, DualShock 4, Steam
+Deck) for this stream. The next stream starts from your settings.
 
 ### Controller mouse
 
@@ -288,10 +294,28 @@ or use **Edit layout** to move, resize and hide controls, separately for wide an
 ### Dual-screen handhelds
 
 On an Android handheld with a second screen of 7 inches or less, or a foldable half open, the
-stream takes one screen and a panel takes the other: statistics, the dial's actions, a trackpad
-and the virtual controller. **Swap screens**, on the dial or the panel, trades the two. The
-handheld remembers the swap, and an **Automatic** resolution or refresh follows the picture: at
-once where the host can change mode mid-stream, else from the next connect.
+stream takes one screen and a panel takes the other: statistics, the dial's actions, a keyboard
+that types on the host while the handheld's own buttons stay on the game, a trackpad and the
+virtual controller. **Screens**, on the dial or the panel, cycles three layouts: the panel below
+the picture, the picture below the panel, or **one picture across both screens** — its top half
+above, its bottom half below, the lower screen's touch landing on its half. That last one is how a
+DS or 3DS emulator's two screens land on two screens: set the emulator to a vertical layout with
+no gap, and the split lands on the hinge. A DS, 3DS or Wii U title launched from the library
+starts that way. The handheld remembers the layout per second screen, and an **Automatic**
+resolution follows it — the picture screen's mode, or two of them stacked when the picture spans
+both — at once where the host can change mode mid-stream, else from the next connect.
+
+### Foldable iPhone
+
+Set a foldable iPhone down half open, like a laptop, and the stream splits at the hinge: the
+picture takes the upright half and the flat half becomes a trackpad, or the
+[virtual controller](#virtual-controller) while it is shown. Open the phone flat and the picture
+takes the whole screen again. Held half open like a book, nothing changes.
+
+A **Native display** resolution follows the picture: the cover screen's mode when the phone is
+shut, the inner screen's when it is open, and the upright half's while it is half open. A size
+you picked stays as picked. With **Match window** on, the stream also follows a rotation and the
+space the phone gives the app beside another one. The host changes mode mid-stream where it can.
 
 ## Pen and stylus
 
@@ -311,5 +335,5 @@ so drawing apps on the host see a real pen.
 | Windows 10 1809 and newer | A system pen with pressure, tilt, rotation, barrel button and eraser |
 
 Without host support, the stylus works as a finger, without pressure or tilt. To turn pen off
-for every client, switch off **Pen input** in the web console under **Host → Settings → Input**,
+for every client, switch off **Pen input** in the web console under **Host → Input**,
 or set `PUNKTFUNK_PEN=0` in [`host.env`](/docs/configuration). It applies from the next session.

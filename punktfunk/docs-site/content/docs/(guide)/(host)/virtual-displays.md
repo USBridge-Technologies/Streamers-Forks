@@ -7,13 +7,14 @@ When a device connects, Punktfunk creates a virtual display at that device's res
 refresh rate and streams it. The **Displays** page of the [web console](/docs/web-console) decides
 what happens around it. A change applies to the next connection.
 
-The page shows your monitors and streamed screens to scale, a sentence saying what the next device
-gets, the presets, the **Devices** list and **Your monitors**. The settings live in
-`display-settings.json` in the host's config directory.
+The page shows your monitors and streamed screens to scale, with a dashed **Next device** where the
+next device's screen lands. Under the map, **Screens** lists every monitor and streamed screen;
+**When a device connects** says what the next device gets and holds the presets. The settings live
+in `display-settings.json` in the host's config directory.
 
 ## Pick a preset
 
-Click one; hover a preset to preview it on the map.
+Click one under **When a device connects**; hover a preset to preview it on the map.
 
 | Preset | For | After a device disconnects | Your monitors | A second device |
 |---|---|---|---|---|
@@ -26,24 +27,25 @@ Click one; hover a preset to preview it on the map.
 Hot-desk remembers display settings per device and resolution; the others per device.
 
 **Save as preset…** stores the settings in force, including
-[Dedicated game sessions](#dedicated-game-sessions), as a card beside the built-ins. Its icons
-rename it, update it to the current settings, or delete it. The built-in presets leave Dedicated
-game sessions as they are.
+[Dedicated game sessions](#dedicated-game-sessions), beside the built-ins. The buttons beside it
+rename it, update it to the current settings, or delete it. The built-in presets leave Dedicated game
+sessions as they are.
 
 ## Customise
 
-**Customise** asks five questions. Each answer saves at once.
+**Customise** asks the questions below that your host acts on, including
+[Dedicated game sessions](#dedicated-game-sessions). Each answer saves at once.
 
 ### After a device disconnects [#keep-alive]
 
-- **Remove its screen**.
+- **Remove its screen**. A host does this until you choose otherwise.
 - **Keep for** a number of seconds (up to 24 hours). A reconnect inside the window drops straight
   back in.
 - **Keep until released**. The screen stays until you click **Release** on it in **Displays**, or
   **Release all kept**.
 
 Closing the client removes the screen at once. A dropped connection is noticed after the
-**Disconnect timeout** (8 s, an advanced setting in **Host → Settings**), then the window starts.
+**Disconnect timeout** (8 s, an advanced setting in **Host**), then the window starts.
 On gamescope the game keeps running as long as its screen does.
 
 > **Keeping a screen with Turn off keeps your monitors dark after you disconnect**, until the
@@ -56,18 +58,20 @@ On gamescope the game keeps running as long as its screen does.
 - **Turn off**: the stream is the only screen until streaming ends.
 - **Automatic**: **Turn off**, or **Stay on** when `PUNKTFUNK_COMPOSITOR` pins a compositor.
 
-| | KWin | GNOME | Sway · Hyprland | Windows |
+| | KWin | GNOME | Sway · Hyprland · niri | Windows |
 |---|---|---|---|---|
 | Stay on | ✅ | ✅ | ✅ | ✅ |
 | Stay on, stream is main | ✅ | ✅ | acts as Stay on | ✅ |
 | Turn off | ✅ | ✅ | ✅ | ✅ |
 
-- **Sway and Hyprland** have no main screen. The host focuses the streamed screen at session start
+- **Sway, Hyprland and niri** have no main screen. The host focuses the streamed screen at session start
   and before each library launch; a window that opens later follows whatever has focus then.
 - **Hyprland** turns monitors back on with `hyprctl reload` when the screen is removed. That
   re-reads your config: changes made with `hyprctl keyword` are lost, and `exec =` lines run again.
-- **KWin, Sway and Hyprland** can keep chosen monitors lit under **Turn off**: set each to **Stay
-  on** in **Your monitors**.
+- **niri** switches monitors off and on over its IPC when the screen is created and removed. If the
+  host dies first, its next start lights them again.
+- **KWin, Sway, Hyprland and niri** can keep chosen monitors lit under **Turn off**: set each to
+  **Stay on** on its row in **Screens**.
 - Punktfunk never turns off a screen it created, so a second device never goes dark.
 
 ### A second device connects
@@ -75,8 +79,11 @@ On gamescope the game keeps running as long as its screen does.
 - **Gets its own screen**.
 - **Takes over**: the first device's stream ends.
 - **Shares the screen**: it joins the live screen at that screen's resolution. Both hear the same
-  audio; mute one from the **Sessions** card on **Home**.
+  audio; mute one from its row under **Now** on **Home**.
 - **Is told it's busy**.
+
+On a Windows host a device that shares the screen sees the pointer as part of the picture. It
+does not see Windows permission prompts or the lock screen; the first device still does.
 
 The same device reconnecting always resumes. A Moonlight host serves one session: **Shares the
 screen** turns the second client away, and the other two hand the host over.
@@ -88,46 +95,56 @@ identity each device gets: see [Persistent scaling](#persistent-scaling).
 
 ### Up to this many screens at once
 
-1 to 16 (default 4). Several devices become monitors of one desktop, side by side. Drag a streamed
-screen on the map to place it; the host then keeps each device where you put it.
+Under **Advanced**: 1 to 16 (default 4). Several devices become monitors of one desktop, side by
+side. Drag a streamed screen on the map to place it; the host then keeps each device where you put
+it. **Arrange automatically**, under **Advanced**, puts them back in a row.
 
 ## Per-device settings
 
-Click **Display settings…** on a device in **Displays** or **Devices**. Each question offers
-**Follow host** or an answer for this device only:
+Open **Display settings…** from a device's row in **Devices**. Each question offers **Follow
+host** or an answer for this device only:
 
-- the keep-alive, second-device and remember questions above;
+- the keep-alive (including **Keep for** a number of seconds), second-device and remember
+  questions above;
 - **Your monitors while streaming** (Linux hosts);
 - **Largest screen this device gets**, such as `2560x1440@60`. The device is told the smaller mode
   when it asks for more;
-- **Scale its screen at** (Linux hosts): the starting scale on GNOME, until you change the scale in
-  the desktop.
+- **Scale its screen at** (GNOME and niri hosts): the starting scale, until you change the scale in the
+  desktop. On KDE, set the scale in System Settings while the device streams; KDE keeps it for
+  that device.
 
 **Follow the host in everything** removes the device's overrides.
 
 ## Stream a real monitor instead
 
-**Linux hosts.** In **Your monitors**, click **Stream this monitor** on a row. Every device then
-sees that monitor instead of its own virtual screen. **Give each device its own screen** switches
-back.
+**Linux and Windows hosts.** In **Screens**, click **Stream this monitor** on a monitor's row. Every
+device then sees that monitor instead of its own virtual screen. Click it again to give each device
+its own screen.
 
-- The monitor is never touched, so keep-alive, **Your monitors** and layout don't apply.
+- The monitor is never touched, so keep-alive, **Your monitors while streaming** and layout don't
+  apply.
 - The resolution is the monitor's; the client scales the picture.
 - Absolute mouse and pen input lands on that monitor.
-- Works on KWin, GNOME, Sway, Hyprland and gamescope Game Mode, with no chooser dialog. A nested or
+- Works on KWin, GNOME, Sway, Hyprland, niri (stock niri too) and gamescope Game Mode, with no
+  chooser dialog. A nested or
   headless gamescope has no monitor to list.
+- On Windows the pointer is part of the picture, and Windows permission prompts and the lock
+  screen are not: the stream keeps showing the desktop behind a prompt, while your input goes to
+  the prompt. A device that connects while the PC is locked or signed out gets a virtual screen
+  instead, so you can sign in; the monitor is streamed again from the next connection.
 
-Monitors are named by connector (`HDMI-A-1`, `DP-2`). `punktfunk-host list-monitors` lists them,
-and `mirror-test` checks the capture without a client ([Host CLI](/docs/host-cli#list-monitors)).
-`punktfunk-host anchor-test --monitor HDMI-A-1` checks where absolute input lands.
+On Linux, monitors are named by connector (`HDMI-A-1`, `DP-2`). `punktfunk-host list-monitors`
+lists them, and `mirror-test` checks the capture without a client
+([Host CLI](/docs/host-cli#list-monitors)). `punktfunk-host anchor-test --monitor HDMI-A-1` checks
+where absolute input lands. On Windows they carry the Windows display name (`\\.\DISPLAY1`), which
+the console shows.
 
 To pin it from the host instead, set `PUNKTFUNK_CAPTURE_MONITOR=HDMI-A-1` in
 [`host.env`](/docs/configuration). It wins over the console, which then shows the choice as locked.
 
 ## Dedicated game sessions
 
-**Linux hosts with gamescope installed.** Under **Dedicated game sessions** on the **Displays**
-page:
+**Linux hosts with gamescope installed.** The last question in **Customise**:
 
 - **Auto** (default): a library launch runs in the session the box is in: Steam Game Mode, a bare
   gamescope, or your desktop.
@@ -140,8 +157,8 @@ when the session ends. Moonlight launches follow the same choice.
 
 ## When a game ends, and when a session does
 
-**Linux and Windows hosts.** Under **When a game or a session ends**, in the same section. These
-act only on a game the host launched for the session, never one you started yourself.
+**Linux and Windows hosts.** In **Host → Session** in the web console. These act only on a game the
+host launched for the session, never one you started yourself.
 
 | Setting | Options (default first) |
 |---|---|
@@ -205,14 +222,15 @@ Set scaling once while streaming and each device gets it back on the next connec
 | **Windows** | Set scaling in Settings while streaming; Windows remembers it per device. |
 | **KDE Plasma** | Set it in System Settings while streaming; KWin reapplies it per device. |
 | **GNOME** | Set it in Settings while streaming; the host saves it per device and reapplies it. |
+| **niri** | Pick **Scale its screen at** in the device's **Display settings…**; the screen starts at it. |
 | **Sway** | Not supported; set the scale in your sway config. |
 
 ## Troubleshooting
 
 ### My monitors stayed off after I disconnected
 
-The screen is kept with **Turn off**. Click **Release** in **Displays**, or pick **Shared
-desktop**.
+The screen is kept with **Turn off**. Click **Release** on its row in **Displays** → **Screens**,
+or pick **Shared desktop**.
 
 ### The streamed screen shows only my wallpaper
 
@@ -226,8 +244,8 @@ or **Turn off**.
 
 ### Keep-alive, monitors or layout settings do nothing
 
-A real monitor is being streamed, and those settings only apply to virtual screens. Click **Give
-each device its own screen** in **Your monitors**.
+A real monitor is being streamed, and those settings only apply to virtual screens. In
+**Screens**, click **Stream this monitor** on the streamed monitor again.
 
 ### The console won't let me pick a monitor
 
@@ -240,8 +258,8 @@ The monitor you picked isn't connected, was renamed, or the host runs in another
 
 ### My couch box's TV stayed on the stream after I disconnected
 
-**Headless box** keeps the screen until released. Click **Release** in **Displays**, return to
-Game Mode on the box, or restart the host.
+**Headless box** keeps the screen until released. Click **Release** on its row in **Displays**,
+return to Game Mode on the box, or restart the host.
 
 A few display knobs in `host.env` apply only while the console has never saved a display setting;
 [Configuration](/docs/configuration) lists them.

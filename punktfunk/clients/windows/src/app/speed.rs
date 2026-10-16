@@ -4,10 +4,9 @@
 
 use super::lucide;
 use super::style::*;
-use super::{Screen, Svc};
+use super::{saved, Screen, Svc};
 use crate::trust::KnownHosts;
 use pf_client_core::presets::PresetsFile;
-use pf_client_core::speed::run_speed_probe;
 use windows_reactor::*;
 
 /// Speed-test lifecycle. Held as ROOT state (the probe worker completes it via
@@ -18,9 +17,14 @@ pub(crate) enum SpeedState {
     Running,
     Failed(String),
     Done {
+        /// What the link carries.
         mbps: f64,
-        loss_pct: f32,
+        /// The clean round under it: `(rate Mbit/s, loss %, jitter ms)`. `None` toward a
+        /// host without a ramp, which gets no loss line.
+        clean: Option<(f64, f32, f64)>,
         recommended_kbps: u32,
+        /// What the check found: `(id, figures)` per finding.
+        findings: Vec<(u8, [u32; 3])>,
     },
 }
 
@@ -56,25 +60,31 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             std::thread::Builder::new()
                 .name("pf-speedtest".into())
                 .spawn(move || {
-                    let outcome = run_speed_probe(
-                        &target.addr,
-                        target.port,
-                        target.fp_hex.as_deref(),
+                    let outcome = pf_client_core::speed::run_network_check_with(
+                        &target.host.addr,
+                        target.host.port,
+                        target.host.fp_hex.as_deref(),
                         identity,
+                        |_| {},
                     );
                     if shared.speed_gen.load(Ordering::SeqCst) != generation {
                         return; // superseded
                     }
                     set_speed.call(match outcome {
-                        Ok(r) => {
-                            let mbps = f64::from(r.throughput_kbps) / 1000.0;
-                            SpeedState::Done {
-                                mbps,
-                                loss_pct: r.loss_pct,
-                                // ≈70 % of measured: headroom for FEC overhead + real-world loss.
-                                recommended_kbps: r.throughput_kbps / 10 * 7,
-                            }
-                        }
+                        Ok(r) => SpeedState::Done {
+                            mbps: f64::from(r.speed.ceiling_kbps) / 1000.0,
+                            clean: r.speed.clean.map(|c| {
+                                (
+                                    f64::from(c.rate_kbps) / 1000.0,
+                                    c.loss_pct,
+                                    f64::from(c.jitter_us) / 1000.0,
+                                )
+                            }),
+                            recommended_kbps: pf_client_core::speed::recommended_kbps(
+                                r.speed.ceiling_kbps,
+                            ),
+                            findings: r.findings.iter().map(|f| (f.id as u8, f.numbers)).collect(),
+                        },
                         Err(msg) => SpeedState::Failed(msg),
                     });
                 })
@@ -89,10 +99,10 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             .on_click(move || ss.call(Screen::Hosts))
             .horizontal_alignment(HorizontalAlignment::Center)
     };
-    let headline = if target.name.is_empty() {
+    let headline = if target.host.name.is_empty() {
         "Network speed test".to_string()
     } else {
-        format!("Network speed test \u{00B7} {}", target.name)
+        format!("Network speed test \u{00B7} {}", target.host.name)
     };
 
     match &props.state {
@@ -121,8 +131,9 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
         }
         SpeedState::Done {
             mbps,
-            loss_pct,
+            clean,
             recommended_kbps,
+            findings,
         } => {
             let recommended_mbps = f64::from(*recommended_kbps) / 1000.0;
             // A measured bitrate belongs in the layer the TESTED host actually reads it from
@@ -131,7 +142,11 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             // it: the one-off this test was started with, else the host's binding.
             let target = ctx.shared.target.lock().unwrap().clone();
             let bound = KnownHosts::load()
-                .resolve(target.fp_hex.as_deref(), &target.addr, target.port)
+                .resolve(
+                    target.host.fp_hex.as_deref(),
+                    &target.host.addr,
+                    target.host.port,
+                )
                 .and_then(|h| h.preset_id.clone());
             let preset = match target.preset.as_deref() {
                 Some("") => None,
@@ -143,26 +158,24 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             let write_global = {
                 let (ctx, ss) = (ctx.clone(), set_screen.clone());
                 move || {
-                    // Rebase on the file before the whole-struct save — same discipline as
-                    // `commit()`; another writer may have moved it under this snapshot.
+                    // The file under its lock, as `commit()` edits it: another writer may have
+                    // moved it under this snapshot.
                     let mut s = ctx.settings.lock().unwrap();
-                    *s = crate::trust::Settings::load();
-                    s.bitrate_kbps = kbps;
-                    s.save();
+                    *s = crate::trust::Settings::update(|file| {
+                        file.bitrate_kbps = kbps;
+                        true
+                    });
                     ss.call(Screen::Hosts);
                 }
             };
             let write_preset = |id: String| {
-                let ss = set_screen.clone();
+                let (ss, st) = (set_screen.clone(), props.svc.set_status.clone());
                 move || {
-                    let mut catalog = PresetsFile::load();
-                    if let Some(slot) = catalog.presets.iter_mut().find(|x| x.id == id) {
-                        slot.overrides.bitrate_kbps = Some(kbps);
-                        if let Err(e) = catalog.save() {
-                            tracing::warn!(error = %format!("{e:#}"),
-                                "saving the measured bitrate");
-                        }
-                    }
+                    let r = super::settings::update_preset(&id, |p| {
+                        p.overrides.bitrate_kbps = Some(kbps)
+                    });
+                    // The host list it returns to redraws anyway; no revision to bump.
+                    saved(r, &st, None);
                     ss.call(Screen::Hosts);
                 }
             };
@@ -213,13 +226,28 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                     .on_click(move || ss.call(Screen::Hosts))
                     .into()
             });
+            let finding_lines: Vec<Element> = findings
+                .iter()
+                .map(|(id, numbers)| {
+                    text_block(pf_client_core::findings::text(*id, *numbers))
+                        .font_size(12.0)
+                        .foreground(ThemeRef::SecondaryText)
+                        .horizontal_alignment(HorizontalAlignment::Center)
+                        .into()
+                })
+                .collect();
             let results = card(
                 vstack((
                     text_block(format!("{mbps:.0} Mbit/s"))
                         .font_size(34.0)
                         .bold()
                         .horizontal_alignment(HorizontalAlignment::Center),
-                    text_block(format!("measured \u{00B7} {loss_pct:.1} % loss"))
+                    text_block(match clean {
+                        Some((rate, loss, jitter)) => format!(
+                            "at {rate:.0} Mbit/s \u{00B7} {loss:.1} % loss \u{00B7} {jitter:.1} ms jitter"
+                        ),
+                        None => "measured".to_string(),
+                    })
                         .font_size(12.0)
                         .foreground(ThemeRef::SecondaryText)
                         .horizontal_alignment(HorizontalAlignment::Center),
@@ -230,6 +258,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                     .font_size(12.0)
                     .foreground(ThemeRef::SecondaryText)
                     .horizontal_alignment(HorizontalAlignment::Center),
+                    vstack(finding_lines).spacing(4.0),
                     hstack(buttons)
                         .spacing(8.0)
                         .horizontal_alignment(HorizontalAlignment::Center),

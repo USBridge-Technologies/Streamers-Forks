@@ -84,6 +84,9 @@ struct LibraryView: View {
     /// Drawn above the tab's sections, inside the scroll, so it moves with the title: the host
     /// filter.
     var tabHeader: AnyView?
+    /// Wake the host and wait for it (the Waking… overlay), then run the closure. Offered when
+    /// auto-wake is off and the host didn't answer; nil offers nothing.
+    var wake: ((StoredHost, @escaping () -> Void) -> Void)?
     #if DEBUG
     /// Shot harness: a canned phase in place of the fetch (`ShotGallery.swift`).
     var shotPhase: ShotLibraryPhase?
@@ -96,8 +99,9 @@ struct LibraryView: View {
     /// The touch grid's sort (the shared `library_sort` key, the same one the console's bar
     /// writes) and its grouping (touch-only — sections are the touch analogue of the console's
     /// Collections place).
-    @AppStorage(DefaultsKey.librarySort) private var sortRaw = ""
+    @AppStorage(DefaultsKey.librarySort) private var sortRaw = SettingDefault.librarySort
     @AppStorage(DefaultsKey.libraryGroupBy) private var groupByRaw = ""
+    @AutoWake private var autoWake
     @Environment(\.dismiss) private var dismiss
     /// Resolves a pinned shelf's preset NAME for the title (the target carries only its id).
     @ObservedObject private var presets = PresetStore.shared
@@ -105,7 +109,8 @@ struct LibraryView: View {
     /// Resume row) and FEEDS: its own `/status` fetch below is the freshest one anybody has.
     @ObservedObject private var nowPlayingStore = NowPlayingStore.shared
     @ObservedObject private var favorites = LibraryFavorites.shared
-    @AppStorage(DefaultsKey.librarySections) private var sectionsRaw = ""
+    @AppStorage(DefaultsKey.librarySections) private var sectionsRaw =
+        SettingDefault.librarySections
     @State private var search = ""
     @State private var showCustomize = false
     /// The title whose details sheet is up (the title menu's Details…).
@@ -116,6 +121,8 @@ struct LibraryView: View {
     /// The title End Game is asking about, and what the host said when it refused.
     @State private var endingGame: GameEntry?
     @State private var endGameNotice: String?
+    /// The title Remove Download is asking about.
+    @State private var removingGame: GameEntry?
     /// The shelf went behind a full-screen details page with its catalog loaded (tvOS).
     @State private var keptForDetail = false
 
@@ -133,9 +140,14 @@ struct LibraryView: View {
     /// titles rather than on an empty frame and a spinner.
     @MainActor private static var shown: [String: [GameEntry]] = [:]
     @State private var errorText: String?
+    /// The host didn't answer and auto-wake is off: the shelf offers a wake instead of sending one.
+    @State private var wakeOffered = false
     /// What the host has launched right now, keyed by library id — the `Resume` affordance. Empty
     /// on an older host, an unreachable one, or while the catalog is being served from cache.
     @State private var running: [String: RunningGame] = [:]
+    /// `/status` downloads by library id, and this device's grants: host state, as `running`.
+    @State private var downloads: [String: HostDownload] = [:]
+    @State private var grants: UInt32?
     /// When the catalog on screen was fetched, if it came from disk rather than from the host.
     /// Non-nil ⇒ these titles are a memory, not an observation, and the view says so.
     @State private var servedFromCacheAt: Date?
@@ -163,8 +175,47 @@ struct LibraryView: View {
         #endif
     }
 
-    var body: some View {
+    /// The shelf with its confirmations and the download poll, apart from `body` so the type
+    /// checker answers in time.
+    private var prompted: some View {
         content
+            .confirmationDialog(
+                endingGame.map { "End \($0.title)?" } ?? "",
+                isPresented: Binding(get: { endingGame != nil }, set: { if !$0 { endingGame = nil } }),
+                titleVisibility: .visible,
+                presenting: endingGame
+            ) { game in
+                Button("End Game", role: .destructive) { endGame(game) }
+            } message: { _ in
+                Text("Unsaved progress in the game is lost.")
+            }
+            .confirmationDialog(
+                removingGame.map { "Remove \($0.title)?" } ?? "",
+                isPresented: Binding(get: { removingGame != nil }, set: { if !$0 { removingGame = nil } }),
+                titleVisibility: .visible,
+                presenting: removingGame
+            ) { game in
+                Button("Remove Download", role: .destructive) { changeInstall(game, .remove) }
+            } message: { _ in
+                Text("Saves stay on the host.")
+            }
+            .alert(
+                endGameNotice ?? "",
+                isPresented: Binding(get: { endGameNotice != nil }, set: { if !$0 { endGameNotice = nil } })
+            ) {
+                Button("OK", role: .cancel) {}
+            }
+            // Percentages move while a download runs and the shelf is up.
+            .task(id: downloads.values.contains(where: \.live)) {
+                while downloads.values.contains(where: \.live), !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(2))
+                    await refreshStatus()
+                }
+            }
+    }
+
+    var body: some View {
+        prompted
             // In the tab the host filter names the shelf, so the title names the place; a TV's
             // tab bar already does.
             .modifier(LibraryTitle(title: tvTab ? nil : inTab ? "Library" : "\(shelfTitle) — Library"))
@@ -204,22 +255,6 @@ struct LibraryView: View {
             #if os(iOS) || os(visionOS) || os(macOS)
             .modifier(TitleSearch(active: inTab, text: $search))
             #endif
-            .confirmationDialog(
-                endingGame.map { "End \($0.title)?" } ?? "",
-                isPresented: Binding(get: { endingGame != nil }, set: { if !$0 { endingGame = nil } }),
-                titleVisibility: .visible,
-                presenting: endingGame
-            ) { game in
-                Button("End Game", role: .destructive) { endGame(game) }
-            } message: { _ in
-                Text("Unsaved progress in the game is lost.")
-            }
-            .alert(
-                endGameNotice ?? "",
-                isPresented: Binding(get: { endGameNotice != nil }, set: { if !$0 { endGameNotice = nil } })
-            ) {
-                Button("OK", role: .cancel) {}
-            }
             #if os(tvOS)
             // A TV's sheet is a narrow card; the details want the screen.
             .fullScreenCover(item: $detailGame, onDismiss: launchPendingTitle) { detailSheet($0) }
@@ -270,6 +305,7 @@ struct LibraryView: View {
             HStack(spacing: 6) {
                 Image(systemName: staleness.symbol)
                 Text(text)
+                wakeButton
             }
             .font(.geist(12, relativeTo: .caption))
             .foregroundStyle(.secondary)
@@ -679,7 +715,9 @@ struct LibraryView: View {
     private func card(_ game: GameEntry, caption: String?, frameID: String) -> GameCard {
         GameCard(
             game: game, artLoader: artLoader, selected: isKeyCursor(game),
-            isRunning: running[game.id] != nil, caption: caption, host: host, frameID: frameID)
+            isRunning: running[game.id] != nil,
+            badge: TileBadge.forTitle(game.install, download: downloads[game.id]),
+            caption: caption, host: host, frameID: frameID)
     }
 
     /// A title's own acts, one level below a host card's (design §2.5): Play / Resume leads,
@@ -703,9 +741,64 @@ struct LibraryView: View {
         if LinkClipboard.isAvailable {
             Button("Copy Link", systemImage: "link") { copyLink(game) }
         }
+        if let files = InstallAction.forTitle(
+            game.install, download: downloads[game.id], grants: grants)
+        {
+            Button(files.label(game.install), systemImage: Self.filesSymbol(files)) {
+                if files == .remove { removingGame = game } else { changeInstall(game, files) }
+            }
+        }
         if canEnd(game) {
             Button("End Game", systemImage: "xmark.circle", role: .destructive) { endingGame = game }
         }
+    }
+
+    private static func filesSymbol(_ action: InstallAction) -> String {
+        switch action {
+        case .install, .resume: return "arrow.down.circle"
+        case .pause: return "pause.circle"
+        case .remove: return "trash"
+        }
+    }
+
+    /// Ask the host to change `game`'s files. A refusal, or no way to ask, says why; a removal
+    /// turns the tile to "not installed" here, and `/status` is read again either way.
+    private func changeInstall(_ game: GameEntry, _ action: InstallAction) {
+        guard let target = MgmtTarget.make(host: host).target(orSay: { endGameNotice = $0 })
+        else { return }
+        Task {
+            let outcome = await LibraryClient.changeInstall(appID: game.id, action: action, on: target)
+            if outcome == .done, action == .remove, let i = games.firstIndex(where: { $0.id == game.id }) {
+                games[i].install?.state = "missing"
+            }
+            if outcome != .done { endGameNotice = outcome.notice(action, title: game.title) }
+            await refreshStatus()
+        }
+    }
+
+    /// What the host runs and downloads, and what this device may do there.
+    private func refreshStatus() async {
+        let current = host
+        guard case .success(let target) = MgmtTarget.make(host: current) else { return }
+        applyStatus(await LibraryClient.status(target), for: current)
+    }
+
+    private func applyStatus(
+        _ status: (games: [RunningGame], downloads: [HostDownload], grants: UInt32?),
+        for current: StoredHost
+    ) {
+        running = Dictionary(
+            status.games.filter(\.isUp).compactMap { g in g.appID.map { ($0, g) } },
+            // Two sessions can have the same title up (the host admits concurrent sessions); for a
+            // Resume badge either one is the same answer, and the endable one carries End Game.
+            uniquingKeysWith: { first, other in other.endable == true ? other : first })
+        downloads = Dictionary(
+            status.downloads.map { ($0.appID, $0) }, uniquingKeysWith: { _, last in last })
+        grants = status.grants
+        // The host cards read the same fact from the store; hand it this answer rather than
+        // letting their TTL ask the host a second time for what we just fetched. It also carries
+        // the entries no badge can: a launch the host cannot track has no id to key on.
+        nowPlayingStore.adopt(status.games, for: current)
     }
 
     /// The host runs a launch of this device's of `game`, so it lets this device end it.
@@ -713,15 +806,14 @@ struct LibraryView: View {
         game.id != LibraryCollation.desktopID && running[game.id]?.endable == true
     }
 
-    /// Ask the host to end `game`. Gone either way drops the badge; a refusal says why.
+    /// Ask the host to end `game`. Gone either way drops the badge; a refusal, or no way to ask,
+    /// says why.
     private func endGame(_ game: GameEntry) {
-        guard let identity = (try? ClientIdentityStore.shared.load())?.identity,
-              let pin = host.pinnedSHA256 else { return }
         let current = host
+        guard let target = MgmtTarget.make(host: current).target(orSay: { endGameNotice = $0 })
+        else { return }
         Task {
-            let outcome = await LibraryClient.endGame(
-                appID: game.id, address: current.address, port: current.effectiveMgmtPort,
-                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            let outcome = await LibraryClient.endGame(appID: game.id, on: target)
             if outcome.gameGone {
                 running[game.id] = nil
                 nowPlayingStore.invalidate(current)
@@ -829,11 +921,24 @@ struct LibraryView: View {
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420)
-            Button("Retry") { reloadToken += 1 }
-                .glassProminentButtonStyle()
+            HStack(spacing: 12) {
+                wakeButton
+                Button("Retry") { reloadToken += 1 }
+                    .glassProminentButtonStyle()
+            }
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// The wake offer: the explicit wake, then a reload once the host answers.
+    @ViewBuilder private var wakeButton: some View {
+        if wakeOffered, let wake {
+            Button("Wake Host") {
+                wake(store.hosts.first { $0.id == host.id } ?? host) { reloadToken += 1 }
+            }
+            .buttonStyle(.bordered)
+        }
     }
 
     private var emptyState: some View {
@@ -893,6 +998,7 @@ struct LibraryView: View {
         }
         loading = true
         errorText = nil
+        wakeOffered = false
         // Dev hook, the twin of the desktop console's `PUNKTFUNK_FAKE_LIBRARY`: a file holding
         // the host's `/api/v1/library` JSON (or the shared collate vectors file, whose `library`
         // array is the same shape) stands in for the host, so the grid, the sort bar and the
@@ -903,129 +1009,46 @@ struct LibraryView: View {
             return
         }
         let current = store.hosts.first { $0.id == host.id } ?? host
-        // mTLS uses this client's persistent identity (the host paired it over QUIC). No identity
-        // yet → the user hasn't connected/paired, which is also when there's nothing to browse.
-        guard let identity = (try? ClientIdentityStore.shared.load())?.identity else {
+        guard let target = MgmtTarget.make(host: current).target(orSay: { errorText = $0 }) else {
             games = []
-            errorText = "Connect to this host once first — the library uses the identity created "
-                + "on pairing to authenticate."
-            loading = false
-            return
-        }
-        // Beyond the client identity, require the HOST's pinned fingerprint. MgmtTransport refuses a
-        // pin-less host; this check only names the remedy. A host can hold a client identity yet no
-        // host pin (abandoned pairing, or after "Forget Identity").
-        guard current.pinnedSHA256 != nil else {
-            games = []
-            errorText = "Pair with this host before browsing its library."
             loading = false
             return
         }
         // Built ahead of the first suspension: a remounted shelf draws its restored tiles
         // before `load()` resumes, and every poster needs this waiting. The fetch's outcome
         // doesn't gate it — cached posters render with the host still down.
-        artLoader = try? LibraryArtLoader(
-            address: current.address,
-            port: current.effectiveMgmtPort,
-            certPEM: identity.certPEM,
-            keyPEM: identity.keyPEM,
-            hostFingerprint: current.pinnedSHA256)
+        artLoader = LibraryArtLoader(target)
 
-        // Show the catalog we already have BEFORE talking to the host. A library is the screen a
-        // player uses to decide what to play, and an empty one while a sleeping box boots is the
-        // opposite of useful — so the last-known titles go up immediately, marked as remembered,
-        // and are replaced the moment the host answers.
-        if let cached = await LibraryCache.shared?.load(hostID: current.id.uuidString) {
-            games = cached.games.launchersFirst
-            servedFromCacheAt = cached.fetchedAt
-            Self.shown[current.id.uuidString] = games
-        }
-        // ...and wake the box while the player is still choosing. Waking has always been bound to
-        // CONNECTING, which is too late to help: by then they have picked a title and are waiting
-        // out a cold boot. Opening the library is the earliest honest signal that someone intends
-        // to play.
-        //
-        // Sent up front and unconditionally rather than only when the host looks offline — the
-        // same shape as the client core's own `orchestrate` path, and for the same reason: a magic
-        // packet is a single fire-and-forget datagram that an already-awake machine ignores, so
-        // waiting to find out whether it is needed costs more than sending it.
-        let waking = !current.wakeMacs.isEmpty && PunktfunkConnection.wakeOnLANAvailable
-        if waking {
-            let (macs, address) = (current.wakeMacs, current.address)
-            DispatchQueue.global(qos: .userInitiated).async { // blocking sends — off main
-                PunktfunkConnection.wakeOnLAN(macs: macs, lastKnownIP: address)
-            }
-        }
-
-        // A woken box takes 20–60 s to answer, so one attempt would almost always land on a host
-        // that is still POSTing. Retry across that window when we sent a packet; without one, ask
-        // exactly once and report what happened, as before.
-        let attempts = waking ? 12 : 1
-        for attempt in 0..<attempts {
-            if Task.isCancelled { break }
-            do {
-                // `launchersFirst` groups launcher entries ahead of titles once, here, so the grid
-                // inherits the D4 ordering.
-                let fetched = try await LibraryClient.fetch(
-                    address: current.address,
-                    port: current.effectiveMgmtPort,
-                    certPEM: identity.certPEM,
-                    keyPEM: identity.keyPEM,
-                    hostFingerprint: current.pinnedSHA256
-                ).launchersFirst
+        // The last-known titles go up before the host is asked, marked as remembered, and the
+        // box is woken while the player is still choosing: opening the library is the earliest
+        // honest signal that someone intends to play. Auto-wake off asks once and offers a wake.
+        let hostID = current.id.uuidString
+        let events = LibraryLoad.run(
+            target: target, hostID: hostID, wakeMacs: current.wakeMacs, autoWake: autoWake)
+        for await event in events {
+            switch event {
+            case .cached(let cached):
+                games = cached.games
+                servedFromCacheAt = cached.fetchedAt
+                Self.shown[hostID] = games
+            case .waking:
+                break
+            case .fetched(let fetched):
                 games = fetched
                 servedFromCacheAt = nil
                 errorText = nil
-                await LibraryCache.shared?.store(fetched, hostID: current.id.uuidString)
-                Self.shown[current.id.uuidString] = games
-                break
-            } catch {
-                // Anything other than "can't reach it" is settled — a rejected certificate does not
-                // become acceptable by waiting, and retrying an unpaired host twelve times just
-                // delays telling the user what is actually wrong.
-                let unreachable: Bool
-                if case .unreachable = error as? LibraryError { unreachable = true } else {
-                    unreachable = false
+                Self.shown[hostID] = games
+            case .failed(let error, _):
+                // Titles on screen outrank the error; the staleness note carries the situation.
+                if games.isEmpty { errorText = LibraryLoad.failure(error) }
+                if case .unreachable = error, !autoWake, WakePolicy.canWake(current.wakeMacs) {
+                    wakeOffered = true
                 }
-                let more = unreachable && attempt + 1 < attempts
-                if !more {
-                    // A cached catalog outranks the error: the titles on screen are still the right
-                    // ones to choose from, and replacing them with a red message because the host
-                    // is asleep is precisely what this cache exists to prevent. The staleness note
-                    // carries the situation instead.
-                    if games.isEmpty {
-                        // `LibraryError` reports a phrase; this state has no title of its
-                        // own, so it supplies the frame the console shells get for free.
-                        let why = (error as? LibraryError)?.errorDescription
-                            ?? error.localizedDescription
-                        errorText = "Couldn't load the library — \(why)"
-                    }
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 5 * NSEC_PER_SEC)
+            case .status(let up, let downloads, let grants):
+                applyStatus((up, downloads, grants), for: current)
+                loading = false
             }
         }
-        // Left mid-load: the next appearance loads again, so ask the host nothing more.
-        if Task.isCancelled { return }
-
-        // What's up on the host right now — never fatal, and deliberately after the catalog so a
-        // slow `/status` can't hold the titles back.
-        let live = await LibraryClient.running(
-            address: current.address,
-            port: current.effectiveMgmtPort,
-            certPEM: identity.certPEM,
-            keyPEM: identity.keyPEM,
-            hostFingerprint: current.pinnedSHA256)
-        running = Dictionary(
-            live.filter(\.isUp).compactMap { g in g.appID.map { ($0, g) } },
-            // Two sessions can have the same title up (the host admits concurrent sessions); for a
-            // Resume badge either one is the same answer, and the endable one carries End Game.
-            uniquingKeysWith: { first, other in other.endable == true ? other : first })
-        // The host cards read the same fact from the store; hand it this answer rather than
-        // letting their TTL ask the host a second time for what we just fetched. It also carries
-        // the entries no badge can: a launch the host cannot track has no id to key on.
-        nowPlayingStore.adopt(live, for: current)
-        loading = false
     }
 
     #if DEBUG
@@ -1179,6 +1202,8 @@ struct GameCard: View {
     /// second copy for a while now, but nothing ever told the player that — so choosing a game
     /// they were already playing looked identical to starting one, and read as a relaunch.
     var isRunning = false
+    /// The title's files when they aren't simply installed: downloading, paused, failed, missing.
+    var badge: TileBadge? = nil
     /// A line under the title for what the current sort or section is about.
     var caption: String? = nil
     /// The host the title is on, named under the title with its OS mark.
@@ -1283,7 +1308,7 @@ struct GameCard: View {
             }
             // Opposite corner from the store badge so the two never collide on a narrow tile.
             .overlay(alignment: .topTrailing) {
-                if isRunning { RunningBadge() }
+                if isRunning { RunningBadge() } else if let badge { FilesBadge(badge: badge) }
             }
     }
 }

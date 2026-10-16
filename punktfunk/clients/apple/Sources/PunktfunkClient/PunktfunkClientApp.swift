@@ -107,12 +107,6 @@ struct PunktfunkClientApp: App {
                 .tint(.brand)
         }
         #endif
-        #if os(visionOS)
-        ImmersiveSpace(id: TheaterStage.spaceID) {
-            TheaterView()
-        }
-        .immersionStyle(selection: .constant(TheaterStage.style), in: TheaterStage.style)
-        #endif
     }
 }
 
@@ -152,6 +146,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             config.delegateClass = ExternalDisplaySceneDelegate.self
         }
         return config
+    }
+
+    func application(
+        _ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?
+    ) -> UIInterfaceOrientationMask {
+        LandscapeLock.mask(for: window)
     }
 }
 #endif

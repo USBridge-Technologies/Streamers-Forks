@@ -16,6 +16,7 @@
 #   PF_PRESET  preset id for a pinned card (old name: PF_PROFILE)         (optional)
 #   PF_GAME    store-qualified library id (steam:570) the host launches into the stream —
 #              set by a stream started from a Steam game's page          (optional)
+#   PF_AS      profile id to play as, for this stream only               (optional)
 #   PF_REQUEST_ACCESS  non-empty = ask the host's operator to admit this device instead of
 #                      pairing with a PIN. The connect PARKS until somebody approves it.
 #   PF_BROWSE  non-empty = open the client's console home instead of streaming
@@ -55,14 +56,14 @@ run_cli() {
         # PATH at all — which is the environment a Steam launch option can leave us in.
         exec "${PF_CLIENT_BIN%/*}/punktfunk" "$@"
     fi
-    exec "$FLATPAK" run --arch=x86_64 --command=punktfunk "$APPID" "$@"
+    exec "$FLATPAK" run --command=punktfunk "$APPID" "$@"
 }
 
 run_session() {
     if [ -n "${PF_CLIENT_BIN:-}" ]; then
         exec "$PF_CLIENT_BIN" "$@"
     fi
-    exec "$FLATPAK" run --arch=x86_64 "$APPID" "$@"
+    exec "$FLATPAK" run "$APPID" "$@"
 }
 
 # What we are about to run, for the log line each branch prints.
@@ -92,6 +93,9 @@ fi
 # against its own library — the Deck never learns what the launch recipe is.
 if [ -n "${PF_GAME:-}" ]; then
     set -- --game "$PF_GAME" "$@"
+fi
+if [ -n "${PF_AS:-}" ]; then
+    set -- --as "$PF_AS" "$@"
 fi
 
 # REQUEST ACCESS RUNS SUPERVISED — no `--exec`. Under --exec the CLI BECOMES the session, so no

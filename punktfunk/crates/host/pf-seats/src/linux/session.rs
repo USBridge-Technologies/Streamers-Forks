@@ -1,0 +1,553 @@
+//! A seat's systemd unit: its environment file, its bind-mount drop-in and its state.
+//!
+//! `punktfunk-seat@<user>.service` runs the seat's user in a logind session. The supervisor
+//! writes its files under `/run` before each start: `punktfunk/seats/<user>.env`, the seat
+//! contract the host reads plus its management token; a drop-in that binds the seat's private
+//! `compatdata`, `shadercache` and `downloading` over the shared games folder's, shows it the
+//! owner's libraries, hides the box's mounted drives and binds the supervisor's uinput proxy
+//! over `/dev/uinput`; and one that
+//! binds [`NO_UPDATE`] over Steam's OS and firmware update helpers. All are rewritten from the
+//! ledger on a start, so a reboot that empties `/run` loses nothing.
+
+use super::{err, libraries, run, shared};
+use crate::backend::BackendError;
+use crate::model::{RuntimeState, RuntimeStatus, Seat, SeatId};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// Where each seat's environment file lives.
+pub(super) const ENV_DIR: &str = "/run/punktfunk/seats";
+/// Where the supervisor's transient unit drop-ins live.
+pub(super) const DROPIN_ROOT: &str = "/run/systemd/system";
+
+/// The seat directories bound over the shared `steamapps` folder of the same name.
+pub(super) const PRIVATE_DIRS: [&str; 3] = ["compatdata", "shadercache", "downloading"];
+
+/// What a seat's Steam runs in place of [`UPDATE_HELPERS`]. They escalate through pkexec, which
+/// a seat's session is refused, and Steam's first-run setup stops on that failure. A seat never
+/// updates the box, so each answers "nothing to do": 7 from `steamos-update`, else 0.
+pub(super) const NO_UPDATE: &str = "/run/punktfunk/seat-no-update";
+const NO_UPDATE_SCRIPT: &str = "#!/bin/sh\n\
+# A punktfunk seat never updates the box's OS or firmware.\n\
+if [ \"${0##*/}\" = steamos-update ]; then\n\
+    case \" $* \" in *\" --supports-duplicate-detection \"*) exit 0 ;; esac\n\
+    exit 7\n\
+fi\n\
+exit 0\n";
+
+/// Steam's update helpers, by the absolute paths it calls them on SteamOS-like distros.
+const UPDATE_HELPERS: [&str; 3] = [
+    "/usr/bin/steamos-polkit-helpers/steamos-update",
+    "/usr/bin/steamos-polkit-helpers/jupiter-biosupdate",
+    "/usr/bin/jupiter-initial-firmware-update",
+];
+
+pub(super) fn unit(account: &str) -> String {
+    format!("punktfunk-seat@{account}.service")
+}
+
+pub(super) fn env_path(account: &str) -> PathBuf {
+    Path::new(ENV_DIR).join(format!("{account}.env"))
+}
+
+/// The unit's `RuntimeDirectory=`: the runner records its session id here, and the owner's runner
+/// marks `ready` once the host in the headless session serves.
+pub(super) fn runtime_dir(account: &str) -> PathBuf {
+    PathBuf::from(format!("/run/punktfunk-seat-{account}"))
+}
+
+pub(super) fn ready_path(account: &str) -> PathBuf {
+    runtime_dir(account).join("ready")
+}
+
+pub(super) fn dropin_dir(account: &str) -> PathBuf {
+    Path::new(DROPIN_ROOT).join(format!("{}.d", unit(account)))
+}
+
+/// `KEY="value"`, the form `EnvironmentFile=` parses without word splitting. Inside double quotes
+/// only `\` and `"` need an escape; `$` and `%` are not expanded in an environment file.
+fn quoted(key: &str, value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("{key}=\"{escaped}\"\n")
+}
+
+/// The management token as the one `KEY=value` line the box's client and `EnvironmentFile=` both
+/// read. Hex, so it needs no quoting.
+pub(super) fn token_line(token: &str) -> String {
+    format!("PUNKTFUNK_MGMT_TOKEN={token}\n")
+}
+
+/// A fresh 32-byte token, hex-encoded.
+pub(super) fn mint_token() -> String {
+    use rand::Rng as _;
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// The seat contract the host reads (`multi-seat-contract.md`), one `KEY="value"` per line, then
+/// the management token the box's client presents. Only the door advertises, so no seat does.
+///
+/// The owner's row keeps the owner's own config directory, library, host name and GameStream
+/// setting: it is the owner's host, behind the door. `PUNKTFUNK_SEAT_OWNER` tells the runner and
+/// the host so. Every other seat plays the box's library, from its trust copy.
+pub(super) fn render_env(seat: &Seat, home: &Path, state: &Path, token: &str) -> String {
+    let trust = shared::trust_dir(state, &seat.id)
+        .to_string_lossy()
+        .into_owned();
+    let mut rows = vec![
+        ("PUNKTFUNK_SEAT_SESSION", "1".to_owned()),
+        ("PUNKTFUNK_SEAT_ID", seat.id.to_string()),
+    ];
+    if seat.owner {
+        rows.push(("PUNKTFUNK_SEAT_OWNER", "1".to_owned()));
+    } else {
+        let config = home.join(".config/punktfunk");
+        rows.push((
+            "PUNKTFUNK_CONFIG_DIR",
+            config.to_string_lossy().into_owned(),
+        ));
+    }
+    rows.extend([
+        ("PUNKTFUNK_TRUST_DIR", trust.clone()),
+        ("PUNKTFUNK_PAIRING", "refused".to_owned()),
+    ]);
+    if !seat.owner {
+        rows.push(("PUNKTFUNK_LIBRARY_DIR", trust));
+    }
+    rows.extend([
+        ("PUNKTFUNK_NATIVE_PORT", seat.native_port.to_string()),
+        (
+            "PUNKTFUNK_MGMT_BIND",
+            format!("127.0.0.1:{}", seat.mgmt_port),
+        ),
+    ]);
+    if !seat.owner {
+        rows.push(("PUNKTFUNK_HOST_NAME", seat.name.clone()));
+        rows.push(("PUNKTFUNK_GAMESTREAM", "0".to_owned()));
+    }
+    rows.push(("PUNKTFUNK_MDNS", "0".to_owned()));
+    let mut out: String = rows.iter().map(|(key, value)| quoted(key, value)).collect();
+    out.push_str(&token_line(token));
+    out
+}
+
+/// The drop-in that gives the unit its private prefix directories, the owner's libraries
+/// ([`libraries`]), an empty `/run/media` and the supervisor's uinput proxy as `/dev/uinput`.
+/// A SteamOS-mode Steam adopts every mounted drive holding a `steamapps` as a library, and the
+/// drive as mounted is the owner's alone. Without the proxy the unit starts all the same.
+pub(super) fn render_binds(
+    state: &Path,
+    id: &SeatId,
+    account: &str,
+    shares: Option<&libraries::Shares>,
+) -> String {
+    let seat = shared::seat_dir(state, id);
+    let shared_steamapps = shared::games_dir(state).join("steamapps");
+    let mut out = String::from("[Service]\nTemporaryFileSystem=/run/media:ro\n");
+    for name in PRIVATE_DIRS {
+        out.push_str(&format!(
+            "BindPaths={}:{}\n",
+            seat.join(name).display(),
+            shared_steamapps.join(name).display()
+        ));
+    }
+    if let Some(shares) = shares {
+        out.push_str(&libraries::unit_lines(state, id, shares));
+    }
+    let proxy = pf_paths::seat::uinput_devname(account);
+    out.push_str(&format!("BindPaths=-/dev/{proxy}:/dev/uinput\n"));
+    out
+}
+
+/// The drop-in that binds [`NO_UPDATE`] over each update helper `present` on this box. `None`
+/// when none is: a bind onto a missing path fails the unit.
+pub(super) fn render_updates(present: impl Fn(&Path) -> bool) -> Option<String> {
+    let binds: String = UPDATE_HELPERS
+        .iter()
+        .filter(|helper| present(Path::new(helper)))
+        .map(|helper| format!("BindReadOnlyPaths={NO_UPDATE}:{helper}\n"))
+        .collect();
+    (!binds.is_empty()).then(|| format!("[Service]\n{binds}"))
+}
+
+/// The owner's drop-in: a `background` session, so the monitor's own login stays the one logind
+/// and polkit treat as the user's display.
+pub(super) fn render_class() -> &'static str {
+    "[Service]\nEnvironment=XDG_SESSION_CLASS=background\n"
+}
+
+/// Writes `contents` at `path` with `mode` unless it already holds exactly that. `true` when it
+/// changed.
+pub(super) fn write_if_changed(path: &Path, contents: &str, mode: u32) -> std::io::Result<bool> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    if std::fs::read_to_string(path).is_ok_and(|current| current == contents) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&temp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&temp)?;
+    file.write_all(contents.as_bytes())?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    file.sync_all()?;
+    std::fs::rename(temp, path)?;
+    Ok(true)
+}
+
+/// Writes the environment file for `seat`. It holds a secret: root reads it before the unit drops
+/// privileges, nobody else. The owner's user unit reads it too, so it is the owner's, `0600`.
+pub(super) fn write_env(
+    seat: &Seat,
+    home: &Path,
+    state: &Path,
+    token: &str,
+    owner: Option<(u32, u32)>,
+) -> Result<(), BackendError> {
+    let io = |what: &str, error: std::io::Error| err("session_files", format!("{what}: {error}"));
+    let path = env_path(&seat.account);
+    write_if_changed(&path, &render_env(seat, home, state, token), 0o600)
+        .map_err(|e| io("write the seat environment file", e))?;
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+            .map_err(|e| io("hand the environment file to its owner", e))?;
+    }
+    Ok(())
+}
+
+/// Writes the environment file and the drop-ins for `seat`, then reloads systemd when a drop-in
+/// changed. Every seat, the owner's included, gets the update helpers' binds; a seat other than
+/// the owner's gets `shares`.
+pub(super) fn write_unit_files(
+    seat: &Seat,
+    home: &Path,
+    state: &Path,
+    token: &str,
+    owner: Option<(u32, u32)>,
+    shares: Option<&libraries::Shares>,
+) -> Result<(), BackendError> {
+    let io = |what: &str, error: std::io::Error| err("session_files", format!("{what}: {error}"));
+    write_env(seat, home, state, token, owner)?;
+    let (name, contents) = if seat.owner {
+        ("class.conf", render_class().to_owned())
+    } else {
+        (
+            "binds.conf",
+            render_binds(state, &seat.id, &seat.account, shares),
+        )
+    };
+    let dropin = dropin_dir(&seat.account).join(name);
+    let mut changed = write_if_changed(&dropin, &contents, 0o644)
+        .map_err(|e| io("write the seat unit drop-in", e))?;
+    let updates = dropin_dir(&seat.account).join("updates.conf");
+    match render_updates(|helper| helper.is_file()) {
+        Some(binds) => {
+            write_if_changed(Path::new(NO_UPDATE), NO_UPDATE_SCRIPT, 0o755)
+                .map_err(|e| io("write the seat's update helper", e))?;
+            changed |= write_if_changed(&updates, &binds, 0o644)
+                .map_err(|e| io("write the seat unit drop-in", e))?;
+        }
+        None => changed |= std::fs::remove_file(&updates).is_ok(),
+    }
+    if changed {
+        daemon_reload()?;
+    }
+    Ok(())
+}
+
+pub(super) fn daemon_reload() -> Result<(), BackendError> {
+    run("systemctl_failed", "systemctl", &["daemon-reload"]).map(drop)
+}
+
+/// A unit's state as `systemctl show` reports it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct UnitState {
+    pub active: String,
+    pub sub: String,
+    /// `success`, or why the last run ended (`exit-code`, `signal`, `start-limit-hit`, ...).
+    pub result: String,
+}
+
+pub(super) fn parse_show(text: &str) -> UnitState {
+    let mut state = UnitState::default();
+    for line in text.lines() {
+        match line.split_once('=') {
+            Some(("ActiveState", value)) => state.active = value.to_owned(),
+            Some(("SubState", value)) => state.sub = value.to_owned(),
+            Some(("Result", value)) => state.result = value.to_owned(),
+            _ => {}
+        }
+    }
+    state
+}
+
+impl UnitState {
+    pub(super) fn runtime(&self) -> RuntimeStatus {
+        match self.active.as_str() {
+            "active" => RuntimeStatus::running(),
+            "activating" if self.sub == "auto-restart" => RuntimeStatus {
+                state: RuntimeState::Starting,
+                detail: Some(format!("restarting after {}", self.result)),
+            },
+            "activating" | "reloading" => RuntimeStatus {
+                state: RuntimeState::Starting,
+                detail: Some("starting".into()),
+            },
+            "deactivating" => RuntimeStatus {
+                state: RuntimeState::Stopping,
+                detail: None,
+            },
+            "failed" => RuntimeStatus::failed(format!("seat unit failed: {}", self.result)),
+            "inactive" => RuntimeStatus::stopped(),
+            _ => RuntimeStatus::default(),
+        }
+    }
+
+    /// The unit is up or on its way, so its seat still needs the trust refresh.
+    pub(super) fn live(&self) -> bool {
+        matches!(self.active.as_str(), "active" | "activating" | "reloading")
+    }
+}
+
+pub(super) fn state(account: &str) -> Result<UnitState, BackendError> {
+    let shown = run(
+        "systemctl_failed",
+        "systemctl",
+        &[
+            "show",
+            &unit(account),
+            "-p",
+            "ActiveState",
+            "-p",
+            "SubState",
+            "-p",
+            "Result",
+        ],
+    )?;
+    Ok(parse_show(&shown))
+}
+
+/// Whether something accepts TCP connections on loopback `port`: the seat host's management API.
+pub(super) fn port_open(port: u16) -> bool {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{RuntimeStatus, Seat, SeatId};
+
+    fn seat(name: &str) -> Seat {
+        Seat {
+            id: SeatId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            name: name.into(),
+            account: "pf-seat-1".into(),
+            display_slot: 12,
+            native_port: 9779,
+            mgmt_port: 47995,
+            autostart: false,
+            runtime: RuntimeStatus::stopped(),
+            owner: false,
+            fingerprint: None,
+        }
+    }
+
+    /// The owner's row for the account `enrico`, as adopted.
+    fn owner() -> Seat {
+        Seat {
+            account: "enrico".into(),
+            name: "enrico".into(),
+            owner: true,
+            ..seat("enrico")
+        }
+    }
+
+    /// The owner's host is the owner's own: no config directory, library, host name or
+    /// GameStream setting from the row, only the contract that moves its ports behind the door.
+    #[test]
+    fn the_owner_s_env_file_leaves_its_config_and_settings_alone() {
+        let text = render_env(
+            &owner(),
+            Path::new("/home/enrico"),
+            Path::new("/var/lib/punktfunk-seats"),
+            "ab12",
+        );
+        assert_eq!(
+            text,
+            "PUNKTFUNK_SEAT_SESSION=\"1\"\n\
+             PUNKTFUNK_SEAT_ID=\"0123456789abcdef0123456789abcdef\"\n\
+             PUNKTFUNK_SEAT_OWNER=\"1\"\n\
+             PUNKTFUNK_TRUST_DIR=\"/var/lib/punktfunk-seats/trust/0123456789abcdef0123456789abcdef\"\n\
+             PUNKTFUNK_PAIRING=\"refused\"\n\
+             PUNKTFUNK_NATIVE_PORT=\"9779\"\n\
+             PUNKTFUNK_MGMT_BIND=\"127.0.0.1:47995\"\n\
+             PUNKTFUNK_MDNS=\"0\"\n\
+             PUNKTFUNK_MGMT_TOKEN=ab12\n"
+        );
+        assert!(!text.contains("CONFIG_DIR"));
+        assert!(!text.contains("LIBRARY_DIR"));
+        assert!(render_class().contains("XDG_SESSION_CLASS=background"));
+    }
+
+    /// The whole seat contract, in the order the doc lists it, with each path under its seat.
+    #[test]
+    fn the_env_file_carries_the_seat_contract() {
+        let text = render_env(
+            &seat("Mara"),
+            Path::new("/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/home"),
+            Path::new("/var/lib/punktfunk-seats"),
+            "ab12",
+        );
+        assert_eq!(
+            text,
+            "PUNKTFUNK_SEAT_SESSION=\"1\"\n\
+             PUNKTFUNK_SEAT_ID=\"0123456789abcdef0123456789abcdef\"\n\
+             PUNKTFUNK_CONFIG_DIR=\"/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/home/.config/punktfunk\"\n\
+             PUNKTFUNK_TRUST_DIR=\"/var/lib/punktfunk-seats/trust/0123456789abcdef0123456789abcdef\"\n\
+             PUNKTFUNK_PAIRING=\"refused\"\n\
+             PUNKTFUNK_LIBRARY_DIR=\"/var/lib/punktfunk-seats/trust/0123456789abcdef0123456789abcdef\"\n\
+             PUNKTFUNK_NATIVE_PORT=\"9779\"\n\
+             PUNKTFUNK_MGMT_BIND=\"127.0.0.1:47995\"\n\
+             PUNKTFUNK_HOST_NAME=\"Mara\"\n\
+             PUNKTFUNK_GAMESTREAM=\"0\"\n\
+             PUNKTFUNK_MDNS=\"0\"\n\
+             PUNKTFUNK_MGMT_TOKEN=ab12\n"
+        );
+    }
+
+    /// A seat name is free text: quotes and backslashes are escaped so it can't end the value or
+    /// add a line, and `$` and `%` pass through because an environment file expands neither.
+    #[test]
+    fn a_seat_name_cannot_break_out_of_its_value() {
+        let text = render_env(
+            &seat(r#"A "B" \ $HOME 100%"#),
+            Path::new("/h"),
+            Path::new("/b"),
+            "ab12",
+        );
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("PUNKTFUNK_HOST_NAME="))
+            .unwrap();
+        assert_eq!(line, r#"PUNKTFUNK_HOST_NAME="A \"B\" \\ $HOME 100%""#);
+        assert_eq!(text.lines().count(), 12);
+    }
+
+    /// The token line is the exact form the box's client parses, and every mint differs.
+    #[test]
+    fn the_token_line_and_a_minted_token_have_the_shape_the_client_reads() {
+        assert_eq!(token_line("deadbeef"), "PUNKTFUNK_MGMT_TOKEN=deadbeef\n");
+        let (a, b) = (mint_token(), mint_token());
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn the_binds_drop_in_maps_each_private_dir_and_the_uinput_proxy() {
+        let id = SeatId::parse("0123456789abcdef0123456789abcdef").unwrap();
+        assert_eq!(
+            render_binds(Path::new("/var/lib/punktfunk-seats"), &id, "pf-seat-1", None),
+            "[Service]\n\
+             TemporaryFileSystem=/run/media:ro\n\
+             BindPaths=/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/compatdata:/var/lib/punktfunk-seats/games/steamapps/compatdata\n\
+             BindPaths=/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/shadercache:/var/lib/punktfunk-seats/games/steamapps/shadercache\n\
+             BindPaths=/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/downloading:/var/lib/punktfunk-seats/games/steamapps/downloading\n\
+             BindPaths=-/dev/punktfunk/uinput-pf-seat-1:/dev/uinput\n"
+        );
+    }
+
+    #[test]
+    fn only_the_update_helpers_on_this_box_are_bound() {
+        assert_eq!(render_updates(|_| false), None);
+        assert_eq!(
+            render_updates(|p| p.starts_with("/usr/bin/steamos-polkit-helpers")).unwrap(),
+            "[Service]\n\
+             BindReadOnlyPaths=/run/punktfunk/seat-no-update:/usr/bin/steamos-polkit-helpers/steamos-update\n\
+             BindReadOnlyPaths=/run/punktfunk/seat-no-update:/usr/bin/steamos-polkit-helpers/jupiter-biosupdate\n"
+        );
+    }
+
+    /// The codes Steam reads as "nothing to do", under each name the script is bound to. `sh`
+    /// reads the file: executing it races another test thread's fork (`ETXTBSY`).
+    #[test]
+    fn the_update_helper_reports_nothing_to_do() {
+        let dir = std::env::temp_dir().join(format!("pf-no-update-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let code = |name: &str, args: &[&str]| {
+            let path = dir.join(name);
+            std::fs::write(&path, NO_UPDATE_SCRIPT).unwrap();
+            std::process::Command::new("sh")
+                .arg(&path)
+                .args(args)
+                .status()
+                .unwrap()
+                .code()
+        };
+        assert_eq!(
+            code("steamos-update", &["--enable-duplicate-detection", "check"]),
+            Some(7)
+        );
+        assert_eq!(code("steamos-update", &[]), Some(7));
+        assert_eq!(
+            code("steamos-update", &["--supports-duplicate-detection"]),
+            Some(0)
+        );
+        assert_eq!(code("jupiter-biosupdate", &["check"]), Some(0));
+        assert_eq!(code("jupiter-initial-firmware-update", &["check"]), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn systemctl_show_maps_to_a_runtime_status() {
+        let status = |text: &str| parse_show(text).runtime();
+        assert_eq!(
+            status("ActiveState=active\nSubState=running\nResult=success\n"),
+            RuntimeStatus::running()
+        );
+        assert_eq!(
+            status("ActiveState=inactive\nSubState=dead\nResult=success\n").state,
+            RuntimeState::Stopped
+        );
+        assert_eq!(
+            status("ActiveState=activating\nSubState=start\nResult=success\n").state,
+            RuntimeState::Starting
+        );
+        let restarting =
+            status("ActiveState=activating\nSubState=auto-restart\nResult=exit-code\n");
+        assert_eq!(restarting.state, RuntimeState::Starting);
+        assert_eq!(
+            restarting.detail.as_deref(),
+            Some("restarting after exit-code")
+        );
+        let failed = status("ActiveState=failed\nSubState=failed\nResult=signal\n");
+        assert_eq!(failed.state, RuntimeState::Failed);
+        assert!(failed.detail.unwrap().contains("signal"));
+        assert_eq!(status("").state, RuntimeState::Unknown);
+        assert!(parse_show("ActiveState=activating\n").live());
+        assert!(!parse_show("ActiveState=failed\n").live());
+    }
+
+    #[test]
+    fn a_file_is_rewritten_only_when_it_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("a/b.env");
+        assert!(write_if_changed(&path, "X=\"1\"\n", 0o640).unwrap());
+        assert!(!write_if_changed(&path, "X=\"1\"\n", 0o640).unwrap());
+        assert!(write_if_changed(&path, "X=\"2\"\n", 0o640).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "X=\"2\"\n");
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+}

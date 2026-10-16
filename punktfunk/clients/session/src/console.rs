@@ -19,16 +19,17 @@ use pf_client_core::gamepad::is_steam_deck;
 use pf_client_core::orchestrate::{
     self, emit, exit, SessionLine, WakeOutcome, WAKE_RESEND_SECS, WAKE_TIMEOUT_SECS,
 };
-use pf_client_core::{discovery, library, start, trust, wol};
+use pf_client_core::{discovery, library, profiles, start, trust, wol};
 use pf_console_ui::{
     ConsoleCmd, ConsoleEntry, ConsoleHandles, ConsoleOptions, ConsoleShared, HostRow, LibraryGame,
-    LibraryPhase, LibraryShared, PairPhase, SkiaOverlay, SpeedPhase, WakeStatus,
+    LibraryPhase, LibraryShared, PairPhase, PairStatus, ProfilesAnswer, RequestKey, SkiaOverlay,
+    SpeedPhase, WakeStatus,
 };
 use pf_presenter::overlay::OverlayAction;
 use pf_presenter::ActionOutcome;
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -234,6 +235,7 @@ pub fn run(target: Option<&str>) -> u8 {
                     title,
                     request_access,
                     preset,
+                    profile,
                 } => {
                     let Some(pin) = trust::parse_hex32(&fp_hex) else {
                         // Connect (and request-access) pin the host's advertised fingerprint;
@@ -277,6 +279,7 @@ pub fn run(target: Option<&str>) -> u8 {
                     // desktop mouse mode — so it follows the latched mode, not this launch's
                     // preset. Otherwise the host composites no cursor and the stream shows none.
                     params.cursor_forward = latched_mouse == trust::MouseMode::Desktop;
+                    params.profile = profile;
                     if request_access {
                         // The host PARKS the connect until the operator approves — outlast its
                         // approval window (host `PENDING_APPROVAL_WAIT`), matching the desktop
@@ -300,6 +303,10 @@ pub fn run(target: Option<&str>) -> u8 {
                 // This console is drawn OVER the session's stream, so the hold coming down is
                 // the shell's own business and the picture is already behind it.
                 OverlayAction::ShowStream => ActionOutcome::Handled,
+                // The console offers these on Android only.
+                OverlayAction::PinShortcut { .. } | OverlayAction::SaveLauncherFile { .. } => {
+                    ActionOutcome::Handled
+                }
                 OverlayAction::Quit => ActionOutcome::Quit,
             }
         },
@@ -316,6 +323,7 @@ pub fn run(target: Option<&str>) -> u8 {
                 emit(SessionLine::Error {
                     msg: &format!("{e:#}"),
                     trust_rejected: Some(false),
+                    refused: None,
                 });
             }
             eprintln!("console: {e:#}");
@@ -327,9 +335,9 @@ pub fn run(target: Option<&str>) -> u8 {
 /// A console row key → its index in the known-hosts store. The key is the pinned
 /// fingerprint when there is one, else `addr:port` (see the row builder) — which names
 /// the placeholder there, never a record pinned at that address. A pinned CARD's key
-/// carries the preset id past a NUL — the console strips that before it sends a
-/// command, so nothing here has to.
+/// carries the preset id past a NUL, dropped here: a card sends the key it shows.
 fn index_for_key(known: &trust::KnownHosts, key: &str) -> Option<usize> {
+    let key = key.split('\0').next().unwrap_or(key);
     known
         .hosts
         .iter()
@@ -381,6 +389,7 @@ fn seed_row(k: Option<&trust::KnownHost>, addr: &str, port: u16) -> HostRow {
         bound_preset: None,
         running: String::new(),
         game_presets: Default::default(),
+        profile: k.and_then(|h| h.profile.clone()),
     }
 }
 
@@ -429,7 +438,10 @@ impl Service {
                     probe_inflight: Arc::new(AtomicBool::new(false)),
                     last_probe: Instant::now() - Duration::from_secs(60),
                     wake_cancel: None,
+                    pair_gen: Arc::new(AtomicU64::new(0)),
                     rescan: None,
+                    stores: Stores::default(),
+                    learn_due: true,
                 }
                 .run(stop_w)
             })
@@ -444,6 +456,9 @@ impl Service {
         }
     }
 }
+
+/// A worker thread a command started. The service never joins one; a test waits on it.
+type Worker = Option<std::thread::JoinHandle<()>>;
 
 struct ServiceState {
     console: ConsoleShared,
@@ -460,51 +475,75 @@ struct ServiceState {
     last_probe: Instant,
     /// Cancels the active wake thread (it owns the model's wake status).
     wake_cancel: Option<Arc<AtomicBool>>,
+    /// Bumped per pairing. A ceremony the player left still persists, but only the
+    /// newest one writes the shared phase.
+    pair_gen: Arc<AtomicU64>,
     /// Forces the mDNS browse to re-query. Installed by `run`; `None` before it starts.
     rescan: Option<discovery::Rescan>,
+    stores: Stores,
+    /// The adverts or the saved hosts moved since each saved host last learned from its advert.
+    learn_due: bool,
+}
+
+/// The saved hosts and the preset catalog as last read. Each is read again only when its file
+/// changed, so a rebuild with nothing new costs two `stat`s and no lock.
+#[derive(Default)]
+struct Stores {
+    known: trust::KnownHosts,
+    known_seen: trust::FileStamp,
+    catalog: pf_client_core::presets::PresetsFile,
+    catalog_seen: trust::FileStamp,
+}
+
+impl Stores {
+    /// `true` when the saved hosts were read again.
+    fn refresh(&mut self) -> bool {
+        if let Some(c) =
+            pf_client_core::presets::PresetsFile::load_if_changed(&mut self.catalog_seen)
+        {
+            self.catalog = c;
+        }
+        let Some(k) = trust::KnownHosts::load_if_changed(&mut self.known_seen) else {
+            return false;
+        };
+        self.known = k;
+        true
+    }
+
+    /// Read both again at the next `refresh`. A command writes the store, and its write can
+    /// carry the timestamp of the read before it.
+    fn forget(&mut self) {
+        self.known_seen = trust::FileStamp::default();
+        self.catalog_seen = trust::FileStamp::default();
+    }
 }
 
 impl ServiceState {
     fn run(mut self, stop: Arc<AtomicBool>) {
         let (discovery_rx, rescan) = discovery::browse();
         self.rescan = Some(rescan);
-        // `rows()` re-parses the host store AND the preset catalog, so rebuilding it every
-        // 100 ms read both files ten times a second for a list that changes on events. Rebuilt
-        // when something could have moved it, with a floor so anything unmarked still lands.
+        // The rows hold probe results and cached host state that change with no event, so they
+        // are rebuilt on a floor as well as when something could have moved them. The stores
+        // under them are read again only when a file changed.
         let mut dirty = true;
         let mut last_rows = Instant::now() - Duration::from_secs(1);
         while !stop.load(Ordering::SeqCst) {
             // mDNS churn.
             while let Ok(ev) = discovery_rx.try_recv() {
                 dirty = true;
-                match ev {
-                    discovery::DiscoveryEvent::Resolved(host) => {
-                        self.discovered.insert(host.fullname.clone(), host);
-                    }
-                    discovery::DiscoveryEvent::Removed { fullname } => {
-                        self.discovered.remove(&fullname);
-                    }
-                }
+                self.on_discovery(ev);
             }
 
             // Shell commands (plus the binary's own seeded initial fetch).
             for cmd in self.bus.drain() {
                 dirty = true;
                 self.handle(cmd);
+                self.stores.forget();
             }
 
             let probe_due = self.last_probe.elapsed() >= Duration::from_secs(10);
             if dirty || probe_due || last_rows.elapsed() >= Duration::from_millis(500) {
-                let rows = self.rows();
-                // The 10 s reachability sweep — saved hosts that don't advertise (routed /
-                // multicast-filtered networks) still get honest presence pips. It reuses this
-                // tick's list rather than building two more of its own.
-                if probe_due {
-                    self.last_probe = Instant::now();
-                    self.sweep(&rows);
-                    self.refresh_host_state(&rows);
-                }
-                self.console.set_hosts(rows);
+                self.publish_rows(probe_due);
                 last_rows = Instant::now();
                 dirty = false;
             }
@@ -515,14 +554,57 @@ impl ServiceState {
         }
     }
 
+    /// An advert came or went: the list moves, and each saved host may learn from it.
+    fn on_discovery(&mut self, ev: discovery::DiscoveryEvent) {
+        self.learn_due = true;
+        match ev {
+            discovery::DiscoveryEvent::Resolved(host) => {
+                self.discovered.insert(host.fullname.clone(), host);
+            }
+            discovery::DiscoveryEvent::Removed { fullname } => {
+                self.discovered.remove(&fullname);
+            }
+        }
+    }
+
+    /// Rebuild the list for the shell, and on a due tick run the 10 s reachability sweep —
+    /// saved hosts that don't advertise (routed / multicast-filtered networks) still get honest
+    /// presence pips. The sweep reuses this tick's list rather than building two more.
+    fn publish_rows(&mut self, probe_due: bool) {
+        let rows = self.rows();
+        if std::mem::take(&mut self.learn_due) {
+            self.learn_from_adverts();
+        }
+        if probe_due {
+            self.last_probe = Instant::now();
+            self.sweep(&rows);
+            self.refresh_host_state(&rows);
+        }
+        self.console.set_hosts(rows);
+    }
+
     fn handle(&mut self, cmd: ConsoleCmd) {
         match cmd {
-            ConsoleCmd::FetchLibrary { addr, mgmt, fp_hex } => {
-                self.fetch_library(addr, mgmt, fp_hex)
-            }
+            ConsoleCmd::FetchLibrary {
+                addr,
+                port,
+                mgmt,
+                fp_hex,
+                req,
+            } => self.fetch_library(addr, port, mgmt, fp_hex, req),
             ConsoleCmd::RefreshRunning { addr, mgmt, fp_hex } => {
-                self.refresh_running(addr, mgmt, fp_hex)
+                self.refresh_running(addr, mgmt, fp_hex);
             }
+            ConsoleCmd::FetchProfiles { addr, mgmt, fp_hex } => {
+                self.fetch_profiles(addr, mgmt, fp_hex)
+            }
+            ConsoleCmd::WakeProfile {
+                addr,
+                mgmt,
+                fp_hex,
+                id,
+            } => self.wake_profile(addr, mgmt, fp_hex, id),
+            ConsoleCmd::SetProfile { key, profile } => self.set_profile(key, profile),
             ConsoleCmd::SendLogs {
                 addr,
                 mgmt,
@@ -550,13 +632,50 @@ impl ServiceState {
                 fp_hex,
                 app_id,
                 title,
-            } => self.end_game(addr, mgmt, fp_hex, app_id, title),
+            } => {
+                self.end_game(addr, mgmt, fp_hex, app_id, title);
+            }
+            ConsoleCmd::Install {
+                addr,
+                mgmt,
+                fp_hex,
+                app_id,
+                title,
+                action,
+            } => {
+                self.change_install(addr, mgmt, fp_hex, app_id, title, action);
+            }
             ConsoleCmd::Pair {
                 addr,
                 port,
                 pin,
                 device_name,
-            } => self.pair(addr, port, pin, device_name),
+                req,
+            } => self.run_pairing(
+                addr,
+                port,
+                req,
+                trust::pair_error_message,
+                move |a, p, id| trust::pair_with_host(a, p, id, &pin, &device_name),
+            ),
+            ConsoleCmd::RequestAccess {
+                addr,
+                port,
+                fp_hex,
+                device_name,
+                req,
+            } => {
+                let pin = trust::parse_hex32(&fp_hex);
+                self.run_pairing(
+                    addr,
+                    port,
+                    req,
+                    trust::access_error_message,
+                    move |a, p, id| {
+                        trust::request_access_to_host(a, p, id, pin, &device_name, None)
+                    },
+                )
+            }
             ConsoleCmd::SaveHost { name, addr, port } => self.save_host(name, addr, port),
             ConsoleCmd::UpdateHost {
                 key,
@@ -566,12 +685,17 @@ impl ServiceState {
             } => self.update_host(key, name, addr, port),
             ConsoleCmd::ForgetHost { key } => self.forget_host(key),
             ConsoleCmd::UnpairHost { key } => self.unpair_host(key),
-            ConsoleCmd::Wake { key, then_connect } => self.wake(key, then_connect),
+            ConsoleCmd::Wake {
+                key,
+                then_connect,
+                req,
+            } => self.wake(key, then_connect, req),
+            // The shell closed the card as it sent this; a `Wake` behind it in the same drain
+            // has already raised the next one.
             ConsoleCmd::CancelWake => {
                 if let Some(c) = self.wake_cancel.take() {
                     c.store(true, Ordering::SeqCst);
                 }
-                self.console.set_wake(None);
             }
             ConsoleCmd::Probe => {
                 self.last_probe = Instant::now() - Duration::from_secs(60);
@@ -584,11 +708,8 @@ impl ServiceState {
                     r.request();
                 }
             }
-            // A platform-native screen (webOS) — the desktop shell has no such row, so this
-            // never arrives here.
-            ConsoleCmd::OpenPlatformScreen { .. } => {}
-            // Grants and rumble tests from the controllers screen. Android-only for the same
-            // reason: the settings row that opens that screen is not on the desktop's list.
+            // Grants and rumble tests from the controllers screen, Android-only: the settings row
+            // that opens that screen is not on the desktop's list.
             ConsoleCmd::PadAction { .. } => {}
             // The Controllers tab offers no input test on the desktop.
             ConsoleCmd::PadTest { .. } => {}
@@ -634,19 +755,14 @@ impl ServiceState {
         }
     }
 
-    fn fetch_library(&self, addr: String, mgmt: u16, fp_hex: String) {
-        // Opening a library is the earliest signal that somebody intends to play, so
-        // the box is woken HERE, not at connect time. Empty with auto-wake off or no
-        // MAC on record: the fetch then asks once instead of retrying across a boot.
+    fn fetch_library(&self, addr: String, port: u16, mgmt: u16, fp_hex: String, req: RequestKey) {
+        // Opening a library is the earliest signal that somebody intends to play, so the box
+        // is woken HERE, not at connect time, with the MACs of the record the pin names, else
+        // of the placeholder at `addr:port`. Empty with auto-wake off or no MAC on record: the
+        // fetch then asks once instead of retrying across a boot.
         let known = trust::KnownHosts::load();
         let macs = known
-            .find_by_fp(&fp_hex)
-            .or_else(|| {
-                known
-                    .hosts
-                    .iter()
-                    .find(|h| h.fp_hex.is_empty() && h.addr == addr)
-            })
+            .resolve(Some(&fp_hex), &addr, port)
             .filter(|_| trust::Settings::load().auto_wake)
             .map(|h| h.mac.clone())
             .unwrap_or_default();
@@ -655,13 +771,13 @@ impl ServiceState {
             addr,
             mgmt,
             self.identity.clone(),
-            fp_hex.clone(),
-            trust::parse_hex32(&fp_hex),
+            fp_hex,
             macs,
+            req,
         );
     }
 
-    fn refresh_running(&self, addr: String, mgmt: u16, fp_hex: String) {
+    fn refresh_running(&self, addr: String, mgmt: u16, fp_hex: String) -> Worker {
         // The carousel behind the shelf reads a different cache for the same fact;
         // dropping it here is what stops a tile advertising the game just quit.
         library::invalidate_running(&fp_hex);
@@ -671,10 +787,52 @@ impl ServiceState {
         let shared = self.library.clone();
         let identity = self.identity.clone();
         let pin = trust::parse_hex32(&fp_hex);
+        // A newer fetch owns the model by the time a slow host answers: its titles are not
+        // this host's to badge.
+        let epoch = shared.fetch_epoch();
         std::thread::Builder::new()
             .name("punktfunk-running".into())
             .spawn(move || {
-                shared.set_running(&library::fetch_running(&addr, mgmt, &identity, pin));
+                let status = library::fetch_status(&addr, mgmt, &identity, pin);
+                if shared.fetch_epoch() == epoch {
+                    shared.set_downloads(&status.downloads, status.grants);
+                    shared.set_running(&status.games);
+                }
+            })
+            .ok()
+    }
+
+    /// The box's profiles for the picker, off the service thread like every fetch here.
+    fn fetch_profiles(&self, addr: String, mgmt: u16, fp_hex: String) {
+        let console = self.console.clone();
+        let identity = self.identity.clone();
+        let pin = trust::parse_hex32(&fp_hex);
+        std::thread::Builder::new()
+            .name("punktfunk-profiles".into())
+            .spawn(move || {
+                let answer = match profiles::fetch_enumerate(&addr, mgmt, &identity, pin) {
+                    Ok(Some(listed)) => ProfilesAnswer::Listed(listed),
+                    Ok(None) => ProfilesAnswer::NoProfiles,
+                    Err(e) => {
+                        tracing::info!(%addr, error = %e, "profile list did not load");
+                        ProfilesAnswer::Failed(e.to_string())
+                    }
+                };
+                console.set_profiles(&fp_hex, answer);
+            })
+            .ok();
+    }
+
+    /// Starts a profile's stopped seat. The shell polls the list for `ready` itself.
+    fn wake_profile(&self, addr: String, mgmt: u16, fp_hex: String, id: String) {
+        let identity = self.identity.clone();
+        let pin = trust::parse_hex32(&fp_hex);
+        std::thread::Builder::new()
+            .name("punktfunk-wake-seat".into())
+            .spawn(move || {
+                if let Err(e) = profiles::wake(&addr, mgmt, &identity, pin, &id) {
+                    tracing::info!(%addr, error = %e, "profile seat did not wake");
+                }
             })
             .ok();
     }
@@ -712,23 +870,40 @@ impl ServiceState {
                 console.advance_speed(&key, SpeedPhase::Measuring);
                 let fp = (!fp_hex.is_empty()).then_some(fp_hex.as_str());
                 let progress = |kbps| console.advance_speed(&key, SpeedPhase::Progress { kbps });
-                let run = pf_client_core::speed::run_speed_probe_with;
+                // The whole check, not just the speed: the takeover lists what it found.
+                let run = pf_client_core::speed::run_network_check_with;
                 match run(&addr, port, fp, identity, progress) {
                     Ok(r) => {
                         tracing::info!(
                             host = %host_name,
-                            kbps = r.throughput_kbps,
-                            loss = r.loss_pct,
-                            "speed test finished"
+                            ceiling_kbps = r.speed.ceiling_kbps,
+                            wall = r.speed.wall,
+                            clean_loss = r.speed.clean.map(|c| c.loss_pct),
+                            findings = ?r.findings.iter().map(|f| f.id).collect::<Vec<_>>(),
+                            "network check finished"
                         );
                         console.advance_speed(
                             &key,
                             SpeedPhase::Done {
-                                throughput_kbps: r.throughput_kbps,
-                                loss_pct: r.loss_pct,
+                                throughput_kbps: r.speed.ceiling_kbps,
+                                wall: r.speed.wall,
+                                clean: r.speed.clean.map(|c| pf_console_ui::model::CleanRound {
+                                    rate_kbps: c.rate_kbps,
+                                    loss_pct: c.loss_pct,
+                                    jitter_us: c.jitter_us,
+                                }),
                                 recommended_kbps: pf_client_core::speed::recommended_kbps(
-                                    r.throughput_kbps,
+                                    r.speed.ceiling_kbps,
                                 ),
+                                findings: r
+                                    .findings
+                                    .iter()
+                                    .map(|f| pf_console_ui::model::FindingRow {
+                                        id: f.id as u8,
+                                        severity: f.severity as u8,
+                                        numbers: f.numbers,
+                                    })
+                                    .collect(),
                             },
                         );
                     }
@@ -764,7 +939,14 @@ impl ServiceState {
             .ok();
     }
 
-    fn end_game(&self, addr: String, mgmt: u16, fp_hex: String, app_id: String, title: String) {
+    fn end_game(
+        &self,
+        addr: String,
+        mgmt: u16,
+        fp_hex: String,
+        app_id: String,
+        title: String,
+    ) -> Worker {
         // Same worker-thread reason as `refresh_running`; the re-read after it is what
         // takes the Resume badge off the poster.
         library::invalidate_running(&fp_hex);
@@ -772,18 +954,69 @@ impl ServiceState {
         let identity = self.identity.clone();
         let pin = trust::parse_hex32(&fp_hex);
         let console = self.console.clone();
+        // As in `refresh_running`: the player may be on another host's shelf by the answer.
+        let epoch = shared.fetch_epoch();
         std::thread::Builder::new()
             .name("punktfunk-endgame".into())
             .spawn(move || {
                 let outcome = library::end_game(&addr, mgmt, &identity, pin, &app_id);
                 tracing::info!(app = %app_id, ?outcome, "end game");
                 console.set_notice(outcome.notice(&title));
-                shared.set_running(&library::fetch_running(&addr, mgmt, &identity, pin));
+                let running = library::fetch_running(&addr, mgmt, &identity, pin);
+                if shared.fetch_epoch() == epoch {
+                    shared.set_running(&running);
+                }
             })
-            .ok();
+            .ok()
     }
 
-    fn pair(&self, addr: String, port: u16, pin: String, device_name: String) {
+    fn change_install(
+        &self,
+        addr: String,
+        mgmt: u16,
+        fp_hex: String,
+        app_id: String,
+        title: String,
+        action: library::InstallAction,
+    ) -> Worker {
+        let shared = self.library.clone();
+        let identity = self.identity.clone();
+        let pin = trust::parse_hex32(&fp_hex);
+        let console = self.console.clone();
+        let epoch = shared.fetch_epoch();
+        std::thread::Builder::new()
+            .name("punktfunk-install".into())
+            .spawn(move || {
+                let outcome = library::change_install(&addr, mgmt, &identity, pin, &app_id, action);
+                tracing::info!(app = %app_id, ?action, ?outcome, "title install");
+                console.set_notice(outcome.notice(action, &title));
+                let status = library::fetch_status(&addr, mgmt, &identity, pin);
+                if shared.fetch_epoch() == epoch {
+                    if outcome == library::InstallOutcome::Done
+                        && action == library::InstallAction::Remove
+                    {
+                        shared.set_installed(&app_id, false);
+                    }
+                    shared.set_downloads(&status.downloads, status.grants);
+                    shared.set_running(&status.games);
+                }
+            })
+            .ok()
+    }
+
+    /// Run one pairing (`ask`: the PIN ceremony or a request access) on its own thread and
+    /// report it under `req` as Busy, then Paired or Failed. A later pairing makes this
+    /// answer stale.
+    fn run_pairing(
+        &mut self,
+        addr: String,
+        port: u16,
+        req: RequestKey,
+        wording: fn(&punktfunk_core::PunktfunkError) -> String,
+        ask: impl FnOnce(&str, u16, &(String, String)) -> Result<[u8; 32], punktfunk_core::PunktfunkError>
+            + Send
+            + 'static,
+    ) {
         // What the list calls each identity at this address (advert or store), picked
         // once the ceremony says which one answered: both OS installs of a dual-boot
         // box sit here, and the first row is not necessarily this one.
@@ -793,13 +1026,22 @@ impl ServiceState {
             .filter(|r| r.addr == addr && r.port == port)
             .map(|r| (r.fp_hex, r.name))
             .collect();
-        self.console.set_pair(PairPhase::Busy);
         let console = self.console.clone();
+        let say = move |phase| {
+            console.set_pair(PairStatus {
+                req: req.clone(),
+                phase,
+            })
+        };
+        say(PairPhase::Busy);
         let identity = self.identity.clone();
+        let generation = self.pair_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let pair_gen = self.pair_gen.clone();
         std::thread::Builder::new()
             .name("punktfunk-pair".into())
             .spawn(move || {
-                match trust::pair_with_host(&addr, port, &identity, &pin, &device_name) {
+                let current = || pair_gen.load(Ordering::SeqCst) == generation;
+                match ask(&addr, port, &identity) {
                     Ok(fp) => {
                         let fp_hex = trust::hex(&fp);
                         let name = named
@@ -807,79 +1049,82 @@ impl ServiceState {
                             .find(|(f, _)| *f == fp_hex)
                             .or_else(|| named.iter().find(|(f, _)| f.is_empty()))
                             .map_or_else(|| addr.clone(), |(_, n)| n.clone());
-                        if let Err(e) = trust::persist_host(&name, &addr, port, &fp_hex, true, &[])
-                        {
-                            tracing::warn!(error = %format!("{e:#}"), "saving the paired host");
+                        let paired = trust::save_paired(&name, &addr, port, fp, &[]);
+                        if !current() {
+                            return;
                         }
-                        console.set_pair(PairPhase::Paired { key: fp_hex });
+                        match paired.saved {
+                            Ok(()) => say(PairPhase::Paired { key: paired.fp_hex }),
+                            // Not "Paired": the pin is gone by the next launch.
+                            Err(e) => say(PairPhase::Failed(format!(
+                                "Paired, but couldn't save — {e:#}"
+                            ))),
+                        }
                     }
                     Err(e) => {
                         // Cause-specific wording (wrong PIN vs not-armed vs unreachable
                         // vs a typed host rejection) — shared with every other surface.
-                        console.set_pair(PairPhase::Failed(trust::pair_error_message(&e)));
+                        if current() {
+                            say(PairPhase::Failed(wording(&e)));
+                        }
                     }
                 }
             })
             .ok();
     }
 
+    /// A manual entry has no pin: it edits the placeholder at its address or files one. A
+    /// record pinned there is another identity and keeps its name.
     fn save_host(&mut self, name: String, addr: String, port: u16) {
-        let mut known = trust::KnownHosts::load();
-        // A manual entry has no pin yet: it renames the placeholder at its address or
-        // adds one. A record pinned there is another identity — the other OS of a
-        // dual-boot box — and keeps its name.
-        if let Some(h) = known
-            .placeholder_at(&addr, port)
-            .and_then(|i| known.hosts.get_mut(i))
-        {
-            if !name.is_empty() {
-                h.name = name;
-            }
-        } else {
-            known.hosts.push(trust::KnownHost {
-                name: if name.is_empty() { addr.clone() } else { name },
-                addr,
-                port,
-                ..Default::default()
-            });
+        let edit = trust::HostEdit {
+            name: Some(name),
+            addr: Some(addr),
+            port: Some(port),
+            ..Default::default()
+        };
+        let mut added = Ok(trust::AddOutcome::Unchanged);
+        let saved = trust::KnownHosts::update_if(|known| {
+            added = known.add(&edit);
+            added.is_ok().then_some(())
+        });
+        if let Err(e) = added {
+            tracing::warn!(error = %format!("{e:#}"), "typed host not saved");
+            return;
         }
-        self.save_known(&known);
+        if let Err(e) = saved {
+            self.save_failed(&e);
+        }
         self.last_probe = Instant::now() - Duration::from_secs(60); // probe it now
     }
 
+    /// Edited in place, never removed and re-added: the pin, the learned MACs, the pinned
+    /// cards and the preset binding hang off this record. A blank name is no edit.
     fn update_host(&mut self, key: String, name: String, addr: String, port: u16) {
-        let mut known = trust::KnownHosts::load();
-        let Some(h) = index_for_key(&known, &key).and_then(|i| known.hosts.get_mut(i)) else {
-            tracing::warn!(%key, "edit for an unknown host — ignoring");
-            return;
+        let edit = trust::HostEdit {
+            name: Some(name),
+            addr: Some(addr),
+            port: Some(port),
+            ..Default::default()
         };
-        // Edited IN PLACE rather than removed and re-added: the fingerprint, the
-        // learned MAC, the pinned cards and the preset binding all hang off this
-        // entry, and re-adding would silently unpair a host the user only renamed.
-        h.name = if name.trim().is_empty() {
-            addr.clone()
-        } else {
-            name
-        };
-        h.move_to(&addr, port);
-        self.save_known(&known);
-        self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
+        let found = self.edit_host(&key, "edit", |h| {
+            h.apply_edit(&edit);
+            true
+        });
+        if found {
+            self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
+        }
     }
 
     fn forget_host(&mut self, key: String) {
-        let mut known = trust::KnownHosts::load();
-        let Some(i) = index_for_key(&known, &key) else {
-            tracing::warn!(%key, "forget for an unknown host — ignoring");
-            return;
-        };
-        match orchestrate::forget_host(&mut known, i) {
-            Ok(gone) => {
+        match orchestrate::forget_host(|known| index_for_key(known, &key)) {
+            Ok(Some(gone)) => {
                 tracing::info!(name = %gone.name, addr = %gone.addr, "host forgotten")
             }
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
-                self.console.set_notice(format!("Couldn't save — {e:#}"));
+            Ok(None) => {
+                tracing::warn!(%key, "forget for an unknown host — ignoring");
+                return;
             }
+            Err(e) => self.save_failed(&e),
         }
         // It may still be advertising, in which case it comes straight back as a
         // DISCOVERED row — unsaved and unpaired, which is the honest state.
@@ -887,29 +1132,14 @@ impl ServiceState {
     }
 
     fn unpair_host(&self, key: String) {
-        let mut known = trust::KnownHosts::load();
-        let Some(i) = index_for_key(&known, &key) else {
-            tracing::warn!(%key, "unpair for an unknown host — ignoring");
-            return;
-        };
-        let host = &mut known.hosts[i];
-        let fp = std::mem::take(&mut host.fp_hex);
-        host.paired = false;
-        let (id, name) = (host.id.clone(), host.name.clone());
-        self.save_known(&known);
-        // The catalog cache is keyed on the fingerprint just dropped; nothing reaches
-        // it again, so it goes now, as a forget's does.
-        pf_client_core::library_cache::forget(&fp);
-        // An unpaired host is no landing: the resolver skips it, and this stops a
-        // later re-pair inheriting the choice.
-        let mut settings = trust::Settings::load();
-        if start::clear_default(&mut settings, id.as_deref()) {
-            settings.save();
+        match orchestrate::unpair_host(|known| index_for_key(known, &key)) {
+            Ok(Some(host)) => tracing::info!(name = %host.name, "host unpaired"),
+            Ok(None) => tracing::warn!(%key, "unpair for an unknown host — ignoring"),
+            Err(e) => self.save_failed(&e),
         }
-        tracing::info!(%name, "host unpaired");
     }
 
-    fn wake(&mut self, key: String, then_connect: bool) {
+    fn wake(&mut self, key: String, then_connect: bool, req: RequestKey) {
         if let Some(c) = self.wake_cancel.take() {
             c.store(true, Ordering::SeqCst);
         }
@@ -921,30 +1151,35 @@ impl ServiceState {
             .map(|i| known.hosts[i].mac.clone())
             .unwrap_or_default();
         if macs.is_empty() {
-            self.console.set_pair(PairPhase::Idle); // no-op; keep state sane
+            // Nothing to send: end the takeover the shell opened for this wake.
+            self.console.set_wake(Some(WakeStatus {
+                req,
+                key: row.key,
+                name: row.name,
+                seconds: 0,
+                timed_out: true,
+                online: false,
+                then_connect,
+            }));
             return;
         }
         let cancel = Arc::new(AtomicBool::new(false));
         self.wake_cancel = Some(cancel.clone());
-        spawn_wake(self.console.clone(), row, macs, then_connect, cancel);
+        spawn_wake(self.console.clone(), row, macs, then_connect, req, cancel);
     }
 
     fn set_pin(&self, key: String, preset_id: String, pin: bool) {
         // Presentation only (design §5.2a): order = card order, appended at the
         // end; never touches `preset_id` (the default binding). Idempotent, so
         // a repeated press inside one refresh window can't double-pin.
-        let mut known = trust::KnownHosts::load();
-        let idx = index_for_key(&known, &key);
-        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-            tracing::warn!(%key, "pin toggle for an unknown host — ignoring");
-            return;
-        };
-        if pin && !h.pinned_presets.contains(&preset_id) {
-            h.pinned_presets.push(preset_id);
-        } else if !pin {
-            h.pinned_presets.retain(|id| *id != preset_id);
-        }
-        self.save_known(&known);
+        self.edit_host(&key, "pin toggle", |h| {
+            if pin && !h.pinned_presets.contains(&preset_id) {
+                h.pinned_presets.push(preset_id);
+            } else if !pin {
+                h.pinned_presets.retain(|id| *id != preset_id);
+            }
+            true
+        });
         // `run` refreshes the rows right after this drain, so the carousel and
         // the pin screen reflect the new card within the same service pass.
     }
@@ -954,13 +1189,7 @@ impl ServiceState {
         // host, `game_presets` for one title. `SetPin` above is the presentation
         // half and never touches either; this never touches the pins. Same store
         // discipline, same refresh-after-drain.
-        let mut known = trust::KnownHosts::load();
-        let idx = index_for_key(&known, &key);
-        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-            tracing::warn!(%key, "preset bind for an unknown host — ignoring");
-            return;
-        };
-        let changed = match &game {
+        self.edit_host(&key, "preset bind", |h| match &game {
             Some(id) => {
                 let moved = h.preset_for_game(id) != preset_id.as_deref();
                 h.bind_game_preset(id, preset_id.as_deref());
@@ -971,25 +1200,27 @@ impl ServiceState {
                 h.preset_id = preset_id;
                 moved
             }
-        };
-        if changed {
-            self.save_known(&known);
-        }
+        });
+    }
+
+    /// The profile this device plays as on a saved host (`KnownHost::profile`). Same store
+    /// discipline as `set_pin`; the next rows carry it to the card.
+    fn set_profile(&self, key: String, profile: Option<profiles::ProfilePick>) {
+        self.edit_host(&key, "profile pick", |h| {
+            let changed = h.profile != profile;
+            h.profile = profile;
+            changed
+        });
     }
 
     fn set_clipboard(&self, key: String, on: bool) {
         // Per-host clipboard trust (`KnownHost::clipboard_sync`) — the host
         // menu's toggle. Same store discipline as `set_pin`.
-        let mut known = trust::KnownHosts::load();
-        let idx = index_for_key(&known, &key);
-        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-            tracing::warn!(%key, "clipboard toggle for an unknown host — ignoring");
-            return;
-        };
-        if h.clipboard_sync != on {
+        self.edit_host(&key, "clipboard toggle", |h| {
+            let changed = h.clipboard_sync != on;
             h.clipboard_sync = on;
-            self.save_known(&known);
-        }
+            changed
+        });
     }
 
     /// One parallel reachability pass over every row. Advertising ones are NOT online by
@@ -1037,14 +1268,36 @@ impl ServiceState {
             .ok();
     }
 
-    /// Write the host store, and SAY so when it fails. The console is the only surface the
-    /// user has here — a warning in the log reaches nobody on a TV — and a dropped write
-    /// means the change they just made is not on disk.
-    fn save_known(&self, known: &trust::KnownHosts) {
-        if let Err(e) = known.save() {
-            tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
-            self.console.set_notice(format!("Couldn't save — {e:#}"));
+    /// Apply `f` to the record `key` names, in the store as it is under its lock, and save
+    /// when `f` says it changed. `what` names the edit in the log when the key matches no
+    /// record. `true` when it matched one.
+    fn edit_host(
+        &self,
+        key: &str,
+        what: &str,
+        f: impl FnOnce(&mut trust::KnownHost) -> bool,
+    ) -> bool {
+        let mut found = false;
+        let saved = trust::KnownHosts::update_if(|known| {
+            let Some(h) = index_for_key(known, key).and_then(|i| known.hosts.get_mut(i)) else {
+                tracing::warn!(%key, "{what} for an unknown host — ignoring");
+                return None;
+            };
+            found = true;
+            f(h).then_some(())
+        });
+        if let Err(e) = saved {
+            self.save_failed(&e);
         }
+        found
+    }
+
+    /// SAY so when a host-store write fails. The console is the only surface the user has
+    /// here — a warning in the log reaches nobody on a TV — and a dropped write means the
+    /// change they just made is not on disk.
+    fn save_failed(&self, e: &impl std::fmt::Display) {
+        tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
+        self.console.set_notice(format!("Couldn't save — {e:#}"));
     }
 
     /// Keep every paired, reachable host's advertised actions and running title fresh (the
@@ -1060,128 +1313,154 @@ impl ServiceState {
         }
     }
 
-    /// The console home's rows: saved hosts in store order, each followed by its pinned
-    /// preset cards (design §5.2a), then discovered-but-unsaved ones by name, then a
-    /// still-uncovered `--browse` seed. `home::arrange` applies the player's sort; the Apple
-    /// and Android producers send the same order (`clients/shared/host-row-vectors.json`).
-    fn rows(&self) -> Vec<HostRow> {
-        let known = trust::KnownHosts::load();
-        let catalog = pf_client_core::presets::PresetsFile::load();
+    /// The console home's rows, from the stores as the last `refresh` left them.
+    fn rows(&mut self) -> Vec<HostRow> {
+        self.learn_due |= self.stores.refresh();
         let probed = self.probed.lock().unwrap();
-        let chip = |p: &pf_client_core::presets::StreamPreset| pf_console_ui::PresetChip {
-            id: p.id.clone(),
-            name: p.name.clone(),
-            accent: p.accent.clone(),
-            // Only the speed test reads this: a preset that PINS bitrate is the layer its
-            // host streams at, so the console must not offer to write the global instead.
-            bitrate_kbps: p.overrides.bitrate_kbps,
-        };
-        let mut rows: Vec<HostRow> = known
-            .hosts
-            .iter()
-            .flat_map(|h| {
-                let key = if h.fp_hex.is_empty() {
-                    format!("{}:{}", h.addr, h.port)
-                } else {
-                    h.fp_hex.clone()
-                };
-                let advert = self
-                    .discovered
-                    .values()
-                    .find(|d| discovery::same_host(h, d));
-                let online = probed.get(&key).copied().unwrap_or(false);
-                // Everything the advert teaches, while it is visible: mgmt port, OS chain, wake
-                // MAC (a Deck in Gaming Mode runs only this console and the Decky panel), and an
-                // address the sweep asks; the card moves only once its pin answers there.
-                if let Some(a) = advert {
-                    pf_client_core::trust::learn_from_advert(
-                        &h.fp_hex,
-                        &h.addr,
-                        h.port,
-                        &a.addr,
-                        &a.mac,
-                        &a.os,
-                        a.mgmt_port,
-                    );
-                }
-                let row = HostRow {
-                    key: key.clone(),
-                    id: h.id.clone(),
-                    name: host_display_name(&h.name, &h.addr),
-                    addr: h.addr.clone(),
-                    port: h.port,
-                    fp_hex: h.fp_hex.clone(),
-                    paired: h.paired,
-                    saved: true,
-                    online,
-                    // Live advert first, then what we saved from an earlier one, then 47990 —
-                    // the same three rungs `os` uses just below. Reading the advert ALONE is why
-                    // a host on a moved mgmt port lost its library the moment mDNS went quiet.
-                    mgmt_port: advert
-                        .and_then(|d| d.mgmt_port)
-                        .or(h.mgmt_port)
-                        .unwrap_or(library::DEFAULT_MGMT_PORT),
-                    can_wake: !online && !h.mac.is_empty(),
-                    clipboard_sync: h.clipboard_sync,
-                    last_used: h.last_used,
-                    os: advert
-                        .filter(|d| !d.os.is_empty())
-                        .map(|d| d.os.clone())
-                        .unwrap_or_else(|| h.os.clone()),
-                    // Whatever this host last told us it lets this device do to it. Empty
-                    // until the first refresh answers, and empty forever for a host that has
-                    // no such route or a device without the grant — the menu simply has no
-                    // power rows then.
-                    actions: pf_client_core::host_actions::cached(&h.fp_hex)
-                        .into_iter()
-                        .map(|a| pf_console_ui::HostAction {
-                            label: a.label().to_string(),
-                            id: a.id,
-                            danger: a.danger,
-                            available: a.available,
-                            unavailable_reason: a.unavailable_reason.unwrap_or_default(),
-                        })
-                        .collect(),
-                    pin: None,
-                    bound_preset: h
-                        .preset_id
-                        .as_deref()
-                        .and_then(|id| catalog.find_by_id(id))
-                        .map(chip),
-                    // What this host last said it has up, from the same TTL'd cache the
-                    // actions come from. Empty until the first refresh answers — and for
-                    // an unpaired host, which has nothing to authenticate the ask with.
-                    running: library::now_playing(&h.fp_hex),
-                    // Ids straight through, dangling ones included: the bind screen only
-                    // compares, and a deleted preset falls back at resolve, not here.
-                    game_presets: h.game_presets.clone(),
-                };
-                // A pinned card shares the primary tile's live state; its own key lets
-                // cursor-follow and the wake path address the card itself.
-                let pins = h
-                    .resolved_pins(&catalog)
-                    .into_iter()
-                    .map(|p| HostRow {
-                        key: pf_console_ui::model::pinned_key(&key, &p.id),
-                        pin: Some(chip(p)),
-                        bound_preset: None,
-                        ..row.clone()
-                    })
-                    .collect::<Vec<_>>();
-                std::iter::once(row).chain(pins)
-            })
-            .collect();
+        build_rows(
+            &self.stores.known,
+            &self.stores.catalog,
+            &self.discovered,
+            &probed,
+            self.seed.as_ref(),
+        )
+    }
 
-        let mut extra: Vec<HostRow> = self
-            .discovered
-            .values()
-            .filter(|d| !known.hosts.iter().any(|h| discovery::same_host(h, d)))
-            .map(|d| HostRow {
-                key: if d.fp_hex.is_empty() {
-                    format!("{}:{}", d.addr, d.port)
-                } else {
-                    d.fp_hex.clone()
-                },
+    /// What each saved host's advert teaches it, while the advert is visible: mgmt port, OS
+    /// chain, wake MAC (a Deck in Gaming Mode runs only this console and the Decky panel),
+    /// and an address the sweep asks; the card moves only once its pin answers there.
+    fn learn_from_adverts(&self) {
+        for h in &self.stores.known.hosts {
+            let advert = self
+                .discovered
+                .values()
+                .find(|d| discovery::same_host(h, d));
+            if let Some(a) = advert {
+                trust::learn_from_advert(
+                    &h.fp_hex,
+                    &h.addr,
+                    h.port,
+                    &a.addr,
+                    &a.mac,
+                    &a.os,
+                    a.mgmt_port,
+                );
+            }
+        }
+    }
+}
+
+/// The console home's rows: saved hosts in store order, each followed by its pinned
+/// preset cards (design §5.2a), then discovered-but-unsaved ones by name, then a
+/// still-uncovered `--browse` seed. `home::arrange` applies the player's sort; the Apple
+/// and Android producers send the same order (`clients/shared/host-row-vectors.json`).
+fn build_rows(
+    known: &trust::KnownHosts,
+    catalog: &pf_client_core::presets::PresetsFile,
+    discovered: &HashMap<String, discovery::DiscoveredHost>,
+    probed: &HashMap<String, bool>,
+    seed: Option<&HostRow>,
+) -> Vec<HostRow> {
+    let chip = |p: &pf_client_core::presets::StreamPreset| pf_console_ui::PresetChip {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        accent: p.accent.clone(),
+        // Only the speed test reads this: a preset that PINS bitrate is the layer its
+        // host streams at, so the console must not offer to write the global instead.
+        bitrate_kbps: p.overrides.bitrate_kbps,
+    };
+    let mut rows: Vec<HostRow> = known
+        .hosts
+        .iter()
+        .flat_map(|h| {
+            let key = if h.fp_hex.is_empty() {
+                format!("{}:{}", h.addr, h.port)
+            } else {
+                h.fp_hex.clone()
+            };
+            let advert = discovered.values().find(|d| discovery::same_host(h, d));
+            let online = probed.get(&key).copied().unwrap_or(false);
+            let row = HostRow {
+                key: key.clone(),
+                id: h.id.clone(),
+                name: host_display_name(&h.name, &h.addr),
+                addr: h.addr.clone(),
+                port: h.port,
+                fp_hex: h.fp_hex.clone(),
+                paired: h.paired,
+                saved: true,
+                online,
+                // Live advert first, then what we saved from an earlier one, then 47990 —
+                // the same three rungs `os` uses just below. Reading the advert ALONE is why
+                // a host on a moved mgmt port lost its library the moment mDNS went quiet.
+                mgmt_port: advert
+                    .and_then(|d| d.mgmt_port)
+                    .or(h.mgmt_port)
+                    .unwrap_or(library::DEFAULT_MGMT_PORT),
+                can_wake: !online && !h.mac.is_empty(),
+                clipboard_sync: h.clipboard_sync,
+                last_used: h.last_used,
+                os: advert
+                    .filter(|d| !d.os.is_empty())
+                    .map(|d| d.os.clone())
+                    .unwrap_or_else(|| h.os.clone()),
+                // Whatever this host last told us it lets this device do to it. Empty
+                // until the first refresh answers, and empty forever for a host that has
+                // no such route or a device without the grant — the menu simply has no
+                // power rows then.
+                actions: pf_client_core::host_actions::cached(&h.fp_hex)
+                    .into_iter()
+                    .map(|a| pf_console_ui::HostAction {
+                        label: a.label().to_string(),
+                        id: a.id,
+                        danger: a.danger,
+                        available: a.available,
+                        unavailable_reason: a.unavailable_reason.unwrap_or_default(),
+                    })
+                    .collect(),
+                pin: None,
+                bound_preset: h
+                    .preset_id
+                    .as_deref()
+                    .and_then(|id| catalog.find_by_id(id))
+                    .map(chip),
+                // What this host last said it has up, from the same TTL'd cache the
+                // actions come from. Empty until the first refresh answers — and for
+                // an unpaired host, which has nothing to authenticate the ask with.
+                running: library::now_playing(&h.fp_hex),
+                // Ids straight through, dangling ones included: the bind screen only
+                // compares, and a deleted preset falls back at resolve, not here.
+                game_presets: h.game_presets.clone(),
+                profile: h.profile.clone(),
+            };
+            // A pinned card shares the primary tile's live state; its own key lets
+            // cursor-follow and the wake path address the card itself.
+            let pins = h
+                .resolved_pins(catalog)
+                .into_iter()
+                .map(|p| HostRow {
+                    key: pf_console_ui::model::pinned_key(&key, &p.id),
+                    pin: Some(chip(p)),
+                    bound_preset: None,
+                    ..row.clone()
+                })
+                .collect::<Vec<_>>();
+            std::iter::once(row).chain(pins)
+        })
+        .collect();
+
+    let mut extra: Vec<HostRow> = discovered
+        .values()
+        .filter(|d| !known.hosts.iter().any(|h| discovery::same_host(h, d)))
+        .map(|d| {
+            let key = if d.fp_hex.is_empty() {
+                format!("{}:{}", d.addr, d.port)
+            } else {
+                d.fp_hex.clone()
+            };
+            let online = probed.get(&key).copied().unwrap_or(false);
+            HostRow {
+                key,
                 // Discovered, not saved: no store record, so no id to point at.
                 id: None,
                 name: host_display_name(&d.name, &d.addr),
@@ -1190,7 +1469,8 @@ impl ServiceState {
                 fp_hex: d.fp_hex.clone(),
                 paired: false,
                 saved: false,
-                online: true,
+                // The probe, as for saved rows: an advert outlives a host that went to sleep.
+                online,
                 mgmt_port: d.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
                 can_wake: false,
                 clipboard_sync: false,
@@ -1203,47 +1483,50 @@ impl ServiceState {
                 bound_preset: None,
                 running: String::new(),
                 game_presets: Default::default(),
-            })
-            .collect();
-        extra.sort_by_key(|h| h.name.to_lowercase());
-        rows.extend(extra);
-
-        if let Some(seed) = &self.seed {
-            if !rows
-                .iter()
-                .any(|r| r.addr == seed.addr && r.port == seed.port)
-            {
-                let mut seed = seed.clone();
-                seed.online = probed.get(&seed.key).copied().unwrap_or(false);
-                rows.push(seed);
+                profile: None,
             }
+        })
+        .collect();
+    extra.sort_by_key(|h| h.name.to_lowercase());
+    rows.extend(extra);
+
+    if let Some(seed) = seed {
+        if !rows
+            .iter()
+            .any(|r| r.addr == seed.addr && r.port == seed.port)
+        {
+            let mut seed = seed.clone();
+            seed.online = probed.get(&seed.key).copied().unwrap_or(false);
+            rows.push(seed);
         }
-        rows
     }
+    rows
 }
 
 /// The wake-and-wait loop (one per wake): [`orchestrate::wake_by_probe`], the cadence every
-/// shell shares. The thread owns the model's wake status; the shell reads
+/// shell shares. The thread reports each tick under `req`; the shell reads
 /// `online`/`timed_out` and acts.
 fn spawn_wake(
     console: ConsoleShared,
     row: HostRow,
     macs: Vec<String>,
     then_connect: bool,
+    req: RequestKey,
     cancel: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("punktfunk-wake".into())
         .spawn(move || {
             orchestrate::wake_by_probe(&row.addr, row.port, &row.fp_hex, &macs, |tick| {
-                // A cancelled thread writes NOTHING: the card it would clear may already have
-                // been replaced by the next host's, and `CancelWake` cleared the slot itself.
+                // A cancelled thread stops; a tick already in flight lands on no card, as the
+                // shell closed this wake's before it sent `CancelWake`.
                 if cancel.load(Ordering::SeqCst) {
                     return false;
                 }
                 // Awake → the shell connects and cancels; timed out → the card waits for Try
                 // Again / Cancel. Either ends this thread; a retry spawns a fresh one.
                 console.set_wake(Some(WakeStatus {
+                    req: req.clone(),
                     key: row.key.clone(),
                     name: row.name.clone(),
                     seconds: tick.seconds as u32,
@@ -1300,24 +1583,21 @@ fn spawn_fetch(
     mgmt: u16,
     identity: (String, String),
     fp_hex: String,
-    pin: Option<[u8; 32]>,
     macs: Vec<String>,
-) {
-    // `begin_fetch`, not `set_phase(Loading)`: it also advances the model's fetch epoch, which
-    // is how a shelf pushed a moment ago knows the titles it is about to see are its own rather
-    // than the previous host's. A cached catalog can land within a millisecond of this, so there
-    // is no phase transition for anyone to observe.
+    req: RequestKey,
+) -> Worker {
+    // Drops what an older fetch left; the list and phase land only under `req`.
     shared.begin_fetch();
-    let epoch = shared.fetch_epoch();
+    let pin = trust::parse_hex32(&fp_hex);
     std::thread::Builder::new()
         .name("punktfunk-library".into())
         .spawn(move || {
             // This worker retries for up to 90 s and cannot be cancelled, so the player can
             // be two hosts further on by the time it answers. Every write below asks first
             // whether this fetch still owns the model.
-            let mine = || shared.fetch_epoch() == epoch;
+            let mine = || shared.fetch_epoch() == req.epoch;
             if let Ok(path) = std::env::var("PUNKTFUNK_FAKE_LIBRARY") {
-                load_fake(&shared, &path);
+                load_fake(&shared, &req, &path);
                 return;
             }
             // Whatever we already know about this host, on screen before a single packet goes
@@ -1326,7 +1606,7 @@ fn spawn_fetch(
             let mut cached_games = None;
             if let Some(cached) = pf_client_core::library_cache::load(&fp_hex) {
                 if !cached.games.is_empty() && mine() {
-                    shared.set_games_cached(to_model(&cached.games));
+                    shared.set_games_cached(&req, to_model(&cached.games));
                     cached_games = Some(cached.games);
                 }
             }
@@ -1390,7 +1670,7 @@ fn spawn_fetch(
                             (cached, false)
                         }
                         None => {
-                            shared.set_phase(LibraryPhase::Error {
+                            shared.set_phase(&req, LibraryPhase::Error {
                                 title: "Couldn't load the library".into(),
                                 body: e.to_string(),
                                 can_retry: true,
@@ -1411,13 +1691,16 @@ fn spawn_fetch(
                 .filter(|(_, candidates)| !candidates.is_empty())
                 .collect();
             if live {
-                shared.set_games(to_model(&games));
+                shared.set_games(&req, to_model(&games));
                 // Remembered AFTER it is on screen: the disk write is not on the path to a shelf.
                 pf_client_core::library_cache::store(&fp_hex, &games);
                 // What the host has up right now, so a title the player can return to says so.
                 // Deliberately after the catalog — a slow `/status` must not hold the titles
                 // back — and never fatal: an older host answers nothing and every badge stays off.
-                shared.set_running(&library::fetch_running(&addr, mgmt, &identity, pin));
+                let running = library::fetch_running(&addr, mgmt, &identity, pin);
+                if mine() {
+                    shared.set_running(&running);
+                }
             }
             if !jobs.is_empty() {
                 let rx = library::spawn_art_fetch(base, identity, pin, jobs);
@@ -1429,7 +1712,7 @@ fn spawn_fetch(
                 }
             }
         })
-        .ok();
+        .ok()
 }
 
 /// The wire catalog in the shell's own terms.
@@ -1458,12 +1741,13 @@ fn to_model(games: &[library::GameEntry]) -> Vec<LibraryGame> {
             stats: g.stats,
             running: false,
             endable: false,
+            install: g.install.clone().map(Into::into),
         })
         .collect()
 }
 
 /// Dev hook: entries from a JSON file; portrait paths starting with `/` load from disk.
-fn load_fake(shared: &LibraryShared, path: &str) {
+fn load_fake(shared: &LibraryShared, req: &RequestKey, path: &str) {
     let games: Vec<library::GameEntry> = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -1475,5 +1759,8 @@ fn load_fake(shared: &LibraryShared, path: &str) {
             }
         }
     }
-    shared.set_games(to_model(&games));
+    shared.set_games(req, to_model(&games));
 }
+
+#[cfg(test)]
+mod tests;

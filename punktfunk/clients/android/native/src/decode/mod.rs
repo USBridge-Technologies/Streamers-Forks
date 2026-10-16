@@ -27,6 +27,8 @@ use async_loop::run_async;
 pub(crate) use setup::{codec_label, codec_mime};
 // Shared with the PyroWave lane, which exists only where the codec is built (see `crate::pyro`).
 #[cfg(target_pointer_width = "64")]
+pub(crate) use async_loop::start_hint;
+#[cfg(target_pointer_width = "64")]
 pub(crate) use latency::now_realtime_ns;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use setup::boost_thread_priority;
@@ -34,10 +36,9 @@ pub(crate) use setup::boost_thread_priority;
 use crate::input_stall::NoOutput;
 use ndk::native_window::NativeWindow;
 use punktfunk_core::client::NativeClient;
-use punktfunk_core::reanchor::ReanchorGate;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Cap on AUs parked in the async loop awaiting a free codec input slot. Matches the connector's
 /// own frame-channel depth; on sustained overflow the oldest is dropped and a keyframe requested
@@ -71,12 +72,10 @@ pub(crate) const NO_VIDEO_PATIENCE: std::time::Duration = std::time::Duration::f
 /// for days (2026-08-20). Keeping the value in core is what stops the two drifting back together.
 const NO_VIDEO_RETRY: std::time::Duration = punktfunk_core::client::NO_VIDEO_RETRY;
 
-/// The keyframe backstops the decode loop runs once a pass: a decoder that owes output
-/// ([`NoOutput`]), a session that never received an AU ([`NO_VIDEO_PATIENCE`]), and the gate's
-/// overdue-freeze re-ask. Every ask shares one 100 ms throttle so a multi-frame gap can't flood
-/// the control stream.
+/// The backstops the decode loop runs once a pass: a decoder that owes output ([`NoOutput`])
+/// and a session that never received an AU ([`NO_VIDEO_PATIENCE`]). Each reports to core,
+/// which owns the freeze, its overdue re-ask and the one ask window.
 pub(super) struct Backstops {
-    last_kf_req: Option<Instant>,
     no_output: NoOutput,
     started: Instant,
     last_no_video_req: Option<Instant>,
@@ -86,7 +85,6 @@ impl Backstops {
     pub(super) fn new() -> Backstops {
         let now = Instant::now();
         Backstops {
-            last_kf_req: None,
             no_output: NoOutput::new(now),
             started: now,
             last_no_video_req: None,
@@ -95,25 +93,20 @@ impl Backstops {
 
     /// One pass. `handled` = AUs fed to the codec or withheld from it; `had_output` = the decoder
     /// produced this pass; `au_parked` = an AU is waiting for an input slot; `losses` = drops this
-    /// pass that are a loss in their own right (a parked-AU overflow), which arm the gate.
-    /// `true` when the no-output window or the gate asked for a keyframe.
+    /// pass that are a loss in their own right (a parked-AU overflow).
     pub(super) fn poll(
         &mut self,
         client: &NativeClient,
-        gate: &mut ReanchorGate,
         handled: u64,
         had_output: bool,
         au_parked: bool,
         losses: u64,
-    ) -> bool {
+    ) {
         let now = Instant::now();
-        if losses > 0 {
-            gate.arm(now);
-        }
-        // Arm the freeze too, so the concealment a re-anchoring decoder emits stays off the glass.
+        // Frozen with the ask, so the concealment a re-anchoring decoder emits stays off the glass.
         let starved = self.no_output.poll(handled, had_output, now);
-        if starved {
-            gate.arm(now);
+        if starved || losses > 0 {
+            client.recovery_lost();
         }
         // Nothing has EVER arrived: the no-output window cannot see it.
         if handled == 0
@@ -128,24 +121,6 @@ impl Backstops {
                 now.duration_since(self.started).as_millis()
             );
             self.last_no_video_req = Some(now);
-            let _ = client.request_keyframe();
-            self.last_kf_req = Some(now); // share the throttle with the loss-recovery path below
-        }
-        let backstop = gate.poll(client.frames_dropped(), now) || starved;
-        if backstop || losses > 0 {
-            self.ask(client);
-        }
-        backstop
-    }
-
-    /// Ask for a keyframe through the shared 100 ms throttle.
-    pub(super) fn ask(&mut self, client: &NativeClient) {
-        let now = Instant::now();
-        if self
-            .last_kf_req
-            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-        {
-            self.last_kf_req = Some(now);
             let _ = client.request_keyframe();
         }
     }
@@ -196,6 +171,13 @@ pub(crate) struct DecodeOptions {
     pub src_crop: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Where the decoder publishes its picture size, packed by [`crate::session::pack_surface_size`].
     pub decoded_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// A dual-screen handheld's second picture window and the layers-shown mask. The
+    /// ASurfaceControl backend alone reads it; the SurfaceView presenter and PyroWave have one
+    /// surface and show the whole picture there.
+    pub layers: std::sync::Arc<crate::session::PictureLayers>,
+    /// Not the session's first video start: the stream is mid-flight, so the fresh decoder
+    /// holds no reference picture the next P-frames lean on.
+    pub restart: bool,
 }
 
 /// The decode entry point on the `pf-decode` thread: dispatches to the codec's loop. All of

@@ -32,7 +32,7 @@ struct HomeView: View {
     /// card tap (the host's binding), an explicit pick from "Connect with ▸" or a pinned card.
     let connect: (StoredHost, PresetSelection) -> Void
     let connectDiscovered: (DiscoveredHost) -> Void
-    /// Pairing succeeded (tvOS PairSheet route) — pin + connect (ContentView guards staleness).
+    /// Pairing succeeded (tvOS PairSheet route) — pin it (ContentView guards staleness).
     let onPaired: (StoredHost, Data) -> Void
     /// Picked a title in the (experimental) library — start a session that launches it, with the
     /// shelf's preset (a pinned card's own; the host's binding on its primary card).
@@ -63,6 +63,8 @@ struct HomeView: View {
     @State private var sendLogsResult: (ok: Bool, message: String)?
     /// What each paired host says this device may do to it (`design/host-actions.md` §7).
     @StateObject private var hostPower = HostPowerStore.shared
+    /// "Switch profile…": the picker, opened from a card's menu.
+    @StateObject private var profileSwitch = ProfileSwitch()
     /// What each paired host is playing right now — refreshed on the same beat below.
     @StateObject private var nowPlaying = NowPlayingStore.shared
     /// A destructive host action awaiting its confirmation.
@@ -70,8 +72,8 @@ struct HomeView: View {
     @State private var hostActionResult: (ok: Bool, message: String)?
     // How this device shows its own list. `.added` is the default because it is what the grid
     // did before it could sort at all — an update should not rearrange anyone's hosts.
-    @AppStorage(DefaultsKey.hostSort) private var sortRaw = HostSort.added.rawValue
-    @AppStorage(DefaultsKey.hostGrouping) private var groupingRaw = HostGrouping.none.rawValue
+    @AppStorage(DefaultsKey.hostSort) private var sortRaw = SettingDefault.hostSort
+    @AppStorage(DefaultsKey.hostGrouping) private var groupingRaw = SettingDefault.hostGrouping
 
     var body: some View {
         NavigationStack {
@@ -265,6 +267,7 @@ struct HomeView: View {
         .frame(minWidth: 480, minHeight: 360)
         #endif
         .tvPushSlide()
+        .sheet(item: $profileSwitch.ask) { ProfilePickerView(ask: $0) }
         #if !os(tvOS)
         .sheet(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
@@ -351,7 +354,8 @@ struct HomeView: View {
                 sendLogs: { Task { sendLogsResult = await SendLogs.toHost(host) } },
                 wake: { wake(host) },
                 showDetails: { showDetails(host) },
-                runPower: { hostAction($0, on: host) }))
+                runPower: { hostAction($0, on: host) },
+                switchProfile: { profileSwitch.start(host, store: store) }))
     }
 
     /// The host page: its own window on the Mac, a sheet of sections on the iPad, pushed on the

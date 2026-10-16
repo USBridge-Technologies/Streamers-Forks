@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Link profiles, named after the simulator's scenarios and carrying its numbers
-# (crates/punktfunk-core/src/abr/sim/scenarios.rs). Sourced by rig.sh.
+# (crates/core/punktfunk-core/src/abr/sim/scenarios.rs). Sourced by rig.sh.
 #
 # Unmeasured in both tiers, and worth knowing before you read a row: a keyframe
 # here is IDR_PCT (10x) of an ordinary frame and the simulator's is 4x. Nobody
@@ -11,6 +11,9 @@
 # TRACE is "<at_s>:<kbit> …" applied while the run goes on; WANDER_PCT/WANDER_S
 # re-draw the rate around it. MODE and ACHIEVABLE_KBPS are what the client asks
 # for and what the summary scores against.
+#
+# `lost` counts frames the client saw a shard of; a frame lost whole shows only
+# in `unrec`.
 
 profile() {
   # Defaults; a profile overrides what it cares about.
@@ -59,6 +62,19 @@ profile() {
   case "$1" in
     lan_1g)
       RATE_KBIT=1000000; DELAY_MS=1; BUFFER_MS=20
+      MODE=3840x2160x120; ACHIEVABLE_KBPS=150000
+      ;;
+    # The 2.5 G host → 1 G client hop: a 1 Gbit/s link whose queue is one switch's SRAM
+    # (1 ms ≈ 125 KB). A line-rate burst (`PUNKTFUNK_DELIVERY=burst`) overruns it on IDRs;
+    # a frame paced at the link rate does not.
+    lan_1g_switch)
+      RATE_KBIT=1000000; DELAY_MS=1; BUFFER_MS=1
+      MODE=3840x2160x120; ACHIEVABLE_KBPS=150000
+      ;;
+    # An untuned receiver on 1 Gbit/s: a queue the size of Linux's default socket buffer
+    # (2 ms ≈ 250 KB). `PUNKTFUNK_DELIVERY=smooth` keeps a frame under it.
+    lan_1g_smallbuf)
+      RATE_KBIT=1000000; DELAY_MS=1; BUFFER_MS=2
       MODE=3840x2160x120; ACHIEVABLE_KBPS=150000
       ;;
     # C1: the G5's clean start. 60 ms is what a switch holds.
@@ -176,7 +192,7 @@ profile() {
       PROBES=2
       ;;
     *)
-      echo "unknown profile '$1' (lan_1g wifi_tv wifi_tv_probe_damage wan_wg_12 \
+      echo "unknown profile '$1' (lan_1g lan_1g_switch lan_1g_smallbuf wifi_tv wifi_tv_probe_damage wan_wg_12 \
 lte_variable wan_still ramp_loss nowall_720p policer_20 shared_two_auto shared_both shared_newcomer \
 shared_fixed_plus_auto shared_fixed_survivor shared_leaver shared_lone shared_fixed_lone)" >&2
       return 1

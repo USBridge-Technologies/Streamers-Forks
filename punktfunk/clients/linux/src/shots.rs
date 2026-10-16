@@ -4,6 +4,7 @@ use crate::app::AppModel;
 use crate::hosts::{ConnectRequest, HostsMsg};
 use gtk::glib;
 use gtk::prelude::*;
+use pf_client_core::orchestrate::HostTarget;
 use relm4::prelude::*;
 use std::rc::Rc;
 
@@ -44,16 +45,17 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
     let sender = &ctx.sender;
     // A plausible host for the trust/pair dialogs (fp_hex = 64 hex chars).
     let mock_req = || ConnectRequest {
-        name: "Living Room PC".to_string(),
-        addr: "192.168.1.42".to_string(),
-        port: 9777,
-        fp_hex: Some(
-            "9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211ffeeddccbbaa00".to_string(),
-        ),
+        host: HostTarget {
+            name: "Living Room PC".to_string(),
+            addr: "192.168.1.42".to_string(),
+            port: 9777,
+            fp_hex: Some(
+                "9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211ffeeddccbbaa00".to_string(),
+            ),
+            ..HostTarget::default()
+        },
         pair_optional: true,
-        launch: None,
-        mac: Vec::new(),
-        preset: None,
+        ..ConnectRequest::default()
     };
     let mock_advert =
         |key: &str, name: &str, addr: &str, fp: &str| crate::discovery::DiscoveredHost {
@@ -67,6 +69,7 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
             mgmt_port: None,
             mac: Vec::new(),
             os: "linux/arch/steamos".to_string(),
+            wire: Vec::new(),
         };
 
     // What the self-capture renders: the main window, its dialogs included.
@@ -102,9 +105,10 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
         // The first saved host's speed test, on the canned burst.
         "speed" => {
             if let Some(k) = ctx.store.hosts().hosts.first() {
-                sender.input(crate::app::AppMsg::SpeedTest(crate::hosts::saved_request(
-                    k,
-                )));
+                sender.input(crate::app::AppMsg::SpeedTest(ConnectRequest {
+                    host: HostTarget::from(k),
+                    ..ConnectRequest::default()
+                }));
             }
         }
         // A stream from the first saved host: its card and the window's banner.
@@ -112,11 +116,11 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
             let _ = hosts.send(HostsMsg::Probed(mock_online(ctx)));
             if let Some(k) = ctx.store.hosts().hosts.first() {
                 sender.input(crate::app::AppMsg::SessionReady {
-                    req: crate::hosts::saved_request(k),
+                    req: ConnectRequest {
+                        host: HostTarget::from(k),
+                        ..ConnectRequest::default()
+                    },
                     fp_hex: k.fp_hex.clone(),
-                    tofu: false,
-                    persist_paired: false,
-                    cancel: None,
                 });
             }
         }
@@ -170,9 +174,13 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
             }
         }
         "trust" | "04-trust" => crate::app::gate::tofu_dialog(&ctx.window, sender, mock_req()),
-        "pair" | "05-pair" => {
-            crate::app::gate::pin_dialog(&ctx.window, sender, ctx.identity.clone(), mock_req())
-        }
+        "pair" | "05-pair" => crate::app::gate::pin_dialog(
+            &ctx.window,
+            sender,
+            ctx.identity.clone(),
+            mock_req(),
+            false,
+        ),
         "addhost" | "06-addhost" => {
             let _ = hosts.send(HostsMsg::ShowAddHost);
         }
@@ -255,6 +263,7 @@ fn mock_library() -> (
 ) {
     let game =
         |id: &str, store: &str, title: &str, played: u64| pf_client_core::library::GameEntry {
+            install: None,
             id: id.to_string(),
             store: store.to_string(),
             title: title.to_string(),
@@ -274,6 +283,7 @@ fn mock_library() -> (
         };
     let games = vec![
         pf_client_core::library::GameEntry {
+            install: None,
             role: Some("launcher".into()),
             icon: Some("steam".into()),
             ..game("steam:bigpicture", "steam", "Steam", 0)
@@ -303,6 +313,7 @@ fn bench_library(n: usize) -> Vec<pf_client_core::library::GameEntry> {
     const STORES: &[&str] = &["steam", "gog", "epic", "heroic", "lutris", "custom"];
     (0..n)
         .map(|i| pf_client_core::library::GameEntry {
+            install: None,
             id: format!("bench:{i}"),
             store: STORES[i % STORES.len()].to_string(),
             title: format!(

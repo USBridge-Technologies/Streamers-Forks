@@ -19,7 +19,7 @@ use super::connect::{initiate_launch, initiate_waking};
 use super::embedded_png::file_uri;
 use super::lucide;
 use super::style::*;
-use super::{AppCtx, Screen, Svc};
+use super::{AppCtx, Screen, Svc, Target};
 use pf_client_core::collate::{self, Collatable, SortKey};
 use pf_client_core::library::{self, initials, store_label, DESKTOP_ID};
 use pf_client_core::trust::Settings;
@@ -131,6 +131,14 @@ impl PartialEq for LibraryProps {
     }
 }
 
+/// Show `target`'s library. The target becomes `Shared::target`, which the grid launches
+/// through, so a pinned card's preset rides along; then the fetch starts and the screen shows.
+pub(crate) fn open_library(svc: &Svc, target: Target) {
+    *svc.ctx.shared.target.lock().unwrap() = target;
+    start_fetch(&svc.ctx, &svc.set_library);
+    svc.set_screen.call(Screen::Library);
+}
+
 /// Fetch the library for `Shared::target` off the UI thread, publishing into root state:
 /// phase first, then art entries as the workers stream them in. A newer call (re-open,
 /// Retry, another host) bumps `Shared::library_gen`, and a superseded worker stops
@@ -147,7 +155,11 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
     std::thread::Builder::new()
         .name("pf-library".into())
         .spawn(move || {
-            let pin = target.fp_hex.as_deref().and_then(crate::trust::parse_hex32);
+            let pin = target
+                .host
+                .fp_hex
+                .as_deref()
+                .and_then(crate::trust::parse_hex32);
             let publish = |state: &LibraryState| {
                 if shared.library_gen.load(Ordering::SeqCst) == generation {
                     set.call(state.clone());
@@ -155,8 +167,8 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
             };
             let mut state = LibraryState::default();
             let games = match library::fetch_games(
-                &target.addr,
-                target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
+                &target.host.addr,
+                target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
                 &identity,
                 pin,
             ) {
@@ -173,8 +185,8 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
 
             // Seed cached posters; queue the art pipeline for the rest.
             let base = library::base_url(
-                &target.addr,
-                target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
+                &target.host.addr,
+                target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
             );
             let cache = art_cache_dir();
             let mut jobs: VecDeque<(String, Vec<String>)> = VecDeque::new();
@@ -207,8 +219,8 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
             publish(&state);
 
             // After the titles: a slow `/status` must not hold the shelf back.
-            let mgmt = target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
-            for g in library::fetch_running(&target.addr, mgmt, &identity, pin) {
+            let mgmt = target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
+            for g in library::fetch_running(&target.host.addr, mgmt, &identity, pin) {
                 if let Some(id) = g.app_id.clone().filter(|_| g.is_up()) {
                     *state.running.entry(id).or_default() |= g.endable;
                 }
@@ -282,9 +294,9 @@ const MENU_END_GAME: &str = "End game";
 fn game_link(target: &super::Target, game_id: &str) -> Option<String> {
     pf_client_core::deeplink::saved_host_link(
         &crate::trust::KnownHosts::load(),
-        target.fp_hex.as_deref(),
-        &target.addr,
-        target.port,
+        target.host.fp_hex.as_deref(),
+        &target.host.addr,
+        target.host.port,
         target.preset.as_deref().filter(|p| !p.is_empty()),
         Some(game_id),
     )
@@ -295,6 +307,11 @@ fn game_link(target: &super::Target, game_id: &str) -> Option<String> {
 /// The shelf's sort picker. Presentation only, like the console's bar: it writes the shared
 /// `library_sort` and re-renders what is already fetched — nothing is refetched, and no other
 /// setting on the page is touched, so a load-modify-save of the whole file is honest here.
+/// The stored sort. `use_state` evaluates its seed on every render and this page re-renders on
+/// each poster that lands, so the file is read once per process; a pick updates this too, since
+/// the page remounts on every visit.
+static STORED_SORT: std::sync::Mutex<Option<SortKey>> = std::sync::Mutex::new(None);
+
 fn sort_row(current: SortKey, on_pick: impl Fn(SortKey) + 'static) -> Element {
     let names: Vec<String> = SortKey::ALL.iter().map(|k| k.label().to_string()).collect();
     let index = SortKey::ALL.iter().position(|k| *k == current).unwrap_or(0);
@@ -305,13 +322,16 @@ fn sort_row(current: SortKey, on_pick: impl Fn(SortKey) + 'static) -> Element {
         ComboBox::new(names)
             .selected_index(index as i32)
             .on_selection_changed(move |i: i32| {
-                let key = SortKey::ALL
-                    .get(i.max(0) as usize)
-                    .copied()
-                    .unwrap_or_default();
-                let mut settings = Settings::load();
-                settings.library_sort = key.id().to_string();
-                settings.save();
+                // -1 is "nothing selected": not a pick of the first sort.
+                let Some(key) = usize::try_from(i).ok().and_then(|i| SortKey::ALL.get(i)) else {
+                    return;
+                };
+                let key = *key;
+                Settings::update(|s| {
+                    s.library_sort = key.id().to_string();
+                    true
+                });
+                *STORED_SORT.lock().unwrap() = Some(key);
                 on_pick(key);
             }),
     ))
@@ -482,10 +502,10 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
     // Responsive poster columns from the live window width (the hosts page's pattern).
     let window = cx.use_inner_size();
     // Shared `library_sort`: the same four orders the console's bar and the GTK dialog offer.
-    // `use_state` evaluates its seed on every render and this page re-renders on each poster
-    // that lands, so the stored value is read once per process rather than once per frame.
-    static STORED_SORT: std::sync::OnceLock<SortKey> = std::sync::OnceLock::new();
-    let seed = *STORED_SORT.get_or_init(|| SortKey::parse(&Settings::load().library_sort));
+    let seed = *STORED_SORT
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| SortKey::parse(&Settings::load().library_sort));
     let (sort, set_sort) = cx.use_state(seed);
     let content_w = (window.width - 64.0).clamp(POSTER_MIN_WIDTH, 1120.0);
     let cols =
@@ -500,10 +520,10 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
             ss.call(Screen::Hosts)
         }
     });
-    let title = if target.name.is_empty() {
+    let title = if target.host.name.is_empty() {
         "Game library".to_string()
     } else {
-        format!("Game library \u{00B7} {}", target.name)
+        format!("Game library \u{00B7} {}", target.host.name)
     };
     let mut body: Vec<Element> = vec![page_header(&title, back_btn)];
     if let Some(said) = &props.end_game.said {
@@ -669,10 +689,14 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
                     .name("punktfunk-endgame".into())
                     .spawn(move || {
                         let target = ctx2.shared.target.lock().unwrap().clone();
-                        let pin = target.fp_hex.as_deref().and_then(crate::trust::parse_hex32);
-                        let mgmt = target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
+                        let pin = target
+                            .host
+                            .fp_hex
+                            .as_deref()
+                            .and_then(crate::trust::parse_hex32);
+                        let mgmt = target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
                         let outcome =
-                            library::end_game(&target.addr, mgmt, &ctx2.identity, pin, &id);
+                            library::end_game(&target.host.addr, mgmt, &ctx2.identity, pin, &id);
                         tracing::info!(app = %id, ?outcome, "end game");
                         se.call(EndGameUi {
                             ask: None,

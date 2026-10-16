@@ -8,7 +8,7 @@
 // read-only library route by its **mTLS certificate** — no bearer token. The host binds this read
 // surface to the LAN by DEFAULT (the bearer-gated admin surface stays loopback-only), so a paired
 // client browses a host's library with no operator step. This mirrors the GameEntry/Artwork/
-// LaunchSpec schema in `crates/punktfunk-host/src/library.rs`.
+// LaunchSpec schema in `crates/host/punktfunk-host/src/library.rs`.
 
 import Foundation
 // `punktfunkDefaultMgmtPort` (and StoredHost/DefaultsKey) now live in PunktfunkShared so the
@@ -100,10 +100,12 @@ public struct GameEntry: Codable, Hashable, Identifiable, Sendable {
     public var players: Int?
     /// Host play stats; `nil` until the host has launched the title once.
     public var stats: GameStats?
+    /// A title a plugin installs; `nil` is installed, as every other title is.
+    public var install: TitleInstall?
 
     private enum CodingKeys: String, CodingKey {
         case id, store, title, art, launch, role, icon, platform
-        case developer, publisher, genres, description, tags, players, stats
+        case developer, publisher, genres, description, tags, players, stats, install
         case releaseYear = "release_year"
     }
 
@@ -138,6 +140,126 @@ public struct GameEntry: Codable, Hashable, Identifiable, Sendable {
         case "gog": return "GOG"
         case "xbox": return "Xbox"
         default: return "Game"
+        }
+    }
+}
+
+/// A title's files on the host, from the library entry's `install`.
+public struct TitleInstall: Codable, Hashable, Sendable {
+    /// `installed` or `missing`; a word this build doesn't know reads as installed.
+    public var state: String
+    /// The download size while missing, the size on disk once installed.
+    public var sizeBytes: UInt64?
+    /// Free space where the download goes.
+    public var freeBytes: UInt64?
+
+    public init(state: String, sizeBytes: UInt64? = nil, freeBytes: UInt64? = nil) {
+        self.state = state
+        self.sizeBytes = sizeBytes
+        self.freeBytes = freeBytes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case state
+        case sizeBytes = "size_bytes"
+        case freeBytes = "free_bytes"
+    }
+
+    public var missing: Bool { state == "missing" }
+}
+
+/// What a title menu offers for a title's files; at most one applies. The rules and words are the
+/// Rust client's (`pf_client_core::library::InstallAction`).
+public enum InstallAction: String, Sendable {
+    case install = "Install", pause = "Pause", resume = "Resume", remove = "Remove"
+
+    /// The one row, if any. `nil` grants (an older host) allow starting a download only.
+    public static func forTitle(
+        _ install: TitleInstall?, download: HostDownload?, grants: UInt32?
+    ) -> InstallAction? {
+        guard let install else { return nil }
+        let launch = grants.map { $0 & PunktfunkConnection.grantLaunch != 0 } ?? true
+        let manage = grants.map { $0 & PunktfunkConnection.grantManageGames != 0 } ?? false
+        let action: InstallAction
+        switch download?.state {
+        case "queued", "downloading": action = .pause
+        case "installing": return nil
+        case "paused": action = .resume
+        case "done": action = .remove
+        default: action = install.missing ? .install : .remove
+        }
+        let allowed = action == .install || action == .resume ? launch : manage
+        return allowed ? action : nil
+    }
+
+    /// The menu row: `Install · 26 GB (212 GB free)`, `Remove download · 26 GB`.
+    public func label(_ install: TitleInstall?) -> String {
+        let size = install?.sizeBytes.map(HostDownload.bytes)
+        switch self {
+        case .install:
+            switch (size, install?.freeBytes.map(HostDownload.bytes)) {
+            case let (size?, free?): return "Install \u{b7} \(size) (\(free) free)"
+            case let (size?, nil): return "Install \u{b7} \(size)"
+            default: return "Install"
+            }
+        case .pause: return "Pause download"
+        case .resume: return "Resume download"
+        case .remove: return size.map { "Remove download \u{b7} \($0)" } ?? "Remove download"
+        }
+    }
+
+    var verb: String { rawValue.lowercased() }
+}
+
+/// A tile's mark for a title's files; an installed title has none. Same words as the Rust tiles.
+public struct TileBadge: Equatable, Sendable {
+    /// `download`, `pause` or `alert`.
+    public var icon: String
+    /// `42 %`, `26 GB`, `Not installed`, `Queued`.
+    public var text: String
+
+    public static func forTitle(_ install: TitleInstall?, download: HostDownload?) -> TileBadge? {
+        let pct = { (d: HostDownload) in
+            d.fraction.map { "\(Int(($0 * 100).rounded(.down))) %" } ?? "Queued"
+        }
+        if let d = download, d.live { return TileBadge(icon: "download", text: pct(d)) }
+        if let d = download, d.state == "paused" { return TileBadge(icon: "pause", text: pct(d)) }
+        if download?.state == "failed" { return TileBadge(icon: "alert", text: "Not installed") }
+        guard let install, install.missing else { return nil }
+        return TileBadge(
+            icon: "download", text: install.sizeBytes.map(HostDownload.bytes) ?? "Not installed")
+    }
+}
+
+/// What asking the host to change a title's files came to. The Rust client's `InstallOutcome`.
+public enum InstallOutcome: Equatable, Sendable {
+    case done
+    /// 403/404/409 with the host's own sentence.
+    case refused(String)
+    /// A host without the route.
+    case unsupported
+    case failed(String)
+
+    /// An answer: the host's sentence when it sent one, else the route is missing.
+    public static func from(status: Int, message: String?) -> InstallOutcome {
+        if (200..<300).contains(status) { return .done }
+        if let message, !message.isEmpty { return .refused(message) }
+        if [401, 404, 405].contains(status) { return .unsupported }
+        return .failed("the host refused it (\(status))")
+    }
+
+    /// The player-facing line.
+    public func notice(_ action: InstallAction, title: String) -> String {
+        switch self {
+        case .done:
+            switch action {
+            case .install, .resume: return "Downloading \(title)."
+            case .pause: return "Paused \(title)'s download."
+            case .remove: return "Removed \(title). Saves stay on the host."
+            }
+        case .refused(let why): return why
+        case .unsupported: return "This host needs an update to manage games from here."
+        case .failed(let why): return "Couldn't \(action.verb) \(title) \u{2014} \(why)"
         }
     }
 }
@@ -188,6 +310,99 @@ public enum LibraryError: LocalizedError {
 /// A deliberately partial mirror of the host's `ActiveGame`: only the fields a client can act on.
 /// The console's own view of this payload carries more (which session, which plane, the grace
 /// countdown), and none of that is a player's business from the library screen.
+/// One title's download, from `GET /api/v1/status` `downloads[]`. Its words match the Rust and
+/// Kotlin shells', so a report quotes one line whichever client it came from.
+public struct HostDownload: Codable, Hashable, Sendable {
+    public var appID: String
+    /// `queued` | `downloading` | `paused` | `installing` | `done` | `failed` | `cancelled`.
+    public var state: String
+    public var doneBytes: UInt64
+    public var totalBytes: UInt64?
+    public var rateBps: UInt64?
+    public var etaS: UInt64?
+    /// The plugin's words: `File 2 of 3`, `Verifying`.
+    public var phase: String?
+    public var error: String?
+
+    public init(
+        appID: String, state: String, doneBytes: UInt64 = 0, totalBytes: UInt64? = nil,
+        rateBps: UInt64? = nil, etaS: UInt64? = nil, phase: String? = nil, error: String? = nil
+    ) {
+        self.appID = appID
+        self.state = state
+        self.doneBytes = doneBytes
+        self.totalBytes = totalBytes
+        self.rateBps = rateBps
+        self.etaS = etaS
+        self.phase = phase
+        self.error = error
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case appID = "app_id"
+        case state
+        case doneBytes = "done_bytes"
+        case totalBytes = "total_bytes"
+        case rateBps = "rate_bps"
+        case etaS = "eta_s"
+        case phase, error
+    }
+
+    /// Making progress, or expected to: a launch waits on it.
+    public var live: Bool { state == "queued" || state == "downloading" || state == "installing" }
+
+    /// 0–1 of the total, when the total is known.
+    public var fraction: Double? {
+        guard let total = totalBytes, total > 0 else { return nil }
+        return min(1, Double(doneBytes) / Double(total))
+    }
+
+    /// `12.3 GB of 26 GB · 48 MB/s · about 4 min left`, `Installing…`.
+    public var line: String {
+        switch state {
+        case "queued": return "Waiting for its turn to download\u{2026}"
+        case "installing": return phase ?? "Installing\u{2026}"
+        default: break
+        }
+        var parts = [
+            totalBytes.flatMap { $0 > 0 ? $0 : nil }.map {
+                "\(HostDownload.bytes(doneBytes)) of \(HostDownload.bytes($0))"
+            } ?? "\(HostDownload.bytes(doneBytes)) so far",
+        ]
+        if state == "downloading" {
+            if let rate = rateBps { parts.append("\(HostDownload.bytes(rate))/s") }
+            if let eta = etaS {
+                parts.append(
+                    eta < 60 ? "less than a minute left"
+                        : eta < 3600 ? "about \((eta + 30) / 60) min left"
+                        : "about \(eta / 3600) h \((eta % 3600) / 60) min left")
+            }
+        }
+        return parts.joined(separator: " \u{b7} ")
+    }
+
+    /// Why a launch that waited on it didn't start the title; nil while it may still.
+    public func stopped(title: String) -> String? {
+        switch state {
+        case "failed": return error.map { "\(title) didn't download \u{2014} \($0)" } ?? "\(title) didn't download."
+        case "cancelled": return "\(title)'s download was cancelled."
+        case "paused": return "\(title)'s download was paused. Start it again to resume."
+        default: return nil
+        }
+    }
+
+    /// Decimal units, as stores count: `12.3 GB`, `48 MB`, `512 kB`.
+    public static func bytes(_ n: UInt64) -> String {
+        let v = Double(n)
+        let (value, unit) = v >= 1e9 ? (v / 1e9, "GB") : v >= 1e6 ? (v / 1e6, "MB") : (v / 1e3, "kB")
+        let rounded = (value * 10).rounded() / 10
+        if value >= 100 || rounded.truncatingRemainder(dividingBy: 1) == 0 {
+            return "\(Int(value.rounded())) \(unit)"
+        }
+        return String(format: "%.1f %@", rounded, unit)
+    }
+}
+
 public struct RunningGame: Codable, Hashable, Sendable {
     /// Store-qualified library id (`steam:570`) — the key that lines this up with a `GameEntry`.
     /// Absent for an operator-typed GameStream command, which has no catalog entry behind it.
@@ -202,7 +417,7 @@ public struct RunningGame: Codable, Hashable, Sendable {
     public var awaitingWindow: Bool?
     /// The live session streaming it; absent for a game nobody streams.
     public var sessionID: UInt64?
-    /// This device may end it (``LibraryClient/endGame(appID:address:port:certPEM:keyPEM:hostFingerprint:)``):
+    /// This device may end it (``LibraryClient/endGame(appID:on:)``):
     /// a game it launched. Absent from a host that predates the field.
     public var endable: Bool?
 
@@ -360,34 +575,16 @@ public enum LibraryClient {
         return games
     }
 
-    /// The host's catalog, walked by `GET /api/v1/library/page` and authenticated by **mTLS**:
-    /// the client presents its paired cert/key PEM and the host's self-signed cert is pinned by
-    /// `hostFingerprint` (SHA-256 of its DER). A host older than the paged route refuses it on
-    /// this lane, so `GET /api/v1/library` answers whole instead.
-    /// `hostFingerprint == nil` throws `unauthorized`: an unpaired host is never trusted.
-    public static func fetch(
-        address: String,
-        port: UInt16 = punktfunkDefaultMgmtPort,
-        certPEM: String,
-        keyPEM: String,
-        hostFingerprint: Data?
-    ) async throws -> [GameEntry] {
-        guard let base = URL(string: "\(baseURL(address: address, port: port))/api/v1/library")
+    /// The host's catalog, walked by `GET /api/v1/library/page`. A host older than the paged
+    /// route refuses it on this lane, so `GET /api/v1/library` answers whole instead.
+    public static func fetch(_ target: MgmtTarget) async throws -> [GameEntry] {
+        guard let base = URL(
+            string: "\(baseURL(address: target.address, port: target.port))/api/v1/library")
         else { throw LibraryError.unreachable("invalid host address") }
-        let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
         let body: (String) async throws -> Data = { path in
-            let response = try await send(
-                path: path, address: address, port: port,
-                identity: identity, hostFingerprint: hostFingerprint)
-            switch response.status {
-            case 200:
-                return response.body
-            // Both are the host declining this certificate, with the same remedy.
-            case 401, 403:
-                throw LibraryError.unauthorized
-            default:
-                throw LibraryError.http(response.status)
-            }
+            let response = try await send(path, to: target)
+            try expectOK(response)
+            return response.body
         }
         var games: [GameEntry]
         do {
@@ -404,86 +601,123 @@ public enum LibraryClient {
         return games
     }
 
-    /// What the host currently has running, from `GET /api/v1/status`.
-    ///
-    /// Same lane, same identity, no new host work: `/status` is already on the paired-certificate
-    /// allowlist (the host's `mgmt::auth::cert_may_access`) alongside `/library`, and has carried a
-    /// `games[]` array since the session⇄game lifetime work. The client simply never read it — so a
-    /// player had no way to see, from the device they browse on, that something was already up.
+    /// The profiles on this host, from `GET /api/v1/profiles/enumerate`, in host order. nil: the
+    /// box has no profiles (a 404, or a host too old to know the route).
+    public static func profiles(_ target: MgmtTarget) async throws -> [ListedProfile]? {
+        let response = try await send("/api/v1/profiles/enumerate", to: target)
+        if response.status == 404 { return nil }
+        try expectOK(response)
+        do {
+            return try JSONDecoder().decode([ListedProfile].self, from: response.body)
+        } catch {
+            throw LibraryError.unreachable("bad JSON")
+        }
+    }
+
+    /// Start profile `id`'s stopped seat: `POST /api/v1/profiles/{id}/wake`. The host answers the
+    /// row, `starting` until the seat is up; the caller reads progress from the list.
+    public static func wakeProfile(id: String, on target: MgmtTarget) async throws {
+        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let response = try await send(
+            "/api/v1/profiles/\(escaped)/wake", to: target, method: "POST",
+            body: (Data(), "application/json"))
+        try expectWoken(response)
+    }
+
+    /// ``expectOK(_:_:)`` for a wake. An unpaired device gets 401, so a 403 is the host refusing
+    /// this device the profile's seat: `http(403)`, not `unauthorized`.
+    static func expectWoken(_ response: HTTPResponse) throws {
+        if response.status == 403 { throw LibraryError.http(403) }
+        try expectOK(response, [200, 202])
+    }
+
+    /// The line a failed ``wakeProfile(id:on:)`` ends a seat wait with: the host's refusal in
+    /// its own words, any other failure under the desk it was for.
+    public static func wakeFailedLine(_ displayName: String, _ error: Error) -> String {
+        if let error = error as? LibraryError, case .http(403) = error {
+            return "This device isn't allowed to start another profile's seat."
+        }
+        return "Couldn't wake \(displayName)'s desk. Try again in a moment."
+    }
+
+    /// What the host currently has running, from `GET /api/v1/status`. Best-effort, as
+    /// ``status(_:)``: the worst case is a Resume badge that doesn't appear.
+    public static func running(_ target: MgmtTarget) async -> [RunningGame] {
+        await status(target).games
+    }
+
+    /// `GET /api/v1/status`: the launched titles and the host's downloads, kept apart because a
+    /// launch the host declined over its download has no game row left to carry it.
     ///
     /// Best-effort by contract: an older host, an unreachable one, or a shape we don't recognize
-    /// yields an empty list rather than an error. Nothing here is worth failing a library screen
-    /// over — the worst case is a Resume badge that doesn't appear.
-    public static func running(
-        address: String,
-        port: UInt16 = punktfunkDefaultMgmtPort,
-        certPEM: String,
-        keyPEM: String,
-        hostFingerprint: Data?
-    ) async -> [RunningGame] {
-        guard let identity = try? clientIdentity(certPEM: certPEM, keyPEM: keyPEM),
-              let response = try? await send(
-                  path: "/api/v1/status", address: address, port: port,
-                  identity: identity, hostFingerprint: hostFingerprint),
+    /// yields empty lists rather than an error. Nothing here is worth failing a screen over.
+    public static func status(
+        _ target: MgmtTarget
+    ) async -> (games: [RunningGame], downloads: [HostDownload], grants: UInt32?) {
+        guard let response = try? await send("/api/v1/status", to: target),
               response.status == 200,
               let status = try? JSONDecoder().decode(HostStatus.self, from: response.body)
-        else { return [] }
-        return status.games ?? []
+        else { return ([], [], nil) }
+        return (status.games ?? [], status.downloads ?? [], status.grants)
+    }
+
+    /// Start, resume, pause or remove a title's download (`/api/v1/library/install/{id}`). Never
+    /// throws: every outcome is something to tell the player, a refusal in the host's words.
+    public static func changeInstall(
+        appID: String, action: InstallAction, on target: MgmtTarget
+    ) async -> InstallOutcome {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove("/")
+        let id = appID.addingPercentEncoding(withAllowedCharacters: allowed) ?? appID
+        let path = "/api/v1/library/install/\(id)"
+        let empty = (data: Data(), contentType: "application/json")
+        do {
+            let response: HTTPResponse
+            switch action {
+            case .install, .resume:
+                response = try await send(path, to: target, method: "POST", body: empty)
+            case .pause:
+                response = try await send(path + "/pause", to: target, method: "POST", body: empty)
+            case .remove:
+                response = try await send(path, to: target, method: "DELETE")
+            }
+            return .from(status: response.status, message: hostReason(response.body))
+        } catch {
+            return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
     }
 
     /// Upload this client's recent log (`ClientLogRing`) to the host — `POST /api/v1/client-logs`,
-    /// the one WRITE a paired certificate may make (the host's `mgmt/client_logs.rs`). Same lane
-    /// and identity as the library; the host files the bundle under this device and shows it on
-    /// its web console's Logs page next to its own log. Returns the stored bundle id (empty for a
-    /// host that predates the id in the reply).
+    /// the host's `mgmt/client_logs.rs`. The host files the bundle under this device and shows it
+    /// on its web console's Logs page next to its own log. Returns the stored bundle id (empty for
+    /// a host that predates the id in the reply).
     ///
-    /// Why it exists: on an Apple TV (or a phone, for anyone who is not a developer) there is no
-    /// way to get the client's log off the device, so every fault report arrived with only the
-    /// host's half of the story. `hostFingerprint` is required, not optional: this is an outbound
-    /// write carrying the device's diagnostics, and it goes to the host the user paired with.
-    public static func sendLogs(
-        address: String,
-        port: UInt16 = punktfunkDefaultMgmtPort,
-        certPEM: String,
-        keyPEM: String,
-        hostFingerprint: Data
-    ) async throws -> String {
-        let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
+    /// The app's previous run goes first as its own bundle, best effort, and is dropped once
+    /// stored: after a freeze or a kill it is the run the report is about.
+    public static func sendLogs(to target: MgmtTarget) async throws -> String {
+        let plain = "text/plain; charset=utf-8"
+        if let file = ClientLogFile.shared, let previous = file.previousRun(),
+           let stored = try? await send(
+               "/api/v1/client-logs", to: target, method: "POST", body: (Data(previous.utf8), plain)),
+           stored.status == 200 || stored.status == 201 {
+            file.dropPrevious()
+        }
         let body = Data(ClientLogRing.render(header: ClientLogRing.header()).utf8)
         let response = try await send(
-            path: "/api/v1/client-logs", address: address, port: port,
-            identity: identity, hostFingerprint: hostFingerprint,
-            body: (body, "text/plain; charset=utf-8"))
-        switch response.status {
-        case 200, 201:
-            let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any]
-            return json?["id"] as? String ?? ""
-        case 401, 403:
-            throw LibraryError.unauthorized
-        default:
-            throw LibraryError.http(response.status)
-        }
+            "/api/v1/client-logs", to: target, method: "POST", body: (body, plain))
+        try expectOK(response, [200, 201])
+        let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+        return json?["id"] as? String ?? ""
     }
 
     /// What this host lets THIS device do to it — sleep, restart, shut it down
     /// (`design/host-actions.md` §7) — from `GET /api/v1/actions`.
     ///
     /// Only the PERMITTED rows come back: the host is the only judge of whether this device's
-    /// access carries the Host-power grant, and a row it would refuse is not this client's to
-    /// render. Best-effort by contract, like ``running(address:port:certPEM:keyPEM:hostFingerprint:)``
-    /// — an older host (no such route), an unreachable one, or a shape we don't recognise yields
-    /// an empty list. A missing menu row costs a menu row; a thrown error would cost the screen.
-    public static func actions(
-        address: String,
-        port: UInt16 = punktfunkDefaultMgmtPort,
-        certPEM: String,
-        keyPEM: String,
-        hostFingerprint: Data?
-    ) async -> [HostAction] {
-        guard let identity = try? clientIdentity(certPEM: certPEM, keyPEM: keyPEM),
-              let response = try? await send(
-                  path: "/api/v1/actions", address: address, port: port,
-                  identity: identity, hostFingerprint: hostFingerprint),
+    /// access carries the Host-power grant. Best-effort, like ``status(_:)``: a missing menu row
+    /// costs a menu row; a thrown error would cost the screen.
+    public static func actions(_ target: MgmtTarget) async -> [HostAction] {
+        guard let response = try? await send("/api/v1/actions", to: target),
               response.status == 200,
               let list = try? JSONDecoder().decode(HostActionList.self, from: response.body)
         else { return [] }
@@ -493,22 +727,12 @@ public enum LibraryClient {
     /// End one title on the host, live session included (`POST /api/v1/game/end`). The host ends
     /// it only if this device launched it. Never throws: every outcome is something to tell the
     /// player.
-    public static func endGame(
-        appID: String,
-        address: String,
-        port: UInt16 = punktfunkDefaultMgmtPort,
-        certPEM: String,
-        keyPEM: String,
-        hostFingerprint: Data
-    ) async -> GameEndOutcome {
+    public static func endGame(appID: String, on target: MgmtTarget) async -> GameEndOutcome {
         let body = (try? JSONSerialization.data(
             withJSONObject: ["app_id": appID, "streaming": true])) ?? Data()
         do {
-            let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
             let response = try await send(
-                path: "/api/v1/game/end", address: address, port: port,
-                identity: identity, hostFingerprint: hostFingerprint,
-                body: (body, "application/json"))
+                "/api/v1/game/end", to: target, method: "POST", body: (body, "application/json"))
             return .from(status: response.status)
         } catch {
             return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
@@ -519,45 +743,27 @@ public enum LibraryClient {
     ///
     /// Returning normally means the host ACCEPTED it (202) — it now ends every session and acts
     /// about a second later, so this is the last word the client will get. A refusal throws
-    /// with the host's own sentence ("another device is streaming from this host right now"),
-    /// which tells a person what to do where a bare status code would not.
-    ///
-    /// The body stays empty by design: the id is the whole request, and no request field ever
-    /// reaches the host's privileged path.
-    public static func invokeAction(
-        id: String,
-        address: String,
-        port: UInt16 = punktfunkDefaultMgmtPort,
-        certPEM: String,
-        keyPEM: String,
-        hostFingerprint: Data
-    ) async throws {
-        let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
+    /// with the host's own sentence ("another device is streaming from this host right now").
+    /// The body stays empty: the id is the whole request.
+    public static func invokeAction(id: String, on target: MgmtTarget) async throws {
         let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         let response = try await send(
-            path: "/api/v1/actions/\(escaped)", address: address, port: port,
-            identity: identity, hostFingerprint: hostFingerprint,
+            "/api/v1/actions/\(escaped)", to: target, method: "POST",
             body: (Data(), "application/json"))
-        switch response.status {
-        case 200, 202:
-            return
-        case 401, 403:
-            throw LibraryError.unauthorized
-        default:
-            // The `ApiError` envelope carries the host's reason; prefer it over the code.
-            let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any]
-            if let why = json?["error"] as? String, !why.isEmpty {
-                throw LibraryError.unreachable(why)
-            }
-            throw LibraryError.http(response.status)
+        if ![200, 202, 401, 403].contains(response.status), let why = hostReason(response.body) {
+            throw LibraryError.unreachable(why)
         }
+        try expectOK(response, [200, 202])
     }
 
     /// Just the slice of `/status` this client reads. Everything else on that payload is the
     /// operator console's business, and decoding only what we use keeps an unrelated schema change
     /// on the host from breaking the library screen.
-    private struct HostStatus: Decodable {
+    struct HostStatus: Decodable {
         var games: [RunningGame]?
+        var downloads: [HostDownload]?
+        /// This device's live grants; absent from a host that predates the field.
+        var grants: UInt32?
     }
 
     private struct HostActionList: Decodable {
@@ -570,43 +776,38 @@ public enum LibraryClient {
         return bare.contains(":") ? "https://[\(bare)]:\(port)" : "https://\(bare):\(port)"
     }
 
-    /// Build the paired identity, restating any keychain failure in the UI's vocabulary.
-    static func clientIdentity(certPEM: String, keyPEM: String) throws -> SecIdentity {
-        do {
-            return try ClientTLS.makeIdentity(certPEM: certPEM, keyPEM: keyPEM)
-        } catch {
-            throw LibraryError.unreachable(
-                (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
-        }
-    }
-
     /// Build and cache the TLS identity ahead of the first request. Blocking Keychain work:
     /// call off the main actor, so the callers on it find the pair built.
     public static func warmIdentity(_ identity: ClientIdentity) {
         _ = try? ClientTLS.makeIdentity(certPEM: identity.certPEM, keyPEM: identity.keyPEM)
     }
 
-    /// One request against the host — a GET, or a POST when `body` is given — with transport
-    /// failures mapped onto `LibraryError`.
+    /// Throws unless the host answered one of `ok`. 401 and 403 are both the host declining this
+    /// certificate, with the same remedy.
+    static func expectOK(_ response: HTTPResponse, _ ok: Set<Int> = [200]) throws {
+        if ok.contains(response.status) { return }
+        if response.status == 401 || response.status == 403 { throw LibraryError.unauthorized }
+        throw LibraryError.http(response.status)
+    }
+
+    /// The host's own sentence from its `ApiError` envelope (`{"error": "..."}`), if it sent one.
+    static func hostReason(_ body: Data) -> String? {
+        let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+        return (json?["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// One request against `target`, with transport failures mapped onto `LibraryError`.
     static func send(
-        path: String, address: String, port: UInt16,
-        identity: SecIdentity, hostFingerprint: Data?,
+        _ path: String, to target: MgmtTarget, method: String = "GET",
         body: (data: Data, contentType: String)? = nil
     ) async throws -> HTTPResponse {
         do {
-            if let body {
-                return try await MgmtTransport.post(
-                    host: address, port: port, path: path, body: body.data,
-                    contentType: body.contentType,
-                    identity: identity, pinnedHostFingerprint: hostFingerprint)
-            }
-            return try await MgmtTransport.get(
-                host: address, port: port, path: path,
-                identity: identity, pinnedHostFingerprint: hostFingerprint)
+            return try await MgmtTransport.request(
+                host: target.address, port: target.port, method: method, path: path,
+                body: body?.data, contentType: body?.contentType,
+                identity: target.identity, pin: target.pin)
         } catch MgmtTransportError.pinMismatch {
             throw LibraryError.pinMismatch
-        } catch MgmtTransportError.unpinned {
-            throw LibraryError.unauthorized
         } catch MgmtTransportError.timedOut {
             throw LibraryError.unreachable("timed out")
         } catch let error as MgmtTransportError {
@@ -703,10 +904,7 @@ final class ArtFlights: @unchecked Sendable {
 ///
 /// Built once per library screen and reused across a whole grid's worth of posters.
 public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
-    private let address: String
-    private let port: UInt16
-    private let identity: SecIdentity
-    private let hostFingerprint: Data?
+    private let target: MgmtTarget
     /// Third-party origins only, with the system's normal certificate validation and no URLCache
     /// (`ArtCache` owns persistence). Process-wide and never invalidated: a fetch that outlives
     /// `close()` would otherwise create a task on a dead session, which raises.
@@ -721,17 +919,8 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
     /// its art twice on a cold cache. Failures are deliberately not remembered.
     private let flights = ArtFlights()
 
-    public init(
-        address: String,
-        port: UInt16 = punktfunkDefaultMgmtPort,
-        certPEM: String,
-        keyPEM: String,
-        hostFingerprint: Data?
-    ) throws {
-        self.address = address
-        self.port = port
-        self.identity = try LibraryClient.clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
-        self.hostFingerprint = hostFingerprint
+    public init(_ target: MgmtTarget) {
+        self.target = target
     }
 
     /// Image bytes for one art URL, cached on disk after the first fetch. A miss propagates the
@@ -740,11 +929,21 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         // Inline art never leaves the manifest — decode it here rather than probe a cache that
         // could never hold it.
         if url.scheme?.lowercased() == "data" { return try Self.inlineBytes(url) }
-        let key = Self.cacheKey(for: url, hostAddress: address, hostPort: port, pin: hostFingerprint)
+        let key = Self.cacheKey(
+            for: url, hostAddress: target.address, hostPort: target.port, pin: target.pin)
         if let cache, let cached = await cache.data(forKey: key) { return cached }
         let fetched = try await flights.value(for: key) { try await self.fetch(url) }
         if let cache { await cache.store(fetched, forKey: key) }
         return fetched
+    }
+
+    /// The poster the disk cache or the URL itself already holds. Never the network: a
+    /// powered-off host costs a full request timeout per poster it is asked for.
+    public func cached(for url: URL) async -> Data? {
+        if url.scheme?.lowercased() == "data" { return try? Self.inlineBytes(url) }
+        let key = Self.cacheKey(
+            for: url, hostAddress: target.address, hostPort: target.port, pin: target.pin)
+        return await cache?.data(forKey: key)
     }
 
     /// The bytes of a base64 `data:` URL — art a plugin inlined rather than linked. Base64 is the
@@ -762,7 +961,7 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
     /// don't sit on open TLS sockets the user is finished with.
     public func close() async {
         await MgmtConnectionPool.shared.closeAll(
-            matching: "\(MgmtTransport.unbracketed(address)):\(port):")
+            matching: "\(MgmtTransport.unbracketed(target.address)):\(target.port):")
     }
 
     /// The cache entry's identity. A HOST-origin URL is `pin | path` — the machine, not the
@@ -789,7 +988,7 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
     }
 
     private func fetch(_ url: URL) async throws -> Data {
-        guard Self.isHostOrigin(url, address: address, port: port) else {
+        guard Self.isHostOrigin(url, address: target.address, port: target.port) else {
             // A library entry names its own art URL, so this is host-supplied. Web schemes and
             // inline `data:` only — a `file:` URL would make the client read its own container and
             // cache the result as a poster — and the same ceiling the pinned path enforces, since
@@ -822,9 +1021,7 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
             if data.count > ceiling { throw MgmtTransportError.tooLarge }
             return data
         }
-        let response = try await LibraryClient.send(
-            path: Self.requestPath(url), address: address, port: port,
-            identity: identity, hostFingerprint: hostFingerprint)
+        let response = try await LibraryClient.send(Self.requestPath(url), to: target)
         guard response.status == 200 else { throw LibraryError.http(response.status) }
         return response.body
     }

@@ -21,6 +21,8 @@ export interface PluginManifest {
 	reads?: string[];
 	writes?: string[];
 	network?: boolean;
+	/** Windows registry keys it reads (`HKLM\…`, `HKCU\…`). Nothing to bind here on Linux. */
+	registry?: string[];
 }
 
 /** An id names the plugin's state dir and socket: one lowercase path component. */
@@ -49,7 +51,12 @@ export const expandHome = (p: string, home: string): string =>
 export interface GrantedRoot {
 	path: string;
 	write: boolean;
+	/** Links the plugin asked through, each with the path under this root it resolves to. */
+	links?: { path: string; target: string }[];
 }
+
+/** `p` is `base` or inside it. */
+const under = (p: string, base: string): boolean => p === base || p.startsWith(`${base}/`);
 
 export interface SandboxPaths {
 	/** Where this plugin's own files live, bound read-write. */
@@ -64,6 +71,8 @@ export interface SandboxPaths {
 	bun: string;
 	runner: string;
 	home: string;
+	/** The host's config dir (`PUNKTFUNK_CONFIG_DIR`), which no plugin may bind. */
+	configDir: string;
 	/** A plugin without network: the runner's dir its UI socket goes in, and the forwarded port. */
 	ui?: { dir: string; port: number };
 	/** The host's `/home` when it is a link ({@link homeLink}), mirrored inside. */
@@ -96,6 +105,8 @@ export const homeLink = (p = "/home"): HomeLink | undefined => {
  *
  * The host's `/home` link is mirrored and every host path binds where it resolves, so a canonical
  * grant and a launcher's `$HOME` path both resolve, and `realpath` inside agrees with the host.
+ * A link the plugin asked through into a grant (`~/Games/SteamLibrary` → `/mnt/ssd/games`) is
+ * recreated the same way.
  */
 /**
  * The namespaces and the minimal root every sandbox gets, shared with {@link sandboxProbe} so a
@@ -197,35 +208,75 @@ export const bwrapArgv = (
 	// than a sandbox that refuses to start.
 	for (const p of manifest.reads ?? []) {
 		const abs = expandHome(p, paths.home);
-		if (bindable(abs, paths.home)) argv.push("--ro-bind-try", abs, at(abs));
+		if (bindable(abs, paths)) argv.push("--ro-bind-try", abs, at(abs));
 	}
 	for (const p of manifest.writes ?? []) {
 		const abs = expandHome(p, paths.home);
-		if (bindable(abs, paths.home)) argv.push("--bind-try", abs, at(abs));
+		if (bindable(abs, paths)) argv.push("--bind-try", abs, at(abs));
 	}
 	// Operator grants are read-only unless one opts into write.
 	for (const grant of grants) {
 		const abs = expandHome(grant.path, paths.home);
-		if (bindable(abs, paths.home))
+		if (bindable(abs, paths))
 			argv.push(grant.write ? "--bind-try" : "--ro-bind-try", abs, at(abs));
+	}
+	// bwrap fails on a link it can't place, so none lands on, in or above anything placed.
+	const placed = destinations(argv);
+	for (const grant of grants) {
+		if (!bindable(expandHome(grant.path, paths.home), paths)) continue;
+		for (const link of grant.links ?? []) {
+			const dest = at(link.path);
+			if (link.path !== path.resolve(link.path) || !bindable(link.path, paths)) continue;
+			if (placed.some((p) => under(p, dest) || under(dest, p))) continue;
+			argv.push("--symlink", link.target, dest);
+			placed.push(dest);
+		}
 	}
 	return argv;
 };
 
+/** Each bwrap op this file emits: how many arguments it takes, and whether the last is a path inside. */
+const OPS: Record<string, [number, boolean]> = {
+	"--setenv": [2, false],
+	"--add-seccomp-fd": [1, false],
+	"--proc": [1, true],
+	"--dev": [1, true],
+	"--tmpfs": [1, true],
+	"--ro-bind": [2, true],
+	"--ro-bind-try": [2, true],
+	"--bind": [2, true],
+	"--bind-try": [2, true],
+	"--symlink": [2, true],
+};
+
+/** Every path `argv` puts something at inside the sandbox. */
+const destinations = (argv: readonly string[]): string[] => {
+	const out: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		const [n, places] = OPS[argv[i] as string] ?? [0, false];
+		if (places) out.push(argv[i + n] as string);
+		i += n;
+	}
+	return out;
+};
+
 /**
  * A root no manifest or grant may bind: the host's processes, devices, the session bus and
- * runtime sockets, the home or anything above it, keys, and punktfunk's own config or anything
- * above it, which holds every plugin's token. Checked on the path and on what it resolves to in
- * the runner's view.
+ * runtime sockets, the home or anything above it, keys, and the host's config dir (`configDir`,
+ * and `~/.config/punktfunk*` wherever the config lives) or anything above it, which holds every
+ * plugin's token. Checked on the path and on what it resolves to in the runner's view. The
+ * host's `refusal_rule` is the other half; path-refusal-vectors.json pins the two.
  */
-export const refusedRoot = (abs: string, home: string): boolean => {
-	const refused = (p: string, h: string) => {
+export const refusedRoot = (abs: string, home: string, configDir: string): boolean => {
+	const refused = (p: string, h: string, c: string) => {
 		const under = (base: string) => p === base || p.startsWith(`${base}/`);
 		const above = (base: string) => `${base}/`.startsWith(`${p}/`);
 		return (
 			p === "/" ||
 			above(h) ||
+			above(c) ||
 			above(path.join(h, ".config", "punktfunk")) ||
+			under(c) ||
 			["/proc", "/sys", "/dev"].some(under) ||
 			(under("/run") && !p.startsWith("/run/media/")) ||
 			[".ssh", ".gnupg"].some((d) => under(path.join(h, d))) ||
@@ -239,15 +290,16 @@ export const refusedRoot = (abs: string, home: string): boolean => {
 			return p;
 		}
 	};
-	// Both spellings of both sides: on Fedora Atomic `/home` is a link to `/var/home`.
+	// Every spelling of every side: on Fedora Atomic `/home` is a link to `/var/home`.
 	const p = path.resolve(abs);
 	const paths = [p, real(p)];
 	const homes = [home, real(home)];
-	return paths.some((x) => homes.some((h) => refused(x, h)));
+	const configs = [configDir, real(configDir)];
+	return paths.some((x) => homes.some((h) => configs.some((c) => refused(x, h, c))));
 };
 
-const bindable = (abs: string, home: string): boolean =>
-	path.isAbsolute(abs) && !refusedRoot(abs, home);
+const bindable = (abs: string, paths: SandboxPaths): boolean =>
+	path.isAbsolute(abs) && !refusedRoot(abs, paths.home, paths.configDir);
 
 /**
  * A seccomp program refusing netlink sockets, as the bytes bwrap reads from `--add-seccomp-fd`.
@@ -308,8 +360,9 @@ export const sandboxEnv = (
 
 /**
  * The operator's extra roots for `id` from `plugin-run/plugin-grants.json`. Accepts a legacy array
- * (read-only grants) and a `{ grants: [{ path, write }] }` record. Anything else — malformed JSON,
- * a missing entry, a shape that does not parse strictly — grants nothing.
+ * (read-only grants) and a `{ grants: [{ path, write }], links: { link: target } }` record; each
+ * link joins the grant its target is in. Anything else — malformed JSON, a missing entry, grants
+ * that do not parse strictly — grants nothing, and a malformed link is dropped alone.
  */
 export const grantedRoots = (configDir: string, id: string): GrantedRoot[] => {
 	try {
@@ -335,7 +388,17 @@ export const grantedRoots = (configDir: string, id: string): GrantedRoot[] => {
 			)
 		)
 			return [];
-		return grants as GrantedRoot[];
+		const raw = (entry as { links?: unknown }).links;
+		const links =
+			typeof raw === "object" && raw !== null && !Array.isArray(raw)
+				? Object.entries(raw).filter((l): l is [string, string] => typeof l[1] === "string")
+				: [];
+		return (grants as GrantedRoot[]).map((g) => {
+			const into = links
+				.filter(([, target]) => under(target, g.path))
+				.map(([p, target]) => ({ path: p, target }));
+			return into.length > 0 ? { ...g, links: into } : g;
+		});
 	} catch {
 		return [];
 	}
@@ -355,6 +418,17 @@ const PROBE_BINDS: readonly string[] = [
 
 /** Host `true` as an absolute path. `/bin/true` is an FHS path NixOS does not have.
  *  Do not realpath: Nix `true` is a symlink onto the coreutils multicall binary. */
+/**
+ * The host binary beside the runner bundle: `<install>\scripting\runner-cli.js` and
+ * `<install>\punktfunk-host.exe`, which `plugins spawn` runs a plugin's AppContainer through.
+ */
+export const hostExe = (): string =>
+	path.resolve(
+		path.dirname(process.env.PUNKTFUNK_RUNNER_ENTRY ?? process.argv[1] ?? ""),
+		"..",
+		"punktfunk-host.exe",
+	);
+
 const whichTrue = (): string => {
 	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
 		if (!dir) continue;
@@ -389,6 +463,12 @@ export const sandboxProbe = (
 	},
 	platform: string = process.platform,
 ): { ok: true } | { ok: false; reason: string } => {
+	if (platform === "win32") {
+		// The host binary beside the runner is the AppContainer's door; the installer puts both.
+		return fs.existsSync(hostExe())
+			? { ok: true }
+			: { ok: false, reason: `${hostExe()} is missing — reinstall punktfunk, or set PUNKTFUNK_PLUGIN_SANDBOX=off` };
+	}
 	if (platform !== "linux") {
 		return { ok: false, reason: "sandboxing is Linux-only here" };
 	}

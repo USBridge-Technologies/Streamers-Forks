@@ -3,7 +3,7 @@
 //! the power-user CLI build).
 //!
 //! One stream session per invocation: `--connect host[:port]` (+ `--fp HEX`,
-//! `--launch id`, `--fullscreen`), exits when the session ends. Reads the same identity
+//! `--launch id`, `--as profile`, `--fullscreen`), exits when the session ends. Reads the same identity
 //! / known-hosts / settings stores as the desktop shell on each OS — the GTK client
 //! (`punktfunk-client`) on Linux, the WinUI client on Windows — so pairing on either side
 //! makes the other connect silently. `--pair - --connect host` runs the ceremony here,
@@ -199,10 +199,9 @@ mod session_main {
     /// same known-hosts store `--connect` reads, so pairing here is exactly what makes the
     /// later stream connect silently.
     ///
-    /// Deliberately identical in shape and output to `punktfunk-client --pair` (which stays
-    /// the desktop route) — the difference is only that this binary carries no toolkit, so it
-    /// is the one a minimal image installs. Present in the `--no-default-features` build too:
-    /// enrolment must not be the reason an embedded image has to pull in Skia.
+    /// Prints the same `paired {addr}:{port} fp=…` line as `punktfunk pair`; provisioning
+    /// scripts read it. Present in the `--no-default-features` build too: enrolment must not
+    /// be the reason an embedded image has to pull in Skia.
     fn headless_pair(pin: &str) -> u8 {
         let Some(target) = arg_value("--connect") else {
             eprintln!("--pair requires --connect host[:port]");
@@ -220,21 +219,13 @@ mod session_main {
                 return exit::CONNECT_FAILED;
             }
         };
-        match trust::pair_with_host(&addr, port, &identity, pin, &name) {
-            Ok(fp) => {
-                let fp_hex = trust::hex(&fp);
-                if let Err(e) = trust::persist_host(
-                    &arg_value("--host-label").unwrap_or_else(|| addr.clone()),
-                    &addr,
-                    port,
-                    &fp_hex,
-                    true,
-                    &[],
-                ) {
+        let label = arg_value("--host-label").unwrap_or_else(|| addr.clone());
+        match trust::pair_and_save(&addr, port, &identity, pin, &name, &label, &[]) {
+            Ok(paired) => {
+                if let Err(e) = paired.saved {
                     eprintln!("couldn't save the host: {e:#}");
                 }
-                trust::forget_placeholder(&addr, port);
-                println!("paired {addr}:{port} fp={fp_hex}");
+                println!("paired {addr}:{port} fp={}", paired.fp_hex);
                 0
             }
             Err(e) => {
@@ -259,6 +250,29 @@ mod session_main {
     /// `punktfunk://…&preset=` link both land here. Absent = honor the host's binding;
     /// `--preset ""` (or a bare `--preset`) forces the global defaults, which is how "Connect
     /// with ▸ Default settings" reaches a bound host. `--profile` is the pre-rename spelling.
+    /// `--as` takes a profile id or name; the wire takes the id, so a name is looked up in the
+    /// host's list. A minted id (12 hex) is sent as is, and so is anything the host can't list.
+    fn as_profile(
+        addr: &str,
+        host: Option<&trust::KnownHost>,
+        identity: &(String, String),
+        pin: [u8; 32],
+        wanted: String,
+    ) -> String {
+        if wanted.len() == 12 && wanted.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return wanted;
+        }
+        let mgmt = host.map_or(pf_client_core::library::DEFAULT_MGMT_PORT, |h| {
+            h.effective_mgmt_port()
+        });
+        match pf_client_core::profiles::fetch_enumerate(addr, mgmt, identity, Some(pin)) {
+            Ok(Some(listed)) => {
+                pf_client_core::profiles::find(&listed, &wanted).map_or(wanted, |p| p.id.clone())
+            }
+            _ => wanted,
+        }
+    }
+
     fn preset_arg() -> Option<String> {
         ["--preset", "--profile"]
             .into_iter()
@@ -362,6 +376,7 @@ mod session_main {
             settings.pad_haptics,
             pf_client_core::pad_audio::speaker_active(&settings.pad_speaker),
         );
+        gamepad.set_rumble(settings.pad_rumble);
         // Short-circuit: Full chroma off must not build an HEVC decoder.
         // The probe constructs one to ask about 4:4:4 profiles.
         let hevc_444_hardware = settings.enable_444
@@ -404,6 +419,8 @@ mod session_main {
                 port,
                 pin,
                 launch,
+                // The caller sets it on the params: only a launch knows its profile.
+                profile: None,
                 connect_timeout: connect_timeout(),
             },
             Probes {
@@ -416,14 +433,13 @@ mod session_main {
                 display_hdr,
                 hevc_444_hardware,
                 stats_verbosity: stats_tier(settings),
-                latch_grid: std::sync::Arc::new(pf_client_core::session::LatchGrid::default()),
             },
         )
     }
 
     /// The window's starting size under Match-window: the persisted last size, so the
     /// first connect's mode already matches the glass; `None` (policy off / never
-    /// stored) = the 1280×720 default.
+    /// stored) = the presenter's default.
     pub(crate) fn window_size(settings: &trust::Settings) -> Option<(u32, u32)> {
         (settings.match_window && settings.last_window_w > 0 && settings.last_window_h > 0)
             .then_some((settings.last_window_w, settings.last_window_h))
@@ -542,24 +558,7 @@ mod session_main {
                         "     vulkan video decode: {}",
                         if a.usable { "YES" } else { "no" }
                     );
-                    // Name every advertised bit, including unsupported VP9, so the labels
-                    // account for the complete mask.
-                    const OPS: [(u32, &str); 4] = [
-                        (0x1, "H.264"),
-                        (0x2, "H.265"),
-                        (0x4, "AV1"),
-                        (0x8, "VP9 (no punktfunk rung)"),
-                    ];
-                    let mut codecs: Vec<String> = OPS
-                        .iter()
-                        .filter(|(bit, _)| a.codec_ops & bit != 0)
-                        .map(|(_, n)| (*n).to_string())
-                        .collect();
-                    let named: u32 = OPS.iter().map(|(b, _)| b).sum();
-                    let unknown = a.codec_ops & !named;
-                    if unknown != 0 {
-                        codecs.push(format!("unrecognised bits 0x{unknown:X}"));
-                    }
+                    let codecs = a.codec_names();
                     println!(
                         "     driver decode ops:   {}",
                         if codecs.is_empty() {
@@ -569,28 +568,8 @@ mod session_main {
                         }
                     );
                     if !a.usable {
-                        // Say which conjunct failed. "no" with no reason is the thing
-                        // this whole flag exists to stop.
-                        let mut why: Vec<String> = Vec::new();
-                        if !a.api_1_3 {
-                            why.push("device is not Vulkan 1.3".into());
-                        }
-                        if !a.features_ok {
-                            why.push(
-                                "missing samplerYcbcrConversion / timelineSemaphore / \
-                                 synchronization2"
-                                    .into(),
-                            );
-                        }
-                        if a.decode_family.is_none() {
-                            why.push("no queue family advertises VIDEO_DECODE".into());
-                        }
-                        if !a.base_missing.is_empty() {
-                            why.push(format!("missing {}", a.base_missing.join(", ")));
-                        }
-                        if a.codec_exts.is_empty() {
-                            why.push("no VK_KHR_video_decode_{h264,h265,av1} extension".into());
-                        }
+                        // "no" with no reason is the thing this whole flag exists to stop.
+                        let why = a.why_not();
                         println!("     why not:             {}", why.join("; "));
                     } else {
                         println!("     extensions:          {}", a.codec_exts.join(", "));
@@ -724,8 +703,12 @@ mod session_main {
 
     pub fn run() -> u8 {
         // Logs to STDERR — stdout is the machine interface (ready/stats/error lines) — plus
-        // the ring "Send logs to host" uploads.
-        pf_client_core::logring::init_tracing(std::io::stderr, true);
+        // the ring "Send logs to host" uploads. A shell pipes stderr into its log file, so
+        // colour only on a terminal.
+        pf_client_core::logring::init_tracing(
+            std::io::stderr,
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        );
         // SEH last-resort: a driver AV otherwise leaves only an exit code in the shell's log.
         #[cfg(windows)]
         punktfunk_core::crash::install();
@@ -858,7 +841,7 @@ mod session_main {
         }
         let Some(target) = arg_value("--connect") else {
             eprintln!(
-                "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--preset REF] [--fullscreen]\n\
+                "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--preset REF] [--as PROFILE] [--fullscreen]\n\
                  \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--json-status] [--until-no-controller]\n\
                  \x20      punktfunk-session --pair - --connect host[:port] [--name LABEL]\n\
                  \n\
@@ -883,15 +866,15 @@ mod session_main {
                 emit(SessionLine::Error {
                     msg: "this device's client key didn't load",
                     trust_rejected: None,
+                    refused: None,
                 });
                 return exit::CONNECT_FAILED;
             }
         };
-        // `--resolved-spec <path>`: the spawner already did the resolving, so this process
-        // performs ZERO store reads (design/client-architecture-split.md §5) — no Settings
-        // load, no known-hosts lookup, no preset resolution. Without it (a hand-run
-        // `--connect`, an old Decky script) the session resolves for itself through the SAME
-        // helper, so the two modes cannot drift.
+        // `--resolved-spec <path>`: the spawner resolved settings, preset and clipboard, so
+        // this process loads no Settings and no preset catalog. It still reads the saved-hosts
+        // store below, for the pin and the window's name. Without a spec (a hand-run
+        // `--connect`, an old Decky script) it resolves through the same helper.
         let spec = arg_value("--resolved-spec").map(std::path::PathBuf::from);
         // `--fp` names its own record; only a bare address falls back to what it answers with.
         let fp_arg = arg_value("--fp").map(|f| f.to_ascii_lowercase());
@@ -906,6 +889,7 @@ mod session_main {
                     emit(SessionLine::Error {
                         msg: "this stream's settings didn't load",
                         trust_rejected: None,
+                        refused: None,
                     });
                     return exit::CONNECT_FAILED;
                 }
@@ -945,6 +929,7 @@ mod session_main {
                     "{addr}:{port} isn't paired with this device yet. Pair it to continue."
                 ),
                 trust_rejected: Some(true),
+                refused: None,
             });
             return exit::TRUST_REJECTED;
         };
@@ -1000,9 +985,11 @@ mod session_main {
             until_no_pads: false,
         };
 
+        let profile =
+            arg_value("--as").map(|wanted| as_profile(&addr, known_host, &identity, pin, wanted));
         let outcome =
             pf_presenter::run_session(opts, move |gamepad, native, hdr, force_software, vulkan| {
-                match resolved {
+                let mut params = match resolved {
                     Some(spec) => params_from_spec(
                         spec,
                         addr,
@@ -1032,7 +1019,9 @@ mod session_main {
                         force_software,
                         vulkan,
                     ),
-                }
+                };
+                params.profile = profile;
+                params
             });
 
         match outcome {
@@ -1046,10 +1035,12 @@ mod session_main {
             Ok(pf_presenter::Outcome::ConnectFailed {
                 msg,
                 trust_rejected,
+                refused,
             }) => {
                 emit(SessionLine::Error {
                     msg: &msg,
                     trust_rejected: Some(trust_rejected),
+                    refused,
                 });
                 if trust_rejected {
                     exit::TRUST_REJECTED
@@ -1062,6 +1053,7 @@ mod session_main {
                 emit(SessionLine::Error {
                     msg: "the stream window didn't start",
                     trust_rejected: None,
+                    refused: None,
                 });
                 exit::RENDERER_FAILED
             }

@@ -58,6 +58,10 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_max_fps,
 		hint: m.setting_max_fps_hint,
 	},
+	vdisplay_hz_mult: {
+		label: m.setting_vdisplay_hz_mult,
+		hint: m.setting_vdisplay_hz_mult_hint,
+	},
 	audio_output_mode: {
 		label: m.setting_audio_output_mode,
 		options: {
@@ -190,6 +194,14 @@ export const SETTING_COPY: Record<string, Copy> = {
 			steamcontroller: m.setting_gamepad_steamcontroller,
 			steamcontroller2: m.setting_gamepad_steamcontroller2,
 			switchpro: m.setting_gamepad_switchpro,
+			steamcontroller2puck: m.setting_gamepad_steamcontroller2puck,
+			joyconpair: m.setting_gamepad_joyconpair,
+			switch2pro: m.setting_gamepad_switch2pro,
+			switch2gamecube: m.setting_gamepad_switch2gamecube,
+			"8bitdoultimate2": m.setting_gamepad_8bitdoultimate2,
+			"8bitdopro2": m.setting_gamepad_8bitdopro2,
+			"8bitdopro3": m.setting_gamepad_8bitdopro3,
+			horipadsteam: m.setting_gamepad_horipadsteam,
 		},
 	},
 	pen: {
@@ -229,10 +241,6 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_gamescope_refresh_rates,
 		hint: m.setting_gamescope_refresh_rates_hint,
 	},
-	gamescope_steam: {
-		label: m.setting_gamescope_steam,
-		hint: m.setting_gamescope_steam_hint,
-	},
 	gamescope_splash: {
 		label: m.setting_gamescope_splash,
 		hint: m.setting_gamescope_splash_hint,
@@ -271,6 +279,30 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_update_apply,
 		hint: m.setting_update_apply_hint,
 	},
+	steam_prewarm: {
+		label: m.setting_steam_prewarm,
+		hint: m.setting_steam_prewarm_hint,
+	},
+	seat_idle_stop: {
+		label: m.setting_seat_idle_stop,
+		hint: m.setting_seat_idle_stop_hint,
+	},
+	seat_end_on_game_exit: {
+		label: m.setting_seat_end_on_game_exit,
+		hint: m.setting_seat_end_on_game_exit_hint,
+	},
+	seat_max_mode: {
+		label: m.setting_seat_max_mode,
+		hint: m.setting_seat_max_mode_hint,
+	},
+	seat_library_writable: {
+		label: m.setting_seat_library_writable,
+		hint: m.setting_seat_library_writable_hint,
+	},
+	tray_autostart: {
+		label: m.setting_tray_autostart,
+		hint: m.setting_tray_autostart_hint,
+	},
 };
 
 export const GROUP_LABEL: Record<SettingGroup, () => string> = {
@@ -281,5 +313,6 @@ export const GROUP_LABEL: Record<SettingGroup, () => string> = {
 	network: m.settings_group_network,
 	game_mode: m.settings_group_game_mode,
 	session: m.settings_group_session,
+	seats: m.settings_group_seats,
 	system: m.settings_group_system,
 };

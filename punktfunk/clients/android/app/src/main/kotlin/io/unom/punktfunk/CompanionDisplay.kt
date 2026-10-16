@@ -6,21 +6,27 @@ import android.hardware.display.DisplayManager
 import android.os.Build
 import android.util.Log
 import android.view.Display
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import android.view.Window
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import io.unom.punktfunk.kit.NativeBridge
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.setViewTreeLifecycleOwner
@@ -48,19 +54,71 @@ private fun Display.diagonalInches(context: Context): Float {
     return hypot(m.widthPixels / m.xdpi, m.heightPixels / m.ydpi)
 }
 
-/** A public display, other than the default and [context]'s own, small enough to be held. */
+/** No physical size behind the metrics: no dpi at all, or exactly Android's 160 dpi default. */
+private fun Display.sizeless(context: Context): Boolean {
+    val m = context.createDisplayContext(this).resources.displayMetrics
+    return m.xdpi <= 0f || m.ydpi <= 0f || (m.densityDpi == 160 && m.xdpi == 160f && m.ydpi == 160f)
+}
+
+/**
+ * The size rule (design §7): a measured diagonal of at most 7″ — or no measure at all while this
+ * device's own display is a handheld's, since a USB-C DisplayPort panel whose EDID carries no
+ * size gets the default density and reads as a 14″ monitor.
+ */
+internal fun companionFits(diagonalInches: Float, sizeless: Boolean, handheld: Boolean): Boolean =
+    diagonalInches <= COMPANION_MAX_INCHES || (sizeless && handheld)
+
+/** A public display, other than the default and [context]'s own, that [companionFits]. */
 internal fun companionDisplay(context: Context, dm: DisplayManager): Display? {
-    val own = ContextCompat.getDisplayOrDefault(context).displayId
+    val ownDisplay = ContextCompat.getDisplayOrDefault(context)
+    val handheld = ownDisplay.diagonalInches(context) <= COMPANION_MAX_INCHES
     return dm.displays.firstOrNull { d ->
-        d.displayId != Display.DEFAULT_DISPLAY && d.displayId != own &&
-            d.flags and Display.FLAG_PRIVATE == 0 && d.diagonalInches(context) <= COMPANION_MAX_INCHES
+        d.displayId != Display.DEFAULT_DISPLAY && d.displayId != ownDisplay.displayId &&
+            d.flags and Display.FLAG_PRIVATE == 0 &&
+            companionFits(d.diagonalInches(context), d.sizeless(context), handheld)
     }
 }
 
-/** The screen the picture goes to: the second screen the player swapped it onto, else [own]. */
+/** The screen the picture goes to: the second screen the player put it on, else [own]. */
 internal fun pictureDisplay(context: Context, own: Display): Display {
     val dm = context.getSystemService(DisplayManager::class.java) ?: return own
-    return companionDisplay(context, dm)?.takeIf { CompanionMemory.swapped(context, it.name) } ?: own
+    return companionDisplay(context, dm)
+        ?.takeIf { CompanionMemory.layout(context, it.name) == ScreenLayout.SWAPPED } ?: own
+}
+
+/** True while the pair's kept layout spans the picture across a second display and this one. */
+internal fun pictureSpanned(context: Context): Boolean {
+    val dm = context.getSystemService(DisplayManager::class.java) ?: return false
+    return companionDisplay(context, dm)?.let { CompanionMemory.layout(context, it.name) == ScreenLayout.SPANNED } == true
+}
+
+/**
+ * The second picture window (design §4): a `SurfaceView` the presenter's second layer composites
+ * into — the picture on a second display, or its lower half there or below a hinge. Attached
+ * and detached as the surface comes and goes; the decoder never restarts for it.
+ */
+@Composable
+internal fun PictureSurface(handle: Long, modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            SurfaceView(ctx).apply {
+                holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(holder: SurfaceHolder) {
+                        NativeBridge.nativePictureWindow(handle, holder.surface, this@apply.width, this@apply.height)
+                    }
+
+                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                        NativeBridge.nativePictureSurfaceSize(handle, this@apply.width, this@apply.height)
+                    }
+
+                    override fun surfaceDestroyed(holder: SurfaceHolder) {
+                        NativeBridge.nativePictureWindow(handle, null, 0, 0)
+                    }
+                })
+            }
+        },
+    )
 }
 
 /** Every display as one `pf.display` line: what a dual-screen device reports, for its bundle. */
@@ -70,7 +128,8 @@ internal fun describeDisplays(context: Context, dm: DisplayManager): String {
         val m = context.createDisplayContext(d).resources.displayMetrics
         "id=${d.displayId} \"${d.name}\" ${m.widthPixels}x${m.heightPixels} dpi=${m.densityDpi} " +
             "xdpi=${m.xdpi.roundToInt()} in=${String.format(Locale.ROOT, "%.1f", d.diagonalInches(context))} " +
-            "flags=0x${Integer.toHexString(d.flags)} presentation=${d.displayId in presentation}"
+            "sizeless=${d.sizeless(context)} flags=0x${Integer.toHexString(d.flags)} " +
+            "presentation=${d.displayId in presentation}"
     }
 }
 
@@ -96,25 +155,46 @@ internal fun rememberCompanionDisplay(): Display? {
  * [content] on [display], as a `Presentation` shown while the activity is started. Its window is
  * not focusable: a tap on a focusable window moves key focus to that display, and the handheld's
  * own buttons would stop reaching the stream. A [pictureHz] means the window holds the picture:
- * it stays lit, pins the panel to the stream's refresh and takes input unbuffered, as
+ * it stays lit while [lit], pins the panel to the stream's refresh and takes input unbuffered, as
  * [StreamWindow] does for the activity's window.
  */
 @Composable
-internal fun CompanionOnDisplay(display: Display, pictureHz: Int? = null, content: @Composable () -> Unit) {
+internal fun CompanionOnDisplay(
+    display: Display,
+    pictureHz: Int? = null,
+    lit: Boolean = true,
+    content: @Composable () -> Unit,
+) {
     val activity = LocalContext.current as? ComponentActivity ?: return
     val latest by rememberUpdatedState(content)
+    // The picture's window, while one is up. Any window with the flag keeps the whole device
+    // awake, so this one follows the stream's own window ([StreamWindow.holdAwake]).
+    var pictureWindow by remember { mutableStateOf<Window?>(null) }
+    LaunchedEffect(pictureWindow, lit) {
+        pictureWindow?.let { w ->
+            if (lit) {
+                w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+    }
     // A Presentation cancels itself when its display's metrics change; the next one takes the new ones.
     var generation by remember { mutableIntStateOf(0) }
     DisposableEffect(activity, display.displayId, generation, pictureHz) {
         val p = Presentation(activity, display)
         p.window?.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+        // Its own window, so the app theme the activity's composition sits under is set again here.
         val view = ComposeView(p.context).apply {
             setViewTreeLifecycleOwner(activity)
             setViewTreeViewModelStoreOwner(activity)
             setViewTreeSavedStateRegistryOwner(activity)
-            setContent { latest() }
+            setContent { PunktfunkTheme { latest() } }
         }
-        if (pictureHz != null) p.window?.let { holdPicture(it, view, display, pictureHz) }
+        if (pictureHz != null) p.window?.let {
+            holdPicture(it, view, display, pictureHz)
+            pictureWindow = it
+        }
         p.setContentView(view)
         var disposed = false
         p.setOnDismissListener { if (!disposed) generation++ }
@@ -130,16 +210,20 @@ internal fun CompanionOnDisplay(display: Display, pictureHz: Int? = null, conten
         activity.lifecycle.addObserver(observer)
         onDispose {
             disposed = true
+            pictureWindow = null
             activity.lifecycle.removeObserver(observer)
             p.dismiss()
         }
     }
 }
 
-/** The picture's window: lit, pinned to a [hz] stream's mode, input off the vsync batch. Dies with it. */
+/**
+ * The picture's window: pinned to a [hz] stream's mode, input off the vsync batch. Dies with it.
+ * `0` pins nothing: the lower half of a spanned picture keeps the panel's own rate. Whether it
+ * stays lit is [CompanionOnDisplay]'s `lit`.
+ */
 private fun holdPicture(window: Window, view: View, display: Display, hz: Int) {
-    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-    display.streamModeFor(hz)?.let { m ->
+    if (hz > 0) display.streamModeFor(hz)?.let { m ->
         window.attributes = window.attributes.apply { preferredDisplayModeId = m.modeId }
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) view.requestUnbufferedDispatch(STREAM_UNBUFFERED_SOURCES)

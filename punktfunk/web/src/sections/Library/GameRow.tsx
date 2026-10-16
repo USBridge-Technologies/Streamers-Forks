@@ -6,7 +6,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { m } from "@/paraglide/messages";
 import type { GameCardProps } from "./GameCard";
-import { isOperatorOwned, storeLabel } from "./helpers";
+import { isOperatorOwned, sourceLabel } from "./helpers";
+import { InstallBadge } from "./Install";
 
 /**
  * One title as a line: a small cover, its name, where it comes from, and the same two controls
@@ -19,6 +20,7 @@ export const GameRow: FC<GameCardProps> = ({
 	onToggleHidden,
 	hiding,
 	nameOf,
+	download,
 }) => {
 	const hidden = game.hidden === true;
 	const isCustom = isOperatorOwned(game);
@@ -64,21 +66,18 @@ export const GameRow: FC<GameCardProps> = ({
 					</p>
 					<div className="mt-1 flex flex-wrap gap-1">
 						<Badge variant={isCustom ? "secondary" : "outline"}>
-							{storeLabel(game.store, nameOf)}
+							{sourceLabel(game, nameOf)}
 						</Badge>
 						{game.platform && game.platform.toUpperCase() !== "PC" && (
 							<Badge variant="outline">{game.platform}</Badge>
 						)}
-						{game.provider && game.provider !== game.store && (
-							<Badge variant="outline">
-								{m.library_owned_by({
-									provider: nameOf?.(game.provider) ?? game.provider,
-								})}
-							</Badge>
-						)}
 						{hidden && (
 							<Badge variant="secondary">{m.library_hidden_badge()}</Badge>
 						)}
+						<InstallBadge
+							{...(game.install ? { install: game.install } : {})}
+							{...(download ? { download } : {})}
+						/>
 					</div>
 				</div>
 			</Link>

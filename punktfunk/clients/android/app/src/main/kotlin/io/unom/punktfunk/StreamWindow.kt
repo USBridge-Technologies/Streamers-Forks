@@ -1,7 +1,8 @@
 package io.unom.punktfunk
 
+import android.app.GameManager
+import android.app.GameState
 import android.content.Context
-import android.content.pm.ActivityInfo
 import android.hardware.display.DisplayManager
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -22,8 +23,7 @@ internal const val STREAM_UNBUFFERED_SOURCES = android.view.InputDevice.SOURCE_C
     android.view.InputDevice.SOURCE_CLASS_TRACKBALL or
     android.view.InputDevice.SOURCE_CLASS_POSITION
 
-/** The display's modes at its current resolution, which is the one the user picked: no pin a
- *  stream sets ever leaves it. */
+/** The display's modes at its current resolution, which is the one the user picked. */
 internal fun Display.sameResolutionModes(): List<Display.Mode> {
     val current = mode
     return supportedModes.filter {
@@ -31,42 +31,67 @@ internal fun Display.sameResolutionModes(): List<Display.Mode> {
     }
 }
 
+/** One row of a display's mode table, landscape. */
+internal data class PanelMode(val id: Int, val width: Int, val height: Int, val hz: Float)
+
 /**
- * The mode a [hz] stream pins this display to: the exact rate, else the smallest integer multiple
- * (120 for a 60 stream: judder-free 2:1 pulldown), else the highest, so nothing is halved.
+ * The mode a [hz] stream of [size] pins: the panel's own size when the stream is exactly that and
+ * [current] renders below it, else [current]'s size. At that size, the exact rate, else the
+ * smallest integer multiple (120 for a 60 stream: judder-free 2:1 pulldown), else the highest.
  */
-internal fun Display.streamModeFor(hz: Int): Display.Mode? {
+internal fun pickStreamMode(
+    modes: List<PanelMode>,
+    current: PanelMode,
+    hz: Int,
+    size: Pair<Int, Int>?,
+): PanelMode? {
     if (hz <= 0) return null
+    val own = current.width to current.height
+    val panel = Resolutions.panelScreens(own, own, modes.map { it.width to it.height }).first
+    val at = if (size == panel) panel else own
     fun multiple(rate: Float): Int {
         val k = (rate / hz).toInt()
         return if (k >= 2 && kotlin.math.abs(rate - hz * k) < 1f) k else 0
     }
-    return sameResolutionModes().minWithOrNull(
+    return modes.filter { it.width to it.height == at }.minWithOrNull(
         compareBy(
             {
                 when {
-                    kotlin.math.abs(it.refreshRate - hz) < 1f -> 0 // exact
-                    multiple(it.refreshRate) > 0 -> 1 // integer multiple — prefer smallest
+                    kotlin.math.abs(it.hz - hz) < 1f -> 0 // exact
+                    multiple(it.hz) > 0 -> 1 // integer multiple — prefer smallest
                     else -> 2 // no relation — prefer highest
                 }
             },
-            { if (multiple(it.refreshRate) > 0) it.refreshRate else -it.refreshRate },
+            { if (multiple(it.hz) > 0) it.hz else -it.hz },
         ),
     )
 }
 
+private fun Display.Mode.row() = PanelMode(
+    modeId,
+    maxOf(physicalWidth, physicalHeight),
+    minOf(physicalWidth, physicalHeight),
+    refreshRate,
+)
+
+/** [pickStreamMode] on this display. [size] is the stream's, or null to stay at the current size. */
+internal fun Display.streamModeFor(hz: Int, size: Pair<Int, Int>? = null): Display.Mode? {
+    val id = pickStreamMode(supportedModes.map { it.row() }, mode.row(), hz, size)?.id ?: return null
+    return supportedModes.firstOrNull { it.modeId == id }
+}
+
 /**
- * The panel refresh a [hz] stream runs against on this display, from the mode TABLE:
+ * The panel refresh a [hz] stream of [size] runs against on this display, from the mode TABLE:
  * `refreshRate` reports a per-uid frame-rate override (games get 60 on Android 15+), not the
  * panel. `0` when unresolvable.
  */
-internal fun Display.streamPanelFps(hz: Int): Int =
-    streamModeFor(hz)?.refreshRate?.let { kotlin.math.round(it).toInt() } ?: 0
+internal fun Display.streamPanelFps(hz: Int, size: Pair<Int, Int>? = null): Int =
+    streamModeFor(hz, size)?.refreshRate?.let { kotlin.math.round(it).toInt() } ?: 0
 
 /**
  * Everything a stream does to the activity's WINDOW, and how to put it back: the wake and Wi-Fi
- * locks, the Wi-Fi link log, the panel's refresh pin, HDMI ALLM, the soft-keyboard and cutout
- * modes, the landscape lock, unbuffered input dispatch and the render-rate vote.
+ * locks, the Wi-Fi link log, the panel's refresh pin, HDMI ALLM, the Game Mode state, the
+ * soft-keyboard and cutout modes, unbuffered input dispatch and the render-rate vote.
  *
  * It is one object because it is one obligation — every field below is a prior value captured on the
  * way in, and [detach] is the only thing that ever restores one. Held in [StreamScreen]'s session
@@ -85,6 +110,8 @@ internal class StreamWindow(
     private val isTv: Boolean,
     /** The negotiated stream refresh (0 = unknown / older native lib). */
     private val streamHz: Int,
+    /** The negotiated stream size, landscape; null when unknown. */
+    private val streamSize: Pair<Int, Int>?,
 ) {
     private val window = activity?.window
     private val controller = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
@@ -173,7 +200,18 @@ internal class StreamWindow(
 
     private var priorSoftInput = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_UNSPECIFIED
     private var priorCutout: Int? = null
-    private var priorOrientation: Int? = null
+
+    /**
+     * Hold the screen awake, or hand it back to the device's own timeout. [attach] holds it;
+     * the stream screen calls this as the keep-awake rule changes its answer.
+     */
+    fun holdAwake(hold: Boolean) {
+        if (hold) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     /** Window state the stream wants from its first frame, before any peripheral exists. */
     fun attach() {
@@ -192,6 +230,12 @@ internal class StreamWindow(
         // 30+. Part of the experimental low-latency stack.
         if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window?.setPreferMinimalPostProcessing(true)
+        }
+        // Game Mode state (API 33): a game is in play, so the OEM power HAL applies its game
+        // profile (MediaTek sizes CPU clocks by it). Interruptible: a stream has no match to guard.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.getSystemService(GameManager::class.java)
+                ?.setGameState(GameState(false, GameState.MODE_GAMEPLAY_INTERRUPTIBLE))
         }
         // System bars: NOT hidden here — App.kt owns hide/show (one owner; the AnimatedContent
         // handoff broke per-screen ownership, see the `immersive` effect there).
@@ -218,27 +262,14 @@ internal class StreamWindow(
                 }
             }
         }
-        // Lock to landscape while streaming — the host streams a landscape desktop, so pin the
-        // device there (either direction is fine) and stop it rotating to portrait mid-session. The
-        // activity declares configChanges=orientation, so this re-lays out the surface in place
-        // without recreating the activity (no stream restart). On TV it is a harmless no-op.
-        //
-        // COMPACT devices only (sw < 600 dp): on tablets/foldables/desktop windows the lock is a
-        // large-display anti-pattern (Play flags it; Android 16+ ignores it there outright), and the
-        // stream doesn't need it — the aspect-ratio letterbox renders correctly in any orientation,
-        // the lock is purely a phone-ergonomics choice.
-        val compactDevice = context.resources.configuration.smallestScreenWidthDp < 600
-        priorOrientation = activity?.requestedOrientation
-        if (compactDevice) {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        }
     }
 
     /**
-     * Pin the panel to the stream's refresh (exact / multiple) for the session. The decoder's own
-     * `ANativeWindow_setFrameRate` hint still aligns vsync, but it is advisory — some OEM refresh
-     * governors ignore it outright and would leave a 120 Hz session on a 60/90 Hz panel. TV boxes
-     * skip the pin: the native side actively drives the HDMI mode there.
+     * Pin the panel to the stream's refresh (exact / multiple) for the session, and to the panel's
+     * own size when the stream is that size ([pickStreamMode]). [detach] and leaving the foreground
+     * drop the pin. The decoder's own `ANativeWindow_setFrameRate` hint still aligns vsync, but it is
+     * advisory — some OEM refresh governors ignore it outright and would leave a 120 Hz session on a
+     * 60/90 Hz panel. TV boxes skip the pin: the native side actively drives the HDMI mode there.
      *
      * Also takes pointer events off the vsync batch and votes the app's render rate up, both of
      * which the stream pays a frame of latency for otherwise.
@@ -247,7 +278,7 @@ internal class StreamWindow(
         if (isTv) {
             activity?.setConsoleHighRefreshRate(false) // the decoder's HDMI mode switch governs
         } else {
-            activity?.setStreamDisplayMode(streamHz)
+            activity?.setStreamDisplayMode(streamHz, streamSize)
         }
         // Moves are vsync-batched by default — up to a frame of input latency the stream
         // shouldn't pay. Unbuffered dispatch delivers them the moment the kernel does. A focus
@@ -293,10 +324,11 @@ internal class StreamWindow(
         if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window?.setPreferMinimalPostProcessing(false)
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.getSystemService(GameManager::class.java)
+                ?.setGameState(GameState(false, GameState.MODE_NONE))
+        }
         wifiLocks.forEach { runCatching { if (it.isHeld) it.release() } }
         mainHandler.removeCallbacks(pollWifiLink)
-        // Release the landscape lock so the rest of the app follows the device/system again.
-        activity?.requestedOrientation =
-            priorOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     }
 }

@@ -122,15 +122,27 @@ pub(crate) fn page_header(title: &str, action: Button) -> Element {
     .into()
 }
 
-/// A full-screen centred "busy" scene: spinner, headline, secondary detail line, and optional
-/// trailing elements (e.g. a Cancel button). Shared by Connecting / RequestAccess / SpeedTest.
+/// A full-screen centred "busy" scene: [`notice_page`] under a spinner. Shared by Connecting /
+/// RequestAccess / Waking / SpeedTest.
 pub(crate) fn busy_page(headline: &str, detail: &str, extra: Vec<Element>) -> Element {
-    let mut children: Vec<Element> = vec![
-        ProgressRing::indeterminate()
-            .width(48.0)
-            .height(48.0)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .into(),
+    let ring = ProgressRing::indeterminate()
+        .width(48.0)
+        .height(48.0)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .into();
+    notice_page(Some(ring), headline, detail, extra)
+}
+
+/// A full-screen centred scene: an optional lead visual, headline, secondary detail line, and
+/// trailing elements (e.g. a Cancel button).
+pub(crate) fn notice_page(
+    lead: Option<Element>,
+    headline: &str,
+    detail: &str,
+    extra: Vec<Element>,
+) -> Element {
+    let mut children: Vec<Element> = lead.into_iter().collect();
+    children.extend([
         text_block(headline)
             .font_size(18.0)
             .semibold()
@@ -142,7 +154,7 @@ pub(crate) fn busy_page(headline: &str, detail: &str, extra: Vec<Element>) -> El
             .foreground(ThemeRef::SecondaryText)
             .horizontal_alignment(HorizontalAlignment::Center)
             .into(),
-    ];
+    ]);
     children.extend(extra);
     // max_width + side margins so the text column reads well wide AND wraps instead of
     // clipping narrow.
@@ -193,6 +205,28 @@ pub(crate) fn avatar(name: &str, os: &str) -> Border {
         .corner_radius(SIZE / 2.0)
         .width(SIZE)
         .height(SIZE)
+}
+
+/// A circle of `size` carrying `text`: a profile's initials on its accent, or on the app accent
+/// when `fill` is `None`.
+pub(crate) fn monogram(text: &str, size: f64, fill: Option<Color>) -> Border {
+    let label = text_block(text)
+        .font_size(size * 0.38)
+        .semibold()
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Center);
+    let disc = match fill {
+        Some(c) => border(label.foreground(Color {
+            a: 255,
+            r: 255,
+            g: 255,
+            b: 255,
+        }))
+        .background(c),
+        None => border(label.foreground(ThemeRef::custom("TextOnAccentFillColorPrimaryBrush")))
+            .background(ThemeRef::Accent),
+    };
+    disc.corner_radius(size / 2.0).width(size).height(size)
 }
 
 /// Pill chip colour intent.

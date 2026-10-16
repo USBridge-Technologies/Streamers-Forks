@@ -36,6 +36,8 @@ data class PendingTrust(
      */
     val preset: String? = null,
     val launch: String? = null,
+    /** Opened by a link: pairing on its way continues into the link's connect. */
+    val fromLink: Boolean = false,
 ) {
     enum class Kind { TRUST_NEW, FP_CHANGED, PAIR, REQUEST_ACCESS }
 }
@@ -54,6 +56,7 @@ data class PendingLinkConnect(
     val host: KnownHost,
     val preset: String? = null,
     val launch: String? = null,
+    val asProfile: String? = null,
 )
 
 /**

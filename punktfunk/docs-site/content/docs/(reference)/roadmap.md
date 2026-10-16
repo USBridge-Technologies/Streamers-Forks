@@ -16,6 +16,8 @@ what changed, the [release notes](https://git.unom.io/unom/punktfunk/releases).
 - **Finishing the clipboard.** The Linux client's side of the bridge, and file transfer, which no
   client offers yet. See [Shared clipboard](/docs/clipboard).
 - **Console parity with the apps.** A speed test and a bitrate setting in the web console.
+- **A desktop per person.** Windows Server seats behind [profiles](/docs/profiles): each person
+  streams a signed-in desktop of their own while someone else plays.
 - **Closing unverified cells.** The matrix's
   [What is not verified](/docs/support-matrix#what-is-not-verified) list.
 
@@ -25,8 +27,8 @@ what changed, the [release notes](https://git.unom.io/unom/punktfunk/releases).
   connection migration so a client roams between Wi-Fi and cellular without dropping the stream.
   Until then, reaching a host from outside takes a VPN, a tunnel or a forwarded port — see
   [Friends over the internet](/docs/friends-over-the-internet).
-- **Per-user sessions.** A connecting client picks an identity that maps to an account on the host,
-  and that person lands in their own signed-in desktop.
+- **Per-user sessions on Linux.** A profile that maps to a user account on the host, so that person
+  lands in their own signed-in desktop.
 - **Remote work.** The host's monitors as separate client windows, the client's camera as a webcam
   on the host, and approving a new device from an already-paired device's app.
 - **Picture and sound.** End-to-end variable refresh, latency measured to the client's screen
@@ -34,10 +36,9 @@ what changed, the [release notes](https://git.unom.io/unom/punktfunk/releases).
 
 ## Not planned, or blocked upstream
 
-- **HDR on Mutter, KWin and wlroots virtual displays.** Those compositors' virtual outputs are
-  SDR-only upstream. gamescope and the GNOME 50+ monitor mirror carry HDR — see [HDR](/docs/hdr).
+- **HDR on Mutter, KWin and Sway virtual displays.** Those compositors' virtual outputs are
+  SDR-only upstream. gamescope, Hyprland and the GNOME 50+ monitor mirror carry HDR — see
+  [HDR](/docs/hdr).
 - **Hosting on macOS, iOS, tvOS or Android.** They are client-only platforms.
 - **HEVC 4:4:4 on AMD.** AMD's encoder can't produce it. Intel's VAAPI path has no 4:4:4 yet
   either. [PyroWave](/docs/pyrowave) carries full chroma on both.
-- **DualSense speaker and haptics over Bluetooth.** The controller exposes no audio over Bluetooth,
-  so the client needs it on USB. Rumble, adaptive triggers and the lightbar work either way.

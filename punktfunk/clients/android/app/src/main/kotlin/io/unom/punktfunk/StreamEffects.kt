@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import android.app.Activity
 import android.widget.Toast
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
@@ -117,15 +118,17 @@ internal fun rememberVirtualPad(
 }
 
 /**
- * The HUD's lines, polled once a second while [statsOn]. Enabling resets the native window, so a
- * re-show never renders stale data; switching off drops the last window for the same reason.
- * [tier] is read at each poll, so a tier change never blanks the numbers.
+ * The HUD's lines, polled once a second while [statsOn], and the same windows as numbers pushed
+ * into [history] for the companion panel's graphs. Enabling resets the native window and the
+ * history, so a re-show never renders stale data; switching off drops the last window for the
+ * same reason. [tier] is read at each poll, so a tier change never blanks the numbers.
  */
 @Composable
 internal fun rememberStatsLines(
     session: ActiveSession,
     statsOn: Boolean,
     tier: StatsVerbosity,
+    history: StatsHistory? = null,
 ): State<List<HudLine>> {
     val handle = session.handle
     val context = LocalContext.current
@@ -134,6 +137,7 @@ internal fun rememberStatsLines(
     LaunchedEffect(handle, statsOn) {
         NativeBridge.nativeSetVideoStatsEnabled(handle, statsOn)
         if (statsOn) {
+            history?.clear()
             while (true) {
                 delay(1000)
                 // The panel's LIVE rate, re-read each poll: a governor that ignored the mode pin
@@ -146,6 +150,7 @@ internal fun rememberStatsLines(
                         session.presetName,
                     ),
                 )
+                if (history != null) StatsSample.of(NativeBridge.nativeVideoStatsSample(handle))?.let(history::push)
             }
         } else {
             lines.value = emptyList()
@@ -341,15 +346,18 @@ internal fun KeepAliveEffects(
         }
     }
 
-    // Leaving the app (Home, task switch, screen off). Android does not suspend a backgrounded
-    // process, so without the keep-alive this must end the session or the host holds it for
-    // nobody. `onSessionEnded` runs the one real teardown; not a quit, so the host lingers the
-    // display and coming straight back is a fast reconnect.
+    // Leaving the app (Home, task switch, screen off). Without the keep-alive this ends the session,
+    // or the host holds it for nobody; not a quit, so the host lingers the display. A stop on the
+    // way to a recreated activity is not leaving: the new one attaches to the same session.
     DisposableEffect(handle, keepAlive) {
         val lifecycle = (context as? LifecycleOwner)?.lifecycle
         val obs = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_STOP -> if (keepAlive) away = true else onSessionEnded(SessionEndReason.LOCAL)
+                Lifecycle.Event.ON_STOP -> when {
+                    (context as? Activity)?.isChangingConfigurations == true -> {}
+                    keepAlive -> away = true
+                    else -> onSessionEnded(SessionEndReason.LOCAL)
+                }
                 Lifecycle.Event.ON_START -> away = false
                 else -> {}
             }

@@ -7,18 +7,21 @@ Stream in a browser tab with nothing to install: you run the page once on your n
 browser there opens it. The browser client is a preview; the [native apps](/docs/clients) give the
 better picture and the lower latency.
 
-It needs a browser with WebTransport and WebCodecs: current Chrome, Edge, Safari or Firefox.
+It needs a browser with WebTransport and WebCodecs: current Chrome, Edge, Safari or Firefox. On a
+Samsung TV the same page installs as an app: [Samsung TV](/docs/samsung-tv).
 
 ## 1. Turn on browser streaming on the host
 
-1. In the host's [web console](/docs/web-console), open **Host → Settings** and turn on **Browser
+1. In the host's [web console](/docs/web-console), open **Host** and turn on **Browser
    streaming**.
 2. Click **Show advanced** and set **Browser origins** to the address you will open the page at,
    for example `https://192.168.1.10:8443`. Left empty, any page open in a browser on your network
-   can reach the host.
+   can reach the host. The list is a rule for browser pages: the Samsung TV app sends no origin
+   and is admitted either way, and pairing is what lets it stream.
 3. Click **Restart Punktfunk**.
-4. Open UDP 9778 on the host: it is in the `punktfunk-native` firewall profile
-   ([Ports](/docs/ports)). The video goes from the host to the browser directly.
+4. Open UDP 9778 on the host. On Linux it is in the `punktfunk-native` firewall profile; on
+   Windows the host adds its **Punktfunk Browser** rule at the restart ([Ports](/docs/ports)).
+   The video goes from the host to the browser directly.
 
 ## 2. Run the page
 

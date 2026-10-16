@@ -18,7 +18,6 @@ import io.unom.punktfunk.kit.Sc2Capture
 import io.unom.punktfunk.kit.SessionAccess
 import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.models.ActiveSession
-import android.media.audiofx.AudioEffect
 import io.unom.punktfunk.kit.deviceBodyVibrator
 
 /**
@@ -36,7 +35,7 @@ internal class StreamPeripherals(
     private val ring: RingState,
     private val haptics: ConsoleHaptics,
     private val isTv: Boolean,
-    private val micEffects: MutableList<AudioEffect>,
+    private val stopMic: () -> Unit,
     private val keyCapture: () -> KeyCaptureView?,
     private val videoView: () -> SurfaceView?,
     private val containerSize: () -> IntSize,
@@ -71,9 +70,8 @@ internal class StreamPeripherals(
             settings.systemButtonsForward(), settings.guideGestureEnabled(),
         )
         activity?.gamepadRouter = router
-        // Every controller that was already connected got a slot in the router's constructor, so
-        // this is the session's pad answer at t=0 — what the start banner's words are chosen from.
-        ui.padPresent = router.forwardedDevices().isNotEmpty()
+        // A pad gets its slot on its first press, so the start banner asks what is connected.
+        ui.padPresent = Gamepad.pads().isNotEmpty()
         // Select+Start+L1+R1 chord leaves the stream — a deliberate quit (signal it so the host skips
         // the keep-alive linger), unlike a host-ended / backgrounded drop. The router debounces it
         // (must be held ~1.5 s) and fires onExitChord on its main-thread timer, so leave the stream
@@ -90,11 +88,7 @@ internal class StreamPeripherals(
         // moment it is claimed, on the main thread.
         router.onMotionUnreachable = { ui.motionHint = true }
         router.onMicChord = {
-            if (ui.micRunning) {
-                val next = !ui.micMuted
-                ui.mute(next)
-                ui.micHint = if (next) "Microphone muted" else "Microphone live"
-            }
+            if (ui.micRunning) ui.mute(!ui.micMuted)
         }
         // Select + X steps the stats overlay one tier — the same live cycle the three-finger tap
         // performs, and the ONLY route to it on a TV or in a passthrough-touch session. Session-
@@ -217,6 +211,7 @@ internal class StreamPeripherals(
             router,
             bodyVibrator = deviceBodyVibrator(context),
             mirrorPad0 = settings.rumbleOnPhone,
+            rumble = settings.padRumble,
         ).also { it.start() }
         // "Gyro from this phone" (opt-in): this device's IMU speaks for controller 1's motion
         // while wire pad 0 is a controller without a gyro of its own — the rumble mirror's
@@ -264,7 +259,7 @@ internal class StreamPeripherals(
         // The menu-time capture (UI navigation) must let go before the stream-mode capture can
         // claim the interfaces; it resumes in onDispose once the stream releases them.
         activity?.stopSc2MenuNav()
-        val sc2 = if (settings.sc2Capture && settings.gamepadForwarding) {
+        val sc2 = if (settings.gamepadForwarding) {
             Sc2Capture(context, router)
         } else {
             null
@@ -371,11 +366,7 @@ internal class StreamPeripherals(
         // an open mic (with the platform's recording indicator lit) feeding a plane the host
         // drops would be the worst kind of lie. Not restarted on a re-grant: the host attaches
         // the mic service at session setup only, so a fresh session is the honest offer.
-        if (grants and SessionAccess.MIC == 0 && ui.micRunning) {
-            releaseMicEffects(micEffects)
-            NativeBridge.nativeStopMic(handle)
-            ui.micRunning = false
-        }
+        if (grants and SessionAccess.MIC == 0 && ui.micRunning) stopMic()
     }
 
     /** Release in the order the handle's lifetime needs; the caller closes the handle after. */

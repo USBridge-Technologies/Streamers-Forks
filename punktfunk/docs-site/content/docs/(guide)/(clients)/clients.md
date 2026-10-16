@@ -1,6 +1,6 @@
 ---
 title: Clients
-description: The Punktfunk apps for Apple devices, Linux, Windows and Android, the browser client, the community webOS app, Moonlight, and the punktfunk command — what each does and which to pick.
+description: The Punktfunk apps for Apple devices, Linux, Windows and Android, the browser client, the Samsung TV app, the community webOS app, Moonlight, and the punktfunk command — what each does and which to pick.
 ---
 
 Pick the app for the device you stream *to*. Install steps for each are on
@@ -16,6 +16,7 @@ Pick the app for the device you stream *to*. Install steps for each are on
 | A Windows PC | The [Windows app](#windows-desktop-client) |
 | An Android phone, tablet or TV | The [Android app](#android-app-phone--android-tv) |
 | An LG webOS TV | The community [webOS app](#webos-lg-tv--community) |
+| A Samsung TV | The [Samsung TV app](/docs/samsung-tv) (preview) |
 | A browser tab, with nothing to install | The [browser client](/docs/browser-client) (preview) |
 | Any other device | [Moonlight](#moonlight-anything-else) |
 | Scripts and home automation | The [`punktfunk` command](#scripting-the-punktfunk-cli) |
@@ -24,7 +25,8 @@ Every Punktfunk app finds hosts on your network, [pairs](/docs/pairing) once and
 own, browses the host's [game library](/docs/game-library), and has a controller interface for the
 couch. They share [presets and `punktfunk://` links](/docs/presets-and-links), the
 [in-stream keys](/docs/input#getting-your-input-back) and the settings on
-[Client settings](/docs/client-settings).
+[Client settings](/docs/client-settings). The Apple, Android, Linux and Windows apps also ask which
+[profile](/docs/profiles#how-players-pick) plays.
 
 ## Apple app (Mac, iPhone, iPad, Apple TV)
 
@@ -36,6 +38,9 @@ One app for macOS, iOS, iPadOS and tvOS. It adds:
 - Widgets for hosts and the game library, a Live Activity while you stream, and Shortcuts actions
   for Siri.
 - DualSense rumble, adaptive triggers, lightbar, motion and touchpad.
+- On a foldable iPhone, a stream that follows the fold: the cover screen, the inner screen, and the
+  upright half when it sits half open like a laptop
+  ([foldable iPhone](/docs/input#foldable-iphone)).
 
 ## Linux desktop client (GTK4)
 
@@ -57,7 +62,8 @@ connects.
 
 A WinUI 3 app for x64 and Arm64 with hardware decode (Vulkan Video or D3D11VA), HDR, WASAPI audio
 and SDL3 controllers. **Punktfunk Console** in the Start menu is the controller interface for a TV or
-HTPC, on x64; the Arm64 build has no console yet.
+HTPC, on x64; the Arm64 build has no console yet. **Controller-optimized UI** opens it when a
+controller connects.
 
 ## Android app (phone + Android TV)
 
@@ -71,9 +77,11 @@ this off.
 
 On a handheld with a second, smaller screen below the first (an Ayn Thor, a Retroid Pocket with the
 Dual Screen add-on) or a foldable half-opened like a laptop, the stream takes the top screen. The
-lower one has tabs for **Stats**, **Actions** (the buttons of the
-[quick-action dial](/docs/input#the-quick-action-dial)), **Trackpad** and **Controller** (the
-[virtual controller](/docs/input#virtual-controller)). There is nothing to set. If the lower screen stays dark while you stream, end the stream and
+lower one shows **Stats**, **Actions** (the buttons of the
+[quick-action dial](/docs/input#the-quick-action-dial)), a **Keyboard**, a **Trackpad** and the
+**Controller** (the [virtual controller](/docs/input#virtual-controller)) — or, with **Screens**,
+the picture itself, below or across both screens
+([dual-screen handhelds](/docs/input#dual-screen-handhelds)). **Settings → Display → Second screen** turns it off — for a phone on a TV — and a preset can carry that. If the lower screen stays dark while you stream, end the stream and
 [send your logs](/docs/report-an-issue): they record the screens your device reported.
 
 ## webOS (LG TV) — community
@@ -99,9 +107,12 @@ punktfunk pair <host>[:port] --pin -          # pair this device; PIN on stdin
 punktfunk hosts list --probe                  # saved hosts, each checked live
 punktfunk library <host-ref> --json           # the host's games
 punktfunk launch <host-ref> --game <id>       # stream, waking the host first
+punktfunk profiles <host-ref>                 # who plays on the host; --pick saves one
+punktfunk launch <host-ref> --as <profile>    # stream as that profile, this time only
 punktfunk end-game <host-ref> --game <id>     # close a game this device launched
 punktfunk open 'punktfunk://connect/<host-ref>'
-punktfunk speed-test <host-ref>               # measure the link, suggest a bitrate
+punktfunk speed-test <host-ref>               # what the link carries, loss at a rate it holds
+punktfunk network-check <host-ref>            # the speed test plus what the link does, by finding
 ```
 
 A `<host-ref>` is a saved host's id, its name or its address. Also: `hosts add`, `hosts forget`,

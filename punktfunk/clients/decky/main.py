@@ -393,14 +393,13 @@ def _native_client() -> str | None:
     return None
 
 
-# The one architecture the flatpak client is built for.
-_FLATPAK_ARCH = "x86_64"
-
-
 def _flatpak_ref() -> dict | None:
     """The INSTALLED client flatpak resolved to a SCOPE and a BRANCH, or None when there is none.
 
-    ``{"scope": "--user"|"--system", "branch": "canary", "ref": "io.unom.Punktfunk//canary"}``.
+    ``{"scope": "--user"|"--system", "branch": "canary", "arch": "aarch64", "ref": "io.unom.Punktfunk//canary"}``.
+
+    The arch is read off the installed tree, not `os.uname()`: Decky's Python can be an x86_64
+    process on an aarch64 SteamOS (Steam Frame).
 
     ⭐⭐ **Naming no branch is not a shorthand for "the only one".** flatpak refuses an ambiguous
     ref rather than guessing at one, and the ambiguity does not need two branches *installed*:
@@ -426,14 +425,16 @@ def _flatpak_ref() -> dict | None:
         (Path("/var/lib/flatpak"), "--system"),
     ):
         try:
-            branches = sorted(
-                p.name for p in (root / "app" / APP_ID / _FLATPAK_ARCH).iterdir()
+            found = sorted(
+                (p.parent.name, p.name) for p in (root / "app" / APP_ID).glob("*/*")
                 if (p / "active").exists()
             )
         except OSError:
             continue  # not installed in this scope
-        if not branches:
+        if not found:
             continue
+        arch = found[0][0]
+        branches = [b for a, b in found if a == arch]
         branch = "stable" if "stable" in branches else branches[0]
         if len(branches) > 1:
             decky.logger.warning(
@@ -441,7 +442,7 @@ def _flatpak_ref() -> dict | None:
                 "to; uninstall the others so the client you launch is the client we update",
                 APP_ID, len(branches), ", ".join(branches), branch,
             )
-        return {"scope": scope, "branch": branch, "ref": f"{APP_ID}//{branch}"}
+        return {"scope": scope, "branch": branch, "arch": arch, "ref": f"{APP_ID}//{branch}"}
     return None
 
 
@@ -476,7 +477,7 @@ def _client_argv() -> list[str] | None:
     if forced != "flatpak" and not ref and native:
         return [native]
     if ref:
-        return [_flatpak(), "run", f"--arch={_FLATPAK_ARCH}", f"--branch={ref['branch']}", APP_ID]
+        return [_flatpak(), "run", f"--arch={ref['arch']}", f"--branch={ref['branch']}", APP_ID]
     return [native] if native else None
 
 
@@ -867,6 +868,36 @@ class Plugin:
         decky.logger.warning("pairing failed (rc=%s): %s", rc, detail)
         return {"ok": False, "error": _cli_error(rc, err), "detail": detail}
 
+    async def request_access(
+        self, addr: str, port: int, name: str = "Steam Deck", fp: str = ""
+    ) -> dict:
+        """No-PIN pairing (``punktfunk pair <addr:port> --request-access --name LABEL --fp HEX``).
+
+        Waits up to ~185 s for the host's operator to approve this Deck, pinned to ``fp``, the
+        fingerprint the host advertised and ``trust_host`` saved. Without it the CLI takes the
+        newest record at the address, which at a dual-boot box can be the other OS. Never
+        streams. Same result shape as ``pair``; on failure ``detail`` is the CLI's sentence for
+        the user. A client too old for the flag asks for a PIN instead, which comes back
+        ``client-outdated``."""
+        fp = str(fp).strip()
+        if fp and not re.fullmatch(r"[0-9a-fA-F]{64}", fp):
+            return {"ok": False, "error": "unresolved", "detail": "bad host fingerprint"}
+        args = ["pair", f"{addr}:{int(port)}", "--request-access", "--name", name]
+        if fp:
+            args += ["--fp", fp]
+        rc, out, err = await _run_cli(args, timeout=200.0)
+        if rc == 0:
+            fp = ""
+            for token in out.split():
+                if token.startswith("fp="):
+                    fp = token[3:]
+            decky.logger.info("access granted by %s:%s", addr, port)
+            return {"ok": True, "fp": fp}
+        detail = (err.strip().splitlines() or ["the request failed"])[-1]
+        decky.logger.warning("request access failed (rc=%s): %s", rc, detail)
+        error = "client-outdated" if rc == 6 and "--pin" in err else _cli_error(rc, err)
+        return {"ok": False, "error": error, "detail": detail}
+
     async def trust_host(self, addr: str, port: int, fp: str, name: str = "") -> dict:
         """Step 1 of request access: save the host with the fingerprint it ADVERTISED
         (``punktfunk hosts add <addr:port> --fp <hex> --name <label>``).
@@ -904,6 +935,16 @@ class Plugin:
         if not ref or ref.startswith("-"):
             return {"ok": False, "error": "unresolved", "detail": "bad host reference"}
         return await _cli_json(["library", ref, "--json"], timeout=20.0)
+
+    async def profiles(self, ref: str) -> dict:
+        """Who plays on the host (``punktfunk profiles <host-ref> --json``).
+
+        ``{ok: True, profiles: [{id, display_name, accent, owner, note}], picked}``. A host
+        without profiles answers ``unresolved``, which the panel reads as "no chips"."""
+        ref = str(ref).strip()
+        if not ref or ref.startswith("-"):
+            return {"ok": False, "error": "unresolved", "detail": "bad host reference"}
+        return await _cli_json(["profiles", ref, "--json"], timeout=20.0)
 
     async def shortcut_art(self) -> dict:
         """The Steam-shortcut artwork shipped with the plugin (committed under ``assets/``):

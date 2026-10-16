@@ -2,10 +2,12 @@
 //! order the device's host sort asks for. Built from the store, the probe sweep and the live
 //! adverts; the page compares a build with the last one, so an unchanged sweep redraws nothing.
 
-use super::{saved_request, ConnectRequest};
+use super::ConnectRequest;
 use crate::discovery::{self, DiscoveredHost};
 use crate::trust::{KnownHost, Settings};
 use pf_client_core::host_order::{self, Arrangeable};
+use pf_client_core::orchestrate::HostTarget;
+use pf_client_core::profiles::ProfilePick;
 use std::collections::HashMap;
 
 /// A preset as a card needs it: what to call it and the colour its chip carries.
@@ -100,6 +102,8 @@ pub enum CardKind {
         pinned: Option<(String, String)>,
         /// The record `Settings::default_host` names.
         is_default: bool,
+        /// The profile this device plays as on the host.
+        profile: Option<ProfilePick>,
     },
     /// Found on the network and not saved. `pair_optional`: the host offers trust on first use.
     Discovered { pair_optional: bool },
@@ -127,7 +131,7 @@ impl CardModel {
     /// still dials straight away (`WakeConnect` dials first).
     pub fn wake_first(&self) -> bool {
         matches!(self.status, Status::Offline | Status::OfflineWakes)
-            && !self.request.mac.is_empty()
+            && !self.request.host.mac.is_empty()
     }
 }
 
@@ -191,7 +195,10 @@ pub fn saved_bands(
                 .preset_id
                 .as_deref()
                 .and_then(|id| presets.iter().find(|p| p.id == id));
-            let mut request = saved_request(k);
+            let mut request = ConnectRequest {
+                host: HostTarget::from(k),
+                ..ConnectRequest::default()
+            };
             request.preset = pinned.map(|p| p.id.clone());
             CardModel {
                 key: match pinned {
@@ -208,6 +215,7 @@ pub fn saved_bands(
                     paired: k.paired,
                     pinned: pinned.map(|p| (p.id.clone(), p.name.clone())),
                     is_default,
+                    profile: k.profile.clone(),
                 },
                 request,
                 last_used: k.last_used,
@@ -255,15 +263,18 @@ pub fn discovered_cards<'a>(
         .into_iter()
         .map(|a| {
             let request = ConnectRequest {
-                name: a.name.clone(),
-                addr: a.addr.clone(),
-                port: a.port,
-                fp_hex: (!a.fp_hex.is_empty()).then(|| a.fp_hex.clone()),
+                host: HostTarget {
+                    name: a.name.clone(),
+                    addr: a.addr.clone(),
+                    port: a.port,
+                    fp_hex: (!a.fp_hex.is_empty()).then(|| a.fp_hex.clone()),
+                    mac: a.mac.clone(),
+                    mgmt_port: a.mgmt_port,
+                    ..HostTarget::default()
+                },
                 // Trust on first use only when the host explicitly opts in.
                 pair_optional: a.pair == "optional",
-                launch: None,
-                mac: a.mac.clone(),
-                preset: None,
+                ..ConnectRequest::default()
             };
             let key = request.card_key();
             CardModel {
@@ -414,6 +425,7 @@ mod tests {
             mgmt_port: None,
             mac: Vec::new(),
             os: String::new(),
+            wire: Vec::new(),
         };
         let adverts = [advert("saved", "ab"), advert("new", "ef")];
         let cards = discovered_cards(adverts.iter(), &[host("Desk", "10.0.0.2", "ab")], None);

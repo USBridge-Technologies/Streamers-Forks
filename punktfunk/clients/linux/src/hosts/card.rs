@@ -91,8 +91,8 @@ fn saved_ref(m: &CardModel) -> Option<HostRef> {
     };
     Some(HostRef {
         id: id.clone(),
-        addr: m.request.addr.clone(),
-        port: m.request.port,
+        addr: m.request.host.addr.clone(),
+        port: m.request.host.port,
     })
 }
 
@@ -130,6 +130,18 @@ fn tile(m: &CardModel) -> gtk::Widget {
         star.set_valign(gtk::Align::Start);
         star.set_tooltip_text(Some("Default host"));
         overlay.add_overlay(&star);
+    }
+    if let CardKind::Saved {
+        profile: Some(pick),
+        pinned: None,
+        ..
+    } = &m.kind
+    {
+        let badge = adw::Avatar::new(20, Some(&pick.display_name), true);
+        badge.set_halign(gtk::Align::End);
+        badge.set_valign(gtk::Align::End);
+        badge.set_tooltip_text(Some(&pick.display_name));
+        overlay.add_overlay(&badge);
     }
     overlay.upcast()
 }
@@ -183,7 +195,13 @@ fn menu(
     presets: &[Preset],
     sender: &relm4::Sender<HostsMsg>,
 ) -> (gio::Menu, gio::SimpleActionGroup) {
-    let CardKind::Saved { paired, pinned, .. } = &m.kind else {
+    let CardKind::Saved {
+        paired,
+        pinned,
+        profile,
+        ..
+    } = &m.kind
+    else {
         unreachable!("only saved cards carry a menu");
     };
     let actions = gio::SimpleActionGroup::new();
@@ -209,11 +227,18 @@ fn menu(
         );
     }
     {
+        let req = m.request.clone();
+        add(
+            "switch-profile",
+            Box::new(move || Act::SwitchProfile(req.clone())),
+        );
+    }
+    {
         let host = host.clone();
         add("details", Box::new(move || Act::Details(host.clone())));
     }
     {
-        let (mac, addr) = (m.request.mac.clone(), m.request.addr.clone());
+        let (mac, addr) = (m.request.host.mac.clone(), m.request.host.addr.clone());
         add(
             "wake",
             Box::new(move || Act::Wake {
@@ -273,8 +298,11 @@ fn menu(
     if *paired {
         menu.append(Some("Browse Library"), Some("card.library"));
     }
-    if !m.status.live() && !m.request.mac.is_empty() {
+    if !m.status.live() && !m.request.host.mac.is_empty() {
         menu.append(Some("Wake Host"), Some("card.wake"));
+    }
+    if profile.is_some() {
+        menu.append(Some("Switch Profile\u{2026}"), Some("card.switch-profile"));
     }
     menu.append(Some("Copy Link"), Some("card.copy-link"));
     menu.append(Some("Host Details\u{2026}"), Some("card.details"));

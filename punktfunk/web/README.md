@@ -1,6 +1,6 @@
 # punktfunk web — management console
 
-The browser UI for the punktfunk host's **management REST API** (`crates/punktfunk-host/src/mgmt.rs`,
+The browser UI for the punktfunk host's **management REST API** (`crates/host/punktfunk-host/src/mgmt.rs`,
 OpenAPI at `api/openapi.json`). It shows live status, host capabilities, paired
 clients, the pairing-PIN flow, and session controls.
 
@@ -126,5 +126,5 @@ src/
     gen/             GENERATED react-query hooks + models (orval)
   lib/i18n.ts        reactive Paraglide locale hook
   paraglide/         GENERATED i18n runtime (paraglide)
-messages/{en,de}.json   translation sources
+messages/{en,de,es}.json   translation sources
 ```

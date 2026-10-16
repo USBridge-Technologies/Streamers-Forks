@@ -21,18 +21,9 @@ pub(crate) fn codec_mime(codec: u8) -> &'static str {
     }
 }
 
-/// A short human label for the codec the host resolved, for the stats HUD's video-feed line
-/// (`"H.264"` / `"HEVC"` / `"AV1"` / `"PyroWave"`). Mirrors [`codec_mime`]'s fallback: anything
-/// not H.264/AV1/PyroWave is reported as HEVC (every pre-negotiation host emitted HEVC). Kept
-/// beside [`codec_mime`] because the MIME collapses PyroWave onto `video/hevc` and so can't name it.
-pub(crate) fn codec_label(codec: u8) -> &'static str {
-    match codec {
-        punktfunk_core::quic::CODEC_H264 => "H.264",
-        punktfunk_core::quic::CODEC_AV1 => "AV1",
-        punktfunk_core::quic::CODEC_PYROWAVE => "PyroWave",
-        _ => "HEVC",
-    }
-}
+/// The codec the host resolved, as every overlay names it: empty for an id this build does not
+/// know, which the stream notification leaves out.
+pub(crate) use punktfunk_core::hud::codec_label;
 
 /// Create the decoder: prefer the specific codec Kotlin ranked from `MediaCodecList`
 /// (`from_codec_name`), falling back to the platform's default decoder for the MIME
@@ -282,8 +273,11 @@ pub(super) fn hdr_static(client: &NativeClient) -> Option<punktfunk_core::quic::
 }
 
 /// Overrides the low-latency profile: `standard` (the default), `off` (no standard `low-latency`
-/// key), `mtk-tv` (no standard key; the TV decoder's game keys and `operating-rate` = fps instead).
-/// `adb shell setprop debug.punktfunk.low_latency_key standard`.
+/// key), `mtk-tv` (no standard key; the TV decoder's game keys and `operating-rate` = fps instead),
+/// `mtk-boost` (standard plus MediaTek's `vendor.mtk.vdec.cpu.boost.mode.value`: the codec asks
+/// PowerHAL for a CPU minimum-clock lock for its life, which the MediaTek library reads at init).
+/// `mtk-boost` stays opt-in because it spends power; a decoder without the key ignores it.
+/// `adb shell setprop debug.punktfunk.low_latency_key mtk-boost`.
 pub(super) const LOW_LATENCY_KEY_PROP: &std::ffi::CStr = c"debug.punktfunk.low_latency_key";
 
 /// TV platforms that show half the stream rate, as (`ro.product.manufacturer`, `ro.product.device`):
@@ -305,8 +299,9 @@ fn half_rate_tv() -> bool {
         .any(|(m, d)| maker.eq_ignore_ascii_case(m) && device == *d)
 }
 
-/// The decoder's configure format: the mode, an input buffer generous enough that a large keyframe
-/// AU is never truncated, the HDR static info, and the low-latency keys for `codec_name`.
+/// The decoder's configure format: the mode, the stream rate (`frame-rate`, the standard key a
+/// decoder's clock table may read), an input buffer generous enough that a large keyframe AU is
+/// never truncated, the HDR static info, and the low-latency keys for `codec_name`.
 /// `keys` is `Some(aggressive)` for [`configure_low_latency`]'s profile, `None` for no
 /// low-latency key at all. A `c2.mtk` decoder on a [`HALF_RATE_TVS`] platform swaps the `Some`
 /// profile for `mtk-tv`; [`LOW_LATENCY_KEY_PROP`] overrides either way.
@@ -322,6 +317,9 @@ pub(super) fn low_latency_format(
     format.set_str("mime", mime);
     format.set_i32("width", mode.width as i32);
     format.set_i32("height", mode.height as i32);
+    if mode.refresh_hz > 0 {
+        format.set_i32("frame-rate", mode.refresh_hz as i32);
+    }
     format.set_i32(
         "max-input-size",
         (mode.width * mode.height).max(2_000_000) as i32,
@@ -329,20 +327,25 @@ pub(super) fn low_latency_format(
     if let Some(aggressive) = keys {
         let forced = sysprop(LOW_LATENCY_KEY_PROP);
         let profile = match forced.as_deref() {
-            Some(p @ ("standard" | "off" | "mtk-tv")) => p,
+            Some(p @ ("standard" | "off" | "mtk-tv" | "mtk-boost")) => p,
             _ if codec_name.to_ascii_lowercase().starts_with("c2.mtk") && half_rate_tv() => {
                 "mtk-tv"
             }
             _ => "standard",
         };
-        configure_low_latency(&mut format, codec_name, aggressive, profile == "standard");
+        let standard_key = matches!(profile, "standard" | "mtk-boost");
+        configure_low_latency(&mut format, codec_name, aggressive, standard_key);
         if profile != "standard" {
-            log::info!("decode: low-latency profile {profile} — standard low-latency key left out");
+            log::info!("decode: low-latency profile {profile}");
         }
-        if profile == "mtk-tv" {
-            format.set_i32("vendor.mtk-codec2.game-mode", 1);
-            format.set_i32("vendor.mtk-codec2.low-latency-mode", 1);
-            format.set_i32("operating-rate", mode.refresh_hz as i32);
+        match profile {
+            "mtk-tv" => {
+                format.set_i32("vendor.mtk-codec2.game-mode", 1);
+                format.set_i32("vendor.mtk-codec2.low-latency-mode", 1);
+                format.set_i32("operating-rate", mode.refresh_hz as i32);
+            }
+            "mtk-boost" => format.set_i32("vendor.mtk.vdec.cpu.boost.mode.value", 1),
+            _ => {}
         }
     }
     if let Some(meta) = hdr_static {

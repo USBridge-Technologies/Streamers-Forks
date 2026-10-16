@@ -13,7 +13,7 @@
 #     stock driver has HEVC and AV1 disabled.
 #
 # Bazzite already ships gamescope, PipeWire and the NVIDIA stack, so on Bazzite the
-# only new runtime bits are opus + libei.
+# only new runtime bit is libei.
 ################################################################################
 
 Name:           punktfunk
@@ -86,7 +86,6 @@ BuildRequires:  pkgconfig(libpipewire-0.3)
 BuildRequires:  pkgconfig(libspa-0.2)
 BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  pkgconfig(xkbcommon)
-BuildRequires:  pkgconfig(opus)
 # Zero-copy GPU path: src/zerocopy/ links libGL + libgbm (mesa) via hand-rolled FFI.
 BuildRequires:  pkgconfig(gl)
 BuildRequires:  pkgconfig(gbm)
@@ -98,7 +97,7 @@ BuildRequires:  pkgconfig(sdl3)
 # client's pf-ffvk, whose bindgen ran over FFmpeg's libavutil/hwcontext_vulkan.h — and M10 deleted
 # it with the rest of the client's FFmpeg. Nothing has replaced that need: pf-vkdecode/pf-presenter
 # reach Vulkan through ash (loader dlopen'd, no headers), and pyrowave-sys builds against its own
-# vendored copy (crates/pyrowave-sys/build.rs).
+# vendored copy (crates/codec/pyrowave-sys/build.rs).
 # The HOST links the NVIDIA CUDA driver lib (-lcuda) via FFI, so libcuda.so must be present
 # at LINK time. A normal NVIDIA host (or Bazzite -nvidia) has it; a headless COPR/koji builder
 # without a GPU does NOT — point %build at the CUDA toolkit stub (…/stubs/libcuda.so) there,
@@ -119,10 +118,12 @@ Recommends:     pipewire-pulseaudio
 # Weak-dep: Fedora desktops ship rtkit anyway, and without it the user@.service.d LimitNICE
 # drop-in below still covers the direct path from the next login.
 Recommends:     rtkit
-Requires:       opus
 Requires:       libei
 # A compositor to drive. Bazzite ships gamescope; the others are user choice.
 Recommends:     gamescope
+# HDR, the real mode and the cursor in a gamescope session. Weak because a Fedora major whose
+# gamescope build failed publishes none; dnf skips a weak dep it can't find.
+Recommends:     punktfunk-gamescope
 Suggests:       kwin
 Suggests:       mutter
 # NVENC + GPU EGL come from the NVIDIA driver; on Bazzite the -nvidia image has it.
@@ -140,6 +141,9 @@ Recommends:     punktfunk-web
 # harmless where a `--with scripting`-less build didn't produce it. Its systemd --user unit ships
 # disabled — the runner is inert until you add scripts/plugins.
 Recommends:     punktfunk-scripting
+# Profile seats and Reachable without logging in (a root supervisor, shipped off). Pinned: the host
+# and the supervisor speak one socket protocol, so they move together.
+Requires:       punktfunk-seats%{?_isa} = %{version}-%{release}
 
 %description
 punktfunk is a Linux-first, low-latency desktop and game streaming host. It speaks
@@ -166,6 +170,25 @@ video (GF(2^16) Leopard FEC + AES-GCM over UDP, QUIC control plane) with Opus
 audio, microphone passthrough, and full gamepad support including DualSense
 touchpad, motion, adaptive triggers and lightbar through SDL3. The host creates a
 virtual output at exactly this client's resolution and refresh rate — no scaling.
+
+%if %{with host}
+%package seats
+Summary:        punktfunk seat supervisor (a user, a session and a host per profile)
+# What the supervisor and the door helper run: useradd/groupadd/usermod, runuser and setpriv,
+# setfacl, loginctl/systemctl, pkill in seat-session. The host requires this package at its own
+# version, so the two move together without a loop back.
+Requires:       shadow-utils
+Requires:       util-linux
+Requires:       acl
+Requires:       systemd
+Requires:       procps-ng
+
+%description seats
+The root daemon behind profile seats. Each seat is a system user with its own logind session,
+a headless desktop and a stock punktfunk host. The package also carries the door units, which
+keep the box reachable with nobody logged in. Installed but not enabled: the console turns seats
+and the door on. Stopping or restarting the daemon leaves running seats up.
+%endif
 
 %if %{with web}
 %package web
@@ -261,7 +284,7 @@ export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
   -p punktfunk-host -p punktfunk-encode-worker \
   -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
-  -p pf-update
+  -p pf-update -p punktfunk-seats
 %else
 # Client-only (aarch64): no host crate, so none of the encode features apply. pf-update still
 # builds — the client subpackage ships its own copy for `punktfunk-client --apply-update`.
@@ -378,6 +401,28 @@ install -Dm0755 target/release/pf-update %{buildroot}%{_libexecdir}/punktfunk/pf
 install -Dm0644 packaging/linux/punktfunk-update.service %{buildroot}%{_unitdir}/punktfunk-update.service
 install -Dm0644 packaging/linux/49-punktfunk-update.rules %{buildroot}%{_datadir}/polkit-1/rules.d/49-punktfunk-update.rules
 install -Dm0755 packaging/linux/restart-user-units.sh %{buildroot}%{_libexecdir}/punktfunk/restart-user-units
+# The host state %%post shares with every other format, and the groups (rpm applies the file).
+install -Dm0755 packaging/linux/post-install.sh %{buildroot}%{_libexecdir}/punktfunk/post-install
+install -Dm0644 packaging/linux/punktfunk.sysusers %{buildroot}%{_sysusersdir}/punktfunk.conf
+
+# The seat supervisor: a root daemon and the helpers its units run. Installed, never enabled.
+install -Dm0755 target/release/punktfunk-seats %{buildroot}%{_libexecdir}/punktfunk/punktfunk-seats
+for f in seat-session seat-reap; do
+  install -Dm0755 packaging/linux/$f %{buildroot}%{_libexecdir}/punktfunk/$f
+done
+for f in punktfunk-seats.service punktfunk-seat@.service; do
+  install -Dm0644 packaging/linux/$f %{buildroot}%{_unitdir}/$f
+done
+install -Dm0644 packaging/linux/punktfunk-seats-user.conf %{buildroot}%{_unitdir}/user@.service.d/50-punktfunk-seats.conf
+install -Dm0644 packaging/linux/punktfunk-seats.tmpfiles %{buildroot}%{_tmpfilesdir}/punktfunk-seats.conf
+# A seat's pads: udev hands each one to its seat's user alone.
+install -Dm0644 packaging/linux/65-punktfunk-seats.rules %{buildroot}%{_udevrulesdir}/65-punktfunk-seats.rules
+# The door: the box's host as a system service, and the root helper the console turns it on with.
+install -Dm0755 packaging/linux/door-helper %{buildroot}%{_libexecdir}/punktfunk/door-helper
+for f in punktfunk-door.service punktfunk-web-door.service punktfunk-door-on@.service punktfunk-door-off@.service; do
+  install -Dm0644 packaging/linux/$f %{buildroot}%{_unitdir}/$f
+done
+install -Dm0644 packaging/linux/49-punktfunk-door.rules %{buildroot}%{_datadir}/polkit-1/rules.d/49-punktfunk-door.rules
 
 # systemd *user* unit (the host runs in the graphical session, not as root).
 install -Dm0644 scripts/punktfunk-host.service %{buildroot}%{_userunitdir}/punktfunk-host.service
@@ -416,11 +461,11 @@ install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
 install -Dm0644 packaging/linux/50-punktfunk-nice.conf \
                 %{buildroot}%{_unitdir}/user@.service.d/50-punktfunk-nice.conf
 
-# Status tray: the per-user SNI icon + its XDG autostart entry (self-gating: --autostart exits
-# silently for users who don't run a host) + the hicolor status icons it names.
+# Status tray: the per-user SNI icon + the hicolor status icons it names. Its autostart entry is
+# per user, written by the host from the tray_autostart setting.
 install -Dm0755 target/release/punktfunk-tray %{buildroot}%{_bindir}/punktfunk-tray
-install -Dm0644 packaging/linux/io.unom.Punktfunk.Tray.desktop \
-                %{buildroot}%{_sysconfdir}/xdg/autostart/io.unom.Punktfunk.Tray.desktop
+install -Dm0644 packaging/linux/io.unom.Punktfunk.StartHost.desktop \
+                %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.StartHost.desktop
 for sz in 22x22 48x48; do
   for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
     install -Dm0644 "$png" %{buildroot}%{_datadir}/icons/hicolor/$sz/apps/"$(basename "$png")"
@@ -464,6 +509,8 @@ sed -i 's#%{_libexecdir}/punktfunk/pf-update#%{_libexecdir}/punktfunk/pf-update-
        %{buildroot}%{_unitdir}/punktfunk-client-update.service
 install -Dm0644 packaging/linux/49-punktfunk-client-update.rules \
                 %{buildroot}%{_datadir}/polkit-1/rules.d/49-punktfunk-client-update.rules
+# The punktfunk-update group, from the file the host ships under its own name.
+install -Dm0644 packaging/linux/punktfunk.sysusers %{buildroot}%{_sysusersdir}/punktfunk-client.conf
 # Install-kind + channel marker for the CLIENT, read by `punktfunk-client --check-update`. Its
 # own DIRECTORY, not just its own filename: the host subpackage claims %{_datadir}/%{name}/*
 # with a glob, so a sibling file there would be owned by both and `dnf install punktfunk
@@ -490,15 +537,15 @@ install -Dm0755 packaging/bazzite/kde-desktop-setup.sh %{buildroot}%{_datadir}/%
 # SELinux dontaudit drop-in for Bazzite/SteamOS: Valve's ds_inhibit (steamos-manager) walks
 # /proc/*/fd on every open/close of a hid-playstation hidraw — our virtual DualSense — and the
 # denied walk sprays ~324 AVCs/sec, which setroubleshootd amplifies into a box-wide stall that
-# starves the stream. Shipped as CIL source (the policy STORE is host state); inserted by %%post
-# below / punktfunk-sysext post_merge where steamos-manager exists. See the file's header.
+# starves the stream. Shipped as CIL source (the policy STORE is host state); inserted by
+# post-install.sh where steamos-manager exists. See the file's header.
 install -Dm0644 packaging/bazzite/punktfunk-ds-inhibit.cil \
                 %{buildroot}%{_datadir}/%{name}/selinux/punktfunk-ds-inhibit.cil
 # Layered-update helper for rpm-ostree hosts: `rpm-ostree upgrade` only re-resolves layered
 # packages when the BASE changes, so a frozen Bazzite base pins punktfunk forever. The script
 # forces a re-resolve of just this layer (--uninstall + --install of the same names in one
 # transaction). It is exactly the command pf-update-check hands an rpm-ostree host
-# (`sudo /usr/share/punktfunk/update-punktfunk.sh`, crates/pf-update-check/src/detect.rs), so it
+# (`sudo /usr/share/punktfunk/update-punktfunk.sh`, crates/core/pf-update-check/src/detect.rs), so it
 # has to exist at that path — an ostree box has no repo checkout to run it from. It only shells
 # out to rpm-ostree/rpm/systemctl, so the installed copy is self-contained. Top level, not
 # bazzite/, because the hint (and any Fedora-Atomic host) names that path.
@@ -553,6 +600,11 @@ chmod 0755 %{buildroot}%{_bindir}/punktfunk-scripting
 # systemd --user unit — installed but NOT auto-enabled (opt-in; the runner is inert until you add
 # scripts/plugins). Enable with `systemctl --user enable --now punktfunk-scripting`.
 install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/punktfunk-scripting.service
+# Where AppArmor restricts unprivileged user namespaces, the generator trades the unit's namespace
+# sandbox for this profile.
+install -Dm0644 packaging/linux/apparmor/punktfunk-scripting %{buildroot}%{_sysconfdir}/apparmor.d/punktfunk-scripting
+install -Dm0755 packaging/linux/punktfunk-scripting-apparmor.generator \
+  %{buildroot}%{_prefix}/lib/systemd/user-generators/punktfunk-scripting-apparmor
 %endif
 
 %if %{with web} || %{with scripting}
@@ -626,6 +678,8 @@ install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %{_libexecdir}/punktfunk/pf-dm-helper
 %{_libexecdir}/punktfunk/pf-update
 %{_libexecdir}/punktfunk/restart-user-units
+%{_libexecdir}/punktfunk/post-install
+%{_sysusersdir}/punktfunk.conf
 %{_unitdir}/punktfunk-update.service
 %{_datadir}/polkit-1/rules.d/49-punktfunk-update.rules
 %{_datadir}/polkit-1/rules.d/49-punktfunk-power.rules
@@ -638,13 +692,33 @@ install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %{_userunitdir}/punktfunk-host.service
 %{_userunitdir}/punktfunk-kde-session.service
 %{_datadir}/applications/io.unom.Punktfunk.Host.desktop
-%{_sysconfdir}/xdg/autostart/io.unom.Punktfunk.Tray.desktop
+%{_datadir}/applications/io.unom.Punktfunk.StartHost.desktop
 %{_datadir}/icons/hicolor/*/apps/punktfunk-tray*.png
 %dir /etc/gamescope-session-plus
 %dir /etc/gamescope-session-plus/sessions.d
 %config(noreplace) /etc/gamescope-session-plus/sessions.d/steam
 %dir %{_datadir}/%{name}
 %{_datadir}/%{name}/*
+%endif
+
+%if %{with host}
+%files seats
+%license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
+%dir %{_libexecdir}/punktfunk
+%{_libexecdir}/punktfunk/punktfunk-seats
+%{_libexecdir}/punktfunk/seat-session
+%{_libexecdir}/punktfunk/seat-reap
+%{_libexecdir}/punktfunk/door-helper
+%{_unitdir}/punktfunk-seats.service
+%{_unitdir}/punktfunk-seat@.service
+%{_unitdir}/user@.service.d/50-punktfunk-seats.conf
+%{_unitdir}/punktfunk-door.service
+%{_unitdir}/punktfunk-web-door.service
+%{_unitdir}/punktfunk-door-on@.service
+%{_unitdir}/punktfunk-door-off@.service
+%{_datadir}/polkit-1/rules.d/49-punktfunk-door.rules
+%{_tmpfilesdir}/punktfunk-seats.conf
+%{_udevrulesdir}/65-punktfunk-seats.rules
 %endif
 
 %files client
@@ -667,6 +741,7 @@ install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %{_libexecdir}/punktfunk/pf-update-client
 %{_unitdir}/punktfunk-client-update.service
 %{_datadir}/polkit-1/rules.d/49-punktfunk-client-update.rules
+%{_sysusersdir}/punktfunk-client.conf
 %dir %{_datadir}/punktfunk-client
 %{_datadir}/punktfunk-client/install-kind
 
@@ -689,6 +764,9 @@ install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %dir %{_datadir}/punktfunk-scripting
 %{_datadir}/punktfunk-scripting/runner-cli.js
 %{_userunitdir}/punktfunk-scripting.service
+%dir %{_sysconfdir}/apparmor.d
+%config(noreplace) %{_sysconfdir}/apparmor.d/punktfunk-scripting
+%{_prefix}/lib/systemd/user-generators/punktfunk-scripting-apparmor
 %endif
 
 %if %{with web} || %{with scripting}
@@ -698,10 +776,6 @@ install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %endif
 
 %post client
-# The (empty) opt-in group for one-tap client updates — nobody is auto-added. Also created by
-# the host subpackage's %%post; groupadd is idempotent, so whichever lands first wins and the
-# other is a no-op.
-getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
 # Pick up the DualSense hidraw rule without a reboot (best-effort; on rpm-ostree it
 # applies on the next boot into the layered deployment).
 udevadm control --reload-rules 2>/dev/null || :
@@ -716,32 +790,6 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 
 %if %{with host}
 %post
-# The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
-getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
-# Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Deliberately NOT 'input': writing
-# 'attach' materialises an arbitrary emulated USB device — a root-only kernel primitive that must
-# not ride on the group users are told to join for gamepads (security-review 2026-08-05 M-4).
-# It is ALSO the group `pf-dm-helper` authorizes on (the polkit action must stay `allow_any`, so
-# membership is the real gate) — so it is what a managed gamescope takeover needs to stop the
-# display manager. Creating it is necessary and NOT sufficient for either use: membership is.
-getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || :
-# Reload udev so /dev/uinput picks up the new rule without a reboot (best-effort).
-udevadm control --reload-rules 2>/dev/null || :
-udevadm trigger --subsystem-match=misc 2>/dev/null || :
-# Apply the UDP socket-buffer tuning (also auto-applied at boot by systemd-sysctl; on rpm-ostree
-# it takes effect on the next boot into the layered deployment).
-sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || :
-# Bazzite/SteamOS only (keyed on the steamos-manager binary): insert the ds_inhibit dontaudit
-# drop-in — Valve's ds_inhibit walks /proc on every open/close of our virtual DualSense's hidraw,
-# the denied walk sprays AVCs, and setroubleshootd amplifies that into a box-wide stall (see
-# packaging/bazzite/punktfunk-ds-inhibit.cil). Keyed on the module NAME for idempotence (a policy
-# rebuild costs seconds — rename the file if the rules ever change). Best-effort and never fatal:
-# rpm-ostree's scriptlet sandbox may refuse semodule; the sysext post_merge and the README's
-# manual command cover that path.
-if command -v semodule >/dev/null 2>&1 && [ -e /usr/lib/steamos-manager ] &&
-   ! semodule -l 2>/dev/null | grep -qx punktfunk-ds-inhibit; then
-    semodule -i %{_datadir}/%{name}/selinux/punktfunk-ds-inhibit.cil >/dev/null 2>&1 || :
-fi
 echo "punktfunk installed. Add yourself to the 'input' group (sudo usermod -aG input \$USER)"
 # Naming only the usbip pad here is how a Nobara host shipped broken: its owner had no Deck pad, so
 # they correctly skipped this group — and then every managed gamescope takeover degraded silently,
@@ -759,36 +807,26 @@ if command -v firewall-cmd >/dev/null 2>&1; then
     echo "    sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload"
     echo "    (use punktfunk-native for the native-only host)"
 fi
-# A running firewalld serves the service it last loaded, so a port this upgrade added to the XML is
-# closed until a reload. `--info-service` asks the daemon, i.e. reads that stale copy.
-if command -v firewall-cmd >/dev/null 2>&1 &&
-   firewall-cmd --state >/dev/null 2>&1 &&
-   firewall-cmd --query-service=punktfunk-web >/dev/null 2>&1 &&
-   ! firewall-cmd --info-service=punktfunk-web 2>/dev/null | grep -q '47993'; then
-    echo ""
-    echo "punktfunk: the punktfunk-web firewalld service now also covers TCP 47993 (plugin UIs)."
-    echo "  Plugin interfaces will not load in the console until:  sudo firewall-cmd --reload"
-fi
-if command -v firewall-cmd >/dev/null 2>&1 &&
-   firewall-cmd --state >/dev/null 2>&1 &&
-   firewall-cmd --query-service=punktfunk-native >/dev/null 2>&1 &&
-   ! firewall-cmd --info-service=punktfunk-native 2>/dev/null | grep -q '9778'; then
-    echo ""
-    echo "punktfunk: the punktfunk-native firewalld service now also covers UDP 9778 (browser"
-    echo "  streaming). A browser cannot connect to this host until:  sudo firewall-cmd --reload"
-fi
-# Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so the
-# warning stays in one place. Exit 1 = something found; never fail the install on it.
-if command -v punktfunk-host >/dev/null 2>&1; then
-    if ! conflict="$(punktfunk-host detect-conflicts 2>/dev/null)"; then
-        echo ""
-        echo "$conflict"
-    fi
-fi
+# Groups, udev, sysctl, the ds_inhibit SELinux module, the stale-firewall notes and the conflict
+# check: the steps every format shares (packaging/linux/post-install.sh).
+%{_libexecdir}/punktfunk/post-install
 
 # Any punktfunk server package update restarts the running services, once per transaction.
 %transfiletriggerin -- %{_bindir}/punktfunk-host %{_datadir}/punktfunk-web %{_datadir}/punktfunk-scripting %{_libexecdir}/punktfunk-bun
 %{_libexecdir}/punktfunk/restart-user-units
+%endif
+
+%if %{with host}
+%post seats
+systemd-tmpfiles --create %{_tmpfilesdir}/punktfunk-seats.conf >/dev/null 2>&1 || :
+
+%preun seats
+# No %%systemd_post: nothing here enables the daemon. door-helper enables the door's units, so
+# removal disables them. A restart leaves running seats up.
+%systemd_preun punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service
+
+%postun seats
+%systemd_postun_with_restart punktfunk-seats.service punktfunk-door.service punktfunk-web-door.service
 %endif
 
 %if %{with web}
@@ -815,6 +853,10 @@ echo "Then open https://<host-ip>:47992"
 # symlink. $1 == 1 is a first INSTALL — on an upgrade ($1 > 1) this must not undo an operator's mask.
 if [ "$1" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
     systemctl --global enable punktfunk-scripting.service >/dev/null 2>&1 || :
+fi
+# Boot loads it from /etc/apparmor.d; this covers the running kernel.
+if command -v apparmor_parser >/dev/null 2>&1 && aa-enabled --quiet 2>/dev/null; then
+    apparmor_parser -r -T -W %{_sysconfdir}/apparmor.d/punktfunk-scripting || :
 fi
 echo "punktfunk-scripting installed and enabled for all users."
 echo "It runs your automation — game-library sources, scripts in"

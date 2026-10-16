@@ -2,9 +2,11 @@ package io.unom.punktfunk
 
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
 import android.os.Build
@@ -22,6 +24,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.systemBars
@@ -214,6 +217,19 @@ class MainActivity : ComponentActivity() {
 
     private val isTv by lazy { isTvDevice(this) }
 
+    /** Who holds the window in landscape ([HoldLandscape]). With none, the device decides. */
+    private val landscapeHolders = mutableSetOf<String>()
+
+    fun holdLandscape(holder: String, hold: Boolean) {
+        if (hold) landscapeHolders += holder else landscapeHolders -= holder
+        val want = if (landscapeHolders.isEmpty()) {
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+        if (requestedOrientation != want) requestedOrientation = want
+    }
+
     /**
      * TV remote-as-pointer for the active session (StreamScreen builds it on TV devices only):
      * hold SELECT to toggle, then the D-pad glides the host cursor. Consulted first for
@@ -300,13 +316,14 @@ class MainActivity : ComponentActivity() {
         // — the streaming one gets backgrounded, and backgrounding ends a session — so the refusal
         // has to happen HERE, before this instance is resumed, not inside the composition (which
         // only ever sees the rare `onNewIntent` case). Finishing now leaves the streaming task in
-        // front, untouched.
+        // front, untouched. A recreated activity already handled its intent: it carries no link.
+        val link = if (savedInstanceState == null) deepLinkFrom(intent) else null
         val live = SessionGate.live
-        if (live != null && deepLinkFrom(intent) != null) {
+        if (live != null && link != null) {
             // Pointing at the host already being streamed is the one exception, and its right
             // answer is to do nothing: the intent has already brought the app forward, which is
             // what "focus it" means here.
-            if (!targetsHost(intent, live)) {
+            if (!targetsHost(link, live)) {
                 Toast.makeText(
                     this,
                     "Already streaming — end this session first.",
@@ -316,7 +333,7 @@ class MainActivity : ComponentActivity() {
             finish()
             return
         }
-        pendingDeepLink = deepLinkFrom(intent)
+        pendingDeepLink = link
         resolveHighRefreshMode()
         setConsoleHighRefreshRate(true) // the console UI wants max refresh; streaming manages its own
         // Dark, transparent system bars regardless of the system theme — our UI is always dark, so
@@ -392,11 +409,43 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * The `punktfunk://` URL of a VIEW intent, or null. Only VIEW: the launcher's MAIN intent
-     * carries no data, and nothing else may inject a URL into the router.
+     * The link of a VIEW intent, or null: a `punktfunk://` URL, or the launcher file a frontend
+     * hands over as `content://` (read now, while its grant holds). Only VIEW: the launcher's MAIN
+     * intent carries no data, and nothing else may inject a URL into the router.
      */
-    private fun deepLinkFrom(intent: Intent?): String? =
-        intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data?.toString()
+    private fun deepLinkFrom(intent: Intent?): String? {
+        val data = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data ?: return null
+        if (data.scheme != ContentResolver.SCHEME_CONTENT) return data.toString()
+        return linkFromLauncherFile(this, data) ?: run {
+            Toast.makeText(this, "Couldn't read a Punktfunk link from that file.", Toast.LENGTH_LONG)
+                .show()
+            null
+        }
+    }
+
+    /** The link and the report-back of a "Save launcher file" waiting on the system's save dialog. */
+    private var launcherFileSave: Pair<String, (String) -> Unit>? = null
+    private val launcherFilePicker =
+        registerForActivityResult(ActivityResultContracts.CreateDocument(LAUNCHER_FILE_MIME)) { uri ->
+            val (url, report) = launcherFileSave ?: return@registerForActivityResult
+            launcherFileSave = null
+            if (uri == null) return@registerForActivityResult // the user backed out
+            report(
+                if (writeLauncherFile(this, uri, url)) "Launcher file saved." else "Couldn't save the launcher file.",
+            )
+        }
+
+    /**
+     * "Save launcher file", for both shells: the system's save dialog, then [url] written as a
+     * `.punktfunk` file a frontend lists and opens. [report] gets the line to show.
+     */
+    fun saveLauncherFile(title: String, url: String, report: (String) -> Unit) {
+        launcherFileSave = url to report
+        runCatching { launcherFilePicker.launch(launcherFileName(title)) }.onFailure {
+            launcherFileSave = null
+            report("Couldn't open a save dialog on this device.")
+        }
+    }
 
     // Discovery and its Wi-Fi locks follow the app on screen, whichever shell subscribed.
     override fun onStart() {
@@ -443,11 +492,11 @@ class MainActivity : ComponentActivity() {
         if (forceAsk) sc2PermissionAsked = false
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
         sc2UsbAttached = usbManager.deviceList.values.any {
-            it.vendorId == Sc2Device.VID_VALVE && it.productId in Sc2Device.USB_PIDS
+            it.vendorId == Sc2Device.VID_VALVE &&
+                (it.productId in Sc2Device.USB_PIDS || it.productId in io.unom.punktfunk.kit.Sc1Device.USB_PIDS)
         }
         if (streamHandle != 0L) return // StreamScreen owns the pad while streaming
         if (sc2Menu?.isActive == true) return
-        if (!SettingsStore(this).load().sc2Capture) return
         val cap = sc2Menu ?: io.unom.punktfunk.kit.Sc2Capture(this).also { c ->
             c.onUiKey = { key, down -> runOnUiThread { sc2NavKey(key, down) } }
             c.onActiveChanged = { on -> runOnUiThread { sc2MenuActive = on } }
@@ -650,15 +699,16 @@ class MainActivity : ComponentActivity() {
      * `ANativeWindow_setFrameRate` braces: the surface hint alone is advisory, and several OEM
      * refresh governors (Nothing OS's LTPO logic among them) ignore it entirely for third-party
      * apps — leaving a 120 Hz session presenting on a 60/90 Hz panel, which reads as judder + a
-     * refresh of extra latency. The preferredDisplayModeId is the one signal they all honor. [hz]
-     * ≤ 0 falls back to releasing the pin (the pre-pin behaviour).
+     * refresh of extra latency. The preferredDisplayModeId is the one signal they all honor. A
+     * stream of the panel's own [size] also takes the panel to that size; [setConsoleHighRefreshRate]
+     * puts the user's resolution back. [hz] ≤ 0 falls back to releasing the pin.
      */
-    fun setStreamDisplayMode(hz: Int) {
+    fun setStreamDisplayMode(hz: Int, size: Pair<Int, Int>? = null) {
         if (hz <= 0) {
             setConsoleHighRefreshRate(false)
             return
         }
-        val target = ownDisplay()?.streamModeFor(hz) ?: return
+        val target = ownDisplay()?.streamModeFor(hz, size) ?: return
         window.attributes = window.attributes.apply { preferredDisplayModeId = target.modeId }
     }
 
@@ -693,15 +743,9 @@ class MainActivity : ComponentActivity() {
                 val bit = Gamepad.padButtonBit(key, event.flags)
                 // A pad with no trigger axis sends its triggers as L2/R2 keys.
                 if (bit == 0 && gamepadRouter?.onTriggerKey(event, key) == true) return true
-                if (bit != 0) {
-                    // The router forwards the bit on this device's own wire pad index and tracks held
-                    // state per pad. The emergency-exit chord (Select + Start + L1 + R1) is handled
-                    // inside the router: holding it briefly (~1 s, with an on-screen hint) fires
-                    // router.onExitChord (wired in StreamScreen), so a couch user with no keyboard/Back
-                    // can still leave — but an accidental brush of the four buttons no longer quits.
-                    gamepadRouter?.onButton(event, bit)
-                    return true // consumed
-                }
+                // The router forwards the bit on this device's own wire pad index, or declines a
+                // device that is no pad yet (a remote's D-pad), which then goes on as a key.
+                if (bit != 0 && gamepadRouter?.onButton(event, bit) == true) return true
             }
             // The ring is modal: its scrim owns every finger, the router masks the pad behind it,
             // and this is the same claim for keys. Non-nav keys are swallowed, not sent — except
@@ -949,9 +993,8 @@ class MainActivity : ComponentActivity() {
         else -> KeyEvent.isGamepadButton(kc)
     }
 
-    /** Does [intent]'s link resolve to the host [live] is already streaming? */
-    private fun targetsHost(intent: Intent?, live: SessionGate.Live): Boolean {
-        val url = deepLinkFrom(intent) ?: return false
+    /** Does [url] resolve to the host [live] is already streaming? */
+    private fun targetsHost(url: String, live: SessionGate.Live): Boolean {
         val parsed = DeepLinks.parse(url) as? DeepLinkResult.Parsed ?: return false
         val target = DeepLinks.resolveHost(parsed.link, KnownHostStore(this).all())
         return target is HostResolution.Record && target.host.id == live.hostId

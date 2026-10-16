@@ -7,13 +7,13 @@
 //! (`super::present`). Nothing here touches the MediaCodec path.
 //!
 //! The feature set is not ours to choose — it mirrors `pf-presenter`'s probe exactly
-//! (`crates/pf-presenter/src/vk/setup.rs`), because pyrowave 0.4.0 reconstructs the
+//! (`crates/client/pf-presenter/src/vk/setup.rs`), because pyrowave 0.4.0 reconstructs the
 //! create-infos from what we report and reads those features to pick its kernels. A
 //! device that misses one is not a slower device, it is a device the codec refuses.
 
 use anyhow::{anyhow, bail, Result};
 use ash::vk;
-use pf_client_core::video_vk::{QueueLock, VulkanDecodeDevice};
+use pf_client_video::video_vk::{QueueLock, VulkanDecodeDevice};
 use std::ffi::CString;
 
 /// Instance extensions, in creation order. `VulkanDecodeDevice::instance_extensions` must
@@ -263,9 +263,6 @@ impl PyroDevice {
             f_timeline_semaphore: true,
             f_synchronization2: true,
             video_decode: false,
-            // No `VK_KHR_present_wait` on this path — Android's latch stamps come from the
-            // ASurfaceControl backend, which the wavelet lane does not use.
-            present_timing: false,
             pyrowave_decode: true,
             f_shader_int16: true,
             f_storage_buffer8: true,

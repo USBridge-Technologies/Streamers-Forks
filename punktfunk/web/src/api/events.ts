@@ -34,6 +34,7 @@ import {
 	getGetStatusQueryKey,
 } from "@/api/gen/host/host";
 import {
+	getGetDownloadsQueryKey,
 	getGetLibraryPageQueryKey,
 	getGetLibraryQueryKey,
 	getListLibraryScannersQueryKey,
@@ -116,6 +117,12 @@ const INVALIDATES = {
 		getListLibraryScannersQueryKey(),
 	],
 	"emulators.changed": [getGetEmulatorsQueryKey()],
+	// A download that starts, stops or ends moves the list and the title's install state.
+	"downloads.changed": [
+		getGetDownloadsQueryKey(),
+		getGetLibraryQueryKey(),
+		getGetLibraryPageQueryKey(),
+	],
 	"update.available": [getGetUpdateStatusQueryKey()],
 	"update.applied": [getGetUpdateStatusQueryKey()],
 	// Registration and folder-access changes move plugin views; a new pending request can add a
@@ -368,7 +375,7 @@ function announceKnock(entry: ActivityEntry | null): void {
 		description: name ? m.pairing_knock_desc({ name }) : undefined,
 		action: {
 			label: m.pairing_knock_action(),
-			onClick: () => window.location.assign("/pairing"),
+			onClick: () => window.location.assign("/devices"),
 		},
 	});
 }

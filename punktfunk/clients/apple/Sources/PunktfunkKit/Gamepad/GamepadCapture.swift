@@ -142,7 +142,7 @@ public final class GamepadCapture {
     /// pf-client-core's `TAP_PRESS`: a held-back Select tap is delivered as a press with
     /// its release this far behind — back-to-back transitions can fold into nothing in
     /// the host's per-pad input fold.
-    private static let tapPress: TimeInterval = 0.05
+    nonisolated private static let tapPress: TimeInterval = 0.05
     private var chordTimer: Timer?
     /// Fired ON MAIN once the escape chord has been held `disconnectHold` — the session owner
     /// disconnects. On tvOS this (plus the Siri Remote's hold-Back) is the ONLY way out of a
@@ -328,21 +328,69 @@ public final class GamepadCapture {
     }
 
     /// A one-shot synthetic tap of a system button on the host's pad (pf-client-core's
-    /// `GamepadService.tapButton`): down now, up `tapPress` later, on the first forwarded slot's
-    /// wire index — pad 0 when none is open, which is best-effort (the host pad may not exist).
-    /// The quick-action ring's route to the host's guide on a device whose OS keeps the physical
-    /// Home press for itself. Deliberately outside `slot.buttons` and the system-buttons policy:
-    /// this is the ring's own press, not the player's.
+    /// `GamepadService.tapButton`), on the first forwarded slot's wire index — pad 0 when none
+    /// is open, which is best-effort (the host pad may not exist). The quick-action ring's
+    /// route to the host's guide on a device whose OS keeps the physical Home press for itself.
+    /// `misc1` is the Quick Access action, pressed as that pad's host device reads it
+    /// (`GamepadWire.quickAccessPresses`). Deliberately outside `slot.buttons` and the
+    /// system-buttons policy: this is the ring's own press, not the player's.
     public func tapButton(_ bit: UInt32) {
         guard let wire else { return }
         let pad = slots.first?.pad ?? 0
-        wire.send(.gamepadButton(bit, down: true, pad: pad))
-        let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.wire?.send(.gamepadButton(bit, down: false, pad: pad))
+        let presses = bit == GamepadWire.misc1
+            ? GamepadWire.quickAccessPresses(
+                hasButton: connection.hasQuickAccess(declared: slots.first?.pref))
+            : [bit]
+        let events = Self.tapEvents(presses)
+        // One timer per moment: two timers due together fire in no promised order.
+        for delay in Set(events.map(\.after)).sorted() {
+            let due = events.filter { $0.after == delay }
+            guard delay > 0 else {
+                for e in due { wire.send(.gamepadButton(e.bit, down: e.down, pad: pad)) }
+                continue
             }
+            let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    for e in due { self?.wire?.send(.gamepadButton(e.bit, down: e.down, pad: pad)) }
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
         }
-        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    /// A synthetic tap's wire events (pf-client-core's `tap_events`): each press `tapPress`
+    /// after the one before, then every release together, last pressed first. Apart, because
+    /// core folds per-transition sends into one state, and because a chord's first button has
+    /// to be held before its second counts.
+    nonisolated static func tapEvents(
+        _ presses: [UInt32]
+    ) -> [(bit: UInt32, down: Bool, after: TimeInterval)] {
+        let downs = presses.enumerated().map {
+            (bit: $0.element, down: true, after: Double($0.offset) * tapPress)
+        }
+        let up = Double(presses.count) * tapPress
+        return downs + presses.reversed().map { (bit: $0, down: false, after: up) }
+    }
+
+    /// The controller type every forwarded pad declares (`.auto` = each pad as itself).
+    public var padType: PunktfunkConnection.GamepadType { manager.typeSetting }
+
+    /// Whether any physical controller holds a slot.
+    public var hasForwardedPads: Bool { !slots.isEmpty }
+
+    /// Emulate `type` for the rest of this stream. The host builds a pad from its arrival and
+    /// never swaps a built one, so each slot whose declared kind moves is closed and reopened.
+    /// The SC2 passthrough declares its own kind and is left alone.
+    public func setPadType(_ type: PunktfunkConnection.GamepadType) {
+        manager.typeSetting = type
+        for slot in slots {
+            guard let dc = manager.forwarded.first(where: { $0.controller === slot.controller }),
+                  manager.declaredKind(for: dc) != slot.pref else { continue }
+            closeSlot(slot)
+            openSlot(dc)
+        }
+        updateEscapeChord()
+        updateDeviceGyro()
     }
 
     /// Bring `slots` in line with the forwarded set: close any slot no longer wanted (flushing its

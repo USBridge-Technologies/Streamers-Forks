@@ -40,13 +40,21 @@ object Gamepad {
 
     // Extended bits (Moonlight `buttonFlags2 << 16` namespace — `input.rs::gamepad`): the four
     // back grips (Steam L4/L5/R4/R5 ≙ Elite P1–P4), touchpad click, and the misc/QAM button.
-    // Android's standard InputDevice path never produces these; the SC2 capture link does.
+    // The SC2 capture link sends all six; [buttonBit] finds the upper grip pair on a plain pad.
     const val BTN_PADDLE1 = 0x10000
     const val BTN_PADDLE2 = 0x20000
     const val BTN_PADDLE3 = 0x40000
     const val BTN_PADDLE4 = 0x80000
     const val BTN_TOUCHPAD = 0x100000
     const val BTN_MISC1 = 0x200000
+
+    /**
+     * What a synthetic Quick Access tap presses, in order (punktfunk-core's
+     * `quick_access_presses`). A pad with the button takes [BTN_MISC1]. Every other pad takes
+     * the chord Steam reads there: Guide held, then A.
+     */
+    fun quickAccessPresses(hasButton: Boolean): List<Int> =
+        if (hasButton) listOf(BTN_MISC1) else listOf(BTN_GUIDE, BTN_A)
 
     // Axis ids — must equal `input.rs::gamepad::AXIS_*`.
     const val AXIS_LS_X = 0
@@ -194,43 +202,32 @@ object Gamepad {
 
     /**
      * True when [dev] is a controller someone can actually hold: a pad source ([isPad]) that is a
-     * REAL device carrying real pad hardware — a stick, a HAT, or the A/B face buttons.
+     * REAL device with a stick or a HAT on the joystick source.
      *
      * [isPad] alone answers "did this event come from a pad source", which is the right question
-     * for ROUTING an event and the wrong one for "is a controller attached". Devices publish
-     * inputs that claim `SOURCE_GAMEPAD`/`SOURCE_JOYSTICK` while being no such thing — OEM
-     * game-mode overlays and the gaming-phone shoulder triggers among them — and one of those is
-     * enough to pin the console UI on forever: a pad that was never there cannot disconnect, so
-     * "With a controller" has no way back to the touch UI.
+     * for ROUTING an event and the wrong one for "is a controller attached". OEM game-mode
+     * overlays, gaming-phone shoulder triggers and TV remotes claim `SOURCE_GAMEPAD`, and a
+     * generic key layout grants a remote the A/B keys too, so face buttons prove nothing. One
+     * such device pins the console UI on and lists itself as a controller.
      *
-     * The capability probe is what separates them: a source class is a claim, a stick or a face
-     * button is hardware. It is not a complete defence — an OEM device that declares `BTN_GAMEPAD`
-     * and a pair of axes is indistinguishable from a pad at this layer — so the master switch stays
-     * the guaranteed way out. `isVirtual` only means "device id < 0" (the platform's own synthetic
-     * device), which is worth excluding but catches none of the above.
+     * A stick or HAT is hardware a remote does not report. `isVirtual` only means "device id < 0".
      */
+    // ponytail: a pad with no stick and no HAT is not listed; the router still forwards it on its
+    // first button. Track first presses here if such a pad turns up.
     fun looksLikeController(dev: InputDevice?): Boolean {
         val d = dev ?: return false
-        return looksLikeController(
-            padSource = isPad(d),
-            virtual = d.isVirtual,
-            hasStick = d.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null ||
-                d.getMotionRange(MotionEvent.AXIS_HAT_X, InputDevice.SOURCE_JOYSTICK) != null,
-            // `hasKeys` answers for the DEVICE, so a pad with no sticks at all (an arcade stick,
-            // a d-pad-only pad) still counts.
-            hasFaceButtons = d.hasKeys(KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B)
-                .any { it },
-        )
+        return looksLikeController(padSource = isPad(d), virtual = d.isVirtual, hasStick = hasStick(d))
     }
+
+    /** Whether [dev] reports a stick or a HAT on the joystick source. */
+    fun hasStick(dev: InputDevice): Boolean =
+        dev.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null ||
+            dev.getMotionRange(MotionEvent.AXIS_HAT_X, InputDevice.SOURCE_JOYSTICK) != null
 
     /** [looksLikeController]'s decision, over plain facts — the seam its truth table is tested at
      * (an [InputDevice] cannot be built off a device). */
-    fun looksLikeController(
-        padSource: Boolean,
-        virtual: Boolean,
-        hasStick: Boolean,
-        hasFaceButtons: Boolean,
-    ): Boolean = padSource && !virtual && (hasStick || hasFaceButtons)
+    fun looksLikeController(padSource: Boolean, virtual: Boolean, hasStick: Boolean): Boolean =
+        padSource && !virtual && hasStick
 
     /** A Steam Controller 2 by identity: wired, BLE, or on one of the Puck dongles. */
     fun isSc2VidPid(vid: Int, pid: Int): Boolean =
@@ -344,28 +341,28 @@ object Gamepad {
         if (setting == PREF_AUTO) prefFor(firstPad()) else setting
 
     /**
-     * Gamepad `KEYCODE_*` → BTN_* bit, or 0 if not a gamepad button we forward. A/B/X/Y are
-     * positional (Xbox layout; Nintendo relabeling needs device-type detection, deferred).
-     * `KEYCODE_DPAD_*` are included but must only be routed here when the event is from a gamepad
-     * (a keyboard's arrow keys share these keycodes and belong to the VK path) — see MainActivity.
-     * L2/R2 are forwarded as the analog trigger axes, never as buttons.
+     * Gamepad `KEYCODE_*` → BTN_* bit, or 0 for a key this client doesn't forward. A/B/X/Y are
+     * positional (Xbox layout). `KEYCODE_DPAD_*` belong here only when the event is from a
+     * gamepad: a keyboard's arrows share them and take the VK path (see MainActivity). L2/R2 are
+     * forwarded as the analog trigger axes, never as buttons.
      *
-     * [BTN_TOUCHPAD] and [BTN_MISC1] have no Android keycode at all, so
-     * [PadButtons.GENERIC_SONY] BORROWS the last two rows of `Generic.kl`'s joystick block for
-     * them ([KEYCODE_BUTTON_15][KeyEvent.KEYCODE_BUTTON_15] / `_16`, evdev `BTN_BASE5`/`BTN_BASE6`)
-     * — see there. This table is global, so a device that genuinely presses one of those two
-     * emits the bit as well. That is the cost of the borrow, and it is why the borrow is at the
-     * TOP of the block rather than at `BUTTON_1`/`BUTTON_2`: those are a flight stick's trigger
-     * and thumb button, which any joystick-usage HID device reports, whereas reaching `BUTTON_15`
-     * takes a pad that declares fifteen. The residual case — a fifteen-button HOTAS whose button
-     * 16 also toggles the client's mic — is the one this leaves on the table; narrowing it
-     * further needs per-device knowledge the router does not have (see `GamepadRouter`).
+     * `BUTTON_C` and `BUTTON_Z` are the two slots the Android gamepad layout leaves empty, and
+     * where a handheld puts its back buttons (AYN: M1 on C, M2 on Z). They are the upper back
+     * grips, L4 and R4. A six-button pad's own C and Z land there too. Only a host pad with
+     * grips shows them: Steam Deck, DualSense Edge.
+     *
+     * [BTN_TOUCHPAD] and [BTN_MISC1] have no Android keycode, so [PadButtons.GENERIC_SONY]
+     * borrows `BUTTON_15`/`BUTTON_16` for them. This table is global: any device that presses
+     * one of those two emits the bit as well. They sit at the top of the joystick block because
+     * `BUTTON_1`/`BUTTON_2` are a flight stick's trigger and thumb button.
      */
     fun buttonBit(keyCode: Int): Int = when (keyCode) {
         KeyEvent.KEYCODE_BUTTON_A -> BTN_A
         KeyEvent.KEYCODE_BUTTON_B -> BTN_B
         KeyEvent.KEYCODE_BUTTON_X -> BTN_X
         KeyEvent.KEYCODE_BUTTON_Y -> BTN_Y
+        KeyEvent.KEYCODE_BUTTON_C -> BTN_PADDLE2 // L4
+        KeyEvent.KEYCODE_BUTTON_Z -> BTN_PADDLE1 // R4
         KeyEvent.KEYCODE_BUTTON_L1 -> BTN_LB
         KeyEvent.KEYCODE_BUTTON_R1 -> BTN_RB
         KeyEvent.KEYCODE_BUTTON_THUMBL -> BTN_LS_CLICK

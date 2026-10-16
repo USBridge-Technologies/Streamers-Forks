@@ -30,40 +30,36 @@ on:
     # web-only push should not light up the whole fleet. Applies to branch pushes;
     # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
     paths:
-      - 'crates/pf-bitstream/**'
-      - 'crates/pf-capture/**'
-      - 'crates/pf-client-core/**'
-      - 'crates/pf-clipboard/**'
-      - 'crates/pf-console-ui/**'
-      - 'crates/pf-dmabuf/**'
-      - 'crates/pf-driver-proto/**'
-      - 'crates/pf-encode/**'
-      - 'crates/pf-encode-core/**'
-      - 'crates/pf-frame/**'
-      - 'crates/pf-gpu/**'
-      - 'crates/pf-host-config/**'
-      - 'crates/pf-inject/**'
-      - 'crates/pf-audio/**'
-      - 'crates/pf-libva/**'
-      - 'crates/pf-paths/**'
-      - 'crates/pf-paths-win/**'
-      - 'crates/pf-portal/**'
-      - 'crates/pf-presenter/**'
-      - 'crates/pf-update/**'
-      - 'crates/pf-update-check/**'
-      - 'crates/pf-vaapi/**'
-      - 'crates/pf-v4l2dec/**'
-      - 'crates/pf-v4l2/**'
-      - 'crates/pf-vdisplay/**'
-      - 'crates/pf-vkdecode/**'
-      - 'crates/pf-win-display/**'
-      - 'crates/pf-zerocopy/**'
-      - 'crates/punktfunk-core/**'
-      - 'crates/punktfunk-ffi/**'
-      - 'crates/punktfunk-encode-worker/**'
-      - 'crates/punktfunk-host/**'
-      - 'crates/punktfunk-tray/**'
-      - 'crates/pyrowave-sys/**'
+      - 'crates/client/**'
+      - 'crates/codec/pf-bitstream/**'
+      - 'crates/codec/pf-libva/**'
+      - 'crates/codec/pf-v4l2/**'
+      - 'crates/codec/pf-v4l2dec/**'
+      - 'crates/codec/pf-vaapi/**'
+      - 'crates/codec/pf-vkdecode/**'
+      - 'crates/codec/pyrowave-sys/**'
+      - 'crates/core/**'
+      - 'crates/host/pf-audio/**'
+      - 'crates/host/pf-capture/**'
+      - 'crates/host/pf-clipboard/**'
+      - 'crates/host/pf-driver-proto/**'
+      - 'crates/host/pf-encode/**'
+      - 'crates/host/pf-encode-core/**'
+      - 'crates/host/pf-frame/**'
+      - 'crates/host/pf-gpu/**'
+      - 'crates/host/pf-host-config/**'
+      - 'crates/host/pf-inject/**'
+      - 'crates/host/pf-paths/**'
+      - 'crates/host/pf-paths-win/**'
+      - 'crates/host/pf-portal/**'
+      - 'crates/host/pf-seats/**'
+      - 'crates/host/pf-vdisplay/**'
+      - 'crates/host/pf-win-display/**'
+      - 'crates/host/pf-zerocopy/**'
+      - 'crates/host/punktfunk-encode-worker/**'
+      - 'crates/host/punktfunk-host/**'
+      - 'crates/install/pf-update/**'
+      - 'crates/install/punktfunk-tray/**'
       - 'clients/linux/**'
       - 'clients/session/**'
       - 'clients/shared/**'
@@ -102,6 +98,7 @@ on:
       - 'scripts/web-init.sh'
       - 'scripts/alsa-ucm2/**'
       - 'scripts/ci/assert-cap-matrix.sh'
+      - 'scripts/ci/assert-payload-parity.sh'
       - 'scripts/ci/gitea-release.sh'
       - 'scripts/ci/pf-version.sh'
       - 'scripts/ci/retry.sh'
@@ -282,7 +279,7 @@ jobs:
           # libcuda link stub — same trick as packaging/rpm/build-rpm.sh: the zerocopy FFI
           # links -lcuda but the builder has no GPU; synthesize every cu* symbol the source
           # references so a newly-added call can't silently break the link.
-          CU_SYMS="$(grep -rhoE '\bcu[A-Z][A-Za-z0-9_]*' crates/punktfunk-host/src/ | sort -u || true)"
+          CU_SYMS="$(grep -rhoE '\bcu[A-Z][A-Za-z0-9_]*' crates/host/punktfunk-host/src/ | sort -u || true)"
           if [ -n "$CU_SYMS" ] && [ ! -e /usr/lib/libcuda.so ]; then
             STUB_C="$(mktemp --suffix=.c)"
             for s in $CU_SYMS; do printf 'int %s(void){return 0;}\n' "$s" >> "$STUB_C"; done
@@ -337,9 +334,16 @@ jobs:
           bash scripts/ci/assert-cap-matrix.sh --self-test
           bash scripts/ci/assert-cap-matrix.sh "$GITHUB_WORKSPACE"/dist/punktfunk-host-*.pkg.tar.zst
 
-      # The optional HDR gamescope companion (packaging/gamescope) — a separate pkgbase with a
-      # completely different dependency set, published into the same repo so `pacman -S
-      # punktfunk-gamescope` is all an Arch/SteamOS box needs for 10-bit BT.2020 PQ.
+      # Every path packaging/linux/payload.txt names, read out of the built packages
+      # (usr/libexec/punktfunk/ is usr/lib/punktfunk/ here).
+      - name: Assert the shared payload (Arch packages)
+        run: |
+          bash scripts/ci/assert-payload-parity.sh --self-test
+          bash scripts/ci/assert-payload-parity.sh "$GITHUB_WORKSPACE"/dist/punktfunk-host-*.pkg.tar.zst \
+            "$GITHUB_WORKSPACE"/dist/punktfunk-client-*.pkg.tar.zst
+
+      # The patched gamescope punktfunk-host depends on (packaging/gamescope) — a separate pkgbase
+      # with a completely different dependency set, published into the same repo.
       #
       # CACHED on `packaging/gamescope/**`: it depends on nothing else in this repo, so a normal
       # push restores the built package instead of spending ~10 minutes on someone else's C++ tree.
@@ -353,8 +357,7 @@ jobs:
 
       - name: Build punktfunk-gamescope (makepkg)
         if: steps.gamescope.outputs.cache-hit != 'true'
-        # Best-effort: punktfunk-host works without it (SDR on the gamescope backend), and a
-        # failure building gamescope must not cost the packages this workflow exists to publish.
+        # Required: punktfunk-host depends on it, so a host published without it cannot install.
         run: |
           set -x
           # Baked into arch-ci — a no-op guard, like the dep step above.
@@ -366,13 +369,12 @@ jobs:
             meson cmake glm wayland-protocols benchmark libxcursor || true
           mkdir -p dist-gamescope && chown builder: dist-gamescope
           chown -R builder: packaging/gamescope
-          if sudo -u builder env PKGDEST="$GITHUB_WORKSPACE/dist-gamescope" \
+          if ! sudo -u builder env PKGDEST="$GITHUB_WORKSPACE/dist-gamescope" \
                bash -c 'cd packaging/gamescope && makepkg -f -d --holdver'; then
-            ls -lh dist-gamescope
-          else
-            echo "::warning::punktfunk-gamescope failed to build — Arch boxes stay SDR on the gamescope backend this run"
             rm -rf dist-gamescope   # never cache a failed build (an empty path is not saved)
+            exit 1
           fi
+          ls -lh dist-gamescope
 
       # THE GATE THIS PIPELINE WAS MISSING. v0.25.0 shipped a soname bound the world had already
       # moved past — every affected user got "unable to satisfy dependency … required by
@@ -397,6 +399,7 @@ jobs:
             pacman -U --print --noconfirm --dbpath /tmp/pf-instcheck --logfile /dev/null "$@" 2>&1
           }
           ls dist/*.pkg.tar.zst >/dev/null 2>&1 || { echo "::error::nothing in dist/ to check"; exit 1; }
+          ls dist-gamescope/*.pkg.tar.zst >/dev/null 2>&1 || { echo "::error::no punktfunk-gamescope to check"; exit 1; }
           rc=0
           # ONE transaction for the whole built set — the shape reality takes (the published repo
           # carries the siblings, so `pacman -S punktfunk-host` resolves punktfunk-icons from it)
@@ -404,34 +407,19 @@ jobs:
           # PLUS each other, and a split-package dependency exists only as a sibling file here.
           # Checking one file at a time turned exactly that into a false "cannot be installed"
           # (punktfunk-icons, run 16446). pacman's own error text names the offending package.
-          if out="$(check dist/*.pkg.tar.zst)"; then
+          if out="$(check dist/*.pkg.tar.zst dist-gamescope/*.pkg.tar.zst)"; then
             echo "OK  the built set resolves together ($(echo "$out" | wc -l) targets)"
           else
             rc=1
             echo "::error::the built set CANNOT be installed on an up-to-date Arch box:"
             echo "$out" | sed 's/^/    /'
           fi
-          # gamescope stays best-effort, exactly as its build step is: a companion that cannot
-          # install is dropped from the upload with a warning, never a reason to withhold the
-          # packages this workflow exists to publish. (It is also the one package that can be
-          # restored from a cache older than the current Arch snapshot.)
-          # The dist set rides along: gamescope may depend on punktfunk packages, and after the
-          # set proved itself above, a failure here is attributable to gamescope alone.
-          for pkg in dist-gamescope/*.pkg.tar.zst; do
-            [ -e "$pkg" ] || continue
-            if out="$(check "$pkg" dist/*.pkg.tar.zst)"; then
-              echo "OK  $(basename "$pkg")  ($(echo "$out" | wc -l) targets resolve)"
-            else
-              echo "::warning::$(basename "$pkg") is not installable on current Arch — NOT publishing it"
-              echo "$out" | sed 's/^/    /'
-              rm -f "$pkg"
-            fi
-          done
           if [ "$rc" != 0 ]; then
             echo "::error::refusing to publish: pacman would reject this on a current box, and a"
             echo "::error::rejected dependency blocks the user's ENTIRE upgrade, not just punktfunk."
             echo "::error::Usual cause: the arch-ci builder image lags Arch across a soname bump —"
             echo "::error::bump 'refreshed:' in ci/arch-ci.Dockerfile, let docker.yml republish it, re-run."
+            echo "::error::punktfunk-gamescope is cached on packaging/gamescope: bump its pkgrel to rebuild."
             exit 1
           fi
 

@@ -18,9 +18,11 @@ can hold: how the packages are built, and the traps.
 | `packages.…punktfunk-client` | `punktfunk-client` (GTK4 shell) + `punktfunk-session` (without the Skia OSD — see below) |
 | `packages.…punktfunk-web` | the management console (bun-built Nitro SSR bundle) |
 | `packages.…punktfunk-scripting` | the plugin/script runner (bun-bundled Effect SDK) |
-| `nixosModules.default` | `services.punktfunk.host` / `.client` / `.web` / `.scripting` |
+| `packages.…punktfunk-seats` | the seat supervisor, the door's helper, their units, tmpfiles rules and polkit rule, rewritten to the store path. The module points the door's host and console units at its own packages |
+| `nixosModules.default` | `services.punktfunk.host` / `.client` / `.web` / `.scripting` / `.seats` |
 | `devShells.…default` | pinned Rust from `rust-toolchain.toml` + every system library |
 | `checks.…nixos-module` | evaluates the module against real nixpkgs and asserts on the rendered units |
+| `checks.…nixos-vm` | boots the module with the real packages in a VM: the user units run, the runner keeps its sandbox. Builds the host; CI runs it under the `ci:nix-rust` label |
 
 One binary covers every GPU vendor: NVENC/CUDA entry points are `dlopen`'d at runtime, so the same
 host runs on NVIDIA, AMD/Intel or software.
@@ -47,15 +49,23 @@ A bare URL follows `main`, which is almost never the published commit.
 The cache serves its own public key at `https://nix.unom.io/punktfunk-cache.pub`, which is the
 source of truth to check any pinned copy against.
 
-**The module builds the host, client and gamescope from your nixpkgs**, so the cache never holds
-them. They dlopen Mesa from `/run/opengl-driver`, which loads only on the glibc it was built for or
-newer; a pinned nixpkgs older than yours leaves AMD and Intel with no EGL, Vulkan or VA-API. The web
-console and runner load no driver and still come from the cache. `packages.…` stay pinned for
-`nix build` and `nix run`.
+**The module builds the host, client and gamescope from your nixpkgs.** They dlopen Mesa from
+`/run/opengl-driver`, which loads only on the glibc it was built for or newer; a pinned nixpkgs
+older than yours leaves AMD and Intel with no EGL, Vulkan or VA-API. The cache holds them only for
+the nixpkgs in our `flake.lock`, so they hit it when your system's nixpkgs follows ours:
 
-**`nixpkgs.follows` turns the rest of the cache off.** Every store path is keyed by the exact inputs
-it was built from, so pointing punktfunk's nixpkgs at yours makes every path miss. It buys one
-shared nixpkgs in the closure instead of two.
+```nix
+inputs.nixpkgs.follows = "punktfunk/nixpkgs";
+```
+
+The canary nightly bumps that nixpkgs to the newest nixos-unstable and pushes the lock to `main` once
+it built; a release carries the lock it was tagged with. Overlays or config that change Mesa,
+PipeWire or another dependency still miss. The web console and runner load no driver and come from
+the cache either way. `packages.…` stay pinned for `nix build` and `nix run`.
+
+**`punktfunk.inputs.nixpkgs.follows` turns the rest of the cache off.** Every store path is keyed by
+the exact inputs it was built from, so pointing punktfunk's nixpkgs at yours makes every path miss.
+It buys one shared nixpkgs in the closure instead of two.
 
 **Why not cachix.** Punktfunk self-hosts every other channel, and a Nix cache is static files behind
 a web server, so it rides the same box and deploy key as the rest. It speaks plain binary-cache
@@ -116,8 +126,10 @@ GPU driver. `nix fmt` formats the `.nix` files.
   `// FIXME: if we have a 'nixpkgs' input, use it to check the module.`). Measured: a module setting
   a nonexistent option, referencing a nonexistent `pkgs` attribute **and** calling a nonexistent
   `lib` function passes clean, printing *all checks passed!*. So that line means nothing.
-  [`module-check.nix`](module-check.nix) closes the gap by evaluating against real nixpkgs in four
-  scenarios and asserting on the rendered systemd units. Two rules if you edit it: **keep every
+  [`module-check.nix`](module-check.nix) closes the gap by evaluating against real nixpkgs in a set
+  of scenarios and asserting on what the module renders: the drop-ins over the packaged user units,
+  and the system wiring. What the shipped unit itself declares is
+  [`vm-test.nix`](vm-test.nix)'s to check. Two rules if you edit it: **keep every
   assertion pure Nix** (instantiating the derivation is what runs them, which is what lets the cheap
   `--no-build` CI leg cover it), and **assert list-valued unit fields on the evaluated lists**, not
   the rendered text — systemd renders `After=` as one space-separated line, so an `hasInfix` on it

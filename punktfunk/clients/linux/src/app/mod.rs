@@ -8,6 +8,7 @@
 mod connect;
 pub mod gate;
 mod host_ops;
+mod profile;
 pub mod spawn;
 
 use crate::hosts::{self, ConnectRequest, HostsMsg, HostsOutput, HostsPage, Phase};
@@ -16,13 +17,19 @@ use crate::store::{Changed, Store};
 use crate::trust;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use pf_client_core::orchestrate::{trust_route, ConnectOutcome, TrustRoute};
+use pf_client_core::orchestrate::{
+    self, trust_route, ConnectAttempt, ConnectOutcome, ExitRoute, HostTarget, TrustRoute,
+    FINGERPRINT_CHANGED,
+};
+use pf_client_core::profiles::{ListedProfile as ProfileRow, ProfilePick};
 use pf_client_core::settings::GamepadUi;
 use pf_client_core::start;
 use relm4::prelude::*;
 use spawn::{CancelHandle, SpawnOpts};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 pub const APP_ID: &str = "io.unom.Punktfunk";
 
@@ -48,31 +55,12 @@ pub struct AppModel {
     library: Controller<LibraryPage>,
     /// Hosts · Library.
     views: adw::ViewStack,
-    /// One session child at a time — connects while one runs are ignored.
-    busy: bool,
-    /// Armed by [`AppMsg::WakeConnect`] (a dial to a host that isn't advertising but has a
-    /// known MAC): if THAT dial's child exits with a connect failure, `SessionExited` falls
-    /// back into the visible wake-and-wait instead of an error. Consumed on the next exit and
-    /// matched against the exiting request, so it can never redirect an unrelated failure.
-    wake_fallback: Option<ConnectRequest>,
-    /// The request-access "waiting for approval" dialog, closed on the first child
-    /// event. A shared slot (not a message): dialogs are main-thread GTK objects and
-    /// `AppMsg` must stay `Send` for the session child's reader thread.
-    ///
-    /// The handler id rides along because `close()` EMITS the close response: closing this
-    /// dialog in code is indistinguishable from the user pressing Cancel unless the handler
-    /// is disconnected first ([`AppModel::close_waiting`]).
-    waiting: crate::app::gate::WaitingSlot,
-    /// Set when this shell kills the session child itself (the request-access Cancel). Read
-    /// once on the child's exit: without it, EVERY signal death read as "we meant that" and
-    /// an OOM-killed or crashed stream vanished with no message at all.
-    session_cancelled: bool,
+    /// One connect at a time: whatever asks while one is in flight is ignored.
+    flight: connect::Flight,
     /// Controllers attached at the last poll — the edge Controller-optimized UI opens on.
     pads: usize,
     /// Fullscreen Always put the window there, so turning it off may take it back out.
     fullscreen_by_setting: bool,
-    /// The running session's child, from spawn to exit.
-    session: Option<CancelHandle>,
     /// "Streaming from …" on both pages, with Disconnect.
     streaming: Banners,
 }
@@ -93,6 +81,38 @@ pub enum AppMsg {
     SpeedTest(ConnectRequest),
     /// The Library on this host's shelf.
     OpenLibrary(ConnectRequest),
+    /// "Switch profile…": the picker without a connect.
+    SwitchProfile(ConnectRequest),
+    /// The profile list came back (`None`: the ask failed or ran late).
+    ProfileAsked {
+        req: ConnectRequest,
+        fp_hex: String,
+        switch: bool,
+        listed: Option<Option<Vec<ProfileRow>>>,
+    },
+    /// A circle in the picker was chosen.
+    ProfilePicked {
+        req: ConnectRequest,
+        fp_hex: String,
+        row: ProfileRow,
+        connect: bool,
+    },
+    /// The host refused the dialed profile as unknown; its list came back (`None`: the read
+    /// failed or ran late). `msg` is the refusal, shown when the profile is gone.
+    ProfileReasked {
+        req: ConnectRequest,
+        fp_hex: String,
+        id: String,
+        msg: String,
+        listed: Option<Option<Vec<ProfileRow>>>,
+    },
+    /// A seat poll's row, or the line that ends the wait. `stop` names the wait it belongs to.
+    SeatPolled {
+        stop: Arc<AtomicBool>,
+        row: Result<ProfileRow, String>,
+    },
+    /// The seat dialog closed by Cancel or Escape.
+    SeatCancelled(Arc<AtomicBool>),
     /// Show a destination by its view name.
     ShowView(&'static str),
     Find,
@@ -106,22 +126,17 @@ pub enum AppMsg {
         tofu: bool,
         opts: SpawnOpts,
     },
-    /// The child presented its first frame. `cancel` remains live across the reader-to-main
-    /// queue so a Cancel that overtakes this message still wins.
+    /// The child presented its first frame.
     SessionReady {
         req: ConnectRequest,
         fp_hex: String,
-        tofu: bool,
-        persist_paired: bool,
-        cancel: Option<CancelHandle>,
     },
     /// The child exited (the session is over, or the connect failed).
     SessionExited {
         req: ConnectRequest,
         code: i32,
-        error: Option<(String, bool)>,
+        error: Option<pf_client_core::orchestrate::SessionError>,
         ended: Option<String>,
-        tofu: bool,
     },
     /// Hand over to the gamepad console (`punktfunk-session --browse`) — the couch UI's
     /// door from the desktop shell.
@@ -131,10 +146,8 @@ pub enum AppMsg {
     /// Preferences closed: re-read what the window itself follows.
     SettingsClosed,
     ToggleFullscreen,
-    /// The console child exited; `Some` carries why it ended badly.
+    /// The console child exited; `Some` is the banner for one that ended badly.
     ConsoleExited(Option<String>),
-    /// Request-access Cancel: the child was killed; release busy quietly.
-    CancelPending,
     /// Upload the client log ring to this paired host (`logring::send_to_host`); the
     /// outcome lands as a Toast either way. The mgmt port rides along when an advert has one.
     SendLogs(ConnectRequest, Option<u16>),
@@ -147,7 +160,7 @@ pub enum AppMsg {
         label: String,
         danger: bool,
     },
-    /// The speed-test dialog resolved (either way) — release `busy`.
+    /// The speed-test page resolved, either way: it frees the slot.
     SpeedTestDone,
     ShowPreferences,
     /// Re-open Preferences editing a specific layer — the settings scope switcher's
@@ -159,42 +172,6 @@ pub enum AppMsg {
     /// End the running stream the way its window does.
     Disconnect,
     Toast(String),
-}
-
-fn ready_was_cancelled(cancel: Option<&CancelHandle>) -> bool {
-    cancel.is_some_and(CancelHandle::is_cancelled)
-}
-
-/// Whether Controller-optimized UI opens the console on this poll: on the first controller
-/// and never on a later one, so a console the player quit stays closed until every
-/// controller has gone and one comes back. Always opens it once, at launch.
-fn console_opens(ui: GamepadUi, prev: usize, now: usize) -> bool {
-    ui == GamepadUi::WithController && prev == 0 && now > 0
-}
-
-#[cfg(test)]
-mod cancel_tests {
-    use super::*;
-
-    #[test]
-    fn the_console_opens_on_the_first_controller_only() {
-        assert!(console_opens(GamepadUi::WithController, 0, 1));
-        assert!(!console_opens(GamepadUi::WithController, 1, 2));
-        assert!(!console_opens(GamepadUi::WithController, 2, 1));
-        assert!(!console_opens(GamepadUi::WithController, 1, 0));
-        assert!(!console_opens(GamepadUi::Off, 0, 1));
-        assert!(!console_opens(GamepadUi::Always, 0, 1));
-    }
-
-    #[test]
-    fn cancelled_request_rejects_late_ready() {
-        let cancel = CancelHandle::default();
-        assert!(!ready_was_cancelled(Some(&cancel)));
-
-        cancel.kill();
-
-        assert!(ready_was_cancelled(Some(&cancel)));
-    }
 }
 
 pub struct AppInit {
@@ -319,6 +296,7 @@ impl SimpleComponent for AppModel {
                 HostsOutput::Pair(req) => AppMsg::Pair(req),
                 HostsOutput::SpeedTest(req) => AppMsg::SpeedTest(req),
                 HostsOutput::Library(req) => AppMsg::OpenLibrary(req),
+                HostsOutput::SwitchProfile(req) => AppMsg::SwitchProfile(req),
                 HostsOutput::SendLogs(req, mgmt) => AppMsg::SendLogs(req, mgmt),
                 HostsOutput::HostAction {
                     req,
@@ -385,12 +363,8 @@ impl SimpleComponent for AppModel {
             hosts,
             library,
             views,
-            busy: false,
-            wake_fallback: None,
-            waiting: Rc::new(RefCell::new(None)),
-            session_cancelled: false,
+            flight: connect::Flight::default(),
             pads: 0,
-            session: None,
             streaming,
             fullscreen_by_setting: false,
         };
@@ -441,14 +415,16 @@ impl SimpleComponent for AppModel {
         let parked = PENDING_LINKS.with_borrow_mut(std::mem::take);
         // Where a bare launch opens (design/default-host.md). Only a bare one: `--connect`,
         // `--browse` and every headless verb have already exec'd or returned before the
-        // application object exists, and a parked link is explicit intent that wins outright.
+        // application object exists, and a link is explicit intent that wins outright. A link
+        // that launched this process is not parked yet: GApplication's `open` follows startup.
+        let bare = parked.is_empty() && crate::cli::deep_link_arg().is_none();
         let console_home = cfg!(feature = "console")
             && crate::shots::shot_scene().is_none()
             && model.store.settings().gamepad_ui() == GamepadUi::Always;
-        if parked.is_empty() && console_home {
+        if bare && console_home {
             // The console follows Start in itself.
             sender.input(AppMsg::OpenConsole);
-        } else if parked.is_empty() {
+        } else if bare {
             let settings = model.store.settings();
             let known = model.store.hosts();
             let (default, source) = start::default_host_with_source(&settings, &known);
@@ -461,7 +437,10 @@ impl SimpleComponent for AppModel {
             let screen = start::start_screen(&settings, &known);
             drop(settings);
             if let Some(i) = screen.host_index() {
-                let req = hosts::saved_request(&known.hosts[i]);
+                let req = ConnectRequest {
+                    host: HostTarget::from(&known.hosts[i]),
+                    ..ConnectRequest::default()
+                };
                 sender.input(AppMsg::OpenLibrary(req.clone()));
                 // Stream is the library PLUS a connect, never a screen of its own: the session
                 // window is the overlay, so ending it leaves the shelf on screen underneath.
@@ -485,25 +464,57 @@ impl SimpleComponent for AppModel {
             AppMsg::DeepLink(url) => self.open_deep_link(&url, &sender),
             AppMsg::Connect(req) => self.connect(req, &sender),
             AppMsg::WakeConnect(req) => {
-                if !self.busy {
+                if !self.flight.busy() {
                     // Never gate the dial on mDNS presence: a routed host (Tailscale/VPN) never
                     // advertises. The magic packet goes first, fire-and-forget, so an asleep box
                     // boots while the dial times out, and the fallback is armed for THIS request.
                     // Auto-wake off means no packet and no wake-and-wait, just the normal dial
                     // error; the host-card menu's explicit "Wake host" stays ungated.
                     if self.store.settings().auto_wake {
-                        crate::wol::wake(&req.mac, req.addr.parse().ok());
-                        self.wake_fallback = Some(req.clone());
+                        crate::wol::wake(&req.host.mac, req.host.addr.parse().ok());
+                        self.flight.attempt.arm_wake(&req.host);
                     }
                     sender.input(AppMsg::Connect(req));
                 }
             }
             AppMsg::Pair(req) => {
-                if !self.busy {
-                    crate::app::gate::pin_dialog(&self.window, &sender, self.identity.clone(), req);
+                if !self.flight.busy() {
+                    crate::app::gate::pin_dialog(
+                        &self.window,
+                        &sender,
+                        self.identity.clone(),
+                        req,
+                        false,
+                    );
                 }
             }
             AppMsg::SpeedTest(req) => self.speed_test(req, &sender),
+            AppMsg::SwitchProfile(req) => {
+                if let Some(fp_hex) = req.host.pin().map(str::to_string) {
+                    self.ask_profile(req, fp_hex, true, &sender);
+                }
+            }
+            AppMsg::ProfileAsked {
+                req,
+                fp_hex,
+                switch,
+                listed,
+            } => self.profile_asked(req, fp_hex, switch, listed, &sender),
+            AppMsg::ProfilePicked {
+                req,
+                fp_hex,
+                row,
+                connect,
+            } => self.profile_picked(req, fp_hex, row, connect, &sender),
+            AppMsg::ProfileReasked {
+                req,
+                fp_hex,
+                id,
+                msg,
+                listed,
+            } => self.profile_reasked(req, fp_hex, id, msg, listed, &sender),
+            AppMsg::SeatPolled { stop, row } => self.seat_polled(stop, row, &sender),
+            AppMsg::SeatCancelled(stop) => self.seat_cancelled(&stop),
             AppMsg::SendLogs(req, mgmt_port) => self.send_logs(req, mgmt_port, &sender),
             AppMsg::HostAction {
                 req,
@@ -512,7 +523,7 @@ impl SimpleComponent for AppModel {
                 label,
                 danger,
             } => self.host_action(req, mgmt, action_id, label, danger, &sender),
-            AppMsg::SpeedTestDone => self.busy = false,
+            AppMsg::SpeedTestDone => self.flight.release(),
             AppMsg::OpenLibrary(req) => {
                 self.show_view("library");
                 self.library.emit(LibraryMsg::Open(req));
@@ -532,24 +543,19 @@ impl SimpleComponent for AppModel {
                 tofu,
                 opts,
             } => self.start_session(req, fp_hex, tofu, opts, &sender),
-            AppMsg::SessionReady {
-                req,
-                fp_hex,
-                tofu,
-                persist_paired,
-                cancel,
-            } => self.session_ready(req, fp_hex, tofu, persist_paired, cancel),
+            AppMsg::SessionReady { req, fp_hex } => self.session_ready(req, fp_hex),
             AppMsg::SessionExited {
                 req,
                 code,
                 error,
                 ended,
-                tofu,
-            } => self.session_exited(req, code, error, ended, tofu, &sender),
+            } => self.session_exited(req, code, error, ended, &sender),
             AppMsg::OpenConsole => self.open_console(&sender, false),
             AppMsg::Pads(n) => {
                 let prev = std::mem::replace(&mut self.pads, n);
-                if !self.busy && console_opens(self.store.settings().gamepad_ui(), prev, n) {
+                if !self.flight.busy()
+                    && orchestrate::console_opens(self.store.settings().gamepad_ui(), prev, n)
+                {
                     self.open_console(&sender, true);
                 }
             }
@@ -562,21 +568,12 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::ConsoleExited(err) => {
-                self.busy = false;
+                self.flight.release();
                 // Quitting the console (B at its root) exits 0 and returns here silently.
                 if let Some(e) = err {
-                    self.hosts
-                        .emit(HostsMsg::ShowError(format!("Console UI ended — {e}")));
+                    self.hosts.emit(HostsMsg::ShowError(e));
                 }
                 self.hosts.emit(HostsMsg::Refresh);
-            }
-            AppMsg::CancelPending => {
-                // The child is being killed by the handler that sent this; its exit is ours.
-                self.session_cancelled = true;
-                self.close_waiting();
-                self.busy = false;
-                self.hosts.emit(HostsMsg::SetSession(None));
-                self.toast("Cancelled — the request may still be pending on the host.");
             }
             AppMsg::ShowPreferences => sender.input(AppMsg::ShowPreferencesScoped(
                 crate::settings::Scope::Defaults,
@@ -586,9 +583,9 @@ impl SimpleComponent for AppModel {
             AppMsg::ShowAbout => crate::settings::show_about(&self.window),
             AppMsg::ShowAddHost => self.hosts.emit(HostsMsg::ShowAddHost),
             AppMsg::Disconnect => {
-                if let Some(child) = &self.session {
-                    // Our own end: an escalated kill must not read as a crash.
-                    self.session_cancelled = true;
+                if let connect::Slot::Session(child) = &self.flight.slot {
+                    // `terminate` records our own end, so an escalated kill does not read as
+                    // a crash.
                     child.terminate(DISCONNECT_GRACE);
                     self.streaming.show("Disconnecting\u{2026}", None);
                 }
@@ -680,8 +677,11 @@ fn clear_steam_sdl_device_filter() {
 
 pub fn run() -> glib::ExitCode {
     // Logs to stdout and the ring "Send logs to host" uploads. The spawned session's stderr
-    // joins the ring too, so a bundle carries the stream's trail.
-    pf_client_core::logring::init_tracing(std::io::stdout, true);
+    // joins the ring too, so a bundle carries the stream's trail. Colour only on a terminal.
+    pf_client_core::logring::init_tracing(
+        std::io::stdout,
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    );
     // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming every
     // physical pad Steam Input has virtualized; the Settings controller list needs the
     // real devices (same rationale as the session binary).
@@ -900,9 +900,18 @@ fn store_health_banner(pages: &[adw::ToolbarView], store: &Store) {
     store.subscribe(move |_| check());
 }
 
-/// The Keyboard Shortcuts dialog: this window's keys, then the session window's, kept here
-/// as discoverable documentation.
+/// The Keyboard Shortcuts dialog: this window's keys, then the session window's, then the
+/// controller chords and touch gestures, which have no accelerator to draw.
 pub fn shortcuts_dialog() -> adw::ShortcutsDialog {
+    let dialog = adw::ShortcutsDialog::new();
+    for section in shortcut_sections() {
+        dialog.add(section);
+    }
+    dialog
+}
+
+fn shortcut_sections() -> Vec<adw::ShortcutsSection> {
+    use pf_client_core::shortcuts;
     let shell = adw::ShortcutsSection::new(Some("This window"));
     for (title, action, _) in ACCELS {
         shell.add(adw::ShortcutsItem::from_action(title, action));
@@ -923,15 +932,50 @@ pub fn shortcuts_dialog() -> adw::ShortcutsDialog {
             "Mute or unmute your microphone (only while the stream sends one)",
             "<Control><Alt><Shift>v",
         ),
-        (
-            "Open the quick actions dial (a pad opens it with Select + A, and aims it with the left stick)",
-            "<Control><Alt><Shift>o",
-        ),
+        ("Open the quick actions dial", "<Control><Alt><Shift>o"),
+        ("Switch the mouse mode", "<Control><Alt><Shift>m"),
     ] {
         stream.add(adw::ShortcutsItem::new(title, accel));
     }
-    let dialog = adw::ShortcutsDialog::new();
-    dialog.add(shell);
-    dialog.add(stream);
-    dialog
+    let mut sections = vec![shell, stream];
+    // The keyboard group is the sections above; the rest read from the shared list.
+    for g in shortcuts::groups(shortcuts::Client::Desktop, true)
+        .into_iter()
+        .filter(|g| g.title != "Keyboard")
+    {
+        let section = adw::ShortcutsSection::new(Some(g.title));
+        for i in g.items {
+            let item = adw::ShortcutsItem::new(i.text, "");
+            item.set_subtitle(i.keys);
+            section.add(item);
+        }
+        sections.push(section);
+    }
+    sections
+}
+
+#[cfg(test)]
+mod shortcuts_tests {
+    /// Every section of the dialog holds items, and the controller chords are in it.
+    /// Needs a display and its own process:
+    /// `cargo test -p punktfunk-client-linux -- --ignored shortcuts_dialog_lists`.
+    #[test]
+    #[ignore = "needs a Wayland/X display"]
+    fn shortcuts_dialog_lists_the_controller_chords() {
+        use adw::prelude::*;
+        assert!(gtk::init().is_ok() && adw::init().is_ok(), "no display");
+        let _ = super::shortcuts_dialog();
+        let mut found = false;
+        for section in super::shortcut_sections() {
+            assert!(section.n_items() > 0, "{:?} is empty", section.title());
+            for i in 0..section.n_items() {
+                let item = section
+                    .item(i)
+                    .and_downcast::<adw::ShortcutsItem>()
+                    .unwrap();
+                found |= item.subtitle() == "Select + A";
+            }
+        }
+        assert!(found, "no Select + A row");
+    }
 }

@@ -5,14 +5,16 @@
 import { type PluginUiHandle, servePluginUi } from "@punktfunk/host";
 import { decodeHostEvent, type GameRef } from "@punktfunk/host/core";
 import { Effect, FileSystem, Layer, Path, Schema, type Scope } from "effect";
-import { Etag, HttpPlatform, HttpRouter } from "effect/unstable/http";
+import { Etag, HttpPlatform, HttpRouter } from "effect/http";
 import type { ConfigService } from "./config.js";
+import { makeInstallHandler, type ServeUiInstall } from "./downloads.js";
 import { UiServeError } from "./errors.js";
 import {
 	HostClient,
 	type HostClientService,
 	PluginInfo,
 } from "./host-client.js";
+import { PAGE_SEGMENT } from "./wire.js";
 
 /**
  * Everything `HttpApiBuilder.layer` needs beyond the router, satisfied from effect core —
@@ -29,7 +31,7 @@ export const httpApiEnv = Layer.provideMerge(
  * Returns `null` when derivation isn't possible, which the console reads as "render the raw JSON
  * editor instead" — the fallback that bounds this whole feature's risk.
  *
- * Authoring rules, verified against effect 4.0.0-beta.99 and pinned by
+ * Authoring rules, verified against effect 4.0.1 and pinned by
  * `test/library-config.test.ts` — if an effect upgrade changes any of them, that test fails:
  *
  * * Use `Schema.Finite` / `Schema.Int`, **never `Schema.Number`** — Number's *encoded* form admits
@@ -40,8 +42,8 @@ export const httpApiEnv = Layer.provideMerge(
  *   time with "Not a valid effect" — deriving is not evidence that the schema works.
  * * Annotate every field: `.annotate({ title, description, default })`. The derivation does NOT
  *   infer `default` from `withDecodingDefaultKey`, so an un-annotated field shows no placeholder.
- * * A *checked* schema (`Schema.Int`, or anything with `.check(...)`) nests its annotations and
- *   constraints under `allOf`, so a form must merge those branches, not read only the top level.
+ * * A *checked* schema (`Schema.Int`, or anything with `.check(...)`) keeps its annotations and
+ *   constraints on the property itself; a form still merges `allOf` branches when one appears.
  * * `Schema.Literals([...])` derives a clean `enum` — prefer it over a union of strings. A union of
  *   non-literals derives an `anyOf`, which is the JSON-editor fallback case.
  * * Fields carrying `withDecodingDefaultKey(..., { encodingStrategy: "omit" })` correctly drop out
@@ -147,7 +149,16 @@ export interface ServeUiGame<S extends Schema.Top> {
 	readonly status?: (
 		entryId: string,
 	) => Effect.Effect<ReadonlyArray<StatusLine>>;
+	/**
+	 * This entry's route in the plugin's own page, one segment like `game.abc`. The tab links to
+	 * it; anything else is dropped.
+	 */
+	readonly page?: (entryId: string) => Effect.Effect<string | undefined>;
 }
+
+/** `page` when it is one segment the console's plugin route can carry (`PAGE_SEGMENT`). */
+const pageRoute = (page: string | undefined): string | undefined =>
+	page !== undefined && new RegExp(PAGE_SEGMENT).test(page) ? page : undefined;
 
 /**
  * A library id the host accepts: `<store>:<external id>`, both halves non-empty, at most 1024
@@ -208,7 +219,17 @@ export const makeGameHandler = <S extends Schema.Top>(
 			const status = game.status
 				? await Effect.runPromise(game.status(entry)).catch(() => [])
 				: [];
-			return Response.json({ schema, value, status: cleanStatus(status) });
+			const page = game.page
+				? pageRoute(
+						await Effect.runPromise(game.page(entry)).catch(() => undefined),
+					)
+				: undefined;
+			return Response.json({
+				schema,
+				value,
+				status: cleanStatus(status),
+				...(page ? { page } : {}),
+			});
 		}
 		if (req.method === "PUT") {
 			let body: unknown;
@@ -329,6 +350,11 @@ export interface ServeUiOptions {
 	readonly holds?: ServeUiHolds;
 	readonly holdTimeoutMs?: number;
 	/**
+	 * Serve `POST /__install`: the host asks this plugin to install, pause, cancel or remove one
+	 * of its titles. Report progress with `downloadReporter`, and mark entries with `install`.
+	 */
+	readonly install?: ServeUiInstall;
+	/**
 	 * The plugin API: `HttpApiBuilder.layer(api)` + group handler layers + raw routes
 	 * (e.g. `sseRoute`), with plugin services already provided. `httpApiEnv` is provided
 	 * here — only `HttpRouter` may remain open.
@@ -370,6 +396,9 @@ export const serveUi = (
 			: undefined;
 		const serveGame = opts.game ? makeGameHandler(opts.game) : undefined;
 		const serveHold = opts.holds ? makeHoldHandler(opts.holds) : undefined;
+		const serveInstall = opts.install
+			? makeInstallHandler(opts.install)
+			: undefined;
 
 		const fetch = async (req: Request): Promise<Response | undefined> => {
 			const url = new URL(req.url);
@@ -389,6 +418,11 @@ export const serveUi = (
 			}
 			if (url.pathname === "/__hold") {
 				return serveHold?.(req) ?? new Response("not found", { status: 404 });
+			}
+			if (url.pathname === "/__install") {
+				return (
+					serveInstall?.(req) ?? new Response("not found", { status: 404 })
+				);
 			}
 			if (!url.pathname.startsWith(prefix)) return undefined; // → static SPA
 			return handler(req);
@@ -412,6 +446,7 @@ export const serveUi = (
 							page: opts.staticDir !== undefined,
 							config: opts.config !== undefined,
 							game: opts.game !== undefined,
+							install: opts.install !== undefined,
 						},
 						...(opts.holds
 							? {

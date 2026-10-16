@@ -7,7 +7,7 @@ Copy on your device and paste on the host, or the other way round, once three sw
 
 ## Turn it on
 
-1. **On the host:** in the web console, open **Host → Settings → Streaming** and set **Shared
+1. **On the host:** in the web console, open **Host → Streaming** and set **Shared
    clipboard** to **Text** or **Text and files**. It applies from the next stream.
 2. **For your device:** its [access level](/docs/access-levels) must include **Clipboard**.
    **Full control** does.
@@ -24,7 +24,7 @@ Copy on your device and paste on the host, or the other way round, once three sw
 
 The client reads its switch when a stream starts, so reconnect after changing it. On a Mac,
 **Stream → Share Clipboard** (⌃⌥⇧C) turns it on mid-stream and **Stop Sharing Clipboard** turns
-it off. The same keys work on an iPad with a keyboard while input is released.
+it off. The same keys work on an iPad with a keyboard.
 
 A `PUNKTFUNK_CLIPBOARD` line in `host.env` overrides step 1 and locks it in the console: see
 [Configuration](/docs/configuration).
@@ -53,8 +53,9 @@ A `PUNKTFUNK_CLIPBOARD` line in `host.env` overrides step 1 and locks it in the 
 - **Moonlight has no clipboard.** It exists only in Punktfunk sessions.
 
 A Linux host needs a desktop that offers a clipboard to it: `ext-data-control-v1` (KWin, Sway,
-Hyprland and other wlroots compositors) or GNOME's remote-desktop clipboard. A
-[gamescope](/docs/gamescope) session has none. A Windows host always has one.
+Hyprland, niri and other wlroots compositors) or GNOME's remote-desktop clipboard. A
+[gamescope](/docs/gamescope) session keeps one plain-text clipboard, so only text crosses there.
+A Windows host always has one.
 
 ## Why the toggle does nothing (or is greyed out)
 
@@ -69,7 +70,8 @@ Work down this list:
 | Your client's switch is off for this host, or you changed it while streaming | Step 3, then reconnect. |
 | Your device's access level lacks **Clipboard** | Step 2. |
 | You're on Linux, a Steam Deck or an Apple TV | These clients don't move the clipboard yet. |
-| The host's session has no clipboard (gamescope, or a desktop without the protocols above) | The host log says `clipboard backend unavailable`. Stream a desktop session instead. |
+| The host's desktop has no clipboard (none of the protocols above) | The host log says `clipboard backend unavailable`. Stream another desktop session instead. |
+| A picture doesn't cross in a gamescope session | gamescope's clipboard holds text only. |
 
 The host logs a `clipboard control` line for each stream with what it decided. See
 [Troubleshooting](/docs/troubleshooting) for where the log is.

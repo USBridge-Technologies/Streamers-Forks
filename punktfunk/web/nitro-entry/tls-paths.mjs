@@ -29,9 +29,8 @@
 //
 // Swapped as a PAIR or not at all — a native cert with the legacy key is a server that cannot
 // complete a handshake with anyone, so both halves must be present AND must come from the same
-// directory. A host that never took the split (upgraded, native clients still pinning the RSA cert,
-// so `load_or_adopt` keeps serving it) has no native pair on disk and falls through unchanged, as
-// does a cert an operator supplied under any other name.
+// directory. An older host still serving the RSA pair to native clients has no native pair on disk
+// and falls through unchanged, as does a cert an operator supplied under any other name.
 import { statSync } from "node:fs";
 
 /**
@@ -48,7 +47,7 @@ import { statSync } from "node:fs";
  * @param {string} base
  * @returns {string | null}
  */
-function dirPrefix(p, base) {
+export function dirPrefix(p, base) {
 	if (p === base) return ""; // bare relative name
 	if (!p.endsWith(base)) return null;
 	const sep = p[p.length - base.length - 1];

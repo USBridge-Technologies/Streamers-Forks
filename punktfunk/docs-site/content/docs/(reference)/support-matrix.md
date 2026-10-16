@@ -35,8 +35,9 @@ Each session gets its own display at the client's resolution and refresh rate �
 | gamescope (SteamOS · Bazzite) | ✅ ³ | ⚠️ ⁴ | ✅ |
 | sway · scroll | ✅ ⁵ | ✅ | ⚠️ ⁶ |
 | Hyprland | ✅ | ✅ | ⚠️ ⁶ |
-| Cinnamon (Mint · LMDE) | ❌ ⁷ | ❌ | ❌ |
-| River, dwl, COSMIC, niri, others | ❌ ⁸ | ❌ | ❌ |
+| niri (biri) | ✅ ⁷ | ✅ | ✅ ⁸ |
+| Cinnamon (Mint · LMDE) | ❌ ⁹ | ❌ | ❌ |
+| River, dwl, COSMIC, others | ❌ ¹⁰ | ❌ | ❌ |
 
 1. Punktfunk's own display driver. Needs Windows 11 22H2 (build 22621); the installer refuses
    anything older. Each paired client gets its own monitor identity carrying its screen's HDR
@@ -50,20 +51,24 @@ Each session gets its own display at the client's resolution and refresh rate �
    hardware yet. See [Sway](/docs/sway).
 6. The host writes the portal's output-chooser config, so a box with nobody at it can answer
    "which output?".
-7. Cinnamon's compositor has no virtual-output API. A Mint or LMDE box can still stream games
+7. Needs [biri](/docs/niri#get-biri), a niri fork that adds virtual outputs. Stock niri can stream
+   only a monitor you pin. Driven over niri's IPC.
+8. Run with every monitor switched off in niri; not yet on a box with none plugged in.
+9. Cinnamon's compositor has no virtual-output API. A Mint or LMDE box can still stream games
    through a headless gamescope — see [Requirements](/docs/requirements#cinnamon-linux-mint-and-lmde).
-8. No host backend. River is detected and takes input, but has no video path.
+10. No host backend. River is detected and takes input, but has no video path.
 
 ### Input, cursor and HDR
 
 | Host | Input backend | Approval dialog | Client-drawn cursor | HDR10 source |
 |---|---|---|---|---|
-| Windows | SendInput | none ¹ | ✅ ² | ✅ ³ |
+| Windows | virtual HID device ¹¹ | none ¹ | ✅ ² | ✅ ³ |
 | KDE Plasma (KWin) | KWin fake input | none ⁴ | ✅ | ❌ ⁵ |
 | GNOME (Mutter) | libei, direct to Mutter | none | ✅ ⁶ | ⚠️ ⁷ |
 | gamescope | libei (gamescope's own) | none | ⚠️ ⁸ | ⚠️ ⁹ |
 | sway · scroll | wlroots virtual pointer + keyboard | none | ❌ ¹⁰ | ❌ ⁵ |
 | Hyprland | wlroots virtual pointer + keyboard | none | ❌ ¹⁰ | ❌ ⁵ |
+| niri (biri) | wlroots virtual pointer + keyboard | none | ❌ ¹² | ❌ ⁵ |
 
 1. The host must run in the signed-in console session, not session 0; the installed service
    starts it there. Over SSH you land in session 0 — see [Windows host](/docs/windows-host).
@@ -83,6 +88,10 @@ Each session gets its own display at the client's resolution and refresh rate �
 9. Needs the patched `punktfunk-gamescope` and a session this host started or manages; an attached
    session streams SDR. See [HDR on gamescope](/docs/gamescope#hdr-on-gamescope).
 10. Their portals offer no separate cursor, so the pointer is always part of the video.
+11. Mouse and keyboard reach Windows as a USB-style HID device, so games that refuse injected input
+    take them. Text, touch and pen use `SendInput` and synthetic pointers. A seat host, and a point
+    off the primary monitor, use `SendInput` too.
+12. The host doesn't carry niri's pointer separately, so it is always part of the video.
 
 ### Version floors worth knowing
 
@@ -94,6 +103,8 @@ Each session gets its own display at the client's resolution and refresh rate �
 - **sway 1.8** — removes headless outputs again on teardown.
 - **Hyprland** — no version gate. With `ecosystem.enforce_permissions` on (0.49+, off by default),
   grant the host `screencopy` — see [Hyprland](/docs/hyprland).
+- **biri built 2026-09-04 or later** — stock niri has no virtual outputs, and older biri builds
+  crash niri when an `off` virtual output is removed. See [niri](/docs/niri#get-biri).
 - **gamescope 3.16.22** — below it, headless capture deadlocks against PipeWire 1.6 and newer.
   **3.16.23** — below it, the Steam overlay never reaches the stream. The host warns but doesn't
   refuse.
@@ -103,32 +114,32 @@ Each session gets its own display at the client's resolution and refresh rate �
 | Host GPU | Backend | Codecs ¹ | HDR | 10-bit SDR | 4:4:4 |
 |---|---|---|---|---|---|
 | Windows · NVIDIA | NVENC | H.264 · HEVC · AV1 | ✅ | ✅ | ⚠️ ² |
-| Windows · AMD | AMF | H.264 · HEVC · AV1 | ✅ | ⚠️ ³ | ❌ ⁴ |
-| Windows · Intel | QSV | H.264 · HEVC · AV1 | ✅ | ❌ | ❌ |
-| Windows · other | Media Foundation ⁵ | H.264 · HEVC | ❌ | ❌ | ❌ |
-| Windows · none | — ⁶ | — | — | — | — |
+| Windows · AMD | AMF | H.264 · HEVC · AV1 | ✅ | ✅ | ❌ ³ |
+| Windows · Intel | QSV | H.264 · HEVC · AV1 | ✅ | ✅ | ❌ |
+| Windows · other | Media Foundation ⁴ | H.264 · HEVC | ❌ | ❌ | ❌ |
+| Windows · none | — ⁵ | — | — | — | — |
 | Linux · NVIDIA | NVENC | H.264 · HEVC · AV1 | ✅ | ✅ | ⚠️ ² |
-| Linux · AMD, Intel | Vulkan Video ⁷ | HEVC · AV1 | ✅ | ⚠️ ⁷ | ❌ |
+| Linux · AMD, Intel | Vulkan Video ⁶ | HEVC · AV1 | ✅ | ⚠️ ⁶ | ❌ |
 | Linux · AMD, Intel | VAAPI | H.264 · HEVC | ✅ | ✅ | ❌ |
-| Any GPU | PyroWave ⁸ | wavelet | ✅ | ⚠️ ⁸ | ✅ |
-| Linux · none | Software ⁹ | H.264 | ❌ | ❌ | ❌ |
+| Any GPU | PyroWave ⁷ | wavelet | ✅ | ⚠️ ⁷ | ✅ |
+| Linux · none | Software ⁸ | H.264 | ❌ | ❌ | ❌ |
 
 1. Intersected with what your GPU and driver report. AV1 encode needs NVIDIA Ada, AMD RDNA3, Intel
    Arc or newer. If the NVENC probe can't run, the host advertises all three codecs.
 2. HEVC only, where the GPU supports 4:4:4. On Windows it combines with HDR; on Linux 4:4:4 is
    8-bit, so a session asking for both gets HDR at 4:2:0.
-3. HEVC only.
-4. AMD's encoder never produces 4:4:4.
-5. Picked when the GPU isn't NVIDIA, AMD or Intel but has a hardware encoder (an Adreno, say), and
+3. AMD's encoder never produces 4:4:4.
+4. Picked when the GPU isn't NVIDIA, AMD or Intel but has a hardware encoder (an Adreno, say), and
    as the fallback when a native encoder won't open on an 8-bit 4:2:0 H.264 or HEVC session.
    Windows on ARM64 has only this backend.
-6. Windows has no software encoder: a box with no usable GPU encoder can't stream.
-7. HEVC and AV1 where the device opens that profile, 10-bit SDR included; anything else goes to
+5. Windows has no software encoder: a box with no usable GPU encoder can't stream.
+6. HEVC and AV1 where the device opens that profile, 10-bit SDR included; anything else goes to
    VAAPI. **Vulkan encoding** in
-   [Host → Settings](/docs/configuration#settings-in-the-web-console) turns this backend off.
-8. [PyroWave](/docs/pyrowave) runs only when the client picks it. Full chroma on any vendor; modes
-   around 8K fall back to 4:2:0. 10-bit SDR on Linux only. Not in Windows ARM64 builds.
-9. Only with `PUNKTFUNK_ENCODER=software`; `auto` never picks it on Linux.
+   [Host](/docs/configuration#settings-in-the-web-console) turns this backend off.
+7. [PyroWave](/docs/pyrowave) runs only when the client picks it. Full chroma on any vendor; modes
+   around 8K fall back to 4:2:0. 10-bit SDR on Linux, and on Windows 11 24H2 and later. Not in
+   Windows ARM64 builds.
+8. Only with `PUNKTFUNK_ENCODER=software`; `auto` never picks it on Linux.
 
 HEVC 4:4:4 means an NVIDIA host, or pick PyroWave. Asking for 4:4:4 is a client setting, off by
 default, on the Linux, Windows and Apple clients; Android has none, and GameStream sessions are
@@ -259,6 +270,9 @@ Apple is one app across macOS, iOS/iPadOS and tvOS. Android TV is the Android ap
 1. Several controllers, each on a stable slot. The pad-type picker on Linux, Windows and the
    console home offers Automatic, Xbox 360, Xbox One, DualSense, DualShock 4, Steam Deck and Steam
    Controller 2; Apple and Android offer the first six, with Steam Controller 2 as its own switch.
+   A 2015 Steam Controller on its cable, its dongle or Bluetooth reaches a Linux or Windows host
+   as itself: from the Linux, Windows and Android clients with nothing to set, and from Apple
+   devices with the Steam Controller 2 switch on (iPhone, iPad and Apple TV over Bluetooth).
 2. DualSense and DualShock 4 touchpad and motion are forwarded, and adaptive triggers and the
    lightbar play back on a real DualSense. Any pad with a gyro sends motion. The host's virtual pad
    needs a gyro to use it: Xbox pads have none, and **Automatic** picks Xbox for pads it doesn't
@@ -325,8 +339,8 @@ Either side can be the reason one of these didn't happen:
   the client. Only the Apple app greys **Share Clipboard** out when the host hasn't offered it.
 - **Pen input** — the host offers it only with a usable `/dev/uinput` (Linux) or Windows 10 1809+.
   Without it, clients turn pen into touch.
-- **Committed text (IME)** — the Windows host and the wlroots backend (sway, scroll, Hyprland) type
-  any text. KDE, GNOME and gamescope fall back to key presses, which can't express every character.
+- **Committed text (IME)** — the Windows host and the wlroots backend (sway, scroll, Hyprland, niri)
+  type any text. KDE, GNOME and gamescope fall back to key presses, which can't express every character.
 - **Client-drawn cursor** — needs the client in desktop mouse mode and a host that carries the
   cursor separately ([table](#input-cursor-and-hdr)). Then the host stops drawing the pointer into
   the video.
@@ -350,27 +364,28 @@ Either side can be the reason one of these didn't happen:
 
 ## Mixing versions
 
-Update a host and its clients in any order; paired devices stay paired. A feature one end doesn't
+Update the host first, then its clients; paired devices stay paired. A feature one end doesn't
 know is not offered, and the session goes ahead without it — see
 [Things both ends have to agree on](#things-both-ends-have-to-agree-on).
 
 | Contract | Current | Rule |
 |---|---|---|
-| `punktfunk/1` wire version | **2** | Client and host must match. |
-| C ABI version | **37** | Between an app and the core library it ships with. |
+| Native protocol | **`punktfunk/2`** | A 0.44 host streams to 0.43 apps and newer. A 0.44 app needs a 0.44 host: an older one shows as offline, and connecting says "update both". |
+| C ABI version | **55** | Between an app and the core library it ships with. |
 | Windows display-driver protocol | **9** | Host and driver must match; the installer updates both. |
 | Windows virtual-gamepad channel | **3** | Host and pad driver must match; same installer. |
 
 ## Where it has been run
 
-Development and testing run on Linux hosts under KWin, Mutter, gamescope, wlroots and Hyprland on
-NVIDIA and AMD GPUs, and on Windows hosts on NVIDIA, AMD and Intel, with the macOS, Linux, Windows
+Development and testing run on Linux hosts under KWin, Mutter, gamescope, wlroots, Hyprland and niri
+(biri) on NVIDIA and AMD GPUs, and on Windows hosts on NVIDIA, AMD and Intel, with the macOS, Linux, Windows
 and Android clients and stock Moonlight. HDR on gamescope has been run end to end on Bazzite and
 SteamOS.
 
 ## What is not verified
 
 - **scroll as a host** — detected and driven like sway, not yet run on real hardware.
+- **niri (biri) on AMD and Intel** — run on NVIDIA only.
 - **gamescope headless capture on the proprietary NVIDIA driver** — plausible, not well trodden,
   and no probe would catch it failing.
 - **Touch input from a Windows client** — the same code as Linux, not run on a Windows touchscreen.

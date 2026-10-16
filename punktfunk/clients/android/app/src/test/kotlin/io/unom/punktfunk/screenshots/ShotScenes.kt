@@ -61,8 +61,9 @@ import io.unom.punktfunk.BrandDark
 import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
 import io.unom.punktfunk.OsdScaled
-import coil.ImageLoader
-import coil.test.FakeImageLoaderEngine
+import coil3.ImageLoader
+import coil3.asImage
+import coil3.test.FakeImageLoaderEngine
 import io.unom.punktfunk.AddHostSheet
 import io.unom.punktfunk.ControllersScreen
 import io.unom.punktfunk.TouchGrid
@@ -554,20 +555,29 @@ internal fun StreamBannerScene(pad: Boolean) {
 
 /**
  * The companion panel on a dual-screen handheld's lower screen: the real [CompanionPanel] on
- * [page], with the stream scene's Normal lines and a session where every action is available.
+ * [page], with a demo minute behind the graphs, the stream scene's Normal lines behind the text
+ * view, and a session where every action is available.
  */
 @Composable
-internal fun CompanionScene(page: io.unom.punktfunk.CompanionPage) {
+internal fun CompanionScene(
+    page: io.unom.punktfunk.CompanionPage,
+    statsView: io.unom.punktfunk.StatsView = io.unom.punktfunk.StatsView.GRAPHS,
+) {
     io.unom.punktfunk.CompanionPanel(
         pages = io.unom.punktfunk.CompanionPage.entries,
         page = page,
         onPage = {},
+        header = io.unom.punktfunk.PanelHeader("Living Room PC · Starfall Vale", "1920×1080 · 120 Hz"),
+        history = remember { io.unom.punktfunk.StatsHistory.demo() },
         stats = shotLines(StatsVerbosity.NORMAL, 1920, 1080, 120, 119.0, 92.1, loss = false),
+        statsView = statsView,
+        onStatsView = {},
         tier = StatsVerbosity.NORMAL,
         onTier = {},
         cfg = io.unom.punktfunk.OverlayConfig.platformDefault(),
         actions = io.unom.punktfunk.fakeRingActions(),
         haptics = remember { io.unom.punktfunk.ConsoleHaptics(null) },
+        keys = { _, _ -> },
         trackpad = {},
         pad = {},
     )
@@ -659,7 +669,7 @@ internal fun TouchLibraryScene() {
                     Icon(Icons.Filled.Refresh, contentDescription = "Reload")
                 }
             }
-            TouchGrid(games, loader, onLaunch = {}, onCopyLink = {}, modifier = Modifier.weight(1f))
+            TouchGrid(games, loader, onLaunch = {}, onLink = { _, _ -> }, modifier = Modifier.weight(1f))
         }
     }
 }
@@ -675,11 +685,11 @@ private fun shotGames() = listOf(
 
 private fun shotLibraryLoader(context: Context): ImageLoader {
     val engine = FakeImageLoaderEngine.Builder()
-        .intercept("shot://art/aurora", poster(context, "AURORA DRIFT", ::drawAurora))
-        .intercept("shot://art/starfall", poster(context, "STARFALL VALE", ::drawStarfall))
-        .intercept("shot://art/neon", poster(context, "NEON CIRCUIT", ::drawNeon))
-        .intercept("shot://art/ember", poster(context, "EMBER PEAKS", ::drawEmber))
-        .default(ColorDrawable(0xFF221E44.toInt()))
+        .intercept("shot://art/aurora", poster(context, "AURORA DRIFT", ::drawAurora).asImage())
+        .intercept("shot://art/starfall", poster(context, "STARFALL VALE", ::drawStarfall).asImage())
+        .intercept("shot://art/neon", poster(context, "NEON CIRCUIT", ::drawNeon).asImage())
+        .intercept("shot://art/ember", poster(context, "EMBER PEAKS", ::drawEmber).asImage())
+        .default(ColorDrawable(0xFF221E44.toInt()).asImage())
         .build()
     return ImageLoader.Builder(context).components { add(engine) }.build()
 }

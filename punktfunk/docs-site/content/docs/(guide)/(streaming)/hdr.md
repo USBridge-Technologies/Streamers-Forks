@@ -9,7 +9,7 @@ anything on this page.
 
 ## The chain
 
-1. **The host allows it.** **Host → Settings → Video → 10-bit and HDR** (`PUNKTFUNK_10BIT`), on
+1. **The host allows it.** **Host → Video → 10-bit and HDR** (`PUNKTFUNK_10BIT`), on
    by default.
 2. **The source delivers 10-bit PQ.** This is the link that fails most — see [Per host](#per-host).
 3. **The codec has a 10-bit path:** HEVC, AV1 or [PyroWave](/docs/pyrowave). H.264 has none, so
@@ -36,19 +36,19 @@ and forces it off for an SDR session; Windows' own **Use HDR** switch doesn't ma
 
 ### Linux + gamescope
 
-The only Linux route to HDR for the Punktfunk apps.
+The Linux route to HDR on KDE and GNOME, and in Game Mode everywhere.
 
-1. Install **`punktfunk-gamescope`**; stock gamescope captures 8-bit.
-   [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) has the package for your distro.
+1. Have **`punktfunk-gamescope`**; stock gamescope captures 8-bit. The host packages install it;
+   [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) covers every distro.
 2. Restart the host. It reads what the gamescope build can do once, at startup.
 3. Let the host start the gamescope session, which is the default. A session it attaches to
-   instead streams SDR: turn off **Attach mode** under **Host → Settings → Game Mode**, or delete
+   instead streams SDR: turn off **Attach mode** under **Host → Game Mode**, or delete
    the `PUNKTFUNK_GAMESCOPE_ATTACH` line from `host.env` if the row says that file set it.
 4. For Steam's own HDR setting to be available, the build must be `+pfhdr14` or newer. Check with
    `punktfunk-gamescope --version`.
 
-SDR content in an HDR session (the desktop, the Steam UI, SDR games) starts at **Host → Settings
-→ Game Mode → SDR brightness** (advanced, `PUNKTFUNK_GAMESCOPE_SDR_NITS`): 203 nits, the level the
+SDR content in an HDR session (the desktop, the Steam UI, SDR games) starts at **Host → Game Mode
+→ SDR brightness** (advanced, `PUNKTFUNK_GAMESCOPE_SDR_NITS`): 203 nits, the level the
 clients expect. Steam's SDR brightness setting moves it during the session. Builds older than
 `+pfhdr16` ignore both and show SDR content oversaturated.
 
@@ -67,10 +67,24 @@ A Punktfunk app connecting to a GNOME host gets SDR.
 With `PUNKTFUNK_CAPTURE_MONITOR=<connector>` set, only that monitor's HDR mode counts. If no
 monitor is in HDR mode, the session streams SDR and says so in the host log.
 
+### Linux + Hyprland
+
+A virtual display is lit in 10-bit HDR when the client asks for HDR: the host adds
+`bitdepth 10`, `cm hdr`, `supports_hdr` and `supports_wide_color` to the streamed head's
+monitor rule. SDR content inside it starts at **SDR brightness** (the Game Mode setting,
+203 nits). The client panel's volume, when the app sends it, becomes the head's mastering
+target. An older Hyprland that refuses those keys streams SDR until the host restarts.
+
+HDR needs Hyprland's colour management, which is on by default. With `render:cm_enabled = false`
+the session streams SDR.
+
+**Streaming a physical monitor** on Hyprland is HDR when that monitor is in HDR mode. Nothing
+to set on the host.
+
 ### Other Linux desktops
 
-SDR. KDE, GNOME's virtual displays and the wlroots-family compositors capture 8-bit, and so does
-streaming a physical monitor to a Punktfunk app. No setting changes this.
+SDR. KDE and GNOME's virtual displays capture 8-bit, and so does streaming a physical monitor
+on KDE to a Punktfunk app. No setting changes this.
 
 ## Per client
 
@@ -88,11 +102,16 @@ The toggle sits with the other [video settings](/docs/client-settings#video).
 
 ## 10-bit SDR
 
-The client's **10-bit SDR** setting asks for a 10-bit stream without HDR. No desktop hands the
-host more than 8 bits of SDR, so the host could only widen each frame: smoother gradients after
-the encoder, one more colour pass on the GPU, no detail the desktop didn't have. The host streams
-8-bit SDR unless **Host → Settings → Video → Allow 10-bit SDR** (`PUNKTFUNK_10BIT_SDR_WIDEN`,
-advanced, off by default) is on.
+The client's **10-bit SDR** setting asks for a 10-bit stream without HDR.
+
+A Windows 11 24H2 (or later) host composes the virtual display in wide colour for that session,
+and Windows shows it as a 10-bit display. The stream then carries the desktop's own bits past 8,
+wherever a game or app renders them. Composing in wide colour costs some GPU time.
+
+Other desktops hand the host only 8 bits of SDR, so the host could only widen each frame:
+smoother gradients after the encoder, one more colour pass on the GPU, no detail the desktop
+didn't have. There the host streams 8-bit SDR unless **Host → Video → Allow 10-bit
+SDR** (`PUNKTFUNK_10BIT_SDR_WIDEN`, advanced, off by default) is on.
 
 ## HDR and 4:4:4
 

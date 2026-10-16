@@ -65,7 +65,7 @@ newer control encryption falls back to a legacy scheme that can reuse GCM nonces
 your network could intercept a pairing or recover input. The host logs a warning whenever the plane
 is on.
 
-GameStream is off on every install. Turn it on or off with **GameStream** in **Host → Settings**,
+GameStream is off on every install. Turn it on or off with **GameStream** in **Host**,
 then **Restart Punktfunk**. If the setting shows as locked, remove the pin where it was set:
 
 | Pinned by | Remove it |
@@ -108,6 +108,25 @@ password vault.
 The Linux host runs in your desktop session as your own account, not root, so a compromise is
 scoped to that user.
 
+### Linux seats share your games
+
+**Reachable without logging in** runs the box's host as the `punktfunk` system user, and a root
+service, `punktfunk-seats`, gives each profile with an [own desktop](/docs/profiles#on-linux) a
+Linux user and host of its own. The service keeps its state in `/var/lib/punktfunk-seats`, which
+only root can change.
+
+- **Controllers.** The service builds a seat's controllers from its own tables, and their device
+  nodes belong to that seat alone. A seat's input can't type or move a pointer on the box.
+- **Stopping.** When a seat stops, everything its user runs ends, and its controllers go with it.
+- **The owner.** Only the account that turned on **Reachable without logging in** is hosted as
+  the box's owner. To hand that to another account, turn it off, then on from that account.
+- **Games.** Every seat writes the shared games folder, `/var/lib/punktfunk-seats/games`. With
+  **Seats update your games** on, the default, every seat also updates and installs into your own
+  Steam libraries. So a seat can change game files that you and the other seats run. Turn
+  **Seats update your games** off to keep your libraries read-only to seats.
+- **Your library.** Every seat gets a read-only copy of your game library, so a game on a seat
+  can read it, commands and prep steps of your custom titles included. It can't change it.
+
 ## Plugins run code on your host
 
 Installing a [plugin](/docs/plugins) is a trust decision, like installing any program. What limits
@@ -123,17 +142,18 @@ it:
 - **Declared programs only.** A package declares which programs the host may start for it and the
   shape of their arguments; a library entry only fills in values. Paths outside what the package
   declares or you allowed are refused, and folder grants are read-only unless you allow a write.
-- **A sandbox per plugin (Linux).** Each plugin runs in its own
+- **A sandbox per plugin.** On Linux each plugin runs in its own
   [bubblewrap](https://github.com/containers/bubblewrap) sandbox: an empty home, no network unless
   its manifest asks, read access to the paths it declared and you allowed, and its own PID namespace,
   so it can't reach the host process. Your `~/.ssh`, browser profile and the host's credentials
-  aren't in it. A box that can't build a sandbox runs no plugins and says so on the
-  **Troubleshooting** page.
+  aren't in it. On Windows each plugin runs in its own AppContainer under the runner's
+  `NT AUTHORITY\LocalService` account: it sees only the folders and registry keys its manifest
+  declared and you allowed, its own state, no other plugin's, and no network unless its manifest
+  asks. It reaches the host over a pipe of its own, not the management port. A box that can't
+  build a sandbox runs no plugins and says so on the **Troubleshooting** page.
 - **A token per plugin.** A plugin can register itself and manage its own library entries, nothing
-  more — never hooks or device admission.
-- **Windows: a separate account.** The plugin runner runs as `NT AUTHORITY\LocalService`, not
-  SYSTEM. Plugins share that account, so one can interfere with another's files; the per-plugin
-  sandbox is Linux-only.
+  more — never hooks or device admission. On Windows the pipe itself is the credential: a plugin
+  holds no token at all.
 
 ## Hardening checklist
 
@@ -143,6 +163,8 @@ it:
 - **Stay on a trusted network** — LAN or VPN. Never port-forward the host.
 - **Leave GameStream off** unless a Moonlight client needs it ([above](#gamestream--moonlight-compatibility-is-the-weak-crypto-path)).
 - **Install plugins you trust**, Verified ones first.
+- **Give seats to people you'd trust with your games**, or turn **Seats update your games** off
+  ([above](#linux-seats-share-your-games)).
 - **Review paired devices** under **Devices** in the web console; remove any you don't recognize.
 - **Keep the host updated** — security fixes ship as patch releases.
 - **On a portable host**, stop the service on untrusted networks.

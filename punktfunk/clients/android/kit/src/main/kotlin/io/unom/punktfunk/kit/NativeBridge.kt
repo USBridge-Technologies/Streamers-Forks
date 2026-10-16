@@ -11,12 +11,6 @@ object NativeBridge {
         System.loadLibrary("punktfunk_android")
     }
 
-    /** punktfunk-core C-ABI version. A successful call proves the native library is linked. */
-    external fun abiVersion(): Int
-
-    /** punktfunk-core crate version string. */
-    external fun coreVersion(): String
-
     /**
      * Mint a fresh persistent self-signed identity, returned as
      * `"<certPem>\n-----PUNKTFUNK-KEY-----\n<keyPem>"`, or `""` on error. Kotlin persists it
@@ -76,6 +70,21 @@ object NativeBridge {
         certPem: String,
         keyPem: String,
         pin: String,
+        name: String,
+    ): String
+
+    /**
+     * Ask for access with no PIN and wait (up to ~185 s) for the host's operator to approve.
+     * [pinHex] is the advertised fingerprint, `""` to trust on first use. Returns the host's
+     * fingerprint (64-hex) to persist as paired, or `""` with the cause in [nativeTakeLastError].
+     * Never streams. Blocking — call off the main thread.
+     */
+    external fun nativeRequestAccess(
+        host: String,
+        port: Int,
+        certPem: String,
+        keyPem: String,
+        pinHex: String,
         name: String,
     ): String
 
@@ -183,22 +192,37 @@ object NativeBridge {
     external fun nativeProbe(host: String, port: Int, timeoutMs: Int): String?
 
     /**
-     * Start a bandwidth speed test on [handle]: the host bursts filler over the real data plane at
-     * [targetKbps] of goodput for [durationMs] (each clamped host-side to ≤ 3 Gbps / ≤ 5 s),
-     * **briefly pausing video**. Measuring over the stream's own path is the point — the answer is
-     * about the link this host's stream will take, not about generic throughput.
-     *
-     * Non-blocking: poll [nativeProbeResult] until it reports done. Starting a probe resets any
-     * prior measurement. Returns false on a dead handle. Cheap; safe on the main thread.
+     * Run the network check over this session and return its report: `[ceilingKbps, wall,
+     * hasClean, cleanRateKbps, cleanLossPct, cleanJitterUs, clientIfaceKind, clientLinkMbps,
+     * clientRcvbufKb, hostIfaceKind, hostLinkMbps, hostSndbufKb, nLegs, burstsLossPct,
+     * cappedLossPct, nFindings]`, `[id, severity, n0, n1, n2]` per finding, then
+     * `recommendedKbps`. Blocking for ten to twenty seconds — call it off the main thread. Null on
+     * a dead handle or when the check could not run.
      */
-    external fun nativeSpeedTest(handle: Long, targetKbps: Int, durationMs: Int): Boolean
+    external fun nativeNetworkCheck(handle: Long): DoubleArray?
 
     /**
-     * The current speed-test measurement, partial until `[0] != 0.0`:
-     * `[done, throughputKbps, lossPct, hostDropPct, elapsedMs, recvBytes]`. Zeros before any
-     * probe, null on a dead handle. Cheap (one lock + a copy); safe to poll on the main thread.
+     * This device's link toward its default route as core reads it: `[kind, mbps]`, a
+     * `PUNKTFUNK_IFACE_KIND_*` (0 unknown, 1 Ethernet, 2 Wi-Fi, 3 other) and Mbit/s, `0` where
+     * the OS did not say. A route lookup: nothing is sent. Cheap; UI-safe.
      */
-    external fun nativeProbeResult(handle: Long): DoubleArray?
+    external fun nativeLocalLink(): IntArray?
+
+    /**
+     * The PyroWave quality row, priced by core: `"<rate>\n<warning>"`, the rate [bppX100] needs
+     * at this mode (`1.6 Gbit/s`), then the warning when a link of [linkKind] and [linkMbps] is
+     * short of it, empty when it fits. Pure; UI-safe.
+     */
+    external fun nativePyrowaveQuality(
+        width: Int,
+        height: Int,
+        refreshHz: Int,
+        chroma444: Boolean,
+        bitDepth: Int,
+        bppX100: Int,
+        linkKind: Int,
+        linkMbps: Int,
+    ): String
 
     /**
      * Apply the user's "Low-latency mode (experimental)" toggle to the process-wide transport
@@ -305,6 +329,32 @@ object NativeBridge {
     external fun nativeVideoSourceCrop(handle: Long, left: Float, top: Float, right: Float, bottom: Float)
 
     /**
+     * A dual-screen handheld's second picture window: a `SurfaceView` on the lower screen that
+     * the ASurfaceControl presenter composites the same decoded frame into, with its own part
+     * of the frame ([nativePictureCrop]) and size ([nativePictureSurfaceSize]). `null` drops it.
+     * The surface may come and go any number of times in a stream; the decoder never restarts
+     * for it. [width]/[height] are the view's pixel size at the call (0 = not laid out yet).
+     * No-op on a `0` handle.
+     */
+    external fun nativePictureWindow(handle: Long, surface: android.view.Surface?, width: Int, height: Int)
+
+    /** The second picture window's live pixel size, from its every `surfaceChanged`. */
+    external fun nativePictureSurfaceSize(handle: Long, width: Int, height: Int)
+
+    /** The part of the frame the second picture window shows, as fractions like [nativeVideoSourceCrop]. */
+    external fun nativePictureCrop(handle: Long, left: Float, top: Float, right: Float, bottom: Float)
+
+    /**
+     * Which picture layers show: [PICTURE_FIRST] the first window's, [PICTURE_SECOND] the second's,
+     * OR'd. A hidden layer keeps its window and takes no frame, so a layout change costs no
+     * decoder restart. One atomic store, UI-safe.
+     */
+    external fun nativePictureShown(handle: Long, mask: Int)
+
+    const val PICTURE_FIRST = 1
+    const val PICTURE_SECOND = 2
+
+    /**
      * The decoder's picture size as `[width, height]`, or `null` before its first output format.
      * Differs from [nativeVideoSize] when the host frames the picture for this device (a join, a
      * mirrored head). One atomic load; UI-safe.
@@ -344,6 +394,42 @@ object NativeBridge {
      * Sticky for the session (survives video stop/start). No-op on `0`.
      */
     external fun nativeSetVideoStatsEnabled(handle: Long, enabled: Boolean)
+
+    /**
+     * The last window [nativeVideoStatsLines] formatted, as numbers indexed by the `STAT_*`
+     * constants, or `null` before the first. A copy; it never closes a window, so the graphs and
+     * the lines read the same second. `-1` is a figure this platform does not have.
+     */
+    external fun nativeVideoStatsSample(handle: Long): FloatArray?
+
+    const val STAT_WINDOW_MS = 0
+    const val STAT_RECEIVED_FPS = 1
+    const val STAT_DECODED_FPS = 2
+    const val STAT_PRESENTED_FPS = 3
+    const val STAT_MBPS = 4
+    const val STAT_TARGET_MBPS = 5
+    const val STAT_E2E_P50_MS = 6
+    const val STAT_E2E_P95_MS = 7
+    /** The OS present pipeline's share, already inside the end-to-end figures. */
+    const val STAT_OS_FLOOR_MS = 8
+    const val STAT_HOST_MS = 9
+    const val STAT_NET_MS = 10
+    const val STAT_DECODE_MS = 11
+    const val STAT_DISPLAY_MS = 12
+    const val STAT_LOST = 13
+    const val STAT_SKIPPED = 14
+    const val STAT_FEC = 15
+    const val STAT_RTT_MS = 16
+    const val STAT_AUDIO_BUFFER_MS = 17
+    const val STAT_AV_OFFSET_MS = 18
+    const val STAT_JUDDER_PERMILLE = 19
+    const val STAT_REFRESH_HZ = 20
+    const val STAT_WIDTH = 21
+    const val STAT_HEIGHT = 22
+    const val STAT_RFIS_LAST_MIN = 23
+    /** Frames behind the end-to-end figures; 0 = nothing displayed this window. */
+    const val STAT_E2E_SAMPLES = 24
+    const val STAT_COUNT = 25
 
     /**
      * Start host→client audio: Opus decode → jitter ring → AAudio, all in Rust.
@@ -479,10 +565,6 @@ object NativeBridge {
     /** One mouse-button transition. button: 1=left 2=middle 3=right 4=X1 5=X2. */
     external fun nativeSendPointerButton(handle: Long, button: Int, down: Boolean)
 
-    /** One scroll step. axis: 0=vertical 1=horizontal. delta: signed, 120-scaled, +=up/right.
-     *  Legacy embedder API — production capture uses [nativeSendNormalizedScroll]. */
-    external fun nativeSendScroll(handle: Long, axis: Int, delta: Int, precise: Boolean)
-
     /**
      * One normalized scroll step (`InputKind::Scroll`). [axis]: 0=vertical 1=horizontal. [delta]:
      * signed Q24.8 in the source's unit — 120-per-detent for Wheel/Unknown, DIP for the rest.
@@ -492,6 +574,17 @@ object NativeBridge {
 
     /** Live natural-scroll toggle, applied once at the core's outbound seam. False on a dead session. */
     external fun nativeSetInvertScroll(handle: Long, invert: Boolean): Boolean
+
+    /**
+     * Whether this stream holds the screen awake right now: always with [keepAwake] (the "Keep
+     * screen awake" setting) on, else only while the player's input is recent, so the device's
+     * own timeout runs over a game left alone.
+     *
+     * Answered natively, off `punktfunk_core::client::holds_screen_awake`: every input this
+     * client forwards passes through the session, which is the one clock for "recent". Poll it
+     * every few seconds. `true` when the session handle is dead.
+     */
+    external fun nativeHoldsScreenAwake(handle: Long, keepAwake: Boolean): Boolean
 
     /**
      * One REAL touchscreen transition (the touch-passthrough input mode). [kind]: 0=down 1=move
@@ -642,12 +735,61 @@ object NativeBridge {
     external fun nativePadMotionReaches(handle: Long, declaredPref: Int): Boolean
 
     /**
+     * Whether the host's device for a pad that declared [declaredPref] has a Quick Access button,
+     * so a synthetic Quick Access tap presses [Gamepad.BTN_MISC1] there and Steam's chord
+     * everywhere else ([Gamepad.quickAccessPresses]). A negative [declaredPref] is a pad that
+     * never declared: the session default answers for it.
+     *
+     * Answered natively, off `punktfunk_core::config::pad_has_quick_access`, for the reason
+     * [nativePadMotionReaches] is. `false` when the session handle is dead.
+     */
+    external fun nativePadHasQuickAccess(handle: Long, declaredPref: Int): Boolean
+
+    /**
+     * The console's outline for a GamepadPref wire byte's pad family, as 24-unit SVG path data,
+     * stroked at 1.5. Empty for Automatic, which keeps its generic gamepad icon.
+     */
+    external fun nativePadMark(pref: Int): String
+
+    /**
      * One raw HID input report from a client-captured controller (the as-is Steam Controller 2
      * passthrough), forwarded verbatim on the rich-input plane. [buf] is a DIRECT ByteBuffer whose
      * first [len] bytes are the report, id byte first (0x42/0x45/0x47 state, 0x43 battery, …);
      * len is clamped to 64. Called from the capture thread at the controller's own report rate.
      */
     external fun nativeSendPadHidReport(handle: Long, pad: Int, buf: java.nio.ByteBuffer, len: Int)
+
+    /** What core holds back of a Steam Controller 2's raw reports on [pad]: an OR of
+     *  [GamepadRouter.SC2_GATE_MASKED] and its siblings, latest wins. */
+    external fun nativeSetSc2Gate(handle: Long, pad: Int, gate: Int)
+
+    /** The [index]th feature query a Steam Controller 2's identity is read with; null past the
+     *  last. [puck] adds the dongle's own queries. */
+    external fun nativeSc2IdentityRequest(puck: Boolean, index: Int): ByteArray?
+
+    /** The [index]th feature query a 2015 Steam Controller's identity is read with, report id 0
+     *  first; null past the last. */
+    external fun nativeSc1IdentityRequest(index: Int): ByteArray?
+
+    /** A fresh state for one 2015 Steam Controller's Bluetooth input, for [nativeSc1BleInput]. */
+    external fun nativeSc1BleState(): ByteArray
+
+    /** One segment of a 2015 Steam Controller's Bluetooth input, `[0x03, header, 18 bytes]`: the
+     *  64-byte wired frame when it completed a state message, else null. [state] changes in place. */
+    external fun nativeSc1BleInput(state: ByteArray, segment: ByteArray): ByteArray?
+
+    /** A wired feature frame for a 2015 Steam Controller, report id 0 first, as its Bluetooth
+     *  segments back to back. */
+    external fun nativeSc1BleSegments(frame: ByteArray): ByteArray
+
+    /** The segments read back for one 2015 Steam Controller feature query, in order: the reply,
+     *  report id 0 first, once the last is in, else null. */
+    external fun nativeSc1BleReply(segments: ByteArray): ByteArray?
+
+    /** A captured Steam Controller 2's identity for wire pad [pad]: its Puck [slot] (0 off a
+     *  Puck), its USB serial and its replies, packed `[len][request][len][reply]…`. The host
+     *  builds the virtual pad from it. */
+    external fun nativeSendPadIdentity(handle: Long, pad: Int, slot: Int, serial: String, replies: ByteArray)
 
     /**
      * One touchpad contact from a client-captured controller (the Sony USB capture), forwarded on
@@ -693,12 +835,12 @@ object NativeBridge {
      */
     external fun nativeNextHidout(handle: Long, buf: java.nio.ByteBuffer): Int
 
-    // ---- The Skia console UI (crates/pf-console-ui over EGL/GLES — clients/android/native/src/console) ----
+    // ---- The Skia console UI (crates/client/pf-console-ui over EGL/GLES — clients/android/native/src/console) ----
     //
     // The same console shell the Linux/Windows session binary shows, drawn by native onto a
     // SurfaceView. Kotlin keeps the services and feeds the console's models as JSON in the model
     // types' own serde shape (HostRow, LibraryGame, ConsoleCmd, OverlayAction, Settings — see
-    // `crates/pf-console-ui/src/model.rs` and `pf-client-core/src/trust.rs`); what the console
+    // `crates/client/pf-console-ui/src/model.rs` and `pf-client-core/src/trust.rs`); what the console
     // raises comes back through [nativeConsoleNextEvent]. Every call is main-thread-safe and cheap
     // except the two polls, which block ~100 ms and belong on their own threads.
 
@@ -716,9 +858,6 @@ object NativeBridge {
      * document. EGL/Skia failures arrive later as a `{"dead": …}` event.
      */
     external fun nativeConsoleCreate(optionsJson: String): Long
-
-    /** Stop the render thread (joined) and free. Stop + join the event poll thread FIRST. */
-    external fun nativeConsoleDestroy(handle: Long)
 
     /** The SurfaceView's surface is up. */
     external fun nativeConsoleSurfaceCreated(handle: Long, surface: android.view.Surface)
@@ -812,6 +951,12 @@ object NativeBridge {
      */
     external fun nativeConsoleAdvanceSpeed(handle: Long, key: String, json: String)
 
+    /**
+     * The answer to `FetchProfiles` for the host pinned to [fpHex]: `{"Listed": [rows]}`,
+     * `"NoProfiles"` or `{"Failed": "why"}`.
+     */
+    external fun nativeConsoleSetProfiles(handle: Long, fpHex: String, json: String)
+
     /** A one-shot toast from a service worker. */
     external fun nativeConsoleNotice(handle: Long, text: String)
 
@@ -835,6 +980,9 @@ object NativeBridge {
 
     /** The host's `/status` games: `[{"app_id": "steam:570", "state": "running"}, …]`. */
     external fun nativeConsoleLibraryRunning(handle: Long, json: String)
+
+    /** The host's `/status` downloads, before the same read's [nativeConsoleLibraryRunning]. */
+    external fun nativeConsoleLibraryDownloads(handle: Long, json: String)
 
     /** 0 fresh, 1 waking, 2 offline — the cached shelf's staleness note. */
     external fun nativeConsoleLibraryStale(handle: Long, stale: Int)

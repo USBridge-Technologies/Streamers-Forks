@@ -33,7 +33,7 @@
       systems = [ "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
 
-      # The workspace version is the single source of truth (crates/*/Cargo.toml inherit it).
+      # The workspace version is the single source of truth (crates/*/*/Cargo.toml inherit it).
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
       overlays = [
@@ -116,6 +116,7 @@
             punktfunk-client
             punktfunk-web
             punktfunk-scripting
+            punktfunk-seats
             punktfunk-tray
             punktfunk-gamescope
             ;
@@ -166,6 +167,7 @@
             punktfunk-client
             punktfunk-web
             punktfunk-scripting
+            punktfunk-seats
             ;
 
           # The NixOS module, actually evaluated. `nix flake check` does NOT do this for
@@ -177,6 +179,12 @@
           nixos-module = pkgs.callPackage ./packaging/nix/module-check.nix {
             inherit nixpkgs system;
             module = import ./packaging/nix/nixos-module.nix;
+          };
+
+          # The module booted in a VM with the real packages. The eval leg instantiates it; the
+          # `ci:nix-rust` lane builds it.
+          nixos-vm = pkgs.callPackage ./packaging/nix/vm-test.nix {
+            module = self.nixosModules.default;
           };
         }
       );
@@ -205,7 +213,6 @@
             buildInputs = [
               # host
                 pkgs.pipewire
-              pkgs.libopus
               pkgs.wayland
               pkgs.libxkbcommon
               pkgs.libGL
@@ -220,8 +227,6 @@
               pkgs.gsettings-desktop-schemas
               pkgs.adwaita-icon-theme
             ];
-            # CMake ≥ 4 rejects the pre-3.5 minimums some vendored C libs (libopus) still declare.
-            CMAKE_POLICY_VERSION_MINIMUM = "3.5";
             LD_LIBRARY_PATH = "/run/opengl-driver/lib:${
               pkgs.lib.makeLibraryPath [
                 pkgs.vulkan-loader

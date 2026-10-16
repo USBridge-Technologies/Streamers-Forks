@@ -8,13 +8,14 @@
 
 use pf_client_core::console::OverlayAction;
 use pf_console_ui::bridge::{
-    self, CreateOptions, EntryJson, Event, MenuCode, Pads, PadsJson, PresetJson, Published,
+    self, CreateOptions, EntryJson, Event, GamesPush, MenuCode, Pads, PadsJson, PhasePush,
+    PresetJson, Published,
 };
 use pf_console_ui::console::FrameCost;
 use pf_console_ui::{
-    Console, ConsoleEntry, ConsoleHandles, HostRow, InputSource, Insets, LibraryGame, LibraryPhase,
-    LicenseSection, PadTestState, PairPhase, Platform, Prompt, SnapshotStore, SpeedPhase, Viewport,
-    WakeStatus,
+    Console, ConsoleEntry, ConsoleHandles, HostRow, InputSource, Insets, LicenseSection,
+    PadTestState, PairStatus, Platform, ProfilesAnswer, Prompt, SnapshotStore, SpeedPhase,
+    Viewport, WakeStatus,
 };
 use skia_safe::gpu::{self, mtl, DirectContext, SurfaceOrigin};
 use skia_safe::ColorType;
@@ -42,9 +43,10 @@ pub struct PunktfunkInsets {
 
 /// `[HostRow]` — the home carousel.
 pub const PUNKTFUNK_CONSOLE_PUSH_HOSTS: u8 = 0;
-/// `"Idle"`, `"Busy"`, `{"Failed": "why"}` or `{"Paired": {"key": "…"}}`.
+/// `{"req": …, "phase": "Busy" | {"Failed": "why"} | {"Paired": {"key": "…"}}}`, `req` the
+/// `Pair` or `RequestAccess` command's.
 pub const PUNKTFUNK_CONSOLE_PUSH_PAIR: u8 = 1;
-/// `WakeStatus`, or `null` to clear.
+/// `WakeStatus` under the `Wake`'s `req`, or `null` when the wake ended.
 pub const PUNKTFUNK_CONSOLE_PUSH_WAKE: u8 = 2;
 /// A JSON string: a one-shot toast.
 pub const PUNKTFUNK_CONSOLE_PUSH_NOTICE: u8 = 3;
@@ -52,16 +54,20 @@ pub const PUNKTFUNK_CONSOLE_PUSH_NOTICE: u8 = 3;
 pub const PUNKTFUNK_CONSOLE_PUSH_SPEED: u8 = 4;
 /// Any JSON: a library fetch is starting for the shelf on screen.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_BEGIN: u8 = 5;
-/// `"Loading"`, `"Empty"`, `"Ready"` or `{"Error": {"title", "body", "can_retry"}}`.
+/// `{"req": …, "phase": "Loading" | "Empty" | "Ready" | {"Error": {"title", "body",
+/// "can_retry"}}}`, `req` the `FetchLibrary`'s.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_PHASE: u8 = 6;
-/// `[LibraryGame]` — the fetched catalog.
+/// `{"req": …, "games": [LibraryGame]}` — the fetched catalog for that `FetchLibrary`.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_GAMES: u8 = 7;
-/// `[LibraryGame]` — the cached catalog, shown while the fetch runs.
+/// `{"req": …, "games": [LibraryGame]}` — the cached catalog, shown while the fetch runs.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_CACHED: u8 = 8;
 /// `[{"app_id": "steam:570", "state": "running"}]` — the host's running games.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING: u8 = 9;
 /// `0` fresh, `1` waking, `2` offline.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_STALE: u8 = 10;
+/// `[{"app_id", "state", "done_bytes", …}]` — the host's downloads, pushed before the same
+/// read's [`PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING`].
+pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_DOWNLOADS: u8 = 19;
 /// `Settings` changed elsewhere; the shell reads it on its next mutation. Not a save.
 pub const PUNKTFUNK_CONSOLE_PUSH_SETTINGS: u8 = 11;
 /// `[{id, name, overrides}]` — the preset catalog.
@@ -80,6 +86,9 @@ pub const PUNKTFUNK_CONSOLE_PUSH_PROMPT: u8 = 16;
 pub const PUNKTFUNK_CONSOLE_PUSH_LICENSES: u8 = 17;
 /// `{"held": [..], "axes": [[name, v]]}` — the pad's reading while the `PadTest` command is on.
 pub const PUNKTFUNK_CONSOLE_PUSH_PAD_TEST: u8 = 18;
+/// `{"fp_hex": "…", "answer": ProfilesAnswer}` — the answer to the `FetchProfiles` command:
+/// `{"Listed": [rows]}`, `"NoProfiles"` or `{"Failed": "why"}`.
+pub const PUNKTFUNK_CONSOLE_PUSH_PROFILES: u8 = 20;
 
 /// One console. Opaque to C.
 pub struct PunktfunkConsole {
@@ -538,6 +547,12 @@ struct SpeedJson {
     phase: SpeedPhase,
 }
 
+#[derive(serde::Deserialize)]
+struct ProfilesJson {
+    fp_hex: String,
+    answer: ProfilesAnswer,
+}
+
 /// Hand the console a model update; `kind` is a `PUNKTFUNK_CONSOLE_PUSH_*`. A bad kind or bad
 /// JSON is a logged no-op.
 ///
@@ -559,7 +574,7 @@ pub unsafe extern "C" fn punktfunk_console_push(
             PUNKTFUNK_CONSOLE_PUSH_HOSTS => {
                 json::<Vec<HostRow>>(text).map(|v| console.set_hosts(v))
             }
-            PUNKTFUNK_CONSOLE_PUSH_PAIR => json::<PairPhase>(text).map(|v| console.set_pair(v)),
+            PUNKTFUNK_CONSOLE_PUSH_PAIR => json::<PairStatus>(text).map(|v| console.set_pair(v)),
             PUNKTFUNK_CONSOLE_PUSH_WAKE => {
                 json::<Option<WakeStatus>>(text).map(|v| console.set_wake(v))
             }
@@ -567,23 +582,28 @@ pub unsafe extern "C" fn punktfunk_console_push(
             PUNKTFUNK_CONSOLE_PUSH_SPEED => {
                 json::<SpeedJson>(text).map(|v| console.advance_speed(&v.key, v.phase))
             }
+            PUNKTFUNK_CONSOLE_PUSH_PROFILES => {
+                json::<ProfilesJson>(text).map(|v| console.set_profiles(&v.fp_hex, v.answer))
+            }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_BEGIN => {
                 library.begin_fetch();
                 Some(())
             }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_PHASE => {
-                json::<LibraryPhase>(text).map(|v| library.set_phase(v))
+                json::<PhasePush>(text).map(|v| library.set_phase(&v.req, v.phase))
             }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_GAMES => {
-                json::<Vec<LibraryGame>>(text).map(|v| library.set_games(v))
+                json::<GamesPush>(text).map(|v| library.set_games(&v.req, v.games))
             }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_CACHED => {
-                json::<Vec<LibraryGame>>(text).map(|v| library.set_games_cached(v))
+                json::<GamesPush>(text).map(|v| library.set_games_cached(&v.req, v.games))
             }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING => {
                 json::<Vec<pf_client_core::library::RunningGame>>(text)
                     .map(|v| library.set_running(&v))
             }
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_DOWNLOADS => json::<pf_console_ui::DownloadsPush>(text)
+                .map(|p| library.set_downloads(&p.downloads, p.grants)),
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_STALE => {
                 json::<u8>(text).map(|v| library.set_stale(bridge::stale_code(v)))
             }

@@ -99,8 +99,9 @@ sudo cp punktfunk-host.raw /var/lib/extensions/
 sudo systemctl enable --now systemd-sysext      # merges it
 systemctl --user enable --now punktfunk-host     # the user unit is now under /usr/lib
 ```
-The udev rule, sysctl, and systemd **user** unit all live under `/usr/lib`, so the merged sysext
-exposes them. `systemd-sysext refresh` re-merges after a reboot. (One HDR nuance of the sysext
+The udev rule and systemd **user** unit live under `/usr/lib`, so the merged sysext exposes them.
+The UDP buffer sysctl does too, but systemd applies sysctl files before the merge, so the image
+carries `punktfunk-sysctl.service` to apply it afterwards. `systemd-sysext refresh` re-merges after a reboot. (One HDR nuance of the sysext
 path: the image ships gamescope without `CAP_SYS_NICE`, so its frame pacing is marginally worse —
 everything works. Capabilities inside the image: `punktfunk-host` carries **none**, on *either*
 path, deliberately — one would make it unidentifiable to KWin and break desktop streaming;
@@ -140,11 +141,16 @@ neither auto-enabled. The commands are on the
 [`data/platforms.json`](../../data/platforms.json).
 
 ## Files
-- `PKGBUILD` — split package: `punktfunk-host` + `punktfunk-client` (builds the working tree via
-  `PF_SRCDIR`, or a git tag for AUR).
-- `punktfunk-host.install` / `punktfunk-client.install` — pacman scriptlets (udev reload + sysctl +
-  first-run hint, incl. the ufw/firewalld enable command for whichever is present), mirror the RPM
-  `%post` / deb postinst.
+- `PKGBUILD` — split package: `punktfunk-host` + `punktfunk-client` + `punktfunk-seats` (builds the
+  working tree via `PF_SRCDIR`, or a git tag for AUR). `punktfunk-seats` is the root supervisor
+  behind profile seats: a host dependency at its own version, installed under `/usr/libexec/punktfunk`,
+  never enabled. It also carries the door's units, root helper and polkit rule.
+- `punktfunk-host.install` / `punktfunk-client.install` — pacman scriptlets (capabilities + first-run
+  hint, incl. the ufw/firewalld enable command for whichever is present). The host's calls the
+  shared `../linux/post-install.sh` (groups, udev, sysctl, firewall notes) that the RPM `%post` and
+  deb postinst call too; the groups come from `../linux/punktfunk.sysusers`.
+  `punktfunk-scripting.install` loads the runner's AppArmor profile. `punktfunk-seats.install`
+  creates the seat directories.
 - The firewall openers are shared across all Linux packaging and live in [`../linux/`](../linux/):
   the ufw application profile (`punktfunk.ufw` → `/etc/ufw/applications.d/punktfunk`) and the
   firewalld service definitions (`punktfunk-native.xml` / `punktfunk-gamestream.xml` /

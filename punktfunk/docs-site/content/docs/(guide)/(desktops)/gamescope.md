@@ -47,7 +47,7 @@ The host picks one of three modes per session and logs it:
 | Mode | When | What happens |
 |---|---|---|
 | **Managed** | Default on a box with a gamescope session (Bazzite, SteamOS, Nobara). Force it with `PUNKTFUNK_GAMESCOPE_MANAGED=1`. | The host takes Gaming Mode over and relaunches it headless at the client's resolution and refresh. A Steam running on the desktop is shut down to free it. Your screens drop out; the box gets its session back after you disconnect. |
-| **Attach** | **Attach mode** on under **Host → Settings → Game Mode** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`), or a gamescope already runs on a box without a gamescope session. | The host streams the running gamescope and never stops it. A box with a monitor serves a mirror of it at the monitor's resolution, not a display of the client's own; only a headless box on its own autologin session restarts at the client's resolution. |
+| **Attach** | **Attach mode** on under **Host → Game Mode** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`), or a gamescope already runs on a box without a gamescope session. | The host streams the running gamescope and never stops it. A box with a monitor serves a mirror of it at the monitor's resolution, not a display of the client's own; only a headless box on its own autologin session restarts at the client's resolution. |
 | **Bare spawn** | No gamescope session and none running, or a [dedicated game session](/docs/virtual-displays#dedicated-game-sessions). | The host starts its own headless gamescope at the client's mode, running the launched game. Nothing on the box is touched. |
 
 ### Nobara and other autologin display managers
@@ -91,16 +91,17 @@ Attach streams that screen, so it stays on.
 ## HDR on gamescope
 
 A stock gamescope captures 8-bit SDR: it tone-maps HDR games down, correctly, before the host sees
-them. For a 10-bit HDR stream install `punktfunk-gamescope`, gamescope plus Punktfunk's capture
-patches. It installs under its own name; your Gaming Mode keeps the system gamescope.
+them. A 10-bit HDR stream needs `punktfunk-gamescope`, gamescope plus Punktfunk's capture
+patches. The host packages install it under its own name; your Gaming Mode keeps the system
+gamescope.
 
 | System | How to get it |
 |---|---|
 | Bazzite, Fedora Atomic | In the Punktfunk sysext: `punktfunk-sysext update`. |
-| Fedora, Nobara, other RPM systems | `sudo dnf install punktfunk-gamescope` from the Punktfunk repo. |
-| Debian 13, Ubuntu 26.04 | `sudo apt install punktfunk-gamescope` from the Punktfunk repo. |
+| Fedora, Nobara, other RPM systems | Installed with the host. On an older install: `sudo dnf install punktfunk-gamescope`. |
+| Debian 13, Ubuntu 26.04 | Installed with the host. On an older install: `sudo apt install punktfunk-gamescope`. |
 | Ubuntu 24.04 | Not available: its wayland is too old. Build from source or upgrade. |
-| Arch | `sudo pacman -S punktfunk-gamescope` |
+| Arch | Installed with the host. |
 | SteamOS | Built by the Steam Deck installer (`scripts/steamdeck/install.sh`, `update.sh`). |
 | NixOS | `services.punktfunk.host.gamescopeHdr` (on by default). |
 | Anything else | `bash packaging/gamescope/build-punktfunk-gamescope.sh` in the source tree. |
@@ -132,7 +133,8 @@ chain, and what to check when a stream comes out SDR, is on [HDR](/docs/hdr#linu
 - **Touch is a single-finger pointer**: taps and drags work, pinch doesn't. The trackpad and pointer
   [touch modes](/docs/input#touch-modes) are unaffected.
 - **Desktop [mouse mode](/docs/input#mouse-modes) is unavailable**; the mouse stays captured.
-- **No [clipboard](/docs/clipboard)**: gamescope offers the host none.
+- **The [clipboard](/docs/clipboard) carries text only**: gamescope keeps one plain-text
+  clipboard.
 
 To stream the Plasma desktop of a Steam box instead, see [KDE Plasma](/docs/kde).
 
@@ -154,7 +156,7 @@ The hand-back failed. Join the [`punktfunk` group](#the-punktfunk-group), or set
 The session ran in attach mode, which streams the box's own screen at its own mode. Check
 `journalctl --user -u punktfunk-host | grep 'gamescope sub-mode'`.
 
-1. Turn off **Attach mode** under **Host → Settings → Game Mode**.
+1. Turn off **Attach mode** under **Host → Game Mode**.
 2. If the row reads **Set by PUNKTFUNK_GAMESCOPE_ATTACH in host.env**, a copied template put it
    there: delete that line, and any `PUNKTFUNK_GAMESCOPE_NODE` line, from
    `~/.config/punktfunk/host.env`, then `systemctl --user restart punktfunk-host`.

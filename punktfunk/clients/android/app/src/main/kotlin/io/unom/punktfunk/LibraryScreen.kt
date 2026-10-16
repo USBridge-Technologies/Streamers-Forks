@@ -32,6 +32,9 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.DesktopWindows
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.CircularProgressIndicator
@@ -75,11 +78,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.ImageLoader
+import coil3.ImageLoader
 import io.unom.punktfunk.components.launcherIcon
-import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.link.DeepLinks
+import io.unom.punktfunk.kit.library.Download
 import io.unom.punktfunk.kit.library.GameEntry
+import io.unom.punktfunk.kit.library.HostStatus
+import io.unom.punktfunk.kit.library.InstallAction
+import io.unom.punktfunk.kit.library.InstallOutcome
+import io.unom.punktfunk.kit.library.TileBadge
 import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
 import io.unom.punktfunk.kit.library.LibraryCache
@@ -95,6 +102,7 @@ import kotlin.math.absoluteValue
 import kotlin.math.cos
 import kotlin.math.sign
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
@@ -137,6 +145,9 @@ private sealed class LibState {
         val identity: ClientIdentity,
         val running: Map<String, RunningGame> = emptyMap(),
         val stale: Stale = Stale.No,
+        /** `/status` downloads by library id, and this device's grants: host state, as [running]. */
+        val downloads: Map<String, Download> = emptyMap(),
+        val grants: Int? = null,
     ) : LibState() {
         /**
          * Display order: anything already running first, so getting back into it is the first
@@ -169,6 +180,20 @@ private sealed class LibState {
 
     data class Message(val text: String) : LibState() // unauthorized / empty / error
 }
+
+/** A `/status` read on the shelf: what is up, what downloads, and what this device may do. */
+private fun LibState.Ready.withStatus(status: HostStatus) = copy(
+    running = status.games
+        .filter { it.isUp }
+        // Two sessions can have the same title up (the host admits concurrent sessions); for a
+        // Resume badge either one is the same answer, and the endable one (sorted last, so it
+        // wins) carries End game.
+        .sortedBy { it.endable }
+        .mapNotNull { g -> g.appId?.let { it to g } }
+        .toMap(),
+    downloads = status.downloads.associateBy { it.appId },
+    grants = status.grants,
+)
 
 @Composable
 fun LibraryScreen(
@@ -210,6 +235,23 @@ fun LibraryScreen(
     }
     val streamSettings = remember(settings, preset) { settings.effectiveFor(preset) }
     val knownHostStore = remember { KnownHostStore(context) }
+    val services = remember { HostServices(knownHostStore, JniHostNative(context)) }
+    // The profile picker a launch waits on.
+    var profileAsk by remember { mutableStateOf<ProfileAsk?>(null) }
+    profileAsk?.let { ask ->
+        ProfilePickerDialog(
+            hostName = host.name.ifBlank { host.address },
+            answer = ProfilesAnswer.Listed(ask.listed),
+            saved = ask.host.asProfile,
+            gone = ask.gone,
+            onPick = { ask.answer.complete(it) },
+            onDismiss = { ask.answer.complete(null) },
+        )
+    }
+    var seatWait by remember { mutableStateOf<ProfileWait?>(null) }
+    seatWait?.let { w ->
+        SeatWaitDialog(w, onCancel = { w.cancelled.complete(Unit); seatWait = null })
+    }
 
     // Keyed on the mgmt port too: a discovery tick can learn it after this screen is composed, and
     // the fetch must redo itself against the real port rather than stay on a stale 47990 failure.
@@ -225,11 +267,10 @@ fun LibraryScreen(
         "${host.name} — Library"
     }
 
-    // Dial the host over the same pinned mTLS trust, booting straight into this title (the host
-    // resolves `launch` = its library id). Shared by both presentations: a tap on a grid tile and A
-    // on a centred cover are the same act, and a launch that behaved differently between them would
-    // be a bug nobody could see until they switched input device.
-    fun launch(identity: ClientIdentity, game: GameEntry) {
+    // Dial through [HostServices.dial] on the pinned trust, booting straight into this title (the
+    // host resolves `launch` = its library id). A grid tap and A on a centred cover share this one
+    // launch. [link] names the profile to play as; [redial] marks the one dial [ProfileRetry] grants.
+    fun launch(identity: ClientIdentity, game: GameEntry, link: String? = null, redial: Boolean = false) {
         if (launching) return
         launching = true
         // The desktop tile is the host, not one of its titles: it streams with no launch id, and
@@ -243,17 +284,29 @@ fun LibraryScreen(
             LibraryPosition.remember(context, host.id, game.id)
         }
         scope.launch {
-            val handle = connectToHost(
-                context, streamSettings, identity,
-                host.address, host.port, host.fpHex,
+            val choice = chooseProfile(knownHostStore, identity, host, link, wait = { seatWait = it }) {
+                profileAsk = it
+            }
+            profileAsk = null
+            if (choice !is ProfileChoice.Dial) {
+                launching = false
+                if (choice is ProfileChoice.Refused) {
+                    Toast.makeText(context, choice.line, Toast.LENGTH_LONG).show()
+                }
+                return@launch
+            }
+            val spec = DialSpec(
+                streamSettings, identity, host.address, host.port, host.fpHex,
                 launch = game.id.takeUnless { game.isDesktop },
                 dialer = "touch/library",
                 preset = preset,
+                profile = choice.id,
             )
+            val dialed = services.dial(spec, host, host.name)
             launching = false
-            if (handle != 0L) {
+            if (dialed is HostServices.Connected) {
                 onLaunched(
-                    SessionFactory.afterDial(handle, host, streamSettings, preset, knownHostStore).copy(
+                    dialed.session.copy(
                         // Where to come back to when this game exits — this shelf, pin and all,
                         // not the host's default one.
                         launchedFromLibrary = true,
@@ -268,10 +321,18 @@ fun LibraryScreen(
                         },
                     ),
                 )
-            } else {
+            } else if (dialed is HostServices.Failed) {
+                val token = dialed.token
+                if (ProfileRetry.afterRefusal(token, host, choice, redial, knownHostStore) { h, p ->
+                        stillListed(identity, h, p)
+                    }
+                ) {
+                    launch(identity, game, choice.id, redial = true)
+                    return@launch
+                }
                 Toast.makeText(
                     context,
-                    ConnectErrors.connectMessage(NativeBridge.nativeTakeLastError(), requestAccess = false),
+                    ConnectErrors.connectMessage(token, requestAccess = false),
                     Toast.LENGTH_LONG,
                 ).show()
             }
@@ -286,20 +347,30 @@ fun LibraryScreen(
         if (autoStream && ready != null) launch(ready, GameEntry.desktop())
     }
 
-    // "Copy link" for one TITLE — the self-emitted form a host card already hands out (design/
-    // client-deep-links.md §4/§5), plus this game's `launch=` id, so pasting the URL into Playnite
-    // or a Stream Deck macro boots straight into it. A shelf opened from a PINNED card copies that
-    // card's preset with it, because that combination is the thing being copied.
-    fun copyLink(game: GameEntry) {
+    // One TITLE's link handed out (design/client-deep-links.md §4/§5): the host card's form plus
+    // this game's `launch=` id, so Playnite, a frontend or a home-screen tap boots straight into
+    // it. A shelf opened from a PINNED card carries that card's preset: that combination is the
+    // thing handed out. Every answer is a toast: this screen has no notice banner or status line.
+    fun linkAction(game: GameEntry, action: LinkAction) {
         val url = DeepLinks.forHost(host, launch = game.id, preset = pinnedPresetId).toUrl()
-        // A toast either way here: this screen renders neither the touch home's notice banner nor
-        // the console's status line, and both of its presentations are full-bleed over artwork.
-        linkCopyMessage(putLinkOnClipboard(context, url))?.let {
-            Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
+        val name = if (game.isDesktop) host.name else game.title
+        val say = { text: String -> Toast.makeText(context, text, Toast.LENGTH_SHORT).show() }
+        when (action) {
+            LinkAction.Copy -> linkCopyMessage(putLinkOnClipboard(context, url))?.let(say)
+            LinkAction.LauncherFile -> (context as? MainActivity)?.saveLauncherFile(name, url, say)
+            LinkAction.HomeScreen -> {
+                val identity = (state as? LibState.Ready)?.identity
+                val key = shortcutId(host.id, game.id.takeUnless { game.isDesktop }, pinnedPresetId)
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        pinTitleShortcut(context, identity, host, game.art.posterCandidates, url, name, key)
+                    }?.let(say)
+                }
+            }
         }
     }
 
-    // Lambdas, NOT `::launch` / `::copyLink`: two callable references to the same local function
+    // Lambdas, NOT `::launch` / `::linkAction`: two callable references to the same local function
     // compare EQUAL however different the frame they captured, so a skipped recomposition would
     // leave the child calling a closure over stale settings. SettingsScreen documents the same
     // trap at `scopePreset()`, having been bitten by it.
@@ -316,8 +387,7 @@ fun LibraryScreen(
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
                 LibraryClient.endGame(
-                    host.address, host.effectiveMgmtPort, ready.identity.certPem,
-                    ready.identity.privateKeyPem, host.fpHex, game.id,
+                    ready.identity, host.address, host.effectiveMgmtPort, host.fpHex, game.id,
                 )
             }
             if (outcome.gameGone) {
@@ -325,6 +395,63 @@ fun LibraryScreen(
             }
             Toast.makeText(context, outcome.notice(game.title), Toast.LENGTH_SHORT).show()
         }
+    }
+    // A title's files: the action, the host's answer as a toast, then `/status` again. A removal
+    // turns the tile to "not installed" here; the next load reads the catalog again.
+    var removeAsk by remember { mutableStateOf<GameEntry?>(null) }
+    fun refreshStatus() {
+        val ready = state as? LibState.Ready ?: return
+        scope.launch {
+            val status = withContext(Dispatchers.IO) {
+                LibraryClient.fetchStatus(
+                    host.address, host.effectiveMgmtPort, ready.identity.certPem,
+                    ready.identity.privateKeyPem, host.fpHex,
+                )
+            }
+            (state as? LibState.Ready)?.let { state = it.withStatus(status) }
+        }
+    }
+    fun changeInstall(game: GameEntry, action: InstallAction) {
+        val ready = state as? LibState.Ready ?: return
+        scope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                LibraryClient.changeInstall(
+                    ready.identity, host.address, host.effectiveMgmtPort, host.fpHex, game.id, action,
+                )
+            }
+            if (outcome == InstallOutcome.Done && action == InstallAction.Remove) {
+                (state as? LibState.Ready)?.let { s ->
+                    state = s.copy(
+                        games = s.games.map { g ->
+                            if (g.id == game.id) g.copy(install = g.install?.copy(state = "missing")) else g
+                        },
+                    )
+                }
+            }
+            Toast.makeText(context, outcome.notice(action, game.title), Toast.LENGTH_SHORT).show()
+            refreshStatus()
+        }
+    }
+    // Percentages move while a download runs and the shelf is up.
+    val downloading = (state as? LibState.Ready)?.downloads?.values?.any { it.live } == true
+    LaunchedEffect(downloading) {
+        while (downloading) {
+            delay(2_000)
+            refreshStatus()
+        }
+    }
+    removeAsk?.let { game ->
+        PunktfunkDialog(
+            title = "Remove ${game.title}?",
+            onDismiss = { removeAsk = null },
+            actions = listOf(
+                DialogAction("Remove download", primary = true) {
+                    removeAsk = null
+                    changeInstall(game, InstallAction.Remove)
+                },
+                DialogAction("Cancel") { removeAsk = null },
+            ),
+        ) { PromptText("Saves stay on the host.") }
     }
     endAsk?.let { game ->
         PunktfunkDialog(
@@ -347,8 +474,11 @@ fun LibraryScreen(
         onBack = onBack,
         onReload = { reloadKey++ },
         onLaunch = { identity, game -> launch(identity, game) },
-        onCopyLink = { game -> copyLink(game) },
+        onLink = { game, action -> linkAction(game, action) },
         onEndGame = { game -> endAsk = game },
+        onFiles = { game, action ->
+            if (action == InstallAction.Remove) removeAsk = game else changeInstall(game, action)
+        },
         resumeAt = resumeAt,
     )
 }
@@ -409,8 +539,8 @@ private suspend fun loadLibrary(
             set(LibState.Ready(res.games, loader, identity))
             // Remembered AFTER it is on screen: the disk write is not on the path to a shelf.
             withContext(Dispatchers.IO) { cache.store(key, res.games) }
-            val running = withContext(Dispatchers.IO) {
-                LibraryClient.fetchRunning(
+            val status = withContext(Dispatchers.IO) {
+                LibraryClient.fetchStatus(
                     address = host.address,
                     mgmtPort = host.effectiveMgmtPort,
                     certPem = identity.certPem,
@@ -418,14 +548,7 @@ private suspend fun loadLibrary(
                     fpHex = host.fpHex,
                 )
             }
-                .filter { it.isUp }
-                // Two sessions can have the same title up (the host admits concurrent
-                // sessions); for a Resume badge either one is the same answer, and the endable
-                // one (sorted last, so it wins) carries End game.
-                .sortedBy { it.endable }
-                .mapNotNull { g -> g.appId?.let { it to g } }
-                .toMap()
-            set(LibState.Ready(res.games, loader, identity, running = running))
+            set(LibState.Ready(res.games, loader, identity).withStatus(status))
         }
         // The shelf stays if we have one; only the words change. The player can still pick a
         // title — the launch dials and wakes the host on its own.
@@ -475,9 +598,11 @@ private fun TouchLibrary(
     onBack: () -> Unit,
     onReload: () -> Unit,
     onLaunch: (ClientIdentity, GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
+    onLink: (GameEntry, LinkAction) -> Unit,
     /** Ask to end a title this device launched; the caller confirms. */
     onEndGame: (GameEntry) -> Unit = {},
+    /** Install, pause, resume or remove a title's download; the caller confirms a removal. */
+    onFiles: (GameEntry, InstallAction) -> Unit = { _, _ -> },
     /** The title this shelf last launched — where the grid opens. Null on a first visit. */
     resumeAt: String? = null,
 ) {
@@ -545,9 +670,12 @@ private fun TouchLibrary(
                     games = state.ordered,
                     loader = state.loader,
                     onLaunch = { game -> onLaunch(state.identity, game) },
-                    onCopyLink = onCopyLink,
+                    onLink = onLink,
                     onEndGame = onEndGame,
                     running = state.running,
+                    downloads = state.downloads,
+                    grants = state.grants,
+                    onFiles = onFiles,
                     resumeAt = resumeAt,
                     modifier = Modifier.weight(1f),
                 )
@@ -583,7 +711,7 @@ internal fun TouchGrid(
     games: List<GameEntry>,
     loader: ImageLoader,
     onLaunch: (GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
+    onLink: (GameEntry, LinkAction) -> Unit,
     onEndGame: (GameEntry) -> Unit = {},
     /**
      * Which titles the host already has up, keyed by library id — so a tile the player can return
@@ -591,6 +719,10 @@ internal fun TouchGrid(
      * unreachable one, and while a shelf is being served from cache.
      */
     running: Map<String, RunningGame> = emptyMap(),
+    /** `/status` downloads by library id, and this device's grants: a tile's badge and menu row. */
+    downloads: Map<String, Download> = emptyMap(),
+    grants: Int? = null,
+    onFiles: (GameEntry, InstallAction) -> Unit = { _, _ -> },
     /** The title this shelf last launched — where the grid opens. Null on a first visit. */
     resumeAt: String? = null,
     modifier: Modifier = Modifier,
@@ -630,8 +762,9 @@ internal fun TouchGrid(
             if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Launchers") }
             items(launchers, key = { "launcher-${it.id}" }) {
                 TouchPoster(
-                    it, loader, onLaunch, onCopyLink, running[it.id] != null,
+                    it, loader, onLaunch, onLink, running[it.id] != null,
                     endable = running[it.id]?.endable == true, onEndGame = onEndGame,
+                    download = downloads[it.id], grants = grants, onFiles = onFiles,
                 )
             }
         }
@@ -639,8 +772,9 @@ internal fun TouchGrid(
             if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Games") }
             items(titles, key = { "game-${it.id}" }) {
                 TouchPoster(
-                    it, loader, onLaunch, onCopyLink, running[it.id] != null,
+                    it, loader, onLaunch, onLink, running[it.id] != null,
                     endable = running[it.id]?.endable == true, onEndGame = onEndGame,
+                    download = downloads[it.id], grants = grants, onFiles = onFiles,
                 )
             }
         }
@@ -690,14 +824,22 @@ private fun TouchPoster(
     game: GameEntry,
     loader: ImageLoader,
     onLaunch: (GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
+    onLink: (GameEntry, LinkAction) -> Unit,
     /** Already up on the host, so tapping resumes rather than starts. */
     running: Boolean = false,
     /** Up, and this device launched it: the long press offers End game. */
     endable: Boolean = false,
     onEndGame: (GameEntry) -> Unit = {},
+    /** Its download, if the host reports one. */
+    download: Download? = null,
+    grants: Int? = null,
+    onFiles: (GameEntry, InstallAction) -> Unit = { _, _ -> },
 ) {
     var menu by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val canPin = remember { canPinShortcuts(context) }
+    val files = InstallAction.forTitle(game.install, download, grants)
+    val badge = TileBadge.forTitle(game.install, download)
     val shape = MaterialTheme.shapes.medium
     Box {
         Column(
@@ -723,6 +865,10 @@ private fun TouchPoster(
                 if (running) {
                     Box(Modifier.fillMaxSize().padding(6.dp), contentAlignment = Alignment.TopEnd) {
                         RunningBadge(compact = true)
+                    }
+                } else if (badge != null) {
+                    Box(Modifier.fillMaxSize().padding(6.dp), contentAlignment = Alignment.TopEnd) {
+                        FilesBadge(badge)
                     }
                 }
                 Box(Modifier.fillMaxSize().padding(6.dp), contentAlignment = Alignment.TopStart) {
@@ -770,9 +916,34 @@ private fun TouchPoster(
                 text = { Text("Copy link") },
                 onClick = {
                     menu = false
-                    onCopyLink(game)
+                    onLink(game, LinkAction.Copy)
                 },
             )
+            if (canPin) {
+                DropdownMenuItem(
+                    text = { Text("Add to home screen") },
+                    onClick = {
+                        menu = false
+                        onLink(game, LinkAction.HomeScreen)
+                    },
+                )
+            }
+            DropdownMenuItem(
+                text = { Text("Save launcher file\u2026") },
+                onClick = {
+                    menu = false
+                    onLink(game, LinkAction.LauncherFile)
+                },
+            )
+            if (files != null) {
+                DropdownMenuItem(
+                    text = { Text(files.label(game.install)) },
+                    onClick = {
+                        menu = false
+                        onFiles(game, files)
+                    },
+                )
+            }
             if (endable) {
                 DropdownMenuItem(
                     text = { Text("End game") },
@@ -783,6 +954,36 @@ private fun TouchPoster(
                 )
             }
         }
+    }
+}
+
+/** A title's files on its tile: `42 %` downloading, paused, failed, or the size to download. */
+@Composable
+private fun FilesBadge(badge: TileBadge) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(PillShape)
+            .background(Color.Black.copy(alpha = 0.72f))
+            .padding(horizontal = 6.dp, vertical = 3.dp),
+    ) {
+        Icon(
+            when (badge.icon) {
+                "pause" -> Icons.Filled.Pause
+                "alert" -> Icons.Filled.Warning
+                else -> Icons.Filled.Download
+            },
+            contentDescription = null,
+            tint = Color.White,
+            modifier = Modifier.size(12.dp),
+        )
+        Text(
+            badge.text,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.White,
+            modifier = Modifier.padding(start = 4.dp),
+        )
     }
 }
 

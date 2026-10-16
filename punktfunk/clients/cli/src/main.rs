@@ -27,7 +27,8 @@ mod cli {
         WAKE_TIMEOUT_SECS,
     };
     use pf_client_core::presets::PresetsFile;
-    use pf_client_core::trust::{self, KnownHost, KnownHosts, Settings};
+    use pf_client_core::profiles::{self, ListedProfile};
+    use pf_client_core::trust::{self, AddOutcome, HostEdit, KnownHost, KnownHosts, Settings};
     use pf_client_core::{library, start, wol};
     use std::time::Duration;
 
@@ -58,11 +59,13 @@ punktfunk — the Punktfunk client, headless
   punktfunk wake <host-ref> [--wait]
   punktfunk library [<host-ref>] [--json]
   punktfunk end-game [<host-ref>] --game ID
-  punktfunk launch [<host-ref>] [--game ID] [--preset REF] [--request-access]
-                                [--exec] [--fullscreen]
+  punktfunk launch [<host-ref>] [--game ID] [--preset REF] [--as PROFILE]
+                                [--request-access] [--exec] [--fullscreen]
+  punktfunk profiles <host-ref> [--json] [--pick PROFILE | --clear]
   punktfunk open <punktfunk://…> [--yes]
   punktfunk reachable <host-ref>
   punktfunk speed-test <host-ref>
+  punktfunk network-check <host-ref> [--json]
   punktfunk presets list [--json]
   punktfunk reset
 
@@ -101,6 +104,13 @@ punktfunk pair <host[:port]> — enrol this device with a host (PIN ceremony)
 
   --pin -       read the PIN from stdin (one line). Without it the command asks,
                 and refuses (exit 6) when there is no terminal to ask on
+  --request-access
+                no PIN: wait (up to ~185 s) for somebody to approve this device
+                in the host's console or web UI. Pins the fingerprint saved for
+                the host (`hosts add --fp`) if there is one. Never streams
+  --fp HEX      with --request-access: the fingerprint the host must show.
+                Without it the one saved for this address is used — the newest
+                when the address names two hosts, as a dual-boot box does
   --name LABEL  the label the host files this device under
                 (default: this machine's name)
 
@@ -186,8 +196,8 @@ device's access expired, 2 when the host couldn't be asked or is too old,
             }
             "launch" => {
                 "\
-punktfunk launch [<host-ref>] [--game ID] [--preset REF] [--request-access]
-                              [--exec] [--fullscreen]
+punktfunk launch [<host-ref>] [--game ID] [--preset REF] [--as PROFILE]
+                              [--request-access] [--exec] [--fullscreen]
 
 Start a stream — waking the host first if it is asleep and its MAC is known.
 The stream runs in the punktfunk-session renderer; this command supervises it
@@ -197,6 +207,9 @@ host (`punktfunk default-host`), and exits 5 when there is none.
   --game ID      ask the host to launch this library title into the stream
   --preset REF   use a preset (id or name) for this connect only;
                  without it the host's own binding applies
+  --as PROFILE   play as this profile (id or name) for this connect only;
+                 without it the profile saved for this host applies
+                 (`punktfunk profiles`), else the host's default
   --fullscreen   start the stream window fullscreen
   --exec         become the session process instead of supervising it — the
                  gamescope-wrapper mode, where the launched process must BE
@@ -214,6 +227,21 @@ host (`punktfunk default-host`), and exits 5 when there is none.
 
 Exit 0 when the stream ends cleanly, 2 connect failed, 3 the host no longer
 trusts this device (re-pair), 4 the renderer could not start."
+            }
+            "profiles" => {
+                "\
+punktfunk profiles <host-ref> [--json] [--pick PROFILE | --clear]
+
+Who plays on the host: id TAB name TAB a note (`Steam sign-in once`, `In use
+by Ben's Apple TV`), with `*` on the profile this device plays as there.
+--json emits {\"profiles\":[…],\"picked\":id|null}.
+
+  --pick PROFILE  play as this profile (id or name) from now on; prints it
+  --clear         forget the pick; the host's default applies again
+
+Exit 5 when the host has no such profile, or no profiles at all; 6 when it
+isn't paired. Without a <host-ref> and without --pick, `punktfunk profiles`
+lists settings presets, as it did before presets were renamed."
             }
             "open" => {
                 "\
@@ -238,6 +266,16 @@ Asks the host directly (no mDNS), so routed/VPN hosts answer too. The
 reference may be an unsaved address — this verb answers \"can I reach it\",
 not \"do I know it\". Exit 0 reachable, 2 not; one line either way."
             }
+            "network-check" => {
+                "\
+punktfunk network-check <host-ref> [--json] — what the path to a host does
+
+Opens a diagnostic session that streams nothing, runs the speed test, two
+bursty legs at the clean round's rate and a slow round, reads both ends'
+network facts, and names what it found: a faster host port, a receiver that
+drops line-rate bursts, a small receive buffer, a link fault, a queue, Wi-Fi.
+Exit 0 when the check ran, whatever it found."
+            }
             "speed-test" => {
                 "\
 punktfunk speed-test <host-ref> [--json] — measure the real data plane
@@ -248,14 +286,15 @@ NOT apply the result: which layer a bitrate belongs in (a bound preset, the
 global default) is a decision the GUI makes with the user, and a CLI silently
 rewriting settings would be exactly the surprise that rule exists to prevent."
             }
-            "presets" | "profiles" => {
+            "presets" => {
                 "\
 punktfunk presets list [--json] — the stream presets on this device
 
 One line per preset: id TAB name TAB how many settings it overrides.
 Presets are created and edited in the desktop client; a connect uses one via
 `punktfunk launch --preset` or a punktfunk:// link that names it.
-`punktfunk profiles` is the old spelling; its --json keeps the `profiles` key."
+`punktfunk profiles` with no host is the old spelling; its --json keeps the
+`profiles` key."
             }
             "reset" => {
                 "\
@@ -315,6 +354,8 @@ from the config directory for a true factory reset."
                 | "--profile"
                 | "--port"
                 | "--timeout"
+                | "--as"
+                | "--pick"
         )
     }
 
@@ -326,14 +367,13 @@ from the config directory for a true factory reset."
     /// and only here: this reference is an argument the user typed in their own terminal, so
     /// there is nobody else to confirm it with. The guessable-reference rule exists for URLs
     /// handed to us by someone else; that path is `open`, which does ask.
-    fn resolve(reference: &str) -> Result<(KnownHosts, usize), u8> {
-        let known = KnownHosts::load();
+    fn resolve_in(known: &KnownHosts, reference: &str) -> Result<usize, u8> {
         let link = DeepLink {
             host_ref: reference.to_string(),
             ..Default::default()
         };
-        match deeplink::resolve_host(&link, &known) {
-            HostResolution::Known(i) | HostResolution::Confirm(i) => Ok((known, i)),
+        match deeplink::resolve_host(&link, known) {
+            HostResolution::Known(i) | HostResolution::Confirm(i) => Ok(i),
             HostResolution::Ambiguous => {
                 eprintln!(
                     "more than one saved host is called \"{reference}\" — use its address or id"
@@ -351,6 +391,13 @@ from the config directory for a true factory reset."
                 Err(UNRESOLVED)
             }
         }
+    }
+
+    /// [`resolve_in`] the store as it loads now, handed back with the index.
+    fn resolve(reference: &str) -> Result<(KnownHosts, usize), u8> {
+        let known = KnownHosts::load();
+        let i = resolve_in(&known, reference)?;
+        Ok((known, i))
     }
 
     /// The host a verb acts on: the `<host-ref>` it was given, else the default host.
@@ -373,10 +420,11 @@ from the config directory for a true factory reset."
     /// Read, set, or clear `Settings::default_host` — the pointer every client's bare
     /// launch resolves through. A headless box (a Deck over ssh) has no other door to it.
     fn default_host_cmd(args: &[String]) -> u8 {
-        let mut settings = Settings::load();
         if has(args, "--clear") {
-            settings.default_host = None;
-            settings.save();
+            Settings::update(|s| {
+                s.default_host = None;
+                true
+            });
             println!("cleared");
             return OK;
         }
@@ -396,13 +444,15 @@ from the config directory for a true factory reset."
                 eprintln!("{} has no record id — re-save it", host.name);
                 return UNRESOLVED;
             };
-            settings.default_host = Some(id);
-            settings.save();
+            Settings::update(|s| {
+                s.default_host = Some(id);
+                true
+            });
             println!("{}\t{}:{}", host.name, host.addr, host.port);
             return OK;
         }
         let known = KnownHosts::load();
-        match start::default_host_with_source(&settings, &known) {
+        match start::default_host_with_source(&Settings::load(), &known) {
             (Some(i), source) => {
                 let h = &known.hosts[i];
                 println!("{}\t{}:{}\t{}", h.name, h.addr, h.port, source.as_str());
@@ -439,8 +489,13 @@ from the config directory for a true factory reset."
             "open" => open(&rest),
             "reachable" => reachable(&rest),
             "speed-test" => speed_test(&rest),
+            "network-check" => network_check(&rest),
             "presets" => presets(&rest, false),
-            "profiles" => presets(&rest, true),
+            // Before the rename `profiles` listed presets; a bare call and `list` still do.
+            "profiles" => match positional(&rest, 0).as_deref() {
+                None | Some("list") if !has(&rest, "--pick") => presets(&rest, true),
+                _ => profiles_cmd(&rest),
+            },
             "reset" => reset(),
             "-h" | "--help" | "help" => match positional(&rest, 0) {
                 None => {
@@ -588,12 +643,16 @@ from the config directory for a true factory reset."
 
     /// Run the SPAKE2 ceremony, prompting on a terminal or reading `--pin -` from stdin.
     /// Literal PIN arguments are refused because process command lines are public metadata.
+    /// `--request-access` pairs with no PIN once the host's operator approves.
     fn pair(args: &[String]) -> u8 {
         let Some(target) = positional(args, 0) else {
-            eprintln!("usage: punktfunk pair <host[:port]> [--pin -]");
+            eprintln!("usage: punktfunk pair <host[:port]> [--pin - | --request-access]");
             return UNRESOLVED;
         };
         let (addr, port) = split_host_port(&target);
+        if has(args, "--request-access") {
+            return request_access(args, &addr, port);
+        }
         let pin = match value(args, "--pin").as_deref() {
             Some("-") => read_pin(None),
             Some(_) => {
@@ -618,18 +677,66 @@ from the config directory for a true factory reset."
             }
         };
         let name = value(args, "--name").unwrap_or_else(trust::device_name);
-        match trust::pair_with_host(&addr, port, &identity, &pin, &name) {
-            Ok(fp) => {
-                let fp_hex = trust::hex(&fp);
-                if let Err(e) = trust::persist_host(&addr, &addr, port, &fp_hex, true, &[]) {
+        let paired = trust::pair_and_save(&addr, port, &identity, &pin, &name, &addr, &[]);
+        report_paired(
+            &addr,
+            port,
+            paired.map_err(|e| trust::pair_error_message(&e)),
+        )
+    }
+
+    /// The pin `pair --request-access` holds the host to: `--fp` when given, else the one
+    /// saved at this address, by [`KnownHosts::find_by_addr`] — the newest when the address
+    /// names two hosts, as a dual-boot box does. `None`: the first certificate shown is trusted.
+    fn access_pin(known: &KnownHosts, fp: Option<&str>, addr: &str, port: u16) -> Option<[u8; 32]> {
+        match fp {
+            Some(fp) => trust::parse_hex32(fp),
+            None => known
+                .find_by_addr(addr, port)
+                .and_then(|h| trust::parse_hex32(&h.fp_hex)),
+        }
+    }
+
+    /// `pair --request-access`: wait for the host's operator, pinned by [`access_pin`].
+    fn request_access(args: &[String], addr: &str, port: u16) -> u8 {
+        let fp = value(args, "--fp");
+        if fp
+            .as_deref()
+            .is_some_and(|fp| trust::parse_hex32(fp).is_none())
+        {
+            eprintln!("--fp takes the host's 64-hex-digit fingerprint");
+            return UNRESOLVED;
+        }
+        let identity = match trust::load_or_create_identity() {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("client identity: {e:#}");
+                return CONNECT_FAILED;
+            }
+        };
+        let name = value(args, "--name").unwrap_or_else(trust::device_name);
+        let pin = access_pin(&KnownHosts::load(), fp.as_deref(), addr, port);
+        eprintln!("waiting for {addr} to approve this device…");
+        let paired = trust::request_access_to_host(addr, port, &identity, pin, &name, None)
+            .map(|fp| trust::save_paired(addr, addr, port, fp, &[]));
+        report_paired(
+            addr,
+            port,
+            paired.map_err(|e| trust::access_error_message(&e)),
+        )
+    }
+
+    fn report_paired(addr: &str, port: u16, paired: Result<trust::Paired, String>) -> u8 {
+        match paired {
+            Ok(paired) => {
+                if let Err(e) = paired.saved {
                     eprintln!("couldn't save the host: {e:#}");
                 }
-                trust::forget_placeholder(&addr, port);
-                println!("paired {addr}:{port} fp={fp_hex}");
+                println!("paired {addr}:{port} fp={}", paired.fp_hex);
                 OK
             }
-            Err(e) => {
-                eprintln!("{}", trust::pair_error_message(&e));
+            Err(msg) => {
+                eprintln!("{msg}");
                 TRUST_REJECTED
             }
         }
@@ -715,62 +822,39 @@ from the config directory for a true factory reset."
                 };
                 let (addr, port) = split_host_port(&target);
                 let fp = value(args, "--fp").unwrap_or_default();
-                let name = value(args, "--name");
-                let mut known = KnownHosts::load();
-                if let Some(i) = add_target(&known, &addr, port, &fp) {
-                    match merge_saved_host(&mut known, i, &fp, name.as_deref()) {
-                        AddOutcome::Unchanged => {
-                            eprintln!("{addr}:{port} is already saved");
-                            return OK;
-                        }
-                        AddOutcome::Pinned => {
-                            return match known.save() {
-                                Ok(()) => {
-                                    println!("updated {addr}:{port}");
-                                    OK
-                                }
-                                Err(e) => {
-                                    eprintln!("saving: {e:#}");
-                                    CONNECT_FAILED
-                                }
-                            }
-                        }
-                        // The guard held: nothing was overwritten, so file this identity below.
-                        AddOutcome::Conflict => {}
-                    }
+                if !fp.is_empty() && trust::parse_hex32(&fp).is_none() {
+                    eprintln!("--fp takes the host's 64-hex-digit fingerprint");
+                    return UNRESOLVED;
                 }
-                // Nothing to merge into here — but a record with this exact FINGERPRINT is this
-                // same host at a new address. Re-point it: a moved host would otherwise file one
-                // record per address it has ever held, and the one its stable id resolves to
-                // keeps an address it has left.
-                if let Some(i) = known
-                    .hosts
-                    .iter()
-                    .position(|h| !fp.is_empty() && h.fp_hex.eq_ignore_ascii_case(&fp))
-                {
-                    let was = format!("{}:{}", known.hosts[i].addr, known.hosts[i].port);
-                    known.hosts[i].move_to(&addr, port);
-                    return match known.save() {
-                        Ok(()) => {
-                            println!("moved {was} to {addr}:{port}");
-                            OK
-                        }
-                        Err(e) => {
-                            eprintln!("saving: {e:#}");
-                            CONNECT_FAILED
-                        }
-                    };
-                }
-                known.hosts.push(KnownHost {
-                    name: name.unwrap_or_else(|| addr.clone()),
-                    addr: addr.clone(),
-                    port,
-                    fp_hex: fp,
+                let edit = HostEdit {
+                    name: value(args, "--name"),
+                    addr: Some(addr.clone()),
+                    port: Some(port),
+                    fp: Some(fp),
                     ..Default::default()
+                };
+                let mut added = Ok(AddOutcome::Unchanged);
+                let saved = KnownHosts::update_if(|known| {
+                    added = known.add(&edit);
+                    matches!(&added, Ok(o) if *o != AddOutcome::Unchanged).then_some(())
                 });
-                match known.save() {
-                    Ok(()) => {
-                        println!("added {addr}:{port}");
+                let line = match added {
+                    // Exits 0: a panel retrying step 1 of request access finds a correct state.
+                    Ok(AddOutcome::Unchanged) => {
+                        eprintln!("{addr}:{port} is already saved");
+                        return OK;
+                    }
+                    Ok(AddOutcome::Added) => format!("added {addr}:{port}"),
+                    Ok(AddOutcome::Pinned | AddOutcome::Edited) => format!("updated {addr}:{port}"),
+                    Ok(AddOutcome::Moved { from }) => format!("moved {from} to {addr}:{port}"),
+                    Err(e) => {
+                        eprintln!("{e:#}");
+                        return UNRESOLVED;
+                    }
+                };
+                match saved {
+                    Ok(_) => {
+                        println!("{line}");
                         OK
                     }
                     Err(e) => {
@@ -784,15 +868,19 @@ from the config directory for a true factory reset."
                     eprintln!("usage: punktfunk hosts forget <host-ref>");
                     return UNRESOLVED;
                 };
-                let (mut known, i) = match resolve(&reference) {
-                    Ok(v) => v,
-                    Err(code) => return code,
+                // Resolved in the store as it is under its lock; a refusal keeps its code.
+                let mut refused = OK;
+                let pick = |now: &KnownHosts| {
+                    resolve_in(now, &reference)
+                        .map_err(|code| refused = code)
+                        .ok()
                 };
-                match orchestrate::forget_host(&mut known, i) {
-                    Ok(gone) => {
+                match orchestrate::forget_host(pick) {
+                    Ok(Some(gone)) => {
                         println!("forgot {}", gone.name);
                         OK
                     }
+                    Ok(None) => refused,
                     Err(e) => {
                         eprintln!("saving: {e:#}");
                         CONNECT_FAILED
@@ -804,70 +892,6 @@ from the config directory for a true factory reset."
                 UNRESOLVED
             }
         }
-    }
-
-    /// What `hosts add` did to a record that was ALREADY saved for this address.
-    #[derive(Debug, PartialEq, Eq)]
-    enum AddOutcome {
-        /// Nothing to do — no fingerprint was offered, or the record already carries this one.
-        /// Exits 0 on purpose: a panel retrying step 1 of request access must not have to
-        /// invent an error to show for a state that is already correct.
-        Unchanged,
-        /// The record had no fingerprint and now has this one.
-        Pinned,
-        /// The record carries a DIFFERENT fingerprint. Never overwritten — a second identity
-        /// is filed beside it.
-        Conflict,
-    }
-
-    /// The saved record `hosts add` is ABOUT: the one at this address already carrying this
-    /// fingerprint, or the unpinned placeholder waiting for one.
-    ///
-    /// A record there carrying a DIFFERENT fingerprint is a different host, and is not this
-    /// add's target — a dual-boot box answers on one lease with one MAC and a certificate per
-    /// OS, so the second one is filed beside the first rather than refused for its address.
-    fn add_target(known: &KnownHosts, addr: &str, port: u16, fp: &str) -> Option<usize> {
-        known.hosts.iter().position(|h| {
-            h.addr == addr
-                && h.port == port
-                && (fp.is_empty() || h.fp_hex.is_empty() || h.fp_hex.eq_ignore_ascii_case(fp))
-        })
-    }
-
-    /// `hosts add --fp` against an address that is already saved. The difference between these
-    /// three is a trust decision, not bookkeeping.
-    ///
-    /// Filling in an empty fingerprint is step 1 of request access (design §5): a host found by
-    /// advert is saved by address first and pinned second. Without it the `--fp` is dropped on
-    /// the floor and the launch that follows refuses for want of a pin — which is what this did
-    /// before, silently and with exit 0.
-    ///
-    /// A *different* fingerprint never lands on this record: a changed identity is a decision
-    /// for a person, and quietly overwriting a pin here would be a back door through the
-    /// pinning the rest of the client is built on. `hosts add` files it as its own record —
-    /// see [`add_target`], which is why this outcome should not reach the caller.
-    fn merge_saved_host(
-        known: &mut KnownHosts,
-        i: usize,
-        fp: &str,
-        name: Option<&str>,
-    ) -> AddOutcome {
-        let existing = known.hosts[i].fp_hex.clone();
-        if fp.is_empty() || existing.eq_ignore_ascii_case(fp) {
-            return AddOutcome::Unchanged;
-        }
-        if !existing.is_empty() {
-            return AddOutcome::Conflict;
-        }
-        known.hosts[i].fp_hex = fp.to_string();
-        // Only a record still named after its own address is renamed: a label the user chose is
-        // theirs, and an advert's name must not quietly overwrite it.
-        if let Some(label) = name {
-            if known.hosts[i].name == known.hosts[i].addr {
-                known.hosts[i].name = label.to_string();
-            }
-        }
-        AddOutcome::Pinned
     }
 
     /// `wake <host-ref> [--wait]` — a magic packet, and with `--wait` the bounded wake-and-wait
@@ -1043,7 +1067,115 @@ from the config directory for a true factory reset."
         if request_access {
             plan.connect_timeout_secs = Some(REQUEST_ACCESS_TIMEOUT_SECS);
         }
+        // An id or a name; the session looks a name up in the host's list.
+        if let Some(wanted) = value(args, "--as") {
+            plan.profile = Some(wanted);
+        }
         run_plan(plan, exec, request_access)
+    }
+
+    fn list_profiles(host: &KnownHost) -> Result<Option<Vec<ListedProfile>>, u8> {
+        let Some(pin) = trust::parse_hex32(&host.fp_hex) else {
+            eprintln!(
+                "{} isn't paired yet — punktfunk pair {}",
+                host.name, host.addr
+            );
+            return Err(NEEDS_INTERACTION);
+        };
+        let identity = trust::load_or_create_identity().map_err(|e| {
+            eprintln!("client identity: {e:#}");
+            CONNECT_FAILED
+        })?;
+        profiles::fetch_enumerate(&host.addr, host.effective_mgmt_port(), &identity, Some(pin))
+            .map_err(|e| {
+                eprintln!("profiles: {e}");
+                CONNECT_FAILED
+            })
+    }
+
+    /// Write `pick` as the saved profile of record `id`, in the store as it is under its
+    /// lock: the host is asked for its list between the read and this write. `false`, with
+    /// the reason on stderr, when the save fails.
+    fn save_pick(id: &Option<String>, pick: Option<profiles::ProfilePick>) -> bool {
+        let saved = KnownHosts::update(|now| {
+            if let Some(h) = now.hosts.iter_mut().find(|h| h.id == *id) {
+                h.profile = pick;
+            }
+        });
+        saved
+            .inspect_err(|e| eprintln!("save hosts: {e:#}"))
+            .is_ok()
+    }
+
+    /// `profiles <host-ref>` — who plays on the host, and which of them this device plays as.
+    fn profiles_cmd(args: &[String]) -> u8 {
+        let usage = "punktfunk profiles <host-ref> [--json] [--pick PROFILE | --clear]";
+        let (known, i) = match resolve_or_default(args, usage) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let id = &known.hosts[i].id;
+        if has(args, "--clear") {
+            if !save_pick(id, None) {
+                return CONNECT_FAILED;
+            }
+            println!("cleared");
+            return OK;
+        }
+        let listed = match list_profiles(&known.hosts[i]) {
+            Ok(Some(listed)) => listed,
+            Ok(None) => {
+                eprintln!("{} has no profiles", known.hosts[i].name);
+                return UNRESOLVED;
+            }
+            Err(code) => return code,
+        };
+        if let Some(wanted) = value(args, "--pick") {
+            let Some(p) = profiles::find(&listed, &wanted) else {
+                eprintln!("{} has no profile called \"{wanted}\"", known.hosts[i].name);
+                return UNRESOLVED;
+            };
+            if !save_pick(id, Some(p.pick())) {
+                return CONNECT_FAILED;
+            }
+            println!("{}\t{}", p.id, p.display_name);
+            return OK;
+        }
+        let picked = known.hosts[i].profile.as_ref().map(|p| p.id.as_str());
+        if has(args, "--json") {
+            let rows: Vec<serde_json::Value> = listed
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "display_name": p.display_name,
+                        "accent": p.accent,
+                        "owner": p.owner,
+                        "note": p.note(),
+                        "legacy_seat": p.legacy_seat,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({ "profiles": rows, "picked": picked })
+            );
+        } else {
+            for p in &listed {
+                let mark = if picked == Some(p.id.as_str()) {
+                    "\t*"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}\t{}\t{}{mark}",
+                    p.id,
+                    p.display_name,
+                    p.note().unwrap_or_default()
+                );
+            }
+        }
+        OK
     }
 
     /// `open <url>` — the `punktfunk://` grammar, headless. Same parser, same refusal rules and
@@ -1124,16 +1256,15 @@ from the config directory for a true factory reset."
     /// `SpawnOpts::persist_paired` means in the GTK shell. Every other launch records nothing,
     /// which is correct: a plain connect proves reachability, not a new trust decision.
     fn run_plan(plan: ConnectPlan, exec: bool, persist_paired: bool) -> u8 {
-        if plan.host.fp_hex.is_none() {
+        let Some(fp) = plan.host.pin() else {
             eprintln!(
                 "{} has no pinned fingerprint — punktfunk pair {}",
                 plan.host.name, plan.host.addr
             );
             return NEEDS_INTERACTION;
-        }
+        };
         // Wake first when the host is asleep and we know how to reach it. This is the thing the
         // old exec-style CLI never did: it fired a packet at best and dialled into the void.
-        let fp = plan.host.fp_hex.as_deref().unwrap_or_default();
         if plan.wake
             && !trust::probe_one(
                 &plan.host.addr,
@@ -1171,7 +1302,7 @@ from the config directory for a true factory reset."
             eprintln!("{e}");
             return RENDERER_FAILED;
         }
-        let mut failure: Option<(String, bool)> = None;
+        let mut failure: Option<orchestrate::SessionError> = None;
         while let Ok(ev) = rx.recv() {
             match ev {
                 SessionEvent::Ready => {
@@ -1180,25 +1311,12 @@ from the config directory for a true factory reset."
                     // is what we are about to rewrite, and the session proved the host holds
                     // exactly this identity by completing a pinned handshake against it.
                     if persist_paired {
-                        if let Some(fp_hex) = &plan.host.fp_hex {
-                            if let Err(e) = trust::persist_host(
-                                &plan.host.name,
-                                &plan.host.addr,
-                                plan.host.port,
-                                fp_hex,
-                                true,
-                                &[],
-                            ) {
-                                eprintln!("couldn't save the host: {e:#}");
-                            }
-                            trust::forget_placeholder(&plan.host.addr, plan.host.port);
+                        if let Err(e) = orchestrate::persist_on_ready(&plan.host, fp, true) {
+                            eprintln!("couldn't save the host: {e:#}");
                         }
                     }
                 }
-                SessionEvent::Error {
-                    msg,
-                    trust_rejected,
-                } => failure = Some((msg, trust_rejected)),
+                SessionEvent::Error(e) => failure = Some(e),
                 SessionEvent::Ended(reason) => eprintln!("{reason}"),
                 // The window size is persisted by the brain on the way past.
                 SessionEvent::Window { .. } | SessionEvent::Stats(_) => {}
@@ -1209,7 +1327,8 @@ from the config directory for a true factory reset."
                             eprintln!("{msg}");
                             TRUST_REJECTED
                         }
-                        ConnectOutcome::ConnectFailed(msg) => {
+                        ConnectOutcome::ConnectFailed(msg)
+                        | ConnectOutcome::Refused { msg, .. } => {
                             eprintln!("{msg}");
                             CONNECT_FAILED
                         }
@@ -1303,42 +1422,189 @@ from the config directory for a true factory reset."
                 return CONNECT_FAILED;
             }
         };
-        if let Err(e) = client.request_probe(3_000_000, 2_000) {
-            eprintln!("probe: {e:?}");
-            return CONNECT_FAILED;
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            std::thread::sleep(Duration::from_millis(250));
-            let r = client.probe_result();
-            if r.done {
-                std::thread::sleep(Duration::from_millis(400));
-                let r = client.probe_result();
-                let recommended = r.throughput_kbps / 10 * 7;
-                if has(args, "--json") {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "mbps": f64::from(r.throughput_kbps) / 1000.0,
-                            "loss_pct": r.loss_pct,
-                            "recommended_kbps": recommended,
-                        })
-                    );
-                } else {
-                    println!(
-                        "{:.0} Mbit/s measured · {:.1}% loss · recommended {:.0} Mbit/s",
-                        f64::from(r.throughput_kbps) / 1000.0,
-                        r.loss_pct,
-                        f64::from(recommended) / 1000.0
-                    );
-                }
-                return OK;
-            }
-            if std::time::Instant::now() > deadline {
-                eprintln!("probe timed out");
+        use punktfunk_core::client::health;
+        let r = match health::speed_test(&client, |_| {}) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("speed test: {e:?}");
                 return CONNECT_FAILED;
             }
+        };
+        let recommended = health::recommended_kbps(r.ceiling_kbps);
+        if has(args, "--json") {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "mbps": f64::from(r.ceiling_kbps) / 1000.0,
+                    "wall": r.wall,
+                    "clean": r.clean.map(|c| serde_json::json!({
+                        "rate_mbps": f64::from(c.rate_kbps) / 1000.0,
+                        "loss_pct": c.loss_pct,
+                        "jitter_ms": f64::from(c.jitter_us) / 1000.0,
+                        "reorders": c.reorders,
+                    })),
+                    "recommended_kbps": recommended,
+                })
+            );
+        } else {
+            let clean = match r.clean {
+                Some(c) => format!(
+                    " · at {:.0} Mbit/s: {:.1}% loss, {:.1} ms jitter",
+                    f64::from(c.rate_kbps) / 1000.0,
+                    c.loss_pct,
+                    f64::from(c.jitter_us) / 1000.0
+                ),
+                None => String::new(),
+            };
+            println!(
+                "{:.0} Mbit/s measured{clean} · recommended {:.0} Mbit/s",
+                f64::from(r.ceiling_kbps) / 1000.0,
+                f64::from(recommended) / 1000.0
+            );
         }
+        OK
+    }
+
+    /// `network-check <host-ref>` — the speed test and the shaped legs over a probe-only
+    /// session, then every finding by id with its figures.
+    fn network_check(args: &[String]) -> u8 {
+        use punktfunk_core::client::health::{self, FindingId, LegShape};
+        let Some(reference) = positional(args, 0) else {
+            eprintln!("usage: punktfunk network-check <host-ref>");
+            return UNRESOLVED;
+        };
+        let (known, i) = match resolve(&reference) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let host = &known.hosts[i];
+        let Some(pin) = trust::parse_hex32(&host.fp_hex) else {
+            eprintln!("{} isn't paired yet", host.name);
+            return NEEDS_INTERACTION;
+        };
+        let identity = match trust::load_or_create_identity() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("client identity: {e:#}");
+                return CONNECT_FAILED;
+            }
+        };
+        let mode = punktfunk_core::config::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let params = punktfunk_core::client::ConnectParams {
+            name: Some(punktfunk_core::client::device_name()),
+            pin: Some(pin),
+            identity: Some(identity),
+            probe_only: true,
+            ..punktfunk_core::client::ConnectParams::new(
+                &host.addr,
+                host.port,
+                mode,
+                Duration::from_secs(15),
+            )
+        };
+        let client = match punktfunk_core::client::NativeClient::connect(params) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("connect: {e:?}");
+                return CONNECT_FAILED;
+            }
+        };
+        let r = match health::health_check(&client, |_| {}) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("network check: {e:?}");
+                return CONNECT_FAILED;
+            }
+        };
+        let label = |id: FindingId| match id {
+            FindingId::SpeedMismatch => "the host's port is faster than this device's",
+            FindingId::BurstIntolerant => "this device drops the head of a line-rate burst",
+            FindingId::ReceiveBuffer => "loss in this device's receive buffer",
+            FindingId::LinkFault => "loss at a rate no link refuses: cable, port or driver",
+            FindingId::QueueBuildUp => "something on the path buffers",
+            FindingId::HostSendBuffer => "the host's send buffer refused packets",
+            FindingId::Wifi => "this device is on Wi-Fi",
+        };
+        let leg_name = |s: LegShape| match s {
+            LegShape::FrameBursts => "bursts",
+            LegShape::Capped => "capped",
+        };
+        if has(args, "--json") {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ceiling_mbps": f64::from(r.speed.ceiling_kbps) / 1000.0,
+                    "wall": r.speed.wall,
+                    "clean": r.speed.clean.map(|c| serde_json::json!({
+                        "rate_mbps": f64::from(c.rate_kbps) / 1000.0,
+                        "loss_pct": c.loss_pct,
+                        "jitter_ms": f64::from(c.jitter_us) / 1000.0,
+                        "reorders": c.reorders,
+                    })),
+                    "client": {
+                        "iface_kind": r.client.link.kind,
+                        "link_mbps": r.client.link.mbps,
+                        "rcvbuf_kb": r.client.rcvbuf_kb,
+                    },
+                    "host": {
+                        "iface_kind": r.host.iface_kind,
+                        "link_mbps": r.host.link_mbps,
+                        "sndbuf_kb": r.host.sndbuf_kb,
+                    },
+                    "legs": r.legs.iter().map(|l| serde_json::json!({
+                        "shape": leg_name(l.shape),
+                        "loss_pct": l.outcome.loss_pct,
+                        "jitter_ms": f64::from(l.outcome.gap_p99_us.saturating_sub(l.outcome.gap_p50_us)) / 1000.0,
+                        "socket_drops": l.socket_drops,
+                    })).collect::<Vec<_>>(),
+                    "slow": r.slow.map(|s| serde_json::json!({
+                        "loss_pct": s.loss_pct,
+                        "jitter_ms": f64::from(s.gap_p99_us.saturating_sub(s.gap_p50_us)) / 1000.0,
+                    })),
+                    "findings": r.findings.iter().map(|f| serde_json::json!({
+                        "id": f.id as u8,
+                        "label": label(f.id),
+                        "severity": f.severity as u8,
+                        "numbers": f.numbers,
+                    })).collect::<Vec<_>>(),
+                })
+            );
+        } else {
+            println!(
+                "Link carries {}{:.0} Mbit/s.",
+                if r.speed.wall { "" } else { "at least " },
+                f64::from(r.speed.ceiling_kbps) / 1000.0
+            );
+            if let Some(c) = r.speed.clean {
+                println!(
+                    "At {:.0} Mbit/s: {:.1} % loss, {:.1} ms jitter.",
+                    f64::from(c.rate_kbps) / 1000.0,
+                    c.loss_pct,
+                    f64::from(c.jitter_us) / 1000.0
+                );
+            }
+            for l in &r.legs {
+                println!(
+                    "{}: {:.1} % loss{}",
+                    leg_name(l.shape),
+                    l.outcome.loss_pct,
+                    l.socket_drops
+                        .map(|d| format!(", {d} dropped at this socket"))
+                        .unwrap_or_default()
+                );
+            }
+            if r.findings.is_empty() {
+                println!("Nothing to fix.");
+            }
+            for f in &r.findings {
+                println!("- {}", label(f.id));
+            }
+        }
+        OK
     }
 
     /// `presets list` — the presets this device has, and what each overrides. `legacy` is the
@@ -1390,9 +1656,10 @@ from the config directory for a true factory reset."
             eprintln!("cancelled");
             return OK;
         }
-        let mut known = KnownHosts::load();
-        known.hosts.clear();
-        let _ = known.save();
+        if let Err(e) = KnownHosts::update(|known| known.hosts.clear()) {
+            eprintln!("couldn't forget the saved hosts: {e:#}");
+            return CONNECT_FAILED;
+        }
         trust::Settings::default().save();
         println!("client state reset");
         OK
@@ -1451,6 +1718,7 @@ from the config directory for a true factory reset."
                 mgmt_port: None,
                 mac: vec![],
                 os: String::new(),
+                wire: Vec::new(),
             };
             assert!(match_saved(&known, &advert).is_none());
             advert.fp_hex = "AA".into();
@@ -1465,6 +1733,27 @@ from the config directory for a true factory reset."
                 match_saved(&known, &advert).is_some(),
                 "no pin: the address decides"
             );
+        }
+
+        /// Both OS installs of a dual-boot box saved at one address: `--fp` picks its own, a
+        /// bare address the newest, and a placeholder listed first never hides a pin.
+        #[test]
+        fn request_access_pins_by_fingerprint_at_a_shared_address() {
+            let (windows, linux) = ("aa".repeat(32), "bb".repeat(32));
+            let at = |fp: &str| KnownHost {
+                addr: "192.168.1.9".into(),
+                fp_hex: fp.into(),
+                ..Default::default()
+            };
+            let known = KnownHosts {
+                hosts: vec![at(""), at(&windows), at(&linux)],
+            };
+            let pin = |fp: Option<&str>| access_pin(&known, fp, "192.168.1.9", 9777);
+            assert_eq!(pin(Some(&windows)), trust::parse_hex32(&windows));
+            assert_eq!(pin(Some(&linux)), trust::parse_hex32(&linux));
+            assert_eq!(pin(None), trust::parse_hex32(&linux));
+            // Nothing saved there: the first certificate shown is trusted.
+            assert_eq!(access_pin(&known, None, "192.168.1.20", 9777), None);
         }
 
         fn argv(v: &[&str]) -> Vec<String> {
@@ -1530,6 +1819,7 @@ from the config directory for a true factory reset."
                 "open",
                 "reachable",
                 "speed-test",
+                "network-check",
                 "presets",
                 "reset",
             ] {
@@ -1543,130 +1833,6 @@ from the config directory for a true factory reset."
             assert!(verb_help("bogus").is_none());
         }
 
-        fn saved(name: &str, addr: &str, fp: &str) -> KnownHost {
-            KnownHost {
-                name: name.into(),
-                addr: addr.into(),
-                port: 9777,
-                fp_hex: fp.into(),
-                ..Default::default()
-            }
-        }
-
-        /// Step 1 of request access: a host saved by address gains the fingerprint its advert
-        /// carried. Before this, `hosts add --fp` on an existing record exited 0 having done
-        /// NOTHING — the launch that followed then refused for want of a pin, and the panel had
-        /// no way to tell why.
-        #[test]
-        fn adding_a_fingerprint_to_a_placeholder_fills_it_in() {
-            let mut known = KnownHosts {
-                hosts: vec![saved("192.168.1.9", "192.168.1.9", "")],
-            };
-            assert_eq!(
-                merge_saved_host(&mut known, 0, "abc123", Some("living-room")),
-                AddOutcome::Pinned
-            );
-            assert_eq!(known.hosts[0].fp_hex, "abc123");
-            assert_eq!(
-                known.hosts[0].name, "living-room",
-                "a record still named after its address takes the offered label"
-            );
-        }
-
-        /// A label the user chose is theirs — an advert's name must not overwrite it.
-        #[test]
-        fn filling_in_a_fingerprint_keeps_a_user_chosen_name() {
-            let mut known = KnownHosts {
-                hosts: vec![saved("Basement rig", "192.168.1.9", "")],
-            };
-            merge_saved_host(&mut known, 0, "abc123", Some("living-room"));
-            assert_eq!(known.hosts[0].name, "Basement rig");
-        }
-
-        /// Idempotent: the panel may retry step 1, and re-offering the fingerprint a record
-        /// already carries is a state that is already correct, not an error to render.
-        #[test]
-        fn re_adding_the_same_fingerprint_changes_nothing() {
-            let mut known = KnownHosts {
-                hosts: vec![saved("desk", "192.168.1.9", "ABC123")],
-            };
-            assert_eq!(
-                merge_saved_host(&mut known, 0, "abc123", None),
-                AddOutcome::Unchanged,
-                "fingerprints compare case-insensitively"
-            );
-            // And a bare `hosts add` with no --fp at all leaves the pin alone.
-            assert_eq!(
-                merge_saved_host(&mut known, 0, "", None),
-                AddOutcome::Unchanged
-            );
-            assert_eq!(known.hosts[0].fp_hex, "ABC123");
-        }
-
-        /// Both OS installs of a dual-boot box answer at one address with a certificate each.
-        /// The second `hosts add --fp` is not about the first's record, so it is filed beside
-        /// it — the pin the user already has must survive, and so must the new one.
-        #[test]
-        fn a_second_identity_at_one_address_is_not_this_adds_target() {
-            let known = KnownHosts {
-                hosts: vec![saved("desk", "192.168.1.9", "abc123")],
-            };
-            assert_eq!(add_target(&known, "192.168.1.9", 9777, "deadbeef"), None);
-            // The same host again, and a placeholder waiting for a pin, both ARE the target.
-            assert_eq!(add_target(&known, "192.168.1.9", 9777, "ABC123"), Some(0));
-            assert_eq!(add_target(&known, "192.168.1.9", 9777, ""), Some(0));
-            let placeholder = KnownHosts {
-                hosts: vec![saved("192.168.1.9", "192.168.1.9", "")],
-            };
-            assert_eq!(
-                add_target(&placeholder, "192.168.1.9", 9777, "abc"),
-                Some(0)
-            );
-        }
-
-        /// A changed identity is a decision for a person. Never a silent overwrite — this is the
-        /// same rule `upsert_trusted` enforces, and a back door here would defeat it everywhere.
-        #[test]
-        fn a_different_fingerprint_is_refused_not_overwritten() {
-            let mut known = KnownHosts {
-                hosts: vec![saved("desk", "192.168.1.9", "abc123")],
-            };
-            assert_eq!(
-                merge_saved_host(&mut known, 0, "deadbeef", None),
-                AddOutcome::Conflict
-            );
-            assert_eq!(
-                known.hosts[0].fp_hex, "abc123",
-                "the pin must survive intact"
-            );
-        }
-
-        /// A host that changed DHCP lease is re-pointed, not filed a second time. Without this
-        /// the record a stable id resolves to keeps an address the host has left, so a launch
-        /// dials into the void while the panel shows the live one.
-        #[test]
-        fn a_known_fingerprint_at_a_new_address_moves_the_record() {
-            let mut known = KnownHosts {
-                hosts: vec![saved("desk", "192.168.1.9", "abc123")],
-            };
-            // Simulates `hosts add 192.168.1.50 --fp abc123` finding no record at that address.
-            let by_addr = known
-                .hosts
-                .iter()
-                .position(|h| h.addr == "192.168.1.50" && h.port == 9777);
-            assert!(
-                by_addr.is_none(),
-                "the new address is not yet on any record"
-            );
-            let by_fp = known
-                .hosts
-                .iter()
-                .position(|h| h.fp_hex.eq_ignore_ascii_case("abc123"));
-            assert_eq!(by_fp, Some(0), "the fingerprint still identifies the host");
-            known.hosts[0].addr = "192.168.1.50".into();
-            assert_eq!(known.hosts.len(), 1, "one host, one record");
-        }
-
         #[test]
         fn value_reads_the_argument_after_its_flag() {
             let a = argv(&["--game", "steam:570", "--exec"]);
@@ -1675,6 +1841,15 @@ from the config directory for a true factory reset."
             // A flag followed by another flag has no value.
             assert_eq!(value(&argv(&["--preset", "--exec"]), "--preset"), None);
             assert!(has(&a, "--exec"));
+        }
+
+        /// `--as` and `--pick` take a value, so it is never read as the host.
+        #[test]
+        fn a_profile_flag_is_not_the_host() {
+            let a = argv(&["--as", "kid", "couch", "--game", "steam:570"]);
+            assert_eq!(positional(&a, 0).as_deref(), Some("couch"));
+            assert_eq!(value(&a, "--as").as_deref(), Some("kid"));
+            assert_eq!(positional(&argv(&["--pick", "Kid"]), 0), None);
         }
     }
 }

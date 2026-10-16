@@ -58,6 +58,28 @@ private const val ACCEL_GAIN = 0.6f
 private const val ACCEL_SPEED_FLOOR = 0.3f
 private const val ACCEL_MAX = 3.0f
 
+/** The pointer gain for a finger speed in px per ms: 1 up to [ACCEL_SPEED_FLOOR], then rising by
+ *  [ACCEL_GAIN] per px/ms, capped at [ACCEL_MAX]. */
+internal fun pointerAccel(speed: Float): Float =
+    (1f + ACCEL_GAIN * (speed - ACCEL_SPEED_FLOOR).coerceAtLeast(0f)).coerceAtMost(ACCEL_MAX)
+
+/** The values `clients/shared/touch-vectors.json` pins against the Apple client's `TouchTuning`.
+ *  The gesture code reads the constants above; these only let a test see them. */
+internal object TouchTuning {
+    val tapDragMs = TAP_DRAG_MS
+    val longPressMs = LONG_PRESS_MS
+    val pointerSens = POINTER_SENS
+    val accelGain = ACCEL_GAIN
+    val accelSpeedFloor = ACCEL_SPEED_FLOOR
+    val accelMax = ACCEL_MAX
+    val keyboardSwipeFraction = KB_SWIPE_FRACTION
+    val dialArmDeg = DIAL_ARM_DEG
+    val dialCommitDeg = DIAL_COMMIT_DEG
+
+    /** The dial's slop in tap slops. */
+    val dialSlopInTapSlops = DIAL_SLOP / TAP_SLOP
+}
+
 /**
  * Touch → mouse, run inside the stream overlay's `pointerInput`. Two models, chosen by the
  * Trackpad-mode setting:
@@ -83,32 +105,47 @@ private const val ACCEL_MAX = 3.0f
  * contact is lifted so nothing stays stuck on the host.
  */
 /**
- * The stream frame the gesture layer maps into: how it fills the container ([fit]) and its size.
- * The video SurfaceView is laid out with the same placement, so every absolute mapping — direct
- * pointer, passthrough, the pen lane, the mouse — lands where the picture is. A frame of unknown
- * size (an older native lib) maps the container onto itself.
+ * The stream frame the gesture layer maps into: how it fills the container ([fit]) and its size
+ * — or, when the picture spans two screens, the [span] rows from [originY] down that this
+ * container shows of the [height]-row frame. The video SurfaceView is laid out with the same
+ * placement, so every absolute mapping — direct pointer, passthrough, the pen lane, the mouse —
+ * lands where the picture is. A frame of unknown size (an older native lib) maps the container
+ * onto itself.
  */
-internal class VideoFrame(val fit: VideoFit, val width: Int, val height: Int) {
+internal class VideoFrame(
+    val fit: VideoFit,
+    val width: Int,
+    val height: Int,
+    val originY: Int = 0,
+    val span: Int = height,
+) {
     fun at(size: IntSize): FrameMap =
-        if (width > 0 && height > 0) {
-            FrameMap(VideoFit.place(fit, size.width, size.height, width, height), width, height)
+        if (width > 0 && span > 0) {
+            FrameMap(VideoFit.place(fit, size.width, size.height, width, span), width, height, originY, span)
         } else {
             FrameMap(VideoFit.place(fit, size.width, size.height, size.width, size.height), size.width, size.height)
         }
 }
 
 /**
- * One placement of a [width]×[height] frame in a container. Container points clamp onto the
- * visible frame: a contact on a bar or on a cropped-away edge has no host position of its own.
+ * One placement of the [span] rows from [originY] of a [width]×[height] frame in a container.
+ * Container points clamp onto the visible rows: a contact on a bar or on a cropped-away edge has
+ * no host position of its own. The host always sees the whole frame's size.
  */
-internal class FrameMap(val placement: VideoPlacement, val width: Int, val height: Int) {
-    val isEmpty: Boolean get() = placement.isEmpty || width <= 0 || height <= 0
+internal data class FrameMap(
+    val placement: VideoPlacement,
+    val width: Int,
+    val height: Int,
+    val originY: Int = 0,
+    val span: Int = height,
+) {
+    val isEmpty: Boolean get() = placement.isEmpty || width <= 0 || span <= 0
 
     /** Container x → frame pixel. */
     fun x(viewX: Float): Int = placement.frameX(viewX.toDouble()).roundToInt().coerceIn(0, width - 1)
 
     /** Container y → frame pixel. */
-    fun y(viewY: Float): Int = placement.frameY(viewY.toDouble()).roundToInt().coerceIn(0, height - 1)
+    fun y(viewY: Float): Int = originY + placement.frameY(viewY.toDouble()).roundToInt().coerceIn(0, span - 1)
 
     /** Container x → 0…1 across the frame, the pen plane's unit. */
     fun nx(viewX: Float): Float =
@@ -116,7 +153,19 @@ internal class FrameMap(val placement: VideoPlacement, val width: Int, val heigh
 
     /** Container y → 0…1 down the frame. */
     fun ny(viewY: Float): Float =
-        (placement.frameY(viewY.toDouble()) / (height - 1).coerceAtLeast(1)).toFloat().coerceIn(0f, 1f)
+        ((originY + placement.frameY(viewY.toDouble())) / (height - 1).coerceAtLeast(1)).toFloat().coerceIn(0f, 1f)
+
+    /** The part of the whole frame this placement shows, as fractions: left, top, right, bottom. */
+    fun sourceCrop(): FloatArray {
+        if (isEmpty) return floatArrayOf(0f, 0f, 1f, 1f)
+        val p = placement
+        return floatArrayOf(
+            (p.srcX / width).toFloat(),
+            ((originY + p.srcY) / height).toFloat(),
+            ((p.srcX + p.srcW) / width).toFloat(),
+            ((originY + p.srcY + p.srcH) / height).toFloat(),
+        )
+    }
 }
 
 /** Whether this change belongs to the stylus lane (only when a pen-capable host is live). */
@@ -586,8 +635,7 @@ private class Gesture(
         prevY = p.position.y
         prevT = p.uptimeMillis
         val speed = hypot(dx, dy) / dt // finger px per ms
-        val accel = (1f + ACCEL_GAIN * (speed - ACCEL_SPEED_FLOOR).coerceAtLeast(0f))
-            .coerceAtMost(ACCEL_MAX)
+        val accel = pointerAccel(speed)
         accX += dx * POINTER_SENS * accel
         accY += dy * POINTER_SENS * accel
         val outX = accX.toInt() // truncates toward zero → remainder kept w/ sign

@@ -85,6 +85,12 @@ data class ConnectRequest(
     val presetId: String? = null,
     /** That preset's name, for people. */
     val presetName: String? = null,
+    /** `2` dials a network check's probes-only session; `0` streams. */
+    val deliveryFlags: Int = 0,
+    /** The host profile to play as (its id); `null` sends none. Rides the Hello as `profile`. */
+    val profile: String? = null,
+    /** PyroWave quality in hundredths of a bit per pixel, 50 to 200; `0` leaves the host's own. */
+    val pyrowaveBppX100: Int = 0,
 ) {
     fun toJson(): String = JSONObject()
         .put("host", host)
@@ -96,6 +102,7 @@ data class ConnectRequest(
         .put("key_pem", keyPem)
         .put("pin_hex", pinHex)
         .put("bitrate_kbps", bitrateKbps)
+        .put("pyrowave_bpp_x100", pyrowaveBppX100)
         .put("compositor_pref", compositorPref)
         .put("gamepad_pref", gamepadPref)
         .put("hdr_enabled", hdrEnabled)
@@ -107,6 +114,7 @@ data class ConnectRequest(
         .put("audio_bits", audioBits)
         .put("video_codecs", videoCodecs)
         .put("preferred_codec", preferredCodec)
+        .put("delivery_flags", deliveryFlags)
         .put("timeout_ms", timeoutMs)
         .put("launch", launch ?: JSONObject.NULL)
         .put("device_name", deviceName ?: JSONObject.NULL)
@@ -116,5 +124,6 @@ data class ConnectRequest(
         .put("dialer", dialer)
         .put("preset_id", presetId ?: JSONObject.NULL)
         .put("preset_name", presetName ?: JSONObject.NULL)
+        .put("profile", profile ?: JSONObject.NULL)
         .toString()
 }

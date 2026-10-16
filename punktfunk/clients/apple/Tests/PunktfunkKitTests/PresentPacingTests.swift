@@ -213,6 +213,17 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(box.take(), 3, "the fresher vend wins over the stale return")
     }
 
+    /// The render thread drops a drawable past its pick: only that one, never a fresher vend.
+    func testLatestBoxTakeWhereChecksTheValueItTakes() {
+        let box = LatestBox<Int>()
+        XCTAssertNil(box.peek { $0 })
+        box.put(5)
+        XCTAssertEqual(box.peek { $0 * 2 }, 10, "peek reads without taking")
+        XCTAssertNil(box.take(where: { $0 < 5 }), "a fresher value stays")
+        XCTAssertEqual(box.take(where: { $0 == 5 }), 5)
+        XCTAssertNil(box.take(), "the matching take emptied the slot")
+    }
+
     // MARK: - PresenterChoice
 
     /// iOS and tvOS default to the deadline link, macOS to arrival-paced Metal. No selection or an
@@ -269,11 +280,11 @@ final class PresentPacingTests: XCTestCase {
         #endif
     }
 
-    /// The decoded video-layer path resolves only on tvOS. Other platforms treat an explicit
-    /// value as unknown and retain their platform default.
-    func testDecodedPresenterIsTvOSOnly() {
-        #if os(tvOS)
-        if #available(tvOS 17.4, *) {
+    /// The decoded video-layer A/B resolves on iOS and tvOS 17.4+. Elsewhere an explicit value is
+    /// unknown and the platform default stays.
+    func testDecodedPresenterIsIOSAndTvOSOnly() {
+        #if os(tvOS) || os(iOS)
+        if #available(iOS 17.4, tvOS 17.4, *) {
             XCTAssertEqual(
                 PresenterChoice.explicit(setting: nil, env: "decoded", allowStage1: true), .decoded)
         } else {
@@ -326,6 +337,7 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(SessionPresenter.pacing(for: .decoded, codec: .pyrowave), .deadline)
     }
 
+    @MainActor
     func testDecodedPacingRequiresAVideoLayer() {
         XCTAssertNil(Stage2Pipeline(endToEndMeter: nil, pacing: .decoded))
     }
@@ -356,9 +368,16 @@ final class PresentPacingTests: XCTestCase {
                 env: env, vsync: vsync, vsyncPaced: vsyncPaced, adaptiveSlotPaced: adaptive)
         }
         let adaptive = policy(nil, adaptive: true)
-        XCTAssertEqual(adaptive, PresentPolicy(adaptiveSlot: true, fixedSlot: false, fixedVsync: false))
-        XCTAssertEqual(adaptive.label(.arrival), "adaptive")
+        XCTAssertEqual(
+            adaptive,
+            PresentPolicy(adaptiveSlot: true, fixedSlot: false, fixedVsync: false, directGate: true))
+        XCTAssertEqual(adaptive.label(.arrival), "direct")
         XCTAssertEqual(policy("garbage", adaptive: true), adaptive, "an unknown mode is no mode")
+        // `adaptive` keeps the slot regime and drops the Direct gate, for A/B.
+        let slotOnly = policy("adaptive", adaptive: true)
+        XCTAssertEqual(slotOnly, PresentPolicy(adaptiveSlot: true, fixedSlot: false, fixedVsync: false))
+        XCTAssertEqual(slotOnly.label(.arrival), "adaptive")
+        XCTAssertFalse(policy("adaptive").directGate, "no gate off an adaptive panel")
 
         let vsync = policy(nil, vsync: true, adaptive: true)
         XCTAssertEqual(vsync, PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: true))

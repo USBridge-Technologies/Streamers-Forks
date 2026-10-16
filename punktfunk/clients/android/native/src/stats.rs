@@ -16,12 +16,40 @@ pub struct VideoStats {
     /// compositor coalesced onto one vsync. Gauges; the presenter owns the window.
     judder_permille: AtomicU32,
     coalesced: AtomicU64,
+    /// The last window as numbers (`nativeVideoStatsSample`), kept beside the lines each
+    /// `nativeVideoStatsLines` call formats, so the two views read one window. Empty until then.
+    sample: Mutex<Vec<f32>>,
 }
 
 /// A realtime stamp as the core takes it. A stamp that never happened reads 0.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn ns(v: i128) -> u64 {
     v.clamp(0, i128::from(u64::MAX)) as u64
+}
+
+/// The ceiling on any latency sample. A vendor's first render callbacks can carry a garbage
+/// stamp, and one such sample would poison every max and percentile it lands in.
+pub const SANE_NS: i128 = 10_000_000_000;
+
+/// A span of `v` ns as µs when it lies in (0, [`SANE_NS`]), else `None`.
+pub fn sane_us(v: i128) -> Option<u64> {
+    (v > 0 && v < SANE_NS).then_some((v / 1000) as u64)
+}
+
+/// Publish one frame's glass-to-glass figure, `displayed_real_ns + offset_ns - pts_ns`, into
+/// `video_e2e` and return it in µs. The audio plane steers its ring by that atomic, so every
+/// presenter calls this whatever the HUD state, and an insane value is dropped rather than stored.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn publish_e2e(
+    video_e2e: &AtomicU64,
+    displayed_real_ns: i128,
+    offset_ns: i64,
+    pts_ns: u64,
+) -> Option<u64> {
+    let e2e_ns = displayed_real_ns + i128::from(offset_ns) - i128::from(pts_ns);
+    let us = sane_us(e2e_ns)?;
+    video_e2e.store(e2e_ns as u64, Ordering::Relaxed);
+    Some(us)
 }
 
 impl VideoStats {
@@ -31,7 +59,17 @@ impl VideoStats {
             decoder: Mutex::new(None),
             judder_permille: AtomicU32::new(0),
             coalesced: AtomicU64::new(0),
+            sample: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn keep_sample(&self, sample: Vec<f32>) {
+        *crate::session::lock_recover(&self.sample) = sample;
+    }
+
+    /// The last window's numbers; empty before the first formatted window.
+    pub fn sample(&self) -> Vec<f32> {
+        crate::session::lock_recover(&self.sample).clone()
     }
 
     /// Whether the overlay wants samples. The decode paths skip their clock reads while not.
@@ -98,9 +136,8 @@ impl VideoStats {
     ) {
         self.hud
             .note_displayed(pts_ns, ns(decoded_ns), ns(released_ns), ns(displayed_ns));
-        let latch = displayed_ns - released_ns;
-        if released_ns > 0 && latch > 0 && latch < 10_000_000_000 {
-            self.hud.note_os_floor_us((latch / 1000) as u64);
+        if let Some(us) = sane_us(displayed_ns - released_ns).filter(|_| released_ns > 0) {
+            self.hud.note_os_floor_us(us);
         }
     }
 
@@ -114,5 +151,23 @@ impl VideoStats {
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn note_skipped_overflow(&self, n: u64) {
         self.hud.note_skipped(0, n.min(u64::from(u32::MAX)) as u32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publish_e2e_stores_only_sane_samples() {
+        let e2e = AtomicU64::new(7);
+        assert_eq!(
+            publish_e2e(&e2e, 5_000_000, 1_000_000, 2_000_000),
+            Some(4_000)
+        );
+        assert_eq!(e2e.load(Ordering::Relaxed), 4_000_000);
+        assert_eq!(publish_e2e(&e2e, 1_000, 0, 2_000), None);
+        assert_eq!(publish_e2e(&e2e, SANE_NS, 0, 0), None);
+        assert_eq!(e2e.load(Ordering::Relaxed), 4_000_000);
     }
 }

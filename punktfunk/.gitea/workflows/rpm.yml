@@ -25,40 +25,36 @@ on:
     # web-only push should not light up the whole fleet. Applies to branch pushes;
     # tag runs are matched by `tags:` (proven by flatpak/windows-msix releases).
     paths:
-      - 'crates/pf-bitstream/**'
-      - 'crates/pf-capture/**'
-      - 'crates/pf-client-core/**'
-      - 'crates/pf-clipboard/**'
-      - 'crates/pf-console-ui/**'
-      - 'crates/pf-dmabuf/**'
-      - 'crates/pf-driver-proto/**'
-      - 'crates/pf-encode/**'
-      - 'crates/pf-encode-core/**'
-      - 'crates/pf-frame/**'
-      - 'crates/pf-gpu/**'
-      - 'crates/pf-host-config/**'
-      - 'crates/pf-inject/**'
-      - 'crates/pf-audio/**'
-      - 'crates/pf-libva/**'
-      - 'crates/pf-paths/**'
-      - 'crates/pf-paths-win/**'
-      - 'crates/pf-portal/**'
-      - 'crates/pf-presenter/**'
-      - 'crates/pf-update/**'
-      - 'crates/pf-update-check/**'
-      - 'crates/pf-vaapi/**'
-      - 'crates/pf-v4l2dec/**'
-      - 'crates/pf-v4l2/**'
-      - 'crates/pf-vdisplay/**'
-      - 'crates/pf-vkdecode/**'
-      - 'crates/pf-win-display/**'
-      - 'crates/pf-zerocopy/**'
-      - 'crates/punktfunk-core/**'
-      - 'crates/punktfunk-ffi/**'
-      - 'crates/punktfunk-encode-worker/**'
-      - 'crates/punktfunk-host/**'
-      - 'crates/punktfunk-tray/**'
-      - 'crates/pyrowave-sys/**'
+      - 'crates/client/**'
+      - 'crates/codec/pf-bitstream/**'
+      - 'crates/codec/pf-libva/**'
+      - 'crates/codec/pf-v4l2/**'
+      - 'crates/codec/pf-v4l2dec/**'
+      - 'crates/codec/pf-vaapi/**'
+      - 'crates/codec/pf-vkdecode/**'
+      - 'crates/codec/pyrowave-sys/**'
+      - 'crates/core/**'
+      - 'crates/host/pf-audio/**'
+      - 'crates/host/pf-capture/**'
+      - 'crates/host/pf-clipboard/**'
+      - 'crates/host/pf-driver-proto/**'
+      - 'crates/host/pf-encode/**'
+      - 'crates/host/pf-encode-core/**'
+      - 'crates/host/pf-frame/**'
+      - 'crates/host/pf-gpu/**'
+      - 'crates/host/pf-host-config/**'
+      - 'crates/host/pf-inject/**'
+      - 'crates/host/pf-paths/**'
+      - 'crates/host/pf-paths-win/**'
+      - 'crates/host/pf-portal/**'
+      - 'crates/host/pf-seats/**'
+      - 'crates/host/pf-vdisplay/**'
+      - 'crates/host/pf-win-display/**'
+      - 'crates/host/pf-zerocopy/**'
+      - 'crates/host/punktfunk-encode-worker/**'
+      - 'crates/host/punktfunk-host/**'
+      - 'crates/install/pf-update/**'
+      - 'crates/install/punktfunk-tray/**'
       - 'clients/linux/**'
       - 'clients/session/**'
       - 'clients/shared/**'
@@ -72,9 +68,16 @@ on:
       - 'packaging/kde/host.env'
       - 'packaging/linux/*.conf'
       - 'packaging/linux/*.desktop'
+      - 'packaging/linux/*.generator'
+      - 'packaging/linux/apparmor/**'
       - 'packaging/linux/*.rules'
       - 'packaging/linux/*.service'
       - 'packaging/linux/*.sh'
+      - 'packaging/linux/*.tmpfiles'
+      - 'packaging/linux/*.sysusers'
+      - 'packaging/linux/payload.txt'
+      - 'packaging/linux/seat-*'
+      - 'packaging/linux/door-*'
       - 'packaging/linux/*.xml'
       - 'packaging/linux/icons/**'
       - 'LICENSE-MIT'
@@ -103,6 +106,7 @@ on:
       - 'scripts/punktfunk-web.service'
       - 'scripts/web-init.sh'
       - 'scripts/ci/assert-cap-matrix.sh'
+      - 'scripts/ci/assert-payload-parity.sh'
       - 'scripts/ci/check-dualsense-ucm.sh'
       - 'scripts/ci/ensure-sccache.sh'
       - 'scripts/ci/gitea-release.sh'
@@ -308,6 +312,12 @@ jobs:
           # client/web/scripting subpackages ship neither and are skipped by the script itself.
           bash scripts/ci/assert-cap-matrix.sh dist/punktfunk-[0-9]*.rpm
 
+      # Every path packaging/linux/payload.txt names, read out of the built host and client rpms.
+      - name: Assert the shared payload (rpm)
+        run: |
+          bash scripts/ci/assert-payload-parity.sh --self-test
+          bash scripts/ci/assert-payload-parity.sh dist/punktfunk-[0-9]*.rpm dist/punktfunk-client-[0-9]*.rpm
+
       - name: Publish to the Gitea RPM registry
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
@@ -370,7 +380,7 @@ jobs:
           # The rest of the Arch package's makedepends that Fedora's older packaged gamescope does
           # not necessarily pull. Best-effort: unlike the static runtime, meson finds fallbacks or
           # does without, and a name that moves between Fedora releases should not fail the job.
-          dnf -y install wayland-protocols-devel glm-devel cmake libXcursor-devel || true
+          dnf -y install wayland-protocols-devel glm-devel cmake libXcursor-devel libei-devel || true
           if bash packaging/gamescope/build-punktfunk-gamescope.sh \
                --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
             # The WHOLE staged tree, not just the binary: it also carries the Vulkan WSI layer built
@@ -468,6 +478,7 @@ jobs:
             dist/punktfunk-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
             dist/punktfunk-web-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
             dist/punktfunk-scripting-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
+            dist/punktfunk-seats-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
             dist/punktfunk-bun-"${PF_VERSION}-${PF_RELEASE}"*.rpm
 
       # Read the capability matrix back OUT of the image that is about to be published — the one

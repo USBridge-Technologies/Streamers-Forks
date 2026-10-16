@@ -3,23 +3,36 @@ title: Controller speaker and haptics
 description: Feel a game's DualSense voice-coil haptics and hear the pad's speaker on the controller in your hands — what to turn on, and how to check it.
 ---
 
-A wired DualSense in your hands plays what the game on the host sends to the controller's
-voice-coil haptics and its built-in speaker. Nothing is sent while the pad is quiet.
+A DualSense in your hands plays what the game on the host sends to the controller's voice-coil
+haptics and its built-in speaker. Nothing is sent while the pad is quiet.
 
 ## What you need
 
-- **A DualSense or DualSense Edge plugged in over USB** on the client. Over Bluetooth the pad has
-  no audio device and gets ordinary rumble.
+- **A DualSense or DualSense Edge** on the client, plugged in over USB or, on Linux and Windows,
+  paired over [Bluetooth](#over-bluetooth). On Android it needs USB.
 - **A Linux, Windows or Android client.** **Controller haptics** is on by default; **Controller
   speaker** is on by default on Linux and Windows, off on Android
   ([client settings](/docs/client-settings#input)). On Android both also need **DualSense /
   DualShock passthrough (USB)** on. The Apple clients play neither.
-- **Controller speaker** on for the host, in the web console under **Host → Settings → Audio**. It
+- **Controller speaker** on for the host, in the web console under **Host → Audio**. It
   is on by default and covers the haptics too.
 - **On a Linux host**, a game running under **GE-Proton 11-5 or newer**. Stock Proton doesn't
   route controller audio.
 - **On a Windows host**, Steam installed: the pad's audio device uses Steam's streaming speaker
   driver.
+
+## Over Bluetooth
+
+A paired DualSense has no sound card on the client, so the client carries the speaker and the
+haptics inside the controller's own Bluetooth reports, about every 11 ms. There is no profile to
+switch and nothing to install. The client log shows
+`pad-audio output opened on the DualSense bluetooth=true`.
+
+- The haptics play at 3 kHz instead of 48 kHz, so the finest textures are softer than over USB.
+- The pad's headphone jack and microphone stay off.
+- On Linux the client needs access to the pad's `hidraw` node, the same access the controller's
+  gyro and lightbar already need.
+- `--pad-audio-test` below checks a USB pad only.
 
 ## No Pro Audio switch on the host
 

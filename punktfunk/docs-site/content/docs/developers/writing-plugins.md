@@ -27,16 +27,16 @@ Linux and `%ProgramData%\punktfunk` on Windows.
 
 | | Linux | Windows |
 |---|---|---|
-| Isolation | One bubblewrap sandbox per plugin, with its own PID namespace | All plugins share the runner's `NT AUTHORITY\LocalService` account |
-| Files | `/usr`, its own code, its state dir, the manifest's paths and the operator's grants | The config dir is read-only except `plugin-state`; the user's profile is closed |
-| Network | None unless the manifest sets `network` | Unrestricted |
-| Host API | A socket the runner forwards; `connect()` finds it | Loopback HTTPS |
+| Isolation | One bubblewrap sandbox per plugin, with its own PID namespace | One AppContainer per plugin, `punktfunk.plugin.<id>`, under the runner's `NT AUTHORITY\LocalService` account |
+| Files | `/usr`, its own code, its state dir, the manifest's paths and the operator's grants | Program Files, its own code, its state dir, the manifest's paths and the operator's grants; user profiles are closed |
+| Network | None unless the manifest sets `network` | None unless the manifest sets `network`; never loopback |
+| Host API | A socket the runner forwards; `connect()` finds it | A named pipe per plugin; `connect()` finds it |
 
 ## The manifest
 
 Declare what the plugin needs in a `punktfunk` block in its `package.json`; the
 [minimal plugin](#a-minimal-library-plugin) below has one. It ships inside the reviewed tarball, so
-nothing the plugin does at runtime widens it. Without it, a plugin does not start on Linux.
+nothing the plugin does at runtime widens it. Without it, a plugin does not start.
 
 | Field | Meaning |
 |---|---|
@@ -45,6 +45,7 @@ nothing the plugin does at runtime widens it. Without it, a plugin does not star
 | `reads` | Paths the plugin reads. Absolute or `~/`-rooted. A missing path is skipped. |
 | `writes` | Paths it also writes. |
 | `network` | `true` to reach the network. |
+| `registry` | Windows registry keys it reads, as `HKLM\…` or `HKCU\…`. A key under `HKCU`, like a path under `~/`, marks a source that belongs to one account. |
 | `exec` | Named argv templates the host may run for this plugin's titles. |
 
 The sandbox never binds `/`, the home directory or its parents, `/proc`, `/sys`, `/dev`, `/run`
@@ -66,6 +67,12 @@ declares its kind:
 No other value may start with `-`. The host drops a title whose values don't fit when the plugin
 publishes it.
 
+A ROM needs no template. `launch: { kind: "emulator", value: "pcsx2", args: [...] }` names a
+catalog emulator, and the arguments `platform`, `file`, and optionally `core` and `extra`. The host
+starts `file` in its best copy of that emulator, after first-run setup and the platform's firmware.
+`GET /api/v1/emulators/catalog` lists the platforms and emulators. A plugin that moves saves asks
+once with `saves: true` on `POST /api/v1/plugin-access/requests`.
+
 ## A minimal library plugin
 
 `@punktfunk/plugin-kit/library` supplies everything except the scan: the sync loop, file watching,
@@ -84,9 +91,9 @@ the console settings form and the CLI. Four files:
     "test": "bun test"
   },
   "dependencies": {
-    "@punktfunk/host": "^0.3.0",
-    "@punktfunk/plugin-kit": "^0.9.0",
-    "effect": "4.0.0-beta.99"
+    "@punktfunk/host": "^0.4.0",
+    "@punktfunk/plugin-kit": "^0.13.0",
+    "effect": "4.0.1"
   },
   "punktfunk": {
     "schema": 1,
@@ -157,6 +164,7 @@ tell when the game quits.
 | A tab on each game's page | `serveUi({ title, game })`; see [below](#a-tab-on-each-games-page) |
 | Art or details for every game | `defineMetadataPlugin`; see [below](#a-source-of-art-and-details) |
 | Work before a game starts | `serveUi({ title, holds })`; see [below](#hold-a-launch) |
+| Titles that download before they play | `serveUi({ title, install })`; see [below](#install-a-title) |
 | Reacting to events only | `definePlugin({ name, main: async (pf) => … })` from `@punktfunk/host` |
 
 Keep Effect values inside the plugin: the runner bundles its own copy of Effect, so the default
@@ -233,7 +241,7 @@ export default plugin.def;
   image `fetch` found. `lookup <id>` on the plugin's CLI prints what it finds for one game.
 
 Add `"network": true` to the manifest. Register in the store's `metadata` category so the console
-offers it under **Library** → **Art & Metadata**.
+offers it under **Library** → **Sources** → **Art & Metadata**.
 
 ## Hold a launch
 
@@ -259,6 +267,47 @@ yield* serveUi({
 - A library source holds through `defineLibraryPlugin({ holds, holdTimeoutMs })`; its handler
   also gets the plugin's config: `(game, cfg) => …`. It fires for every launch on the host, so
   check that `game.app` is one of yours.
+
+## Install a title
+
+A plugin can list titles that aren't on the host yet: a ROM on a server, a game in a store. Mark
+each with `install` in its entry, serve the host's install requests, and report progress. The host
+does the rest: speed and time left, the console's Downloads list, and every client's launch screen.
+A player who starts a title that isn't installed waits on that screen until the files are in, then
+the game starts.
+
+```ts
+const reporter = yield* downloadReporter("my-plugin");
+yield* serveUi({
+  title: "My library",
+  install: {
+    start: ({ externalId }) => startDownload(externalId, reporter),
+    pause: ({ externalId }) => pauseDownload(externalId),
+    cancel: ({ externalId }) => cancelDownload(externalId),
+    uninstall: ({ externalId }) => removeFiles(externalId),
+  },
+});
+// In each entry the plugin reconciles:
+//   install: { state: "missing", size_bytes: 26e9, target: "/mnt/games/my-plugin" }
+```
+
+- `start` answers once the download is under way, not when it ends. Start a paused one again from
+  where it stopped. Every handler may fail with `InstallRefused({ message })`: one sentence the
+  player or operator reads ("Not enough space in /mnt/games: it needs 26 GB and 8 GB is free.").
+- `reporter.set({ externalId, state, doneBytes, totalBytes, phase, error })` on every change. The
+  reporter keeps the host's rules for you: one send a second at most, and a restatement every 5 s
+  while a title is `queued`, `downloading` or `installing`. A title the host hears nothing about for
+  30 s counts as stalled, and a launch waiting on it gives up.
+- `pause` keeps the partial files, `cancel` discards them, `uninstall` removes what the plugin
+  downloaded and nothing else. Saves stay.
+- After a download finishes or files go, reconcile again so the entry's `install.state` says what
+  is on disk. `target` must be a folder the plugin may write; the host shows its free space.
+- On a host that predates downloads, `reporter.supported()` turns `false`: keep fetching in a
+  launch hold, as before.
+- A library source passes the four handlers to `defineLibraryPlugin({ install })`, each with
+  the config as its second argument, and reports from `downloads: (reporter, config) => …`,
+  which runs beside the sync. The host takes a row for any title the plugin lists, so a source
+  can also report downloads its launcher started.
 
 ## Folders you can't know in advance
 

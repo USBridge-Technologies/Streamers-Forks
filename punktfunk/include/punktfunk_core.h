@@ -1,4 +1,4 @@
-/* punktfunk C ABI — see crates/punktfunk-ffi/src/lib.rs */
+/* punktfunk C ABI — see crates/client/punktfunk-ffi/src/lib.rs */
 
 #ifndef PUNKTFUNK_CORE_H
 #define PUNKTFUNK_CORE_H
@@ -56,6 +56,17 @@
 // send via [`punktfunk_connection_send_hid_report`], never by building the datagram.
 #define PUNKTFUNK_RICH_HID_REPORT 4
 
+// [`punktfunk_connection_set_sc2_gate`] bit: the client's overlay owns the pad. Its raw state
+// goes out neutral, and a button held now stays off the wire until it is released.
+#define PUNKTFUNK_SC2_GATE_MASKED 1
+
+// [`punktfunk_connection_set_sc2_gate`] bit: Steam and QAM stay with the client.
+#define PUNKTFUNK_SC2_GATE_SYSTEM_LOCAL 2
+
+// [`punktfunk_connection_set_sc2_gate`] bit: the client opens its ring on Select then A, so
+// that chord stays off the wire.
+#define PUNKTFUNK_SC2_GATE_CHORDS 4
+
 // [`PunktfunkPenSample::state`] bit: the pen hovers in range (implied by `TOUCHING`).
 #define PUNKTFUNK_PEN_IN_RANGE 1
 
@@ -80,6 +91,10 @@
 
 // [`PunktfunkPenSample::tilt_deg`] sentinel: no tilt reading.
 #define PUNKTFUNK_PEN_TILT_UNKNOWN 255
+
+// Longest profile id, in bytes, that [`PunktfunkConnectOpts::profile_id`] sends and
+// [`punktfunk_connection_profile`] writes (before the NUL).
+#define PUNKTFUNK_PROFILE_ID_MAX 64
 
 // [`PunktfunkPenSample::azimuth_deg`] / `roll_deg` sentinel: no reading.
 #define PUNKTFUNK_PEN_ANGLE_UNKNOWN 65535
@@ -109,6 +124,9 @@
 
 // A Windows host's virtual display. Only ever resolved, never requested.
 #define PUNKTFUNK_COMPOSITOR_WINDOWS 6
+
+// niri (the biri fork, which adds virtual outputs).
+#define PUNKTFUNK_COMPOSITOR_NIRI 7
 
 // Gamepad-backend preference for [`punktfunk_connect_ex2`]: which virtual pad
 // the host creates. Precedence: client choice > `PUNKTFUNK_GAMEPAD` env > X-Box 360.
@@ -272,11 +290,6 @@
 // (`design/remote-desktop-sweep.md`).
 #define PUNKTFUNK_CLIENT_CAP_CURSOR 1
 
-// [`punktfunk_connect_ex9`] `client_caps` bit: presenter is vsync-aware and
-// feeds [`punktfunk_connection_report_phase`] (`design/phase-locked-capture.md`).
-// Advisory: the host arms on report receipt.
-#define PUNKTFUNK_CLIENT_CAP_PHASE_LOCK 2
-
 // [`punktfunk_connect_ex9`] `client_caps` bit: pad-audio plane (0xD1 — DualSense
 // voice-coil + speaker). Drain [`punktfunk_connection_next_pad_audio`] and declare
 // pads via [`punktfunk_connection_set_pad_audio_caps`]. Host emits only with
@@ -310,6 +323,11 @@
 // values still writes the device.
 #define PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER 1
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Bytes of state [`punktfunk_sc1_ble_input`] keeps per pad.
+#define PUNKTFUNK_SC1_BLE_STATE_LEN 160
+#endif
+
 // [`PunktfunkClipEvent::kind`]: host announced clipboard content
 // (`transfer_id` = offer `seq`; `data`/`len` = `\n`-separated `"<mime>\t<size_hint>"`).
 // Fetch lazily on local paste via [`punktfunk_connection_clipboard_fetch`].
@@ -335,6 +353,18 @@
 // `PunktfunkStatus` code).
 #define PUNKTFUNK_CLIP_ERROR 6
 
+// [`punktfunk_connection_recovery_on_decoded`]'s `evidence`: the lane has no parser.
+#define PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE 0
+
+// The picture predicts only from references that decoded clean.
+#define PUNKTFUNK_ANCHOR_EVIDENCE_CLEAN 1
+
+// The picture predicts from a concealed one: its anchor flag does not lift the freeze.
+#define PUNKTFUNK_ANCHOR_EVIDENCE_DAMAGED 2
+
+// Most findings one report carries; the rules can produce seven.
+#define PUNKTFUNK_HEALTH_FINDINGS_MAX 8
+
 // [`punktfunk_au_admission_note`]'s `concealed`: the lane has no concealer.
 #define PUNKTFUNK_CONCEALED_NONE 0
 
@@ -350,21 +380,13 @@
 // symbols and leave every existing function's signature and behaviour alone.
 // New connect options append to `PunktfunkConnectOpts` behind `struct_size`;
 // do not mint another `connect_ex*` or grow `PunktfunkAudioPcm` / `PunktfunkStats`
-// (no size guard, allocated by value). v27 is the exception: `PunktfunkHidOutput`
-// grew 19 → 85 bytes and the version check is the overrun guard — a second pull
-// symbol would fork the hidout drain forever.
+// (no size guard, allocated by value). Growing a struct the library writes whole into
+// the caller's buffer is a bump: the version check is the overrun guard
+// (`PunktfunkHidOutput` at 27, `PunktfunkProbeResult` at 43).
 //
-// Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
-// Pin the integer in `punktfunk-ffi` (`abi_version_is_pinned`). Per-bump notes live
-// in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 42
-
-// punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
-//
-// Separate from [`ABI_VERSION`]: the C surface can grow without a wire byte changing.
-// Bump only when the handshake or a plane changes incompatibly. Riding a C-only bump
-// onto the wire locks new clients out of every deployed host.
-#define PUNKTFUNK_WIRE_VERSION 2
+// The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
+// (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
+#define PUNKTFUNK_ABI_VERSION 55
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -534,12 +556,7 @@
 // Same pin as [`MOTION_GYRO_LSB_PER_DEG_S`].
 #define MOTION_ACCEL_LSB_PER_G 10000
 
-// Video packet discriminator; input datagrams use a different magic ([`crate::input`]).
-#define PUNKTFUNK_MAGIC 201
-
 #define PUNKTFUNK_FLAG_PIC 1
-
-#define PUNKTFUNK_FLAG_EOF 2
 
 #define PUNKTFUNK_FLAG_SOF 4
 
@@ -594,8 +611,8 @@
 #define PUNKTFUNK_RFI_MAX_RANGE 256
 
 // Acceptance ceiling, not a transmit size. 9216 fits a 9000-MTU jumbo
-// (sealed ~8972 B). `Config::validate` keeps
-// `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD` under this. Receive rings
+// (sealed 8972 B). `Config::validate` keeps
+// `shard_payload + WIRE_OVERHEAD` under this. Receive rings
 // are sized from it so a jumbo geometry needs no mid-session resize.
 #define PUNKTFUNK_MAX_DATAGRAM_BYTES 9216
 
@@ -625,11 +642,18 @@
 // Not a datagram; [`classify`] is untouched. Machine power only — never plugin actions.
 #define PUNKTFUNK_GRANT_POWER 64
 
+// Pause and remove a title's download on the mgmt cert lane (`design/plugin-downloads.md`).
+// Starting one is [`GRANT_LAUNCH`]: launching a missing title installs it anyway.
+#define PUNKTFUNK_GRANT_MANAGE_GAMES 128
+
 // An omitted Welcome or registry mask reads as this: every bit above.
-#define PUNKTFUNK_GRANT_ALL 127
+#define PUNKTFUNK_GRANT_ALL 255
 
 // Stored "Full control" before [`GRANT_POWER`]. [`normalize_legacy_full`] lifts it.
 #define PUNKTFUNK_GRANT_ALL_PRE_POWER 63
+
+// Stored "Full control" before [`GRANT_MANAGE_GAMES`]. [`normalize_legacy_full`] lifts it.
+#define PUNKTFUNK_GRANT_ALL_PRE_MANAGE 127
 
 // The management API rejects these; it never silently clears unknown bits
 // (that would grant less than the caller asked).
@@ -670,16 +694,14 @@
 #define PUNKTFUNK_VIDEO_CAP_PROBE_SEQ 16
 
 // [`Hello::video_caps`]: the reassembler accepts streamed access units. Non-final blocks
-// use SENTINEL headers (`block_count == 0`, `frame_bytes == 0`, exactly
-// `max_data_per_block` data shards); the FINAL block carries real `frame_bytes` /
-// `block_count` and `FLAG_EOF`. A geometry mismatch drops the frame. Hosts stream only
-// to clients that set this bit; others get a whole-AU seal.
+// leave as sentinels before the AU size is known; the FINAL block carries the real
+// totals. A geometry mismatch drops the frame. Hosts stream only to clients that set
+// this bit; others get a whole-AU seal.
 #define PUNKTFUNK_VIDEO_CAP_STREAMED_AU 32
 
 // [`Hello::video_caps`]: client can open ChaCha20-Poly1305 session datagrams and wants
-// them (software-AES targets). The host grants only when `PUNKTFUNK_CHACHA20` allows,
-// answering [`Welcome::cipher`] `= 1` plus [`Welcome::key_chacha`]. Other clients keep
-// the AES-128-GCM Welcome byte-identical.
+// them (software-AES targets). The host grants only when `PUNKTFUNK_CHACHA20` allows, and
+// says so in the `ServerHello` suite.
 #define PUNKTFUNK_VIDEO_CAP_CHACHA20 64
 
 // [`Hello::video_caps`]: the decoder accepts multi-slice AUs. The embedder sets this from
@@ -711,11 +733,6 @@
 // [`HOST_CAP_CURSOR`], it must stop blending the cursor into the video
 // (`SessionPlan.cursor_blend = false`) or the user sees it twice.
 #define PUNKTFUNK_CLIENT_CAP_CURSOR 1
-
-// [`Hello::client_caps`]: the presenter is vsync-aware and will send
-// [`PhaseReport`](super::control::PhaseReport)s so the host can phase-lock capture
-// (`design/phase-locked-capture.md`). Without the bit the host never arms the controller.
-#define PUNKTFUNK_CLIENT_CAP_PHASE_LOCK 2
 
 // [`Hello::client_caps`]: the client can decode the redundant desktop-audio plane
 // ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`). Active only when the
@@ -767,10 +784,8 @@
 // host-global wiring, so any live session that asked wins until it ends.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 
-// [`Hello::client_caps`]: the client parses the tagged extension block after Welcome's
-// frozen positional layout ([`EXT_TAG_PADDING`](super::EXT_TAG_PADDING)). The host
-// appends a block only toward this bit, so a client that leaves it clear still gets the
-// Welcome byte-identical to today's. `0x80` is the last free `client_caps` bit.
+// [`Hello::client_caps`]: every client sets it; it gates nothing on `punktfunk/2`.
+// `0x80` is the last free `client_caps` bit.
 #define PUNKTFUNK_CLIENT_CAP_EXT 64
 
 // [`Welcome::host_caps`]: the session is on the lossless audio plane
@@ -797,9 +812,8 @@
 // contacts vanish with no error (`design/touch-client-overlay.md`).
 #define PUNKTFUNK_HOST_CAP2_TOUCH 2
 
-// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host parses the tagged
-// extension block after `Start`'s 6 bytes. The client appends one only after seeing this
-// bit — Hello is first contact, with no host capability known yet, and stays frozen.
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads the
+// `ClientHello` entries. Every host sets it; a 0.43 client sends them only toward it.
 #define PUNKTFUNK_HOST_CAP2_EXT 4
 
 // [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
@@ -809,13 +823,8 @@
 // client that does not see the bit bursts beside live video as before.
 #define PUNKTFUNK_HOST_CAP2_RAMP 16
 
-// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads a
-// [`DeliveryReport`](super::control::DeliveryReport) every report window and divides a path
-// two sessions share by them (`abr::governor`). Toward this bit the client sends one per
-// window — 13 bytes against 750 ms; toward every other host it sends one while nothing is
-// arriving and one when the first packets land, because an older host logs each unknown
-// message. A host that leaves the bit clear therefore learns nothing about a session's air
-// after its first window, and its groups are left alone.
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2), reserved: every feedback window
+// carries the delivery count, so no end reads this bit.
 #define PUNKTFUNK_HOST_CAP2_DELIVERY 32
 
 // [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads
@@ -839,7 +848,7 @@
 // `design/pyrowave-codec-plan.md`). Deliberately absent from [`resolve_codec`]'s ladder:
 // selected only when the client also names it [`Hello::preferred_codec`] (or the operator
 // forces the mask). The bit means the bitstream of the vendored pin
-// (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`); upstream has no version
+// (`crates/codec/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`); upstream has no version
 // field, so a bitstream-changing vendor bump bumps the punktfunk protocol instead.
 #define PUNKTFUNK_CODEC_PYROWAVE 8
 
@@ -869,56 +878,6 @@
 
 // Rejections tolerated before the streak's best batch is applied anyway.
 #define ResyncGuard_MAX_REJECTED_STREAK 3
-
-#define PUNKTFUNK_MSG_RECONFIGURE 1
-
-#define PUNKTFUNK_MSG_RECONFIGURED 2
-
-#define PUNKTFUNK_MSG_REQUEST_KEYFRAME 3
-
-#define PUNKTFUNK_MSG_LOSS_REPORT 4
-
-#define PUNKTFUNK_MSG_SET_BITRATE 5
-
-#define PUNKTFUNK_MSG_BITRATE_CHANGED 6
-
-#define PUNKTFUNK_MSG_RFI_REQUEST 7
-
-#define PUNKTFUNK_MSG_SHARD_PAYLOAD_CHANGED 8
-
-#define PUNKTFUNK_MSG_SHARD_PAYLOAD_ACK 9
-
-// [`PipelineGap`]. 0x0A stays in the 0x01–0x09 video/rate-control block
-// (same ABR consumer). Not 0x30: it carries a duration, no clock domain.
-#define PUNKTFUNK_MSG_PIPELINE_GAP 10
-
-#define PUNKTFUNK_MSG_DELIVERY_REPORT 11
-
-#define PUNKTFUNK_MSG_LINK_REPORT 12
-
-#define PUNKTFUNK_MSG_PROBE_REQUEST 32
-
-#define PUNKTFUNK_MSG_PROBE_RESULT 33
-
-#define PUNKTFUNK_MSG_CLOCK_PROBE 48
-
-#define PUNKTFUNK_MSG_CLOCK_ECHO 49
-
-#define PUNKTFUNK_MSG_PHASE_REPORT 50
-
-// Idempotent enable/disable. Opt-in is here, not just in UI.
-#define PUNKTFUNK_MSG_CLIP_CONTROL 64
-
-#define PUNKTFUNK_MSG_CLIP_STATE 65
-
-// Format list only — no clipboard bytes.
-#define PUNKTFUNK_MSG_CLIP_OFFER 66
-
-// Fetch stream only — never the control stream.
-#define PUNKTFUNK_MSG_CLIP_FETCH 67
-
-// Fetch stream only — header that precedes the data chunks.
-#define PUNKTFUNK_MSG_CLIP_FETCH_HDR 68
 
 // Absent ⇒ files are filtered from offers in both directions.
 #define PUNKTFUNK_CLIP_FLAG_FILES 1
@@ -965,33 +924,19 @@
 // Not a file fetch (a whole non-file format, or the file manifest).
 #define PUNKTFUNK_CLIP_FILE_INDEX_NONE UINT32_MAX
 
-#define PUNKTFUNK_MSG_CURSOR_SHAPE 80
-
-#define PUNKTFUNK_MSG_CURSOR_RENDER 81
-
-// Per-side pixel cap. Control frames are `u16`-length-prefixed (65535).
-// 128×128 RGBA is 65536 B before the 17-byte header; 120² (57.6 KiB +
-// header) fits. Host downscales anything larger.
+// Per-side pixel cap. A 0.43 client re-frames a shape behind a `u16` length,
+// so 120² RGBA (57.6 KiB) is the largest it takes. Host downscales anything larger.
 #define PUNKTFUNK_CURSOR_SHAPE_MAX_SIDE 120
 
-// [`AccessUpdate`]. 0x58: 0x50–0x51 are cursor; 0x40–0x44 are clipboard.
-#define PUNKTFUNK_MSG_ACCESS_UPDATE 88
+// Longest [`PadIdentity::serial`] in bytes.
+#define PUNKTFUNK_PAD_IDENTITY_SERIAL_MAX 32
 
-// [`AudioState`]. 0x59: next after [`MSG_ACCESS_UPDATE`].
-#define PUNKTFUNK_MSG_AUDIO_STATE 89
-
-// [`PadSlots`]. 0x5B: 0x5A is the launch outcome.
-#define PUNKTFUNK_MSG_PAD_SLOTS 91
-
-// [`LaunchOutcome`]. 0x5A: next after [`MSG_AUDIO_STATE`].
-#define PUNKTFUNK_MSG_LAUNCH_OUTCOME 90
+// Longest [`PadIdentity::replies`] in bytes: room for every query with margin.
+#define PUNKTFUNK_PAD_IDENTITY_REPLIES_MAX 4096
 
 // Longest [`LaunchOutcome::message`] in UTF-8 bytes. One sentence plus a cause;
 // a host cannot make the client hold more than this.
 #define PUNKTFUNK_LAUNCH_MESSAGE_MAX 200
-
-// [`InputEdge`]. 0x5C: 0x58–0x5B are access, audio, launch and pad slots.
-#define PUNKTFUNK_MSG_INPUT_EDGE 92
 
 #define PUNKTFUNK_AUDIO_MAGIC 201
 
@@ -1109,12 +1054,6 @@
 // Longest [`Hello::launch`] id (UTF-8 bytes). Ids are short; 128 bounds the length prefix.
 #define PUNKTFUNK_HELLO_LAUNCH_MAX 128
 
-// [`Welcome::cipher`]: AES-128-GCM. Default; the only id pre-cipher builds know.
-#define PUNKTFUNK_CIPHER_AES_128_GCM 0
-
-// [`Welcome::cipher`]: ChaCha20-Poly1305 (RFC 8439), via [`VIDEO_CAP_CHACHA20`].
-#define PUNKTFUNK_CIPHER_CHACHA20_POLY1305 1
-
 // [`Welcome::audio_codec`]: Opus on `0xC9` (48 kHz). `0` so absence and older hosts both
 // read as Opus; a declined hi-res session resolves here — silence is the unacceptable outcome.
 #define PUNKTFUNK_AUDIO_CODEC_OPUS 0
@@ -1128,54 +1067,29 @@
 // `2` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1`.
 #define PUNKTFUNK_AUDIO_CODEC_PCM 2
 
-// Extension tag `1`: no-op filler. Carries nothing, so a peer skips it like any tag it
-// does not know. Tag `0` is reserved. Every tag is allocated here with a doc line, as
-// `quic/caps.rs` does for bits, and an id is never reused for a second meaning: a peer
-// that skips an unknown id cannot tell two meanings apart.
-#define PUNKTFUNK_EXT_TAG_PADDING 1
-
-// Extension tag `2` on `Start`: what the client calls itself, UTF-8, no NUL — its build and
-// the shell that dialled (`"android 0.38.0 console/library"`). A label for the host's log, never
-// a fact it acts on: two sessions from one device are told apart here instead of by capture.
-// Bounded by [`EXT_CLIENT_MAX`]; a longer value is truncated on a char boundary by
-// [`client_label`].
-#define PUNKTFUNK_EXT_TAG_CLIENT 2
-
-// Longest [`EXT_TAG_CLIENT`] value in UTF-8 bytes. A log field, so short.
+// Longest [`ClientHello::client_label`] in UTF-8 bytes. A log field, so short.
 #define PUNKTFUNK_EXT_CLIENT_MAX 96
 
-// Extension tag `3` on `Start`: one byte of ABR protocol features the client understands,
-// as a bitfield ([`EXT_ABR_ACK_REASON`] is bit 0). A later feature takes another bit here
-// rather than a tag of its own, so the host reads one byte and answers what it recognises.
-// An absent tag, an empty value or a zero byte is a client that understands none of them —
-// which is every client shipped so far.
-#define PUNKTFUNK_EXT_TAG_ABR 3
-
-// [`EXT_TAG_ABR`] bit 0: the client reads the reason byte on
+// [`ClientHello::abr_features`] bit 0: the client reads the reason byte on
 // [`BitrateChanged`](super::control::BitrateChanged). The host sends that tenth byte only
 // toward this bit, because every client without it rejects an ack of any other length.
 // Core sets it for every embedder that links the controller reading it, not the embedder.
 #define PUNKTFUNK_EXT_ABR_ACK_REASON 1
 
-// Extension tag `4` on `Start`: the settings preset this session was dialled with, as
-// [`SessionPreset::encode`] writes it. The id is the client's own and stable across a rename;
-// the name is for people. The host shows it and hands it to hooks and plugins; it changes
-// nothing about the stream. Absent when the client streams with its plain settings.
-#define EXT_TAG_PRESET 4
+// The connect-options bit that dials a diagnostic session ([`ClientHello::probe_only`]): the
+// FFI `delivery_flags` and the JNI dial carry it.
+#define PUNKTFUNK_EXT_DELIVERY_PROBE_ONLY 2
+
+// Entry `7` in `ClientHello`: `bpp_x100 u16`, the player's PyroWave quality in hundredths of
+// a bit per pixel. Absent or `0` leaves the host's own; the host holds it inside
+// [`crate::pyrowave::BPP_FLOOR`]..=[`crate::pyrowave::BPP_MAX`].
+#define PUNKTFUNK_EXT_TAG_PYROWAVE_QUALITY 7
 
 // Longest [`SessionPreset::id`], printable ASCII.
 #define PRESET_ID_MAX 32
 
 // Longest [`SessionPreset::name`] in UTF-8 bytes.
 #define PRESET_NAME_MAX 64
-
-// Largest extension block on the wire, its `ext_len` header included. The block is read
-// before the peer is trusted, so this bounds what one message makes the other side hold.
-#define PUNKTFUNK_EXT_MAX_BYTES 4096
-
-// Most entries in one block. Tags are unique, so this only bounds a flood of zero-length
-// entries inside [`EXT_MAX_BYTES`].
-#define PUNKTFUNK_EXT_MAX_ENTRIES 64
 
 #define PUNKTFUNK_MSG_PAIR_REQUEST 16
 
@@ -1184,10 +1098,6 @@
 #define PUNKTFUNK_MSG_PAIR_PROOF 18
 
 #define PUNKTFUNK_MSG_PAIR_RESULT 19
-
-#define PUNKTFUNK_MSG_AUTH_CHALLENGE 20
-
-#define PUNKTFUNK_MSG_AUTH_RESPONSE 21
 
 // `host → client`, browser plane: why the host is about to close. The native plane says this
 // with the QUIC close code and reason; a browser cannot read those in every engine (WebKit
@@ -1226,11 +1136,6 @@
 // Capture only fires on change, so senders repeat the last sample every ~100 ms while
 // in range — two heartbeats clear of this deadline. Repeats re-decode as Motion.
 #define PUNKTFUNK_PEN_TOUCH_TIMEOUT_MS 200
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Other stream kinds mux under [`STREAM_MAGIC`] with a different byte.
-#define PUNKTFUNK_CLIP_STREAM_KIND_FETCH 1
-#endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Stream-reset / stop code for a cancelled fetch. Distinct from connection close
@@ -1304,6 +1209,22 @@
 // session. `design/host-actions.md`.
 #define PUNKTFUNK_HOST_POWER_CLOSE_CODE 107
 
+// `ClientHello.profile` names no profile on this host, or another seat's.
+#define PROFILE_UNKNOWN_CLOSE_CODE 108
+
+// Every seat is taken. Reason bytes name the occupants.
+#define NO_SEAT_CLOSE_CODE 109
+
+// The profile's seat is in use by another device.
+#define SEAT_OCCUPIED_CLOSE_CODE 110
+
+// The profile's seat can't run: removed, or its host would not start.
+#define SEAT_UNAVAILABLE_CLOSE_CODE 111
+
+// Not a rejection: the answer to an access-only hello. This device may connect now.
+// 0x70 and 0x71 are stream codes.
+#define ACCESS_GRANTED_CLOSE_CODE 114
+
 // Under-render floor; presenter upscales.
 #define PUNKTFUNK_MIN_SCALE 0.5
 
@@ -1312,6 +1233,17 @@
 
 // Two missed 500 ms legacy refreshes. A quieter host is treated as gone.
 #define PUNKTFUNK_LEGACY_STALE_MS 1000
+
+// Interface kinds, as [`ifinfo`] reads them and the wire carries them
+// ([`crate::quic::HostLink`], [`crate::quic::LinkFacts`]).
+#define PUNKTFUNK_IFACE_KIND_UNKNOWN 0
+
+#define PUNKTFUNK_IFACE_KIND_ETHERNET 1
+
+#define PUNKTFUNK_IFACE_KIND_WIFI 2
+
+// Loopback, a tunnel, a bridge: a link with no wire of its own.
+#define PUNKTFUNK_IFACE_KIND_OTHER 3
 
 // Stable C ABI status codes. `Ok` is 0; errors are negative so callers can
 // test `rc < 0`. Existing variants must not be renumbered — only append.
@@ -1344,6 +1276,10 @@ enum PunktfunkStatus
     PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED = -30,
     PUNKTFUNK_STATUS_REJECTED_LAUNCH_NOT_PERMITTED = -31,
     PUNKTFUNK_STATUS_REJECTED_HOST_POWER = -32,
+    PUNKTFUNK_STATUS_REJECTED_PROFILE_UNKNOWN = -33,
+    PUNKTFUNK_STATUS_REJECTED_NO_SEAT = -34,
+    PUNKTFUNK_STATUS_REJECTED_SEAT_OCCUPIED = -35,
+    PUNKTFUNK_STATUS_REJECTED_SEAT_UNAVAILABLE = -36,
     PUNKTFUNK_STATUS_PANIC = -99,
 };
 #ifndef __cplusplus
@@ -1562,12 +1498,6 @@ typedef struct PunktfunkH265Concealer PunktfunkH265Concealer;
 // Opaque session handle. C sees only the pointer.
 typedef struct PunktfunkSession PunktfunkSession;
 
-// Shared post-loss freeze. A client feeds *arm* (loss), each decoded frame
-// ([`on_decoded`](Self::on_decoded)), each no-output AU ([`on_no_output`](Self::on_no_output)),
-// and a periodic [`poll`](Self::poll). The gate emits *intents* only: `true` means the client
-// should ask for a keyframe through its own ~100 ms throttle. The gate never touches the wire.
-typedef struct ReanchorGate ReanchorGate;
-
 // Log sink for [`punktfunk_set_log_callback`]. `level` 1..=5 (error…trace).
 // `target` and `message` are NUL-terminated UTF-8, borrowed for this call —
 // copy them out. Any thread may call; thread-safe, non-blocking, no re-entry.
@@ -1579,17 +1509,11 @@ typedef struct {
     uint32_t struct_size;
     // 0 = host, 1 = client.
     uint32_t role;
-    // 1 = P1 (GameStream-compatible), 2 = P2 (`punktfunk/1`).
-    uint32_t phase;
     // 0 = GF(2⁸), 1 = GF(2¹⁶).
     uint32_t fec_scheme;
     uint32_t fec_percent;
     uint32_t max_data_per_block;
     uint32_t shard_payload;
-    // Non-zero enables AES-128-GCM.
-    uint32_t encrypt;
-    uint8_t key[16];
-    uint8_t salt[4];
     // Test hook for the loopback transport; 0 in production.
     uint32_t loopback_drop_period;
     // Largest encoded access unit the receiver accepts (reassembler memory bound).
@@ -1608,20 +1532,6 @@ typedef struct {
     // clock as `pts_ns`). A stamp at poll return includes pre-decode queue wait.
     uint64_t received_ns;
 } PunktfunkFrame;
-
-// `#[repr(C)]` as `PunktfunkInputEvent`.
-typedef struct {
-    PunktfunkInputKind kind;
-    uint8_t _pad[3];
-    // keycode / button id / axis id, depending on `kind`.
-    uint32_t code;
-    // x / dx / abs-x / axis-value / scroll-delta, depending on `kind`.
-    int32_t x;
-    // y / dy / abs-y, depending on `kind`.
-    int32_t y;
-    // modifier bitmask or gamepad index.
-    uint32_t flags;
-} PunktfunkInputEvent;
 
 // Session counters.
 typedef struct {
@@ -1709,6 +1619,22 @@ typedef struct {
     const char *preset_id;
     // The preset's display name, or null. Read only beside a non-null `preset_id`.
     const char *preset_name;
+    // Always `0`.
+    uint8_t reserved3;
+    // `2` dials a network check's probes-only session (`EXT_DELIVERY_PROBE_ONLY`). `0` streams,
+    // which is what a shorter prefix defaults to.
+    uint8_t delivery_flags;
+    // Always `0`. Fills what would otherwise be padding, as `reserved0` does.
+    uint8_t reserved2[6];
+    // The profile to play as: a host profile id (at most 64 bytes), or null to let the host
+    // choose. [`punktfunk_connection_profile`] reads which it resolved.
+    const char *profile_id;
+    // The player's PyroWave quality in hundredths of a bit per pixel, 50 to 200
+    // ([`punktfunk_pyrowave_kbps`]). `0`, which a shorter prefix defaults to, leaves the
+    // host's own.
+    uint16_t pyrowave_bpp_x100;
+    // Always `0`. Fills what would otherwise be tail padding.
+    uint8_t reserved4[6];
 } PunktfunkConnectOpts;
 #endif
 
@@ -1832,6 +1758,20 @@ typedef struct {
     uint32_t host_us;
 } PunktfunkHostTiming;
 #endif
+
+// `#[repr(C)]` as `PunktfunkInputEvent`.
+typedef struct {
+    PunktfunkInputKind kind;
+    uint8_t _pad[3];
+    // keycode / button id / axis id, depending on `kind`.
+    uint32_t code;
+    // x / dx / abs-x / axis-value / scroll-delta, depending on `kind`.
+    int32_t x;
+    // y / dy / abs-y, depending on `kind`.
+    int32_t y;
+    // modifier bitmask or gamepad index.
+    uint32_t flags;
+} PunktfunkInputEvent;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // One rich client→host input for the host virtual DualSense
@@ -2014,7 +1954,44 @@ typedef struct {
     // Wire packets the host put on the link, and the ones its send buffer dropped.
     uint32_t wire_packets_sent;
     uint32_t send_dropped;
+    // Probe inter-arrival gap, µs, to a tenth of a millisecond: median and 99th percentile.
+    // Their difference is the path's jitter.
+    uint32_t gap_p50_us;
+    uint32_t gap_p99_us;
+    // Probe packets that arrived behind a later one.
+    uint32_t reorders;
 } PunktfunkProbeResult;
+
+// One finding of the network check: the id names the text the app shows
+// ([`punktfunk_core::client::health::FindingId`] as a byte), `numbers` are its figures.
+typedef struct {
+    uint8_t id;
+    uint8_t severity;
+    uint32_t numbers[3];
+} PunktfunkHealthFinding;
+
+// The network check's report ([`punktfunk_core::client::health::HealthReport`]), flat.
+// `has_clean` 0 = a host without a ramp (no loss figure is honest); a leg or fact that was
+// not sampled reads `0`.
+typedef struct {
+    uint32_t ceiling_kbps;
+    uint8_t wall;
+    uint8_t has_clean;
+    uint32_t clean_rate_kbps;
+    float clean_loss_pct;
+    uint32_t clean_jitter_us;
+    uint8_t client_iface_kind;
+    uint32_t client_link_mbps;
+    uint32_t client_rcvbuf_kb;
+    uint8_t host_iface_kind;
+    uint32_t host_link_mbps;
+    uint32_t host_sndbuf_kb;
+    // Loss of the bursts leg and the capped leg, percent; `n_legs` says how many ran.
+    uint8_t n_legs;
+    float leg_loss_pct[2];
+    uint8_t n_findings;
+    PunktfunkHealthFinding findings[PUNKTFUNK_HEALTH_FINDINGS_MAX];
+} PunktfunkHealthReport;
 
 // [`punktfunk_av1_sequence_info`]'s answer: what an `av1C` record and a colour description
 // take from an AV1 sequence header. Colour codes are ITU-T H.273, 2 when none is coded.
@@ -2115,16 +2092,8 @@ PunktfunkStatus punktfunk_wake_on_lan(const uint8_t *macs,
                                       uintptr_t mac_count,
                                       const char *last_known_ip);
 
-// Create a session over UDP (`local`/`peer` are `host:port` strings). NULL on error.
-//
-// # Safety
-// `cfg`, `local`, `peer` are valid pointers; the strings are NUL-terminated.
-PunktfunkSession *punktfunk_session_new(const PunktfunkConfig *cfg,
-                                        const char *local,
-                                        const char *peer);
-
 // Connected host+client pair on in-process loopback. Test/dev only: full FEC
-// + framing without a network.
+// + framing without a network, unsealed.
 //
 // # Safety
 // All four pointers are valid; the two out-params receive owned handles.
@@ -2136,7 +2105,7 @@ PunktfunkStatus punktfunk_test_loopback_pair(const PunktfunkConfig *host_cfg,
 // Free a session handle. NULL is a no-op.
 //
 // # Safety
-// `s` is a handle from `punktfunk_session_new` / `punktfunk_test_loopback_pair`, freed once.
+// `s` is a handle from `punktfunk_test_loopback_pair`, freed once.
 void punktfunk_session_free(PunktfunkSession *s);
 
 // Host: FEC-protect, packetize, seal, and send one encoded access unit.
@@ -2156,29 +2125,6 @@ PunktfunkStatus punktfunk_host_submit_frame(PunktfunkSession *s,
 // # Safety
 // `s` is a valid client handle; `out` points to a writable `PunktfunkFrame`.
 PunktfunkStatus punktfunk_client_poll_frame(PunktfunkSession *s, PunktfunkFrame *out);
-
-// Client: serialize and send one input event to the host.
-// `InvalidArg` if `ev->kind` is not a recognized event kind.
-//
-// # Safety
-// `s` is a valid client handle; `ev` points to a readable `InputEvent`-sized allocation.
-PunktfunkStatus punktfunk_send_input(PunktfunkSession *s, const PunktfunkInputEvent *ev);
-
-// Register the host-side input callback (NULL fn pointer clears). Fires from
-// [`punktfunk_host_poll_input`] on the calling thread.
-//
-// # Safety
-// `s` is a valid host handle; `user` is passed back verbatim to `cb`.
-PunktfunkStatus punktfunk_set_input_callback(PunktfunkSession *s,
-                                             void (*cb)(const PunktfunkInputEvent *event, void *user),
-                                             void *user);
-
-// Host: drain pending input events, invoking the registered callback for each.
-// Returns the count dispatched (≥ 0), or a negative [`PunktfunkStatus`] on error.
-//
-// # Safety
-// `s` is a valid host handle. The callback must not free `s`: the drain uses it again.
-int32_t punktfunk_host_poll_input(PunktfunkSession *s);
 
 // Copy session counters into `*out`.
 //
@@ -2566,6 +2512,44 @@ PunktfunkConnection *punktfunk_connect_opts(const PunktfunkConnectOpts *opts,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// The rate, kbps, a PyroWave quality of `bpp_x100` hundredths of a bit per pixel needs at a
+// mode: what the quality row shows. `0` prices the client default, 1.6. Pass the mode a
+// connect would ask for and the chroma and depth the player's switches ask.
+uint32_t punktfunk_pyrowave_kbps(uint32_t width,
+                                 uint32_t height,
+                                 uint32_t refresh_hz,
+                                 bool chroma_444,
+                                 uint8_t bit_depth,
+                                 uint16_t bpp_x100);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// What the OS says about this device's interface toward `host_ip`, or toward its default
+// route when `host_ip` is null or no IP literal: `PUNKTFUNK_IFACE_KIND_*` and link speed in
+// Mbit/s, `0` where it did not say. `false` when it named no interface; both outs are written
+// either way. A route lookup: nothing is sent.
+//
+// # Safety
+// `host_ip` is null or a NUL-terminated C string; `out_kind` and `out_mbps` are null or
+// writable for one value.
+bool punktfunk_local_link_facts(const char *host_ip, uint8_t *out_kind, uint32_t *out_mbps);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The line the PyroWave quality row shows when `required_kbps` is more than this device's
+// link carries ([`punktfunk_local_link_facts`]'s `kind` and `mbps`), NUL-terminated into
+// `out`; empty when it fits. One wording for every client. 160 bytes is ample.
+//
+// # Safety
+// `out` is writable for `cap` bytes.
+PunktfunkStatus punktfunk_pyrowave_link_warning(uint32_t required_kbps,
+                                                uint8_t kind,
+                                                uint32_t mbps,
+                                                char *out,
+                                                uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Generate a persistent client identity: self-signed certificate + private key,
 // both PEM, NUL-terminated, written into the caller's buffers. Generate once,
 // store both, pass them to [`punktfunk_pair`] and every [`punktfunk_connect`].
@@ -2615,6 +2599,26 @@ PunktfunkStatus punktfunk_pair(const char *host,
                                const char *name,
                                uint8_t *host_sha256_out,
                                uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Request access without a PIN: blocks until the host's operator approves this device,
+// refuses it, or `timeout_ms` passes. Never starts a stream. On success the host fingerprint
+// is written to `host_sha256_out` — persist it as paired, like [`punktfunk_pair`]'s.
+// A refusal is its `PUNKTFUNK_STATUS_REJECTED_*` code.
+//
+// # Safety
+// `host`/`client_cert_pem`/`client_key_pem`/`name` are NUL-terminated UTF-8; `pin_sha256`
+// is NULL (trust on first use) or valid for 32 bytes; `host_sha256_out` is writable for
+// 32 bytes.
+PunktfunkStatus punktfunk_request_access(const char *host,
+                                         uint16_t port,
+                                         const char *client_cert_pem,
+                                         const char *client_key_pem,
+                                         const uint8_t *pin_sha256,
+                                         const char *name,
+                                         uint8_t *host_sha256_out,
+                                         uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -3044,6 +3048,19 @@ PunktfunkStatus punktfunk_connection_send_input(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Whether this stream holds the screen awake right now. `keep_awake` is the "Keep screen
+// awake" setting: on, always. Off, only while the player's input is recent, so the device's
+// own idle timer runs over a game left alone. Poll every few seconds; `*out` is filled when
+// non-NULL.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `bool`.
+PunktfunkStatus punktfunk_connection_holds_screen_awake(const PunktfunkConnection *c,
+                                                        bool keep_awake,
+                                                        bool *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Send one Opus mic frame (48 kHz) as a QUIC datagram. The host decodes it into
 // a virtual microphone. Non-blocking; `seq`/`pts_ns` are diagnostics only.
 // Empty `opus_data`/`len` is DTX. Data is copied before return.
@@ -3090,6 +3107,90 @@ PunktfunkStatus punktfunk_connection_send_hid_report(PunktfunkConnection *c,
                                                      uint8_t pad,
                                                      const uint8_t *data,
                                                      uintptr_t len);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Gate what of a Steam Controller 2's raw reports on `pad` reaches the host: an OR of
+// `PUNKTFUNK_SC2_GATE_*`. Call when the client's overlay takes or returns the pad and when its
+// system-button policy changes. Latest wins; unknown bits are ignored; `pad` masks to 16.
+//
+// # Safety
+// `c` is a valid connection handle. Callable from any thread.
+PunktfunkStatus punktfunk_connection_set_sc2_gate(PunktfunkConnection *c,
+                                                  uint8_t pad,
+                                                  uint32_t gate);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The `index`-th feature query a client reads off a Steam Controller 2 for
+// [`punktfunk_connection_send_pad_identity`], id first, copied into `out`. Returns its length;
+// 0 past the last one or when `cap` is short. `puck` adds a Puck slot's queries.
+//
+// # Safety
+// `out` points to `cap` writable bytes.
+uintptr_t punktfunk_sc2_identity_request(bool puck, uint32_t index, uint8_t *out, uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`punktfunk_sc2_identity_request`] for a 2015 Steam Controller: the `index`-th query, report
+// id 0 first. Returns its length; 0 past the last one or when `cap` is short.
+//
+// # Safety
+// `out` points to `cap` writable bytes.
+uintptr_t punktfunk_sc1_identity_request(uint32_t index, uint8_t *out, uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One segment of a 2015 Steam Controller's Bluetooth input, `[0x03, header, 18 bytes]`. True
+// when it completed a state message: `out` then holds the 64-byte wired frame to forward.
+// `state` is [`PUNKTFUNK_SC1_BLE_STATE_LEN`] bytes, zeroed once per link and kept.
+//
+// # Safety
+// `state` points to that many writable bytes, `segment` to `len` readable ones, `out` to 64
+// writable ones.
+bool punktfunk_sc1_ble_input(uint8_t *state, const uint8_t *segment, uintptr_t len, uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// A wired feature frame for a 2015 Steam Controller, report id 0 first, as the 20-byte
+// segments its Bluetooth link takes, back to back in `out`. Returns the bytes written; 0 when
+// `cap` is short.
+//
+// # Safety
+// `frame` points to `len` readable bytes, `out` to `cap` writable ones.
+uintptr_t punktfunk_sc1_ble_segments(const uint8_t *frame,
+                                     uintptr_t len,
+                                     uint8_t *out,
+                                     uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The segments read back for one 2015 Steam Controller feature query, back to back and in
+// order. Once the last one is in, the reply goes to `out`, report id 0 first, and this returns
+// its length; 0 before then or when `cap` is short.
+//
+// # Safety
+// `segments` points to `len` readable bytes, `out` to `cap` writable ones.
+uintptr_t punktfunk_sc1_ble_reply(const uint8_t *segments,
+                                  uintptr_t len,
+                                  uint8_t *out,
+                                  uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Tell the host who the Steam Controller 2 on `pad` is, before its arrival: `serial` is its USB
+// serial (UTF-8, NUL-terminated), `replies` the `(request, reply)` pairs packed as
+// `[len][request][len][reply]…`, each part at most 64 bytes. `slot` is a Puck pad's slot (its USB
+// interface less 2), else 0. Too long, torn or a slot past 3 is `InvalidArg`.
+//
+// # Safety
+// `c` is a valid connection handle; `serial` is NUL-terminated; `replies` points to `len` bytes.
+PunktfunkStatus punktfunk_connection_send_pad_identity(PunktfunkConnection *c,
+                                                       uint8_t pad,
+                                                       uint8_t slot,
+                                                       const char *serial,
+                                                       const uint8_t *replies,
+                                                       uintptr_t len);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -3192,6 +3293,18 @@ PunktfunkStatus punktfunk_connection_access_expires_in(const PunktfunkConnection
 PunktfunkStatus punktfunk_connection_end_reject_said(const PunktfunkConnection *c,
                                                      char *out,
                                                      uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The profile the host resolved this session to, NUL-terminated, into the caller's buffer;
+// empty from a host without profiles. A buffer of [`PUNKTFUNK_PROFILE_ID_MAX`] + 1 bytes fits
+// every id.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for `cap` bytes.
+PunktfunkStatus punktfunk_connection_profile(const PunktfunkConnection *c,
+                                             char *out,
+                                             uintptr_t cap);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -3345,8 +3458,9 @@ PunktfunkStatus punktfunk_connection_request_mode(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Request an IDR now. Infinite GOP has one opening IDR; throttle — a wedged
-// decoder stays stuck for several frames, so per-frame requests flood control.
+// The decoder needs an IDR; infinite GOP sends none unasked. With a decoder reporting
+// through `punktfunk_connection_recovery_*` the core arms the freeze and sends one ask per
+// 100 ms window. Before the first report, and after a reset, the ask goes at once: throttle.
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -3365,32 +3479,74 @@ PunktfunkStatus punktfunk_connection_request_rfi(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Note each received `frame_index`. A forward gap fires throttled RFI; keyframe
-// on `frames_dropped` is the backstop. `gap_out` (nullable) is whether a gap was seen.
+// Report one AU before decode, in receive order; a sliced AU once, on its first part. On a
+// gap the core arms the freeze and asks the host for the lost range. `out_admit` false:
+// drop the AU, a straggler a reference decoder rewinds on or a partial a newer frame beat.
+// `out_gap` is the frames lost ahead of it, the `gap` [`punktfunk_au_admission_note`]
+// takes. `complete` false is a partial delivery. `decode_order` is the decoder's count so
+// far, 0 where it numbers none.
 //
 // # Safety
-// `c` is a valid connection handle; `gap_out` is writable or NULL.
-PunktfunkStatus punktfunk_connection_note_frame_index(const PunktfunkConnection *c,
-                                                      uint32_t frame_index,
-                                                      bool *gap_out);
+// `c` is a valid connection handle; the out pointers are writable or NULL.
+PunktfunkStatus punktfunk_connection_recovery_on_frame(const PunktfunkConnection *c,
+                                                       uint32_t index,
+                                                       bool complete,
+                                                       uint64_t decode_order,
+                                                       bool *out_admit,
+                                                       uint32_t *out_gap);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`punktfunk_connection_note_frame_index`] with the gap width: writes how many
-// frames this arrival revealed as missing (0 = contiguous/straggler). Pass the
-// width to [`punktfunk_reanchor_gate_arm_expecting_drops`] so a later
-// `frames_dropped` climb for the same loss cannot re-freeze a healed stream.
+// Report one decoded picture. `out_hold` true: keep the last good picture on glass
+// instead of this one. `flags` are the AU's wire flags; `keyframe` is the decoder's own
+// IDR bit, false where it flags none; `evidence` is a `PUNKTFUNK_ANCHOR_EVIDENCE_*`;
+// `decode_order` is this picture's decode count from 1, 0 where the decoder numbers none.
+// `out_forgive` true: the freeze lifted on an intra-refresh heal, so a reference-chain
+// ledger forgets its damage marks. An unknown `evidence` returns
+// [`PunktfunkStatus::InvalidArg`].
 //
 // # Safety
-// `c` is a valid connection handle; `gap_width_out` is writable or NULL.
-PunktfunkStatus punktfunk_connection_note_frame_index_ex(const PunktfunkConnection *c,
-                                                         uint32_t frame_index,
-                                                         uint32_t *gap_width_out);
+// `c` is a valid connection handle; the out pointers are writable or NULL.
+PunktfunkStatus punktfunk_connection_recovery_on_decoded(const PunktfunkConnection *c,
+                                                         uint32_t flags,
+                                                         bool keyframe,
+                                                         uint32_t evidence,
+                                                         uint64_t decode_order,
+                                                         bool *out_hold,
+                                                         bool *out_forgive);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Unrecoverable reassembler drops. Poll and request a keyframe when it climbs —
-// infinite GOP conceals missing refs with no decode error. Writes 0 on NULL.
+// An AU produced no picture. Three in a row arm the freeze and ask for a keyframe.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_recovery_on_no_output(const PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// A loss the frame index cannot show, such as a wedged decoder: arms the freeze and asks
+// for a keyframe.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_recovery_lost(const PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The decoder is gone or parked (a restart, a background drain): drops the freeze.
+// Nothing asks until the next report, which starts a fresh one. Call it while draining
+// AUs undecoded: a freeze nothing reports to asks for a keyframe every half second.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_recovery_reset(const PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Unrecoverable reassembler drops. For a client that reports through
+// `punktfunk_connection_recovery_*` the core watches it: a climb past a gap's credit
+// freezes and asks for a keyframe. Writes 0 on NULL.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable (NULL is skipped).
@@ -3468,20 +3624,6 @@ PunktfunkStatus punktfunk_connection_report_decode_us(const PunktfunkConnection 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Report the display-latch grid (`design/phase-locked-capture.md`).
-// `next_latch_host_ns` is already host clock. ~1 Hz; no-op if unnegotiated.
-//
-// # Safety
-// `c` is a caller handle or null (error, not UB).
-PunktfunkStatus punktfunk_connection_report_phase(const PunktfunkConnection *c,
-                                                  uint64_t next_latch_host_ns,
-                                                  uint32_t latch_period_ns,
-                                                  uint32_t uncertainty_ns,
-                                                  uint32_t arrival_lead_ns,
-                                                  uint16_t coherence_milli);
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Whether [`punktfunk_connection_report_decode_us`] is worth calling: writes true
 // only when Automatic bitrate is armed (non-PyroWave). Skip the per-frame
 // measurement otherwise. Constant for the session. Writes false on a NULL connection.
@@ -3513,6 +3655,19 @@ PunktfunkStatus punktfunk_connection_speed_test(const PunktfunkConnection *c,
 // (NULL is an error).
 PunktfunkStatus punktfunk_connection_probe_result(const PunktfunkConnection *c,
                                                   PunktfunkProbeResult *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Run the network check over this connection and write its report into `*out`. Blocking
+// for ten to twenty seconds — call it off the main thread. The connection should have been
+// dialled for probes only (`delivery_flags` `2`). Errors: `Unsupported` when the host
+// declined, `Timeout` when a round never reported.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for one `PunktfunkHealthReport`
+// (NULL is an error).
+PunktfunkStatus punktfunk_connection_network_check(const PunktfunkConnection *c,
+                                                   PunktfunkHealthReport *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -3573,69 +3728,6 @@ void punktfunk_h265_concealer_release(uint8_t *buf, uintptr_t len);
 PunktfunkStatus punktfunk_av1_sequence_info(const uint8_t *data,
                                             uintptr_t len,
                                             PunktfunkAv1SequenceInfo *out);
-
-// Create a re-anchor gate seeded with the session's current `frames_dropped` (so
-// the first [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss).
-// Free with [`punktfunk_reanchor_gate_free`]. Never returns NULL.
-ReanchorGate *punktfunk_reanchor_gate_new(uint64_t frames_dropped);
-
-// Free a gate created by [`punktfunk_reanchor_gate_new`]. NULL is a no-op.
-//
-// # Safety
-// `g` was returned by [`punktfunk_reanchor_gate_new`] and is not used after this call.
-void punktfunk_reanchor_gate_free(ReanchorGate *g);
-
-// Arm the freeze: a loss was detected (frame-index gap, or decoder wedge/demotion).
-// Zeroes the recovery-mark count and (re-)sets the backstop deadline. NULL is a no-op.
-//
-// # Safety
-// `g` is a valid gate handle.
-void punktfunk_reanchor_gate_arm(ReanchorGate *g);
-
-// Arm for a frame-index gap, pre-crediting `expected_drops` so a later
-// `frames_dropped` climb is not a second loss (double-arm race). Plain `arm`
-// for decoder wedge/demotion. NULL is a no-op.
-//
-// # Safety
-// `g` is a valid gate handle.
-void punktfunk_reanchor_gate_arm_expecting_drops(ReanchorGate *g, uint64_t expected_drops);
-
-// Fold one decoded frame; `out_present` is whether to display it. Reads `FLAG_SOF`,
-// `USER_FLAG_RECOVERY_ANCHOR`, `USER_FLAG_RECOVERY_POINT`. Platform decoders that
-// do not flag IDRs pass `decoder_keyframe = false` — wire `FLAG_SOF` covers it.
-// Uncorroborated: C callers cannot supply bitstream evidence.
-//
-// # Safety
-// `g` is a valid gate handle; `out_present` is writable or NULL.
-PunktfunkStatus punktfunk_reanchor_gate_on_decoded(ReanchorGate *g,
-                                                   uint32_t flags,
-                                                   bool decoder_keyframe,
-                                                   bool *out_present);
-
-// A received AU produced no decoded frame. Writes to `out_request_kf` whether the
-// no-output streak has tripped and the client should (throttled) request a keyframe
-// — the gate arms the freeze at the same time.
-//
-// # Safety
-// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
-PunktfunkStatus punktfunk_reanchor_gate_on_no_output(ReanchorGate *g, bool *out_request_kf);
-
-// Periodic fold of `frames_dropped` plus the overdue backstop. Writes to
-// `out_request_kf` whether the client should (throttled) request a keyframe
-// (a drop-count climb armed a freeze, or the freeze is overdue and re-asks).
-//
-// # Safety
-// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
-PunktfunkStatus punktfunk_reanchor_gate_poll(ReanchorGate *g,
-                                             uint64_t frames_dropped,
-                                             bool *out_request_kf);
-
-// Whether the gate is currently withholding concealed frames (frozen on the last
-// good picture). Writes `false` on a NULL gate.
-//
-// # Safety
-// `g` is a valid gate handle; `out_holding` is writable or NULL.
-PunktfunkStatus punktfunk_reanchor_gate_is_holding(const ReanchorGate *g, bool *out_holding);
 
 // Create an admission rule. Free with [`punktfunk_au_admission_free`]. Never returns NULL.
 AuAdmission *punktfunk_au_admission_new(void);

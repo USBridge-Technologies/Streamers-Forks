@@ -323,7 +323,7 @@ private val previewActions = RingActions(
     pointerGranted = { true }, padMouseTarget = { 1 }, padMouseMode = { 0 }, cyclePadMouse = {},
     audioMute = { 0 }, audioMuteLabel = { null }, toggleStreamMute = {},
     currentMode = { intArrayOf(1920, 1080, 60) }, requestMode = { _, _, _ -> },
-    screensSwappable = { true },
+    screenLayouts = { ScreenLayout.entries },
 )
 
 private data class SlotOption(val id: String, val label: String, val note: String? = null)
@@ -344,12 +344,13 @@ private fun slotGroups(cfg: OverlayConfig): List<SlotGroup> {
             SlotOption("pad", "Virtual controller", "Shows or hides the on-screen controller"),
             SlotOption("send_text", "Send text"),
             SlotOption("guide", "Guide button", "The host's Xbox / PS / Steam button"),
-            SlotOption("qam", "Quick access menu", "Only where the host's pad is Steam-shaped"),
+            SlotOption("qam", "Quick access menu", "Where the host runs Steam"),
             SlotOption("pad_mouse", "Controller mouse", "Your controller moves the host's pointer"),
+            SlotOption("pad_type", "Controller type", "The controller the host emulates, for this stream"),
         )),
         SlotGroup("View", listOf(
             SlotOption("stats", "Statistics"),
-            SlotOption("swap_screens", "Swap screens", "Dual-screen handhelds only"),
+            SlotOption("swap_screens", "Screens", "Dual-screen handhelds: the panel below, the picture below, or across both"),
         )),
         SlotGroup("Audio", listOf(
             SlotOption("mic", "Microphone"),

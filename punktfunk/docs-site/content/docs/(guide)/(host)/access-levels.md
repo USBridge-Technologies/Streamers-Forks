@@ -10,14 +10,14 @@ see [Friends over the internet](/docs/friends-over-the-internet).
 
 Pick the access when you
 [approve a device or arm a PIN](/docs/pairing#choosing-access-when-you-admit-a-device). Change it
-later in the console under **Devices** → **Paired devices** → **Edit access**; the **Access**
-column shows each device's level and time left.
+later in the console: **Devices** → the device's **Edit access**. Each row shows the
+device's level and time left.
 
 ## The three presets
 
 | Access level | The device can |
 |---|---|
-| **Full control** | Do everything: keyboard, mouse, controllers, clipboard, microphone, launching games, host power. A plain **Approve** gives this. |
+| **Full control** | Do everything: keyboard, mouse, controllers, clipboard, microphone, launching games, host power, managing games. A plain **Approve** gives this. |
 | **Controller only** | Send controller input. Its pads appear as extra controllers, with rumble and pad audio. |
 | **View only** | Watch and listen, and send nothing. |
 
@@ -36,6 +36,7 @@ Under **Advanced** in the access dialog:
 | **Microphone** | Sending the client's microphone to the host. |
 | **Launch games** | Starting a title from the [library](/docs/game-library) when connecting. Without it, such a connect is refused with a message; the library stays visible. |
 | **Host power** | Sleep, restart and shut down the host from the client ([Host power](/docs/host-power)). Full control includes it, since keyboard access reaches the desktop's power menu anyway. |
+| **Manage games** | Pausing a title's download and removing a downloaded title from the client's library. **Launch games** already starts a download. Full control includes it, since keyboard access reaches the store's own uninstall anyway. |
 
 **Controller only** leaves out **Launch games**, so you choose what runs. Tick it to let a guest
 pick games.
@@ -64,17 +65,18 @@ To add a second player to the game you're streaming:
 1. Pair the guest's device **Controller only**.
 2. In its **Display settings…**, set **A second device connects** to **Shares the screen**
    ([Per-device settings](/docs/virtual-displays#per-device-settings)).
-3. The guest connects. The **Sessions** card on **Home** lists them as **Joined another session**,
-   and their pads arrive as extra controllers on your desktop.
+3. The guest connects. **Now** on **Home** lists them; the row's **Details** say **Joined another
+   session**, and their pads arrive as extra controllers on your desktop. On a host with
+   [profiles](/docs/profiles), the guest picks theirs on connect and the row shows it.
 
-The **Sessions** card picks **Player 1–4** for each session, and the device keeps that player on
-its next connect. A pad that is already plugged in keeps its slot until it reconnects. A slot
+A row's player picker under **Now** sets **Player 1–4** for each session, and the device keeps that
+player on its next connect. A pad that is already plugged in keeps its slot until it reconnects. A slot
 another live session asked for first stays theirs. Clients show *player 2* in the
 [stats overlay](/docs/stats).
 
 ## Changing a live session
 
-The **Sessions** card on **Home** also has an access picker per session: hand a view-only friend
+A row on **Home** also has an access picker per session: hand a view-only friend
 the controller, take it back when your turn comes. It changes that session only, never beyond
 what the device is paired for, and ends with the session. Resolution, bitrate and keyframe
 requests are never restricted; they shape only that device's own stream.

@@ -87,7 +87,8 @@ check("cli argv: native sibling found", main._cli_argv() == [str(tmp / "punktfun
 # and the panel reported the client up to date forever. One branch INSTALLED is not enough to
 # make the query unambiguous; the ambiguity lives on the remote.
 shutil.rmtree("/tmp/pf-test-home", ignore_errors=True)
-_fp_root = Path("/tmp/pf-test-home/.local/share/flatpak/app/io.unom.Punktfunk/x86_64")
+# An arm install (Steam Frame): the resolver must look under the installed arch, not uname's.
+_fp_root = Path("/tmp/pf-test-home/.local/share/flatpak/app/io.unom.Punktfunk/aarch64")
 main._flatpak = lambda: "/usr/bin/flatpak"
 main._client_argv = _real_client_argv  # undo the fixture patches above
 
@@ -107,19 +108,19 @@ check("ref: a branch dir without `active` is leftovers, not an install", main._f
 _install_branch("canary")
 ref = main._flatpak_ref()
 check("ref: the single installed branch is used", ref == {
-    "scope": "--user", "branch": "canary", "ref": "io.unom.Punktfunk//canary",
+    "scope": "--user", "branch": "canary", "arch": "aarch64", "ref": "io.unom.Punktfunk//canary",
 })
 check(
     "ref: the launcher pins that branch, app id still LAST",
     main._client_argv() == [
-        "/usr/bin/flatpak", "run", "--arch=x86_64", "--branch=canary", "io.unom.Punktfunk",
+        "/usr/bin/flatpak", "run", "--arch=aarch64", "--branch=canary", "io.unom.Punktfunk",
     ],
 )
 # The pin must survive _cli_argv's rewrite, or the CLI runs a different build than the GUI.
 check(
     "ref: --command= is inserted before the app id, keeping the pin",
     main._cli_argv() == [
-        "/usr/bin/flatpak", "run", "--arch=x86_64", "--branch=canary",
+        "/usr/bin/flatpak", "run", "--arch=aarch64", "--branch=canary",
         "--command=punktfunk", "io.unom.Punktfunk",
     ],
 )
@@ -203,6 +204,26 @@ check("library: ...and is reported as unresolved", got == {
 captured.clear()
 got = asyncio.run(main.Plugin().library("   "))
 check("library: an empty ref is refused the same way", "args" not in captured and got["ok"] is False)
+
+# ---- Plugin.request_access: the advertised fingerprint pins the request -------------------
+#
+# Both OS installs of a dual-boot box answer at one address. Without `--fp` the CLI takes the
+# newest record there, which can be the other OS.
+desk = "ab" * 32
+captured.clear()
+asyncio.run(main.Plugin().request_access("192.168.1.9", 9777, "Steam Deck", desk))
+check(
+    "request access: argv pins the advertised fingerprint",
+    captured.get("args")
+    == ["pair", "192.168.1.9:9777", "--request-access", "--name", "Steam Deck", "--fp", desk],
+)
+captured.clear()
+asyncio.run(main.Plugin().request_access("192.168.1.9", 9777, "Steam Deck"))
+check("request access: no fingerprint, no --fp", "--fp" not in captured.get("args", []))
+captured.clear()
+got = asyncio.run(main.Plugin().request_access("192.168.1.9", 9777, "Steam Deck", "--exec"))
+check("request access: a flag-shaped fingerprint never reaches the CLI", "args" not in captured)
+check("request access: ...and is reported as unresolved", got["error"] == "unresolved")
 
 # ---- game_art: the inputs that become a URL and a file name are validated ----------------
 #

@@ -250,6 +250,12 @@ public final class GamepadFeedback {
         pad: UInt8, low: UInt16, high: UInt16, leftTrigger: UInt16, rightTrigger: UInt16
     ) {
         guard let renderer = withRouting({ silenced ? nil : rumbleByPad[pad] }) else { return }
+        // Controller rumble off plays every command as a stop, so a motor already running halts.
+        if UserDefaults.standard.object(forKey: DefaultsKey.padRumble) as? Bool == false {
+            renderer.apply(low: 0, high: 0, leftTrigger: 0, rightTrigger: 0)
+            if pad == 0 { deviceRumble?.apply(low: 0, high: 0) }
+            return
+        }
         renderer.apply(low: low, high: high, leftTrigger: leftTrigger, rightTrigger: rightTrigger)
         // The opt-in device mirror follows controller 1 unconditionally — the pads it exists for
         // have no motors (their renderer above no-ops), and mirroring deliberately isn't gated on
@@ -299,7 +305,10 @@ public final class GamepadFeedback {
         // the main-actor hop would only add latency to Steam's 25–40 ms rumble resends.
         if case let .hidRaw(pad, kind, data) = ev {
             let sink = withRouting { hidRawSink }
-            sink?(pad, kind, data)
+            // Controller rumble off plays Steam's rumble report as a stop, like every pad's.
+            let rumbleOff = UserDefaults.standard.object(forKey: DefaultsKey.padRumble) as? Bool == false
+            let muted = rumbleOff && kind == 0 && data.first == 0x80
+            sink?(pad, kind, muted ? [0x80] + [UInt8](repeating: 0, count: 9) : data)
             return
         }
         DispatchQueue.main.async {

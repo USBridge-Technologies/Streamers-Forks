@@ -9,22 +9,11 @@ import {
 	useForceUpdateCheck,
 	useGetUpdateStatus,
 } from "@/api/gen/update/update";
-import {
-	PasswordConfirmField,
-	usePasswordFailure,
-} from "@/components/password-confirm";
+import { PasswordConfirmDialog } from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-	Dialog,
-	DialogContent,
-	DialogDescription,
-	DialogFooter,
-	DialogHeader,
-	DialogTitle,
-} from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { apiErrorMessage } from "@/lib/errors";
 import { fmtDateTimeSecs } from "@/lib/format";
@@ -35,13 +24,13 @@ import { m } from "@/paraglide/messages";
 const APPLY_TIMEOUT_MS = 8 * 60 * 1000;
 
 /**
- * Container: the host update card. Check everywhere (U0) + one-click apply where the host
- * reports `apply: "full"` (U1 — Windows installer). The apply flow deliberately survives the
- * console's own backends dying: once an apply is accepted, the card renders from the LAST
- * status snapshot (React Query keeps data across failed polls) and treats poll errors as "the
- * host is restarting", not as failures — until the target version answers or a timeout.
+ * The host update: check everywhere (U0), one-click apply where the host reports `apply: "full"`
+ * (U1 — Windows installer). The apply flow survives the console's own backends dying: once an
+ * apply is accepted, the card renders from the LAST status snapshot (React Query keeps data
+ * across failed polls) and treats poll errors as "the host is restarting", until the target
+ * version answers or a timeout.
  */
-export const UpdateSection: FC = () => {
+export function useUpdate() {
 	const qc = useQueryClient();
 	const [applying, setApplying] = useState<{
 		target: string;
@@ -84,17 +73,44 @@ export const UpdateSection: FC = () => {
 				),
 		});
 
-	return (
-		<UpdateCard
-			state={status}
-			onCheck={checkNow}
-			checkBusy={check.isPending}
-			applying={applying}
-			onApplied={(target) => setApplying({ target, startedAt: Date.now() })}
-			onGiveUp={() => setApplying(null)}
-		/>
+	return {
+		state: status,
+		onCheck: checkNow,
+		checkBusy: check.isPending,
+		applying,
+		onApplied: (target: string) =>
+			setApplying({ target, startedAt: Date.now() }),
+		onGiveUp: () => setApplying(null),
+	};
+}
+
+export type Update = ReturnType<typeof useUpdate>;
+
+/**
+ * Whether the update needs more than the Host strip's line: one exists or is running, the
+ * check failed, or the last one did not simply succeed.
+ */
+export function updateNeedsCard(u: Update): boolean {
+	const s = u.state.data;
+	const r = s?.last_result;
+	return Boolean(
+		u.applying ||
+			s?.job ||
+			s?.available ||
+			s?.last_error ||
+			s?.manifest?.stale ||
+			(r && (!r.ok || r.staged)),
 	);
-};
+}
+
+/** The strip's line: whether this host is current. */
+export function updateLine(u: Update): string | undefined {
+	const s = u.state.data;
+	if (!s) return undefined;
+	if (u.applying || s.job) return m.host_updating();
+	if (s.available) return m.update_available_badge();
+	return s.manifest ? m.host_up_to_date() : undefined;
+}
 
 export const UpdateCard: FC<{
 	state: Loadable<UpdateStatus>;
@@ -273,43 +289,30 @@ const ApplyPanel: FC<{
 	onApplied: (target: string) => void;
 }> = ({ status, onApplied }) => {
 	const [open, setOpen] = useState(false);
-	const [password, setPassword] = useState("");
-	const refusal = usePasswordFailure();
-	const [error, setError] = useState<string | null>(null);
 	const [needsForce, setNeedsForce] = useState(false);
-	const [busy, setBusy] = useState(false);
 	const target = status.manifest?.version ?? "";
 
-	const submit = async (force: boolean) => {
-		setBusy(true);
-		setError(null);
-		refusal.reset();
+	const submit = async (password: string) => {
 		try {
 			await apiFetch("/api/v1/update/apply", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ password, force }),
+				body: JSON.stringify({ password, force: needsForce }),
 			});
-			setOpen(false);
-			setPassword("");
-			onApplied(target);
 		} catch (e) {
-			if (refusal.classify(e)) return;
-			const message = e instanceof ApiError ? apiErrorMessage(e) : undefined;
 			if (
 				e instanceof ApiError &&
 				e.status === 409 &&
-				message?.includes("force")
+				apiErrorMessage(e)?.includes("force")
 			) {
-				// The host refused because a stream is live — escalate to the explicit
-				// "drop the stream" confirmation instead of showing a raw error.
+				// A live stream: the dialog stays open as the explicit "drop the stream" step, and
+				// its description says why.
 				setNeedsForce(true);
-			} else {
-				setError(message || m.common_error());
+				return "";
 			}
-		} finally {
-			setBusy(false);
+			throw e;
 		}
+		onApplied(target);
 	};
 
 	return (
@@ -321,60 +324,26 @@ const ApplyPanel: FC<{
 				</Button>
 				<CommandLine command={status.channel_hint} />
 			</div>
-			<Dialog
+			<PasswordConfirmDialog
 				open={open}
-				onOpenChange={(o) => {
-					setOpen(o);
-					if (!o) {
-						setPassword("");
-						setError(null);
-						refusal.reset();
-						setNeedsForce(false);
-					}
+				id="update-apply-password"
+				title={m.update_apply_confirm_title({ version: target })}
+				body={
+					needsForce
+						? m.update_apply_force_warning()
+						: m.update_apply_confirm_body()
+				}
+				submitLabel={
+					needsForce ? m.update_apply_force_button() : m.update_apply_button()
+				}
+				busyLabel={m.update_apply_working()}
+				destructive={needsForce}
+				onSubmit={submit}
+				onClose={() => {
+					setOpen(false);
+					setNeedsForce(false);
 				}}
-			>
-				<DialogContent>
-					<DialogHeader>
-						<DialogTitle>
-							{m.update_apply_confirm_title({ version: target })}
-						</DialogTitle>
-						<DialogDescription>
-							{needsForce
-								? m.update_apply_force_warning()
-								: m.update_apply_confirm_body()}
-						</DialogDescription>
-					</DialogHeader>
-					<form
-						className="space-y-3"
-						onSubmit={(e) => {
-							e.preventDefault();
-							void submit(needsForce);
-						}}
-					>
-						<PasswordConfirmField
-							id="update-apply-password"
-							value={password}
-							onChange={setPassword}
-							failure={refusal.failure}
-							autoFocus
-						/>
-						{error && <p className="text-sm text-destructive">{error}</p>}
-						<DialogFooter>
-							<Button
-								type="submit"
-								variant={needsForce ? "destructive" : "default"}
-								disabled={busy || password.length === 0}
-							>
-								{busy
-									? m.update_apply_working()
-									: needsForce
-										? m.update_apply_force_button()
-										: m.update_apply_button()}
-							</Button>
-						</DialogFooter>
-					</form>
-				</DialogContent>
-			</Dialog>
+			/>
 		</div>
 	);
 };

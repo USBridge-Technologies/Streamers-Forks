@@ -8,7 +8,8 @@
 //! verified fingerprint; literal PIN arguments are refused. `--discover` lists native mDNS hosts.
 //!
 //! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE]
-//! [--bitrate KBPS] [--codec auto|h264|hevc|av1] [--input-test|--mic-test|--touch-test]
+//! [--bitrate KBPS] [--codec auto|h264|hevc|av1]
+//! [--input-test|--mic-test|--touch-test|--pad-audio-test [--pads N]]
 //! [--pin HEX|--pair -] [--compositor NAME] [--gamepad NAME] [--trajectory FILE] |
 //! --discover [SECS]`
 #![forbid(unsafe_code)]
@@ -21,12 +22,15 @@ use punktfunk_core::config::Role;
 use punktfunk_core::fp::{hex, parse_hex32};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::FLAG_PROBE;
+use punktfunk_core::quic::v2::dgram::Feedback;
+use punktfunk_core::quic::v2::hello::{ClientHello, Ready, ServerHello};
+use punktfunk_core::quic::v2::io as v2io;
+use punktfunk_core::quic::v2::msg::{decode, V2Message};
 use punktfunk_core::quic::{
-    endpoint, io, window_loss_ppm, BitrateChanged, CursorRenderMode, DeliveryReport, Hello,
-    LinkReport, LossReport, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe,
-    SetBitrate, Start, Welcome,
+    endpoint, window_loss_ppm, BitrateChanged, CursorRenderMode, CursorShape, Hello, ProbeRequest,
+    ProbeResult, Reconfigure, Reconfigured, SetBitrate, Welcome,
 };
-use punktfunk_core::transport::UdpTransport;
+use punktfunk_core::session::test_frame;
 use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
@@ -47,6 +51,11 @@ struct Args {
     /// `--rich-input-test` — drive the DualSense touchpad + motion over 0xCC (host needs
     /// `PUNKTFUNK_GAMEPAD=dualsense`); also logs the 0xCD HID-output feedback that comes back.
     rich_input_test: bool,
+    /// `--pad-audio-test` — declare pads DualSenses that render haptics and speaker, and count
+    /// the `0xD1` pad-audio datagrams the host streams back, per pad and lane.
+    pad_audio_test: bool,
+    /// `--pads N` — how many pads `--pad-audio-test` declares, 1 to 4.
+    pads: u8,
     /// `--quit` — close the connection with the deliberate-quit code (`QUIT_CLOSE_CODE`) at end of
     /// stream, so the host tears its virtual display down immediately (skips keep-alive linger). A
     /// bare exit closes with code 0 → the host lingers for a reconnect. Tests the #2 quit path.
@@ -63,14 +72,14 @@ struct Args {
     /// encoder rate retarget (Phase 3.2) / rebuild fallback. Wiggles the cursor around the switch
     /// so a damage-driven idle desktop actually publishes frames through it.
     rebitrate: Option<(u32, u32)>,
-    /// `--link-kbps N` — send the [`LinkReport`] a real client's bring-up ramp would, so the
+    /// `--link-kbps N` — send the link rate a real client's bring-up ramp would, so the
     /// host paces a pinned stream at that link rate. The probe runs no ramp of its own.
     link_kbps: Option<u32>,
     /// `--pair -` — run the pairing ceremony instead of a session.
     pair: Option<String>,
     /// `--name LABEL` — how the host labels this client when pairing.
     name: String,
-    /// `--compositor NAME` — request a host compositor backend (auto|kwin|wlroots|mutter|gamescope|hyprland).
+    /// `--compositor NAME` — request a host compositor backend (auto|kwin|wlroots|mutter|gamescope|hyprland|niri).
     compositor: CompositorPref,
     /// `--gamepad NAME` — request a host virtual-pad backend (auto|xbox360|dualsense).
     gamepad: GamepadPref,
@@ -100,7 +109,7 @@ struct Args {
     /// `--launch ID` — ask the host to launch a library title in this session (a store-qualified
     /// id from the host's `GET /api/v1/library`, e.g. `steam:570`). Host resolves it; `None` = none.
     launch: Option<String>,
-    /// `--preset ID:NAME` — the settings preset this session names on `Start`, as a client does.
+    /// `--preset ID:NAME` — the settings preset this session names, as a client does.
     preset: Option<punktfunk_core::quic::SessionPreset>,
     /// `--speed-test KBPS:MS` — after the stream starts, ask the host for a `MS`-millisecond
     /// bandwidth probe burst at `KBPS`, then report measured throughput + loss.
@@ -135,6 +144,12 @@ struct Args {
     link: trajectory::Link,
     /// `--profile NAME` — the row name the trajectory summary prints under.
     profile: String,
+    /// `--as ID` — play as this profile. A host that places it elsewhere answers with a
+    /// `Redirect`, which the probe follows once, as the client pump does: the address it names
+    /// (else the same), its port, pinned to the certificate it names (else the same pin).
+    as_profile: Option<String>,
+    /// Set once a `Redirect` was followed; a second one on the same connect ends the run.
+    redirected: bool,
     /// `--decoder-hold` — hold the picture after a lost frame until one that re-anchors it
     /// arrives, asking for a keyframe while held, as the shipped TV client does. Without it
     /// the rig resumes as soon as frame indexes line up, which no decoder can do.
@@ -144,6 +159,42 @@ struct Args {
     /// the headless validator for the host answering `ClockProbe` at any time (what the native
     /// clients' mid-stream re-sync relies on). Aborts the session when the re-probe fails.
     clock_resync: bool,
+}
+
+/// The control stream's halves; `punktfunk/2`'s cross the translation edges.
+type CtlTx = quinn::SendStream;
+type CtlRx = v2io::FrameReader<quinn::RecvStream>;
+
+/// The connection, its datagrams as `punktfunk/1` encodings: on `punktfunk/2` they carry a kind.
+#[derive(Clone)]
+struct Wire {
+    conn: quinn::Connection,
+}
+
+impl Wire {
+    fn send_datagram(&self, d: Vec<u8>) -> Result<(), quinn::SendDatagramError> {
+        match punktfunk_core::quic::v2::dgram::wrap(&d) {
+            Some(w) => self.conn.send_datagram(w.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// The next datagram; a kind the probe reads nothing from is skipped.
+    async fn read_datagram(&self) -> Result<Vec<u8>, quinn::ConnectionError> {
+        loop {
+            let b = self.conn.read_datagram().await?;
+            if let Some(p) = punktfunk_core::quic::v2::dgram::client_payload(&b) {
+                return Ok(p.to_vec());
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for Wire {
+    type Target = quinn::Connection;
+    fn deref(&self) -> &quinn::Connection {
+        &self.conn
+    }
 }
 
 fn parse_mode(m: &str) -> Option<Mode> {
@@ -162,7 +213,10 @@ fn load_or_create_identity() -> Result<(String, String)> {
 }
 
 fn parse_args() -> Args {
-    let argv: Vec<String> = std::env::args().collect();
+    parse_argv(std::env::args().collect())
+}
+
+fn parse_argv(argv: Vec<String>) -> Args {
     let get = |flag: &str| {
         argv.iter()
             .skip_while(|a| *a != flag)
@@ -202,7 +256,7 @@ fn parse_args() -> Args {
         Some(s) => match CompositorPref::from_name(s) {
             Some(c) => c,
             None => {
-                eprintln!("--compositor takes auto, kwin, mutter, hyprland, wlroots or gamescope");
+                eprintln!("--compositor: auto, kwin, mutter, hyprland, niri, wlroots or gamescope");
                 std::process::exit(2);
             }
         },
@@ -229,6 +283,11 @@ fn parse_args() -> Args {
         mic_burst: argv.iter().any(|a| a == "--mic-burst"),
         touch_test: argv.iter().any(|a| a == "--touch-test"),
         rich_input_test: argv.iter().any(|a| a == "--rich-input-test"),
+        pad_audio_test: argv.iter().any(|a| a == "--pad-audio-test"),
+        pads: get("--pads")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, PAD_AUDIO_PADS as u8),
         quit: argv.iter().any(|a| a == "--quit"),
         seconds: get("--seconds").and_then(|s| s.parse().ok()),
         pin,
@@ -309,6 +368,8 @@ fn parse_args() -> Args {
             },
         },
         profile: get("--profile").unwrap_or("rig").to_string(),
+        as_profile: get("--as").map(str::to_string),
+        redirected: false,
         decoder_hold: argv.iter().any(|a| a == "--decoder-hold"),
         clock_resync: argv.iter().any(|a| a == "--clock-resync"),
         cursor_capture: argv.iter().any(|a| a == "--cursor-capture"),
@@ -399,7 +460,8 @@ fn run(args: Args) -> Result<()> {
 
 /// Browse the LAN for native (`_punktfunk._udp`) hosts for `secs` seconds and print them, then
 /// exit — the discovery side of the host's mDNS advert (host crate `discovery.rs`). TXT keys:
-/// `fp` (host cert fingerprint to pin), `pair` (required|optional), `id` (stable host id).
+/// `fp` (host cert fingerprint to pin), `pair` (required|optional), `id` (stable host id),
+/// `wire` (the protocols the host answers).
 fn discover(secs: u64) -> Result<()> {
     use mdns_sd::{ServiceDaemon, ServiceEvent};
     use std::collections::BTreeMap;
@@ -449,9 +511,10 @@ fn discover(secs: u64) -> Result<()> {
                     id
                 };
                 let row = format!(
-                    "  {name:<24} {addr}:{:<6} pair={:<9} fp={fp_short}…",
+                    "  {name:<24} {addr}:{:<6} pair={:<9} wire={:<4} fp={fp_short}…",
                     info.get_port(),
                     val("pair"),
+                    val("wire"),
                 );
                 hosts.insert(key, row);
             }
@@ -472,6 +535,9 @@ fn discover(secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// Pads `--pad-audio-test` can declare and count.
+const PAD_AUDIO_PADS: usize = 4;
+
 /// Counters the planes share. The data loop mirrors the session's figures into the first four
 /// for the control tasks; the datagram task counts the host→client planes for the report.
 #[derive(Default)]
@@ -480,8 +546,8 @@ struct Counters {
     /// throughput and loss count every delivered wire packet, not just reassembled probe AUs.
     rx_wire_packets: AtomicU64,
     rx_wire_bytes: AtomicU64,
-    /// The windowed loss estimate the loss relay sends as a LossReport, so the host sizes FEC to
-    /// the link. `u32::MAX` = no fresh sample this window.
+    /// The windowed loss estimate the loss relay sends in its feedback window, so the host sizes
+    /// FEC to the link. `u32::MAX` = no fresh sample this window.
     loss_ppm: AtomicU32,
     /// The session's cumulative unrecoverable-frame count. The loss relay requests a keyframe
     /// when it grows, the loss trigger under infinite GOP (see `NativeClient::frames_dropped`).
@@ -490,6 +556,9 @@ struct Counters {
     audio_bytes: AtomicU64,
     rumble_pkts: AtomicU64,
     hidout_pkts: AtomicU64,
+    /// `0xD1` pad-audio datagrams by pad and lane (haptics, speaker), and those carrying sound.
+    pad_audio_pkts: [[AtomicU64; 2]; PAD_AUDIO_PADS],
+    pad_audio_voiced: AtomicU64,
     /// A self-terminating v2 rumble envelope (0xCA with the seq+ttl tail) arrived. Asserted at
     /// report time under `PUNKTFUNK_TEST_FEEDBACK`; a legacy v1 datagram leaves it false.
     saw_v2_rumble: AtomicBool,
@@ -497,20 +566,89 @@ struct Counters {
     closed: AtomicBool,
 }
 
-async fn session(args: Args) -> Result<()> {
-    let (ep, conn, remote) = connect(&args).await?;
+/// The host placed this profile on another host of the box.
+#[derive(Debug)]
+struct Redirected(punktfunk_core::quic::v2::msg::Redirect);
+
+impl std::fmt::Display for Redirected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the host placed this profile on port {}", self.0.port)
+    }
+}
+
+impl std::error::Error for Redirected {}
+
+/// Points `args` at the host a `Redirect` names, once per connect.
+fn follow(args: &mut Args, to: &punktfunk_core::quic::v2::msg::Redirect) -> Result<()> {
+    anyhow::ensure!(!args.redirected, "redirected twice on one connect");
+    let mut remote: std::net::SocketAddr = args.connect.parse().context("--connect host:port")?;
+    if !to.addr.is_empty() {
+        remote.set_ip(to.addr.parse().context("the Redirect's address")?);
+    }
+    remote.set_port(to.port);
+    args.connect = remote.to_string();
+    if !to.pin.is_empty() {
+        args.pin = punktfunk_core::fp::parse_hex32(&to.pin);
+    }
+    args.redirected = true;
+    Ok(())
+}
+
+async fn session(mut args: Args) -> Result<()> {
+    let (ep, quic, shared) = connect(&args).await?;
+    let conn = Wire { conn: quic.clone() };
     let (mut send, recv) = conn.open_bi().await.context("open control stream")?;
     // Frame every read on the control stream through the resumable reader, exactly as the client
     // pump does: `clock_sync` bounds each read with a timeout, and a frame straddling two wakeups
     // would otherwise leave the stream permanently misaligned for the rest of the run.
-    let mut recv = io::MsgReader::new(recv);
-    let (welcome, udp_port) = handshake(&mut send, &mut recv, &args).await?;
+    v2io::write_stream_type(
+        &mut send,
+        punktfunk_core::quic::v2::registry::STREAM_CONTROL,
+    )
+    .await?;
+    let mut recv: CtlRx = v2io::FrameReader::new(recv);
+    let extra = Extra {
+        resume: None,
+        suites: if std::env::var_os("PUNKTFUNK_CLIENT_CHACHA20").is_some() {
+            vec![
+                punktfunk_core::crypto::MediaSuite::ChaCha20Poly1305,
+                punktfunk_core::crypto::MediaSuite::Aes128Gcm,
+            ]
+        } else {
+            vec![punktfunk_core::crypto::MediaSuite::Aes128Gcm]
+        },
+    };
+    let server = match handshake(&mut send, &mut recv, &args, extra).await {
+        Ok(server) => server,
+        Err(e) => match e.downcast::<Redirected>() {
+            Ok(Redirected(to)) => {
+                follow(&mut args, &to)?;
+                quic.close(0u32.into(), b"redirected");
+                return Box::pin(session(args)).await;
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    let welcome = server.welcome;
+    // Media on the dialing socket, under keys from the connection's exporter.
+    let suite = server.suite.context("unsealed native media")?;
+    let keys =
+        endpoint::media_keys(&quic, &server.session_id, suite).context("native media keys")?;
+    shared.stats().set_host(quic.remote_address());
+    let media = (
+        shared,
+        punktfunk_core::session::MediaV2 {
+            clock_origin_ns: server.clock_origin_ns,
+            keys: Some(keys),
+            clock: None,
+        },
+    );
     let clock_offset_ns = clock(&mut send, &mut recv, args.clock_resync).await?;
     let counters = Arc::new(Counters {
         loss_ppm: AtomicU32::new(u32::MAX),
         ..Counters::default()
     });
-    control_plane(&args, &conn, send, recv, welcome.encrypt, &counters).await?;
+    control_plane(&args, &conn, send, recv, &counters).await?;
     if args.input_test {
         spawn_input_test(&conn, args.mode);
     }
@@ -522,6 +660,9 @@ async fn session(args: Args) -> Result<()> {
     }
     if args.rich_input_test {
         spawn_rich_input_test(&conn);
+    }
+    if args.pad_audio_test {
+        spawn_pad_audio_test(&conn, args.pads);
     }
     // Closed-flag for the blocking receive loop.
     {
@@ -550,8 +691,7 @@ async fn session(args: Args) -> Result<()> {
     let result = tokio::task::spawn_blocking(move || {
         data_plane(
             welcome,
-            remote,
-            udp_port,
+            media,
             out_path,
             seconds,
             clock_offset_ns,
@@ -596,41 +736,53 @@ async fn session(args: Args) -> Result<()> {
 /// Dials `--connect`, pinned to `--pin` when given, and logs how the host was trusted.
 async fn connect(
     args: &Args,
-) -> Result<(quinn::Endpoint, quinn::Connection, std::net::SocketAddr)> {
+) -> Result<(
+    quinn::Endpoint,
+    quinn::Connection,
+    punktfunk_core::transport::shared::ClientMedia,
+)> {
     let remote: std::net::SocketAddr = args.connect.parse().context("--connect host:port")?;
     let identity = load_or_create_identity()?;
-    let (ep, observed) = endpoint::client_pinned_with_identity(
+    let identity = Some((identity.0.as_str(), identity.1.as_str()));
+    // QUIC and media on one socket, as the clients dial.
+    let (r, observed) = endpoint::client_shared(
         args.pin,
-        Some((identity.0.as_str(), identity.1.as_str())),
+        identity,
+        &[punktfunk_core::quic::v2::registry::ALPN],
     );
-    let ep = ep.map_err(|e| anyhow!("QUIC client endpoint: {e}"))?;
+    let (ep, media) = r.map_err(|e| anyhow!("QUIC client endpoint: {e}"))?;
     let conn = ep
         .connect(remote, "punktfunk")
         .context("connect")?
         .await
         .context("QUIC handshake (a pin mismatch fails here)")?;
     match (args.pin, *observed.lock().unwrap()) {
-        (Some(_), _) => tracing::info!(%remote, "punktfunk/1 connected — host fingerprint pinned"),
+        (Some(_), _) => tracing::info!(%remote, "connected — host fingerprint pinned"),
         (None, Some(fp)) => tracing::info!(
             %remote,
             fingerprint = %hex(&fp),
-            "punktfunk/1 connected (trust-on-first-use) — pass --pin to verify this host"
+            "connected (trust-on-first-use) — pass --pin to verify this host"
         ),
-        (None, None) => tracing::info!(%remote, "punktfunk/1 connected"),
+        (None, None) => tracing::info!(%remote, "connected"),
     }
-    Ok((ep, conn, remote))
+    Ok((ep, conn, media))
 }
 
-/// Hello out and Welcome back, then `Start` naming the data-plane port this probe reserved.
+/// What the `ClientHello` carries beyond the `Hello`.
+struct Extra {
+    resume: Option<[u8; 16]>,
+    suites: Vec<punktfunk_core::crypto::MediaSuite>,
+}
+
+/// `ClientHello` out and `ServerHello` back, then `Ready`.
 async fn handshake(
-    send: &mut quinn::SendStream,
-    recv: &mut io::MsgReader<quinn::RecvStream>,
+    send: &mut CtlTx,
+    recv: &mut CtlRx,
     args: &Args,
-) -> Result<(Welcome, u16)> {
-    io::write_msg(
-        send,
-        &Hello {
-            abi_version: punktfunk_core::WIRE_VERSION,
+    extra: Extra,
+) -> Result<ServerHello> {
+    let hello = ClientHello {
+        hello: Hello {
             mode: args.mode,
             compositor: args.compositor,
             gamepad: args.gamepad,
@@ -723,6 +875,9 @@ async fn handshake(
                 if args.audio_format.is_some() {
                     c |= punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES;
                 }
+                if args.pad_audio_test {
+                    c |= punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO;
+                }
                 c
             },
             // Like STREAMED_AU above: the shared-core reassembler pins geometry per-frame, so
@@ -738,16 +893,55 @@ async fn handshake(
             // invites exactly the misreading that a rate alone asks for something.
             audio_rate_hz: args.audio_format.map(|(r, _)| r).unwrap_or(0),
             audio_bits: args.audio_format.map(|(_, b)| b).unwrap_or(0),
+        },
+        client_label: None,
+        abr_features: 0,
+        preset: args.preset.clone(),
+        link: Default::default(),
+        probe_only: false,
+        pyrowave_bpp_x100: 0,
+        resume: extra.resume,
+        suites: extra.suites,
+        // A host answers a `Redirect` only to a client that says it follows one.
+        features: {
+            let none = punktfunk_core::quic::v2::features::FeatureSet::default();
+            if args.as_profile.is_some() {
+                none.with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES)
+            } else {
+                none
+            }
+        },
+        profile: args.as_profile.clone(),
+        access_only: false,
+    };
+    v2io::send(send, &hello).await?;
+    // `Pending` repeats while the host asks its console about this probe.
+    let server = loop {
+        let (ty, body) = recv.read_frame().await?;
+        match ty {
+            punktfunk_core::quic::v2::msg::Redirect::TYPE => {
+                let to = punktfunk_core::quic::v2::msg::Redirect::from_body(&body)
+                    .map_err(|e| anyhow!("Redirect decode: {e:?}"))?;
+                println!(
+                    "redirect addr={:?} port={} profile={} seat_no={} seat_name={:?} occupant={:?} pin={}",
+                    to.addr, to.port, to.profile, to.seat_no, to.seat_name, to.occupant, to.pin
+                );
+                return Err(anyhow::Error::new(Redirected(to)));
+            }
+            ServerHello::TYPE => {
+                break ServerHello::from_body(&body)
+                    .map_err(|e| anyhow!("ServerHello decode: {e:?}"))?
+            }
+            punktfunk_core::quic::v2::registry::MSG_PENDING => {
+                tracing::info!("the host is waiting for this probe to be approved")
+            }
+            _ => {}
         }
-        .encode(),
-    )
-    .await?;
-    let welcome =
-        Welcome::decode(&recv.read_msg().await?).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
+    };
+    let welcome = &server.welcome;
     tracing::info!(
         mode = ?welcome.mode,
         fec = ?welcome.fec,
-        encrypt = welcome.encrypt,
         frames = welcome.frames,
         compositor = welcome.compositor.as_str(),
         gamepad = welcome.gamepad.as_str(),
@@ -757,39 +951,17 @@ async fn handshake(
         chroma_444 = welcome.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
         chroma_format_idc = welcome.chroma_format,
         codec = codec_ext(welcome.codec),
-        cipher = if welcome.cipher == punktfunk_core::quic::CIPHER_CHACHA20_POLY1305 {
-            "chacha20-poly1305"
-        } else {
-            "aes-128-gcm"
-        },
+        suite = ?server.suite,
         "session offer"
     );
 
-    // Reserve our data-plane port, then tell the host to start.
-    let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    let udp_port = probe.local_addr()?.port();
-    drop(probe);
-    let start = Start {
-        client_udp_port: udp_port,
-    };
-    let preset = args.preset.as_ref().map(|p| p.encode()).unwrap_or_default();
-    let start_msg =
-        if preset.is_empty() || welcome.host_caps2 & punktfunk_core::quic::HOST_CAP2_EXT == 0 {
-            start.encode()
-        } else {
-            start.encode_ext(&[(punktfunk_core::quic::EXT_TAG_PRESET, &preset)])?
-        };
-    io::write_msg(send, &start_msg).await?;
-    Ok((welcome, udp_port))
+    v2io::send(send, &Ready {}).await?;
+    Ok(server)
 }
 
 /// The wall-clock skew handshake, plus the `--clock-resync` re-probe. `None` is an old host
 /// that does not answer.
-async fn clock(
-    send: &mut quinn::SendStream,
-    recv: &mut io::MsgReader<quinn::RecvStream>,
-    resync: bool,
-) -> Result<Option<i64>> {
+async fn clock(send: &mut CtlTx, recv: &mut CtlRx, resync: bool) -> Result<Option<i64>> {
     // Wall-clock skew handshake on the still-private control stream (before --remode/--speed-test
     // take it): align our clock to the host's so the per-frame capture→received latency is valid
     // across machines. `None` ⇒ an old host that doesn't answer — fall back to a shared clock (0).
@@ -849,28 +1021,32 @@ async fn clock(
 /// client runs. The tests are mutually exclusive: each needs the stream to itself.
 async fn control_plane(
     args: &Args,
-    conn: &quinn::Connection,
-    mut send: quinn::SendStream,
-    recv: io::MsgReader<quinn::RecvStream>,
-    encrypt: bool,
+    conn: &Wire,
+    send: CtlTx,
+    recv: CtlRx,
     counters: &Arc<Counters>,
 ) -> Result<()> {
-    if let Some(proven_kbps) = args.link_kbps {
-        io::write_msg(&mut send, &LinkReport { proven_kbps }.encode())
-            .await
-            .map_err(|e| anyhow!("LinkReport write: {e}"))?;
-        tracing::info!(proven_kbps, "sent the link report");
+    let link_kbps = args.link_kbps.unwrap_or(0);
+    if link_kbps != 0 {
+        let fb = Feedback {
+            link_kbps,
+            ..Default::default()
+        };
+        conn.conn
+            .send_datagram(fb.encode().into())
+            .map_err(|e| anyhow!("link rate datagram: {e}"))?;
+        tracing::info!(link_kbps, "sent the link rate");
     }
     if let Some((new_mode, after_secs)) = args.remode {
         spawn_remode(send, recv, new_mode, after_secs);
     } else if let Some((new_kbps, after_secs)) = args.rebitrate {
         spawn_rebitrate(conn, send, recv, new_kbps, after_secs);
     } else if let Some(test) = args.speed_test {
-        spawn_speed_test(conn, send, recv, test, encrypt, counters);
+        spawn_speed_test(conn, send, recv, test, counters);
     } else if args.cursor_capture || args.cursor_nochannel || args.cursor_channel {
         spawn_cursor_test(conn, send, recv, args.cursor_capture, args.cursor_channel);
     } else {
-        spawn_loss_relay(send, counters);
+        spawn_loss_relay(conn.conn.clone(), send, counters, link_kbps);
     }
     Ok(())
 }
@@ -878,27 +1054,33 @@ async fn control_plane(
 /// `--remode`: after a delay, ask the host to switch modes on the still-open control stream.
 /// The stream then carries new-mode AUs (IDR + in-band parameter sets); ffprobe the `--out`
 /// file to see both resolutions.
-fn spawn_remode(
-    mut rs: quinn::SendStream,
-    mut rr: io::MsgReader<quinn::RecvStream>,
-    new_mode: Mode,
-    after_secs: u32,
-) {
+/// The next control frame of type `M`. The host also sends a `StreamConfig` and its notices
+/// unasked, so an answer is not always the next frame.
+async fn next_of<M: V2Message>(r: &mut CtlRx) -> std::io::Result<M> {
+    loop {
+        let (ty, body) = r.read_frame().await?;
+        if let Ok(m) = decode::<M>(ty, &body) {
+            return Ok(m);
+        }
+    }
+}
+
+fn spawn_remode(mut rs: CtlTx, mut rr: CtlRx, new_mode: Mode, after_secs: u32) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(after_secs as u64)).await;
         tracing::info!(?new_mode, "requesting mid-stream mode switch");
-        if io::write_msg(&mut rs, &Reconfigure { mode: new_mode }.encode())
+        if v2io::send(&mut rs, &Reconfigure { mode: new_mode })
             .await
             .is_err()
         {
             tracing::error!("Reconfigure write failed");
             return;
         }
-        match rr.read_msg().await.map(|b| Reconfigured::decode(&b)) {
-            Ok(Ok(ack)) if ack.accepted => {
+        match next_of::<Reconfigured>(&mut rr).await {
+            Ok(ack) if ack.accepted => {
                 tracing::info!(mode = ?ack.mode, "mode switch ACCEPTED")
             }
-            Ok(Ok(ack)) => tracing::warn!(active = ?ack.mode, "mode switch REJECTED"),
+            Ok(ack) => tracing::warn!(active = ?ack.mode, "mode switch REJECTED"),
             other => tracing::error!(?other, "bad Reconfigured"),
         }
     });
@@ -910,13 +1092,7 @@ fn spawn_remode(
 /// which. The cursor wiggle keeps a damage-driven idle desktop publishing frames through
 /// the whole window: the encode loop only drains bitrate requests between frames, and the
 /// post-switch AUs are what prove the stream carried on.
-fn spawn_rebitrate(
-    conn: &quinn::Connection,
-    mut rs: quinn::SendStream,
-    mut rr: io::MsgReader<quinn::RecvStream>,
-    new_kbps: u32,
-    after_secs: u32,
-) {
+fn spawn_rebitrate(conn: &Wire, mut rs: CtlTx, mut rr: CtlRx, new_kbps: u32, after_secs: u32) {
     let conn2 = conn.clone();
     tokio::spawn(async move {
         let wiggle = |i: u32| InputEvent {
@@ -933,18 +1109,17 @@ fn spawn_rebitrate(
         let mut sent = false;
         let mut i = 0u32;
         while std::time::Instant::now() < end {
-            let _ = conn2.send_datagram(wiggle(i).encode().to_vec().into());
+            let _ = conn2.send_datagram(wiggle(i).encode().to_vec());
             i += 1;
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if !sent && std::time::Instant::now() >= switch_at {
                 sent = true;
                 tracing::info!(new_kbps, "requesting mid-stream bitrate change");
-                if io::write_msg(
+                if v2io::send(
                     &mut rs,
                     &SetBitrate {
                         bitrate_kbps: new_kbps,
-                    }
-                    .encode(),
+                    },
                 )
                 .await
                 .is_err()
@@ -952,8 +1127,8 @@ fn spawn_rebitrate(
                     tracing::error!("SetBitrate write failed");
                     return;
                 }
-                match rr.read_msg().await.map(|b| BitrateChanged::decode(&b)) {
-                    Ok(Ok(ack)) => tracing::info!(
+                match next_of::<BitrateChanged>(&mut rr).await {
+                    Ok(ack) => tracing::info!(
                         applied_kbps = ack.bitrate_kbps,
                         "BITRATE CHANGE acked by host"
                     ),
@@ -968,21 +1143,16 @@ fn spawn_rebitrate(
 /// measure delivered WIRE packets (session-stat delta) against what the host reports putting
 /// on the wire.
 fn spawn_speed_test(
-    conn: &quinn::Connection,
-    mut ss: quinn::SendStream,
-    mut sr: io::MsgReader<quinn::RecvStream>,
+    conn: &Wire,
+    mut ss: CtlTx,
+    mut sr: CtlRx,
     (target_kbps, duration_ms): (u32, u32),
-    encrypt: bool,
     counters: &Arc<Counters>,
 ) {
     let c = counters.clone();
-    // Per-packet wire size to express delivered bytes as link bytes (header + shard + crypto);
+    // Per-packet wire size to express delivered bytes as link bytes (header + shard + tag);
     // every shard is zero-padded to shard_payload so all data packets are this exact size.
-    let crypto_overhead = if encrypt {
-        punktfunk_core::packet::CRYPTO_OVERHEAD as u64
-    } else {
-        0
-    };
+    let crypto_overhead = punktfunk_core::crypto::TAG_LEN as u64;
     let conn2 = conn.clone();
     tokio::spawn(async move {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1000,7 +1170,7 @@ fn spawn_speed_test(
                 y: 0,
                 flags: 0,
             };
-            let _ = conn2.send_datagram(mv.encode().to_vec().into());
+            let _ = conn2.send_datagram(mv.encode().to_vec());
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         // Baseline the packet-level counters right before the burst (video is paused during it,
@@ -1008,22 +1178,16 @@ fn spawn_speed_test(
         let base_pkts = c.rx_wire_packets.load(Relaxed);
         let base_bytes = c.rx_wire_bytes.load(Relaxed);
         tracing::info!(target_kbps, duration_ms, "requesting speed-test probe");
-        if io::write_msg(
-            &mut ss,
-            &ProbeRequest {
-                target_kbps,
-                duration_ms,
-            }
-            .encode(),
-        )
-        .await
-        .is_err()
-        {
+        let ask = punktfunk_core::quic::ProbeShaped::from(ProbeRequest {
+            target_kbps,
+            duration_ms,
+        });
+        if v2io::send(&mut ss, &ask).await.is_err() {
             tracing::error!("ProbeRequest write failed");
             return;
         }
-        let res = match sr.read_msg().await.map(|b| ProbeResult::decode(&b)) {
-            Ok(Ok(r)) => r,
+        let res = match next_of::<ProbeResult>(&mut sr).await {
+            Ok(r) => r,
             other => {
                 tracing::error!(?other, "bad ProbeResult");
                 return;
@@ -1087,9 +1251,9 @@ fn spawn_speed_test(
 /// still in its initial client-draws state, and dropping our recv half would fail those
 /// writes host-side.
 fn spawn_cursor_test(
-    conn: &quinn::Connection,
-    mut cs: quinn::SendStream,
-    mut cr: io::MsgReader<quinn::RecvStream>,
+    conn: &Wire,
+    mut cs: CtlTx,
+    mut cr: CtlRx,
     flip_channel: bool,
     flip_twice: bool,
 ) {
@@ -1097,9 +1261,7 @@ fn spawn_cursor_test(
         if flip_twice {
             for (at, client_draws) in [(15, false), (20, true)] {
                 tokio::time::sleep(std::time::Duration::from_secs(at)).await;
-                if let Err(e) =
-                    io::write_msg(&mut cs, &CursorRenderMode { client_draws }.encode()).await
-                {
+                if let Err(e) = v2io::send(&mut cs, &CursorRenderMode { client_draws }).await {
                     tracing::error!(error = %format!("{e:#}"), "cursor-channel: render-mode write failed");
                     return;
                 }
@@ -1108,12 +1270,11 @@ fn spawn_cursor_test(
         }
         if flip_channel {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            match io::write_msg(
+            match v2io::send(
                 &mut cs,
                 &CursorRenderMode {
                     client_draws: false,
-                }
-                .encode(),
+                },
             )
             .await
             {
@@ -1127,13 +1288,22 @@ fn spawn_cursor_test(
                 }
             }
         }
-        // Drain (and just log) whatever the host still sends on the control stream.
-        while let Ok(b) = cr.read_msg().await {
-            tracing::debug!(
-                len = b.len(),
-                ty = b.get(4).copied().unwrap_or(0),
-                "cursor-capture: control message drained"
-            );
+        // Drain whatever the host still sends on the control stream; a shape says what
+        // size it came in.
+        while let Ok((ty, b)) = cr.read_frame().await {
+            match decode::<CursorShape>(ty, &b) {
+                Ok(s) => tracing::info!(
+                    serial = s.serial,
+                    w = s.w,
+                    h = s.h,
+                    hot_x = s.hot_x,
+                    hot_y = s.hot_y,
+                    "cursor-channel: CursorShape received"
+                ),
+                Err(_) => {
+                    tracing::debug!(len = b.len(), ty, "cursor-capture: control message drained")
+                }
+            }
         }
     });
     let wiggle_conn = conn.clone();
@@ -1152,73 +1322,64 @@ fn spawn_cursor_test(
                 y: (10.0 * t.sin()) as i32,
                 flags: 0,
             };
-            let _ = wiggle_conn.send_datagram(e.encode().to_vec().into());
+            let _ = wiggle_conn.send_datagram(e.encode().to_vec());
             t += 0.2;
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     });
 }
 
-/// Normal stream mode: relay the data loop's windowed loss estimate to the host as periodic
-/// LossReports, so it can size FEC to the link (adaptive FEC), and — like the real clients —
-/// request a keyframe whenever the unrecoverable-frame count grows (100 ms poll = a natural
-/// throttle; several drops in a burst coalesce into one request). The control stream is
-/// otherwise idle here (remode/speed-test own it in their modes).
-///
-/// Delivery truth for the host's dead-data-plane check: report what actually landed on the
-/// wire, so the probe reproduces a real client's answer rather than the "cannot answer"
-/// sentinel — which is exactly what makes it usable for testing that path.
-fn spawn_loss_relay(mut ls: quinn::SendStream, counters: &Arc<Counters>) {
+/// Normal stream mode: relay the data loop's windowed loss estimate and what landed on the
+/// wire to the host as numbered feedback windows, so it sizes FEC to the link and can tell a
+/// dead data plane, and — like the real clients — ask for a keyframe whenever the
+/// unrecoverable-frame count grows (100 ms poll = a natural throttle; several drops in a
+/// burst coalesce into one ask). Each ask goes out twice: a datagram can be lost. The control
+/// stream stays open and idle here (remode/speed-test own it in their modes).
+fn spawn_loss_relay(conn: quinn::Connection, ls: CtlTx, counters: &Arc<Counters>, link_kbps: u32) {
     let c = counters.clone();
     tokio::spawn(async move {
         use std::sync::atomic::Ordering::Relaxed;
+        let _control = ls; // a dropped send half would finish the stream and end the session
+        let send = |fb: Feedback| conn.send_datagram(fb.encode().into()).is_ok();
         let mut last_report = std::time::Instant::now();
         let mut last_dropped = 0u64;
-        // Mirrors the real clients' rule (see `pump/data.rs`): report the delivery count every
-        // window while it is zero, once when the first packets land, then stop — so a host that
-        // predates the message is not flooded with "unknown control message" on a good session.
-        let mut delivery_confirmed = false;
+        let mut loss_ppm = 0u32;
+        let (mut window, mut ask) = (0u32, 0u16);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let d = c.dropped_frames.load(Relaxed);
             if d > last_dropped {
                 last_dropped = d;
-                if io::write_msg(&mut ls, &RequestKeyframe.encode())
-                    .await
-                    .is_err()
-                {
-                    break; // control stream gone
+                ask = ask.wrapping_add(1).max(1);
+                let fb = Feedback {
+                    ask,
+                    keyframe: true,
+                    link_kbps,
+                    ..Default::default()
+                };
+                if !(send(fb) && send(fb)) {
+                    break; // connection gone
                 }
                 tracing::debug!(dropped = d, "unrecoverable frame — requested keyframe");
             }
             if last_report.elapsed() >= std::time::Duration::from_millis(750) {
                 last_report = std::time::Instant::now();
+                // A window without a fresh loss sample repeats the last: what a dead data
+                // plane looks like is the delivery count standing still, not a silent window.
                 let v = c.loss_ppm.swap(u32::MAX, Relaxed);
-                // Independent of whether there is a fresh loss sample: "no fresh sample" is
-                // exactly the shape a dead data plane has, so gating it on one would silence
-                // it in the state it exists to report.
-                let received = c.rx_wire_packets.load(Relaxed);
-                if received == 0 || !delivery_confirmed {
-                    delivery_confirmed = received > 0;
-                    if io::write_msg(
-                        &mut ls,
-                        &DeliveryReport {
-                            packets_received: received,
-                        }
-                        .encode(),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break; // control stream gone
-                    }
+                if v != u32::MAX {
+                    loss_ppm = v;
                 }
-                if v != u32::MAX
-                    && io::write_msg(&mut ls, &LossReport { loss_ppm: v }.encode())
-                        .await
-                        .is_err()
-                {
-                    break; // control stream gone
+                window = window.wrapping_add(1).max(1);
+                let fb = Feedback {
+                    window,
+                    loss_ppm,
+                    packets_received: c.rx_wire_packets.load(Relaxed),
+                    link_kbps,
+                    ..Default::default()
+                };
+                if !send(fb) {
+                    break; // connection gone
                 }
             }
         }
@@ -1227,7 +1388,7 @@ fn spawn_loss_relay(mut ls: quinn::SendStream, counters: &Arc<Counters>) {
 
 /// Input plane: scripted events as QUIC datagrams (mouse square + 'A' taps), proving the
 /// low-latency input path without a real input device.
-fn spawn_input_test(conn: &quinn::Connection, mode: Mode) {
+fn spawn_input_test(conn: &Wire, mode: Mode) {
     let conn2 = conn.clone();
     let (mw, mh) = (mode.width, mode.height);
     tokio::spawn(async move {
@@ -1248,7 +1409,7 @@ fn spawn_input_test(conn: &quinn::Connection, mode: Mode) {
                 y: dy,
                 flags: 0,
             };
-            let _ = conn2.send_datagram(mv.encode().to_vec().into());
+            let _ = conn2.send_datagram(mv.encode().to_vec());
             // Absolute motion too (the GTK client's path): a diagonal sweep, with the
             // coordinate-space size packed in `flags` — the contract injectors require.
             let abs = InputEvent {
@@ -1259,7 +1420,7 @@ fn spawn_input_test(conn: &quinn::Connection, mode: Mode) {
                 y: ((i * mh) / 160) as i32,
                 flags: (mw << 16) | (mh & 0xffff),
             };
-            let _ = conn2.send_datagram(abs.encode().to_vec().into());
+            let _ = conn2.send_datagram(abs.encode().to_vec());
             if i % 20 == 0 {
                 for kind in [InputKind::KeyDown, InputKind::KeyUp] {
                     let key = InputEvent {
@@ -1270,7 +1431,7 @@ fn spawn_input_test(conn: &quinn::Connection, mode: Mode) {
                         y: 0,
                         flags: 0,
                     };
-                    let _ = conn2.send_datagram(key.encode().to_vec().into());
+                    let _ = conn2.send_datagram(key.encode().to_vec());
                 }
                 // Gamepad plane: tap A + sweep the left stick on pad 0 (the host
                 // accumulates these into its virtual xpad; needs /dev/uinput access).
@@ -1293,7 +1454,7 @@ fn spawn_input_test(conn: &quinn::Connection, mode: Mode) {
                         y: 0,
                         flags: 0, // pad index 0
                     };
-                    let _ = conn2.send_datagram(ev.encode().to_vec().into());
+                    let _ = conn2.send_datagram(ev.encode().to_vec());
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
@@ -1311,7 +1472,7 @@ fn spawn_input_test(conn: &quinn::Connection, mode: Mode) {
 ///                  ~2048-frame buffers → two packets per ~42 ms). A host without a jitter
 ///                  buffer crackles on this pattern; a steady 5 ms stream never trips it.
 ///                  Record the host mic and count silence gaps to test host-side buffering.
-fn spawn_mic_test(conn: &quinn::Connection, burst: bool) {
+fn spawn_mic_test(conn: &Wire, burst: bool) {
     let conn2 = conn.clone();
     tokio::spawn(async move {
         let mut enc =
@@ -1354,7 +1515,7 @@ fn spawn_mic_test(conn: &quinn::Connection, burst: bool) {
                         punktfunk_core::quic::wall_clock_ns(),
                         &out[..n],
                     );
-                    if conn2.send_datagram(d.into()).is_err() {
+                    if conn2.send_datagram(d).is_err() {
                         break 'stream;
                     }
                 }
@@ -1368,7 +1529,7 @@ fn spawn_mic_test(conn: &quinn::Connection, burst: bool) {
 /// Touch plane: drag a synthetic finger (touch id 0) in a circle on the client surface, so
 /// the host injects it via libei ei_touchscreen — proves the touch path end to end. `flags`
 /// packs the surface w/h; x/y are pixels (the host maps them into the device region).
-fn spawn_touch_test(conn: &quinn::Connection, mode: Mode) {
+fn spawn_touch_test(conn: &Wire, mode: Mode) {
     let conn2 = conn.clone();
     let (w, h) = (mode.width, mode.height);
     tokio::spawn(async move {
@@ -1385,24 +1546,14 @@ fn spawn_touch_test(conn: &quinn::Connection, mode: Mode) {
         };
         tracing::info!("touch-test: dragging a finger in a circle for ~6s");
         for loop_i in 0..3u32 {
-            let _ = conn2.send_datagram(
-                touch(InputKind::TouchDown, cx + r, cy)
-                    .encode()
-                    .to_vec()
-                    .into(),
-            );
+            let _ = conn2.send_datagram(touch(InputKind::TouchDown, cx + r, cy).encode().to_vec());
             for i in 0..60u32 {
                 let a = std::f32::consts::TAU * i as f32 / 60.0;
                 let mv = touch(InputKind::TouchMove, cx + r * a.cos(), cy + r * a.sin());
-                let _ = conn2.send_datagram(mv.encode().to_vec().into());
+                let _ = conn2.send_datagram(mv.encode().to_vec());
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             }
-            let _ = conn2.send_datagram(
-                touch(InputKind::TouchUp, cx + r, cy)
-                    .encode()
-                    .to_vec()
-                    .into(),
-            );
+            let _ = conn2.send_datagram(touch(InputKind::TouchUp, cx + r, cy).encode().to_vec());
             let _ = loop_i;
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -1414,7 +1565,7 @@ fn spawn_touch_test(conn: &quinn::Connection, mode: Mode) {
 /// DualSense), then drive its touchpad (drag a finger across) + motion (gyro wobble) over the
 /// 0xCC plane. Proves the rich client→host path; the 0xCD feedback is logged by the receive
 /// loop below. Requires the host on the DualSense backend (`PUNKTFUNK_GAMEPAD=dualsense`).
-fn spawn_rich_input_test(conn: &quinn::Connection) {
+fn spawn_rich_input_test(conn: &Wire) {
     let conn2 = conn.clone();
     tokio::spawn(async move {
         use punktfunk_core::input::gamepad::{AXIS_LS_X, MOTION_ACCEL_LSB_PER_G};
@@ -1429,7 +1580,7 @@ fn spawn_rich_input_test(conn: &quinn::Connection) {
             y: 0,
             flags: 0,
         };
-        let _ = conn2.send_datagram(arrive.encode().to_vec().into());
+        let _ = conn2.send_datagram(arrive.encode().to_vec());
         tracing::info!(
             "rich-input-test: dragging the DualSense touchpad + wobbling motion for ~6s"
         );
@@ -1441,10 +1592,10 @@ fn spawn_rich_input_test(conn: &quinn::Connection) {
             y,
         };
         for _ in 0..3u32 {
-            let _ = conn2.send_datagram(touch(true, 0, 32768).encode().into());
+            let _ = conn2.send_datagram(touch(true, 0, 32768).encode());
             for i in 0..60u32 {
                 let x = ((i * 65535) / 60) as u16;
-                let _ = conn2.send_datagram(touch(true, x, 32768).encode().into());
+                let _ = conn2.send_datagram(touch(true, x, 32768).encode());
                 let g = (((i as i32 % 20) - 10) * 500) as i16; // gyro wobble, ±250 °/s
                 let _ = conn2.send_datagram(
                     RichInput::Motion {
@@ -1454,15 +1605,51 @@ fn spawn_rich_input_test(conn: &quinn::Connection) {
                         // and not the 8192 or 16384 a particular driver happens to use.
                         accel: [0, 0, MOTION_ACCEL_LSB_PER_G as i16],
                     }
-                    .encode()
-                    .into(),
+                    .encode(),
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             }
-            let _ = conn2.send_datagram(touch(false, 65535, 32768).encode().into());
+            let _ = conn2.send_datagram(touch(false, 65535, 32768).encode());
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         tracing::info!("rich-input-test: done");
+    });
+}
+
+/// Pad-audio plane: declare `pads` DualSenses with haptics and speaker. Each arrival repeats, as
+/// a real client's does, and a neutral axis creates the pad.
+fn spawn_pad_audio_test(conn: &Wire, pads: u8) {
+    let conn2 = conn.clone();
+    tokio::spawn(async move {
+        use punktfunk_core::input::{encode_gamepad_arrival, gamepad::AXIS_LS_X};
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        for pad in 0..pads {
+            let arrival = InputEvent {
+                kind: InputKind::GamepadArrival,
+                _pad: [0; 3],
+                code: u32::from(GamepadPref::DualSense.to_u8()),
+                x: 0,
+                y: 0,
+                flags: encode_gamepad_arrival(pad, 0b11),
+            };
+            for _ in 0..3 {
+                let _ = conn2.send_datagram(arrival.encode().to_vec());
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            let axis = InputEvent {
+                kind: InputKind::GamepadAxis,
+                _pad: [0; 3],
+                code: AXIS_LS_X,
+                x: 0,
+                y: 0,
+                flags: u32::from(pad),
+            };
+            let _ = conn2.send_datagram(axis.encode().to_vec());
+        }
+        tracing::info!(
+            pads,
+            "pad-audio-test: declared DualSense pads with haptics and speaker"
+        );
     });
 }
 
@@ -1470,7 +1657,7 @@ fn spawn_rich_input_test(conn: &quinn::Connection) {
 /// job; here we verify the planes flow), decode the audio, and forward per-AU host timings
 /// to the data plane.
 fn spawn_datagram_rx(
-    conn: &quinn::Connection,
+    conn: &Wire,
     welcome: &Welcome,
     audio_out_path: Option<String>,
     counters: &Arc<Counters>,
@@ -1522,6 +1709,19 @@ fn spawn_datagram_rx(
             }
         };
         while let Ok(d) = conn2.read_datagram().await {
+            if let Some(frame) = punktfunk_core::quic::decode_pad_audio_datagram(&d) {
+                if let Some(lane) = c
+                    .pad_audio_pkts
+                    .get(usize::from(frame.pad))
+                    .and_then(|pad| pad.get(usize::from(frame.kind)))
+                {
+                    lane.fetch_add(1, Relaxed);
+                }
+                if !frame.opus.is_empty() {
+                    c.pad_audio_voiced.fetch_add(1, Relaxed);
+                }
+                continue;
+            }
             if let Some((_, _, pcm_wire)) =
                 punktfunk_core::quic::decode_audio_pcm_datagram(&d).filter(|_| lossless)
             {
@@ -1617,15 +1817,16 @@ fn spawn_datagram_rx(
 #[allow(clippy::too_many_arguments)]
 fn data_plane(
     welcome: Welcome,
-    remote: std::net::SocketAddr,
-    udp_port: u16,
+    (shared, media): (
+        punktfunk_core::transport::shared::ClientMedia,
+        punktfunk_core::session::MediaV2,
+    ),
     out_path: Option<String>,
     seconds: Option<u64>,
     clock_offset_ns: Option<i64>,
     counters: Arc<Counters>,
     host_timing_rx: std::sync::mpsc::Receiver<punktfunk_core::quic::HostTiming>,
 ) -> Result<()> {
-    let host_udp = std::net::SocketAddr::new(remote.ip(), welcome.udp_port);
     let cfg = welcome.session_config(Role::Client);
     let expected = welcome.frames;
     // Express our receive time in the host clock before differencing against the host-stamped
@@ -1633,17 +1834,8 @@ fn data_plane(
     // is then only valid same-host, as before).
     let clock_offset = clock_offset_ns.unwrap_or(0);
     let skew_corrected = clock_offset_ns.is_some();
-    let transport = UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())
-        .context("bind data plane")?;
-    // Hole-punch the host's data port so video traverses a NAT / inter-VLAN firewall. This
-    // tool runs one session then exits, so the keepalive thread dies with the process — no
-    // explicit stop needed (the flag is never set).
-    if let Ok(sock) = transport.try_clone_socket() {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        punktfunk_core::transport::spawn_data_punch(sock, stop);
-    }
     let mut session =
-        Session::new(cfg, Box::new(transport)).map_err(|e| anyhow!("client session: {e:?}"))?;
+        Session::new(cfg, media, Box::new(shared)).map_err(|e| anyhow!("client session: {e:?}"))?;
     let mut sink = match &out_path {
         Some(p) => Some(std::io::BufWriter::new(
             std::fs::File::create(p).with_context(|| format!("create {p}"))?,
@@ -1672,12 +1864,12 @@ fn data_plane(
     // Stream-duration cap: `--seconds N`, else the 120s default. Ending the loop here reaches the
     // graceful `conn.close` below (with the deliberate-quit code if `--quit`).
     let cap_secs = seconds.unwrap_or(120);
-    // Adaptive-FEC loss window: publish a fresh estimate every 750 ms for the LossReport task.
+    // Adaptive-FEC loss window: publish a fresh estimate every 750 ms for the loss relay.
     let mut last_loss_report = std::time::Instant::now();
     let (mut last_recovered, mut last_late, mut last_received) = (0u64, 0u64, 0u64);
     loop {
         // Mirror packet-level receive counters for the speed-test reporter (reads their delta),
-        // and publish a windowed loss estimate for the adaptive-FEC LossReport task.
+        // and publish a windowed loss estimate for the loss relay.
         {
             use std::sync::atomic::Ordering::Relaxed;
             let s = session.stats();
@@ -1751,8 +1943,12 @@ fn data_plane(
                     }
                 }
                 if expected > 0 {
-                    // Verification mode: deterministic content.
-                    let idx = u32::from_le_bytes(frame.data[0..4].try_into().unwrap());
+                    // Verification mode: deterministic content. A frame under four bytes
+                    // carries no index and checks as zeros.
+                    let idx = frame
+                        .data
+                        .first_chunk()
+                        .map_or(0, |b| u32::from_le_bytes(*b));
                     if frame.data == test_frame(idx, frame.data.len()) {
                         ok += 1;
                     } else {
@@ -1809,7 +2005,7 @@ fn data_plane(
         lat_p99_us = pct(0.99),
         lat_max_us = latencies_us.last().copied().unwrap_or(0),
         skew_corrected,
-        "punktfunk/1 stream complete (capture→received latency; skew_corrected=true ⇒ \
+        "stream complete (capture→received latency; skew_corrected=true ⇒ \
          cross-machine valid, false ⇒ same-host clock)"
     );
     if !host_us_v.is_empty() {
@@ -1879,16 +2075,64 @@ fn report_side_planes(counters: &Counters) {
             "host→client datagrams (Opus 48 kHz stereo, 5 ms frames; rumble; DualSense HID)"
         );
     }
+    for (pad, [haptics, speaker]) in counters.pad_audio_pkts.iter().enumerate() {
+        let (haptics, speaker) = (haptics.load(Relaxed), speaker.load(Relaxed));
+        if haptics > 0 || speaker > 0 {
+            tracing::info!(
+                pad,
+                haptics_pkts = haptics,
+                speaker_pkts = speaker,
+                "pad audio (0xD1)"
+            );
+        }
+    }
+    let voiced = counters.pad_audio_voiced.load(Relaxed);
+    if voiced > 0 {
+        tracing::info!(voiced_pkts = voiced, "pad audio frames carrying sound");
+    }
 }
 
-/// The host's deterministic test frame (mirror of `punktfunk-host::m3::test_frame`).
-fn test_frame(idx: u32, len: usize) -> Vec<u8> {
-    let mut d = vec![0u8; len];
-    if len >= 4 {
-        d[0..4].copy_from_slice(&idx.to_le_bytes());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(flags: &[&str]) -> Args {
+        parse_argv(
+            std::iter::once("punktfunk-probe")
+                .chain(flags.iter().copied())
+                .map(String::from)
+                .collect(),
+        )
     }
-    for (i, b) in d.iter_mut().enumerate().skip(4) {
-        *b = (idx as u8).wrapping_add(i as u8);
+
+    #[test]
+    fn a_redirect_is_followed_once_pinned_to_the_seat() {
+        let mut a = args(&["--connect", "192.168.1.213:9777", "--as", "ada"]);
+        let to = punktfunk_core::quic::v2::msg::Redirect {
+            port: 9779,
+            pin: "ab".repeat(32),
+            ..Default::default()
+        };
+        follow(&mut a, &to).unwrap();
+        assert_eq!(a.connect, "192.168.1.213:9779");
+        assert_eq!(a.pin, Some([0xab; 32]));
+        assert!(
+            follow(&mut a, &to).is_err(),
+            "a second Redirect ends the run"
+        );
     }
-    d
+
+    #[test]
+    fn an_empty_pin_keeps_the_one_dialed_with() {
+        let pin = "cd".repeat(32);
+        let mut a = args(&["--connect", "10.0.0.2:9777", "--pin", &pin]);
+        let to = punktfunk_core::quic::v2::msg::Redirect {
+            addr: "10.0.0.3".into(),
+            port: 9780,
+            ..Default::default()
+        };
+        follow(&mut a, &to).unwrap();
+        assert_eq!(a.connect, "10.0.0.3:9780");
+        assert_eq!(a.pin, Some([0xcd; 32]));
+    }
 }

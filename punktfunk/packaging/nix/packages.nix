@@ -40,7 +40,6 @@
   wrapGAppsHook4,
   # host + client shared libs
   pipewire,
-  libopus,
   wayland,
   libxkbcommon,
   libGL,
@@ -62,6 +61,7 @@
   nodejs,
   makeWrapper,
   stdenvNoCC,
+  coreutils,
   # bun2nix (github:nix-community/bun2nix, pinned in flake.nix): `.fetchBunDeps` turns a generated
   # `bun.nix` into bun's global install cache, and `.hook` runs an offline `bun install` off it.
   bun2nix,
@@ -87,16 +87,10 @@ let
       outputHashes = {
         "git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc#acb5a1a7441033d9312b16842af02eb0c2b403dc" =
           "sha256-i92qO/7YO4XB9LQ2w9etTAwGebM/SdwSi8hJaGoGq/Y=";
-        "git+https://github.com/unom-io/usbfs-iso?rev=f3de1fd62cec271d07f45664dc464f23e423e721#f3de1fd62cec271d07f45664dc464f23e423e721" =
-          "sha256-RWQgE6AHnvXKwbBRw0dVavZy0TLngCs3C+OZENqYG2c=";
+        "git+https://github.com/unom-io/usbfs-iso?rev=ff5468ac68cea3de64ecc4a1e16b4dbdba2f8b39#ff5468ac68cea3de64ecc4a1e16b4dbdba2f8b39" =
+          "sha256-4y84oeUPEXC3c/45X/sBIYjJwxID6XvZU283/dLgNKk=";
       };
     };
-
-    # nixpkgs ships CMake ≥ 4, which errors on `cmake_minimum_required(VERSION <3.5)`. Several
-    # vendored C libraries built through the `cmake` crate still declare a pre-3.5 minimum
-    # (audiopus_sys' libopus; belt-and-braces for pyrowave-sys / aws-lc-sys). CMake reads this env
-    # var as the floor policy version, letting those configure instead of aborting.
-    CMAKE_POLICY_VERSION_MINIMUM = "3.5";
 
     # crane's default is a two-derivation split (buildDepsOnly → buildPackage); disable it, because
     # the deps-only pass builds a "dummy" source tree that drops pyrowave-sys's `vendor/pyrowave`
@@ -109,7 +103,7 @@ let
 
     nativeBuildInputs = [
       pkg-config
-      cmake # pyrowave-sys (C++/Vulkan), the vendored libopus (opus crate), aws-lc-sys (rustls)
+      cmake # pyrowave-sys (C++/Vulkan), the vendored libopus (opusic-sys), aws-lc-sys (rustls)
       nasm # libopus SIMD + OpenH264 (openh264 `source` feature)
       perl # aws-lc-sys asm generation (rustls' aws-lc-rs crypto provider)
       rustPlatform.bindgenHook # LIBCLANG_PATH + clang args for pyrowave-sys bindgen
@@ -131,7 +125,7 @@ let
   # Cargo unifies features across every package in a single `cargo build`, so co-building the tray
   # with the host would pull the host's `ashpd → zbus/tokio` onto the tray's SHARED `zbus`. The tray
   # deliberately runs zbus on `ksni`'s `async-io` executor with the `blocking` API and no tokio
-  # runtime (see crates/punktfunk-tray/Cargo.toml), so a tokio-flavoured zbus panics at startup:
+  # runtime (see crates/install/punktfunk-tray/Cargo.toml), so a tokio-flavoured zbus panics at startup:
   # "there is no reactor running, must be called from the context of a Tokio 1.x runtime". A separate
   # invocation keeps the tray's zbus on async-io. (The host package copies this binary into its $out.)
   punktfunk-tray = craneLib.buildPackage (
@@ -172,7 +166,6 @@ in
 
       buildInputs = [
         pipewire # libpipewire-0.3 + libspa-0.2 (portal capture + the `pipewire` crate)
-        libopus # audiopus_sys links system opus via pkg-config (else it vendors a static libopus that mis-links)
         wayland # libwayland-client (wlr / KWin fake_input backends)
         libxkbcommon # virtual-keyboard keymap build/validate
         libGL # src/linux/zerocopy/egl.rs `#[link(name = "GL")]`
@@ -189,6 +182,12 @@ in
         # stays on async-io; ship it in the host's $out so the tray .desktop below resolves it.
         install -Dm0755 ${punktfunk-tray}/bin/punktfunk-tray "$out/bin/punktfunk-tray"
 
+        # The user unit every channel ships, run from the store path itself: KWin identifies the
+        # host by that path. The NixOS module adds its own settings as a drop-in.
+        install -Dm0644 scripts/punktfunk-host.service "$out/lib/systemd/user/punktfunk-host.service"
+        substituteInPlace "$out/lib/systemd/user/punktfunk-host.service" \
+          --replace-fail "%h/punktfunk/target/release/punktfunk-host" "$out/bin/punktfunk-host"
+
         # udev: /dev/uinput + /dev/uhid (virtual gamepads) + the vhci sysfs perms for the virtual Deck.
         install -Dm0644 scripts/60-punktfunk.rules "$out/lib/udev/rules.d/60-punktfunk.rules"
         # WirePlumber: hold a DualSense's sound card open + keep it off the graph clock.
@@ -200,10 +199,10 @@ in
         substituteInPlace "$out/share/applications/io.unom.Punktfunk.Host.desktop" \
           --replace-fail "/usr/bin/punktfunk-host" "$out/bin/punktfunk-host"
 
-        # Status-tray autostart entry + its hicolor status icons.
-        install -Dm0644 packaging/linux/io.unom.Punktfunk.Tray.desktop \
-          "$out/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop"
-        substituteInPlace "$out/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop" \
+        # The tray's launcher + hicolor status icons. The host writes its per-user autostart entry.
+        install -Dm0644 packaging/linux/io.unom.Punktfunk.StartHost.desktop \
+          "$out/share/applications/io.unom.Punktfunk.StartHost.desktop"
+        substituteInPlace "$out/share/applications/io.unom.Punktfunk.StartHost.desktop" \
           --replace-fail "/usr/bin/punktfunk-tray" "$out/bin/punktfunk-tray"
         for sz in 22x22 48x48; do
           for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
@@ -229,9 +228,9 @@ in
       # but carries neither the Khronos loader nor libva. A miss here is silent: the codepath just
       # reports "unavailable" and falls back.
       postFixup = ''
-        # Both binaries dlopen the GPU stack; the worker owns a Vulkan device of its own for
-        # PyroWave, and without it the host silently falls back to the in-process encoder at
-        # default priority. The tray (its own derivation, copied in above) does not.
+        # Both binaries dlopen the GPU stack; the worker owns the Vulkan devices for PyroWave and
+        # the NVIDIA frame convert, and without it the host silently falls back to default
+        # priority. The tray (its own derivation, copied in above) does not.
         for b in punktfunk-host punktfunk-encode-worker; do
           addDriverRunpath "$out/bin/$b"
           patchelf --add-rpath "${vulkan-loader.out}/lib" "$out/bin/$b"
@@ -251,6 +250,66 @@ in
       meta = meta // {
         description = "Low-latency desktop/game streaming host (Moonlight-compatible + native punktfunk/1)";
         mainProgram = "punktfunk-host";
+      };
+    }
+  );
+
+  # The seat supervisor: a root daemon, the helpers its units run, and those units and tmpfiles
+  # rules with the /usr/libexec path rewritten to this store path. The NixOS module installs them
+  # through `systemd.packages` and `systemd.tmpfiles.packages`. The door's files ride along: its
+  # two host and console units still name /usr/bin, which the module points at its own packages.
+  # No GPU runpath: it links pf-inject for the pads it builds, not the capture or encode stack.
+  punktfunk-seats = craneLib.buildPackage (
+    commonArgs
+    // {
+      pname = "punktfunk-seats";
+      cargoExtraArgs = "--locked -p punktfunk-seats --bin punktfunk-seats";
+
+      buildInputs = [
+        libxkbcommon # pf-inject's keymap
+      ];
+
+      postInstall = ''
+        install -d "$out/libexec/punktfunk"
+        mv "$out/bin/punktfunk-seats" "$out/libexec/punktfunk/"
+        rmdir "$out/bin"
+        for f in seat-session seat-reap; do
+          install -Dm0755 "packaging/linux/$f" "$out/libexec/punktfunk/$f"
+        done
+        for f in punktfunk-seats.service punktfunk-seat@.service; do
+          install -Dm0644 "packaging/linux/$f" "$out/lib/systemd/system/$f"
+          substituteInPlace "$out/lib/systemd/system/$f" \
+            --replace-fail /usr/libexec/punktfunk "$out/libexec/punktfunk"
+        done
+        install -Dm0644 packaging/linux/punktfunk-seats.tmpfiles "$out/lib/tmpfiles.d/punktfunk-seats.conf"
+        # A seat's pads: the rule runs `punktfunk-seats fence` from this store path.
+        install -Dm0644 packaging/linux/65-punktfunk-seats.rules "$out/lib/udev/rules.d/65-punktfunk-seats.rules"
+        substituteInPlace "$out/lib/udev/rules.d/65-punktfunk-seats.rules" \
+          --replace-fail /usr/libexec/punktfunk "$out/libexec/punktfunk"
+        install -Dm0755 packaging/linux/door-helper "$out/libexec/punktfunk/door-helper"
+        substituteInPlace "$out/libexec/punktfunk/door-helper" \
+          --replace-fail /usr/libexec/punktfunk "$out/libexec/punktfunk"
+        for f in punktfunk-door-on@.service punktfunk-door-off@.service; do
+          install -Dm0644 "packaging/linux/$f" "$out/lib/systemd/system/$f"
+          substituteInPlace "$out/lib/systemd/system/$f" \
+            --replace-fail /usr/libexec/punktfunk "$out/libexec/punktfunk"
+        done
+        for f in punktfunk-door.service punktfunk-web-door.service; do
+          install -Dm0644 "packaging/linux/$f" "$out/lib/systemd/system/$f"
+        done
+        install -Dm0644 packaging/linux/49-punktfunk-door.rules \
+          "$out/share/polkit-1/rules.d/49-punktfunk-door.rules"
+        # seat-session seeds the portal grant and the virtual speaker from these two files. They
+        # live in the package, not the host's, so the store path does not depend on the host build.
+        for f in kde-authorized punktfunk-sink.conf; do
+          install -Dm0644 "scripts/headless/$f" "$out/share/punktfunk/headless/$f"
+        done
+        substituteInPlace "$out/libexec/punktfunk/seat-session" \
+          --replace-fail /usr/share/punktfunk/headless "$out/share/punktfunk/headless"
+      '';
+
+      meta = meta // {
+        description = "punktfunk seat supervisor (a user, a session and a host per profile)";
       };
     }
   );
@@ -275,7 +334,6 @@ in
       # / openh264 + rav1d, both built from vendored source).
       buildInputs = [
         pipewire # PipeWire audio playback + mic capture
-        libopus # audiopus_sys → system opus via pkg-config (Opus decode)
         sdl3 # window + gamepads (SDL3 HIDAPI: DualSense touchpad/motion/triggers)
         gtk4 # the GTK4 shell (clients/linux, relm4)
         libadwaita
@@ -344,7 +402,7 @@ in
   #
   # Unlike apt/dnf — which have no bun in their repos and so VENDOR a bun binary into the package —
   # Nix has `pkgs.bun`, so the launcher just execs it from the store (no vendored runtime). The
-  # systemd `--user` units + firewall wiring live in the NixOS module, pointed at this store path.
+  # systemd `--user` units ship here; the NixOS module adds its drop-ins and the firewall.
   punktfunk-web = stdenvNoCC.mkDerivation {
     pname = "punktfunk-web";
     inherit src version;
@@ -422,6 +480,15 @@ in
       install -Dm0755 scripts/web-init.sh $out/share/punktfunk-web/web-init.sh
       install -Dm0644 web/web.env.example $out/share/punktfunk-web/web.env.example
 
+      # The user units every channel ships, pointed at this store path.
+      install -Dm0644 scripts/punktfunk-web.service $out/lib/systemd/user/punktfunk-web.service
+      install -Dm0644 scripts/punktfunk-web-init.service \
+        $out/lib/systemd/user/punktfunk-web-init.service
+      substituteInPlace $out/lib/systemd/user/punktfunk-web.service \
+        --replace-fail /usr/bin/punktfunk-web-server $out/bin/punktfunk-web-server
+      substituteInPlace $out/lib/systemd/user/punktfunk-web-init.service \
+        --replace-fail /usr/share/punktfunk-web $out/share/punktfunk-web
+
       # PATH-stable launcher: run the SSR bundle on bun from the store (mirrors the deb/rpm
       # /usr/bin/punktfunk-web-server, minus the vendored-bun indirection).
       makeWrapper ${bun}/bin/bun $out/bin/punktfunk-web-server \
@@ -442,7 +509,7 @@ in
   # Effect), which discovers ~/.config/punktfunk/{scripts,plugins} and supervises each unit as an
   # Effect fiber. It runs on `bun` (it import()s the operator's `.ts` plugin files, which only bun
   # can do). Mirrors the Debian punktfunk-scripting .deb / the RPM's `--with scripting` subpackage,
-  # which the host package Recommends — the NixOS module wires the opt-in systemd --user unit.
+  # which the host package Recommends. Its systemd --user unit ships here too.
   #
   # Unlike the deb/rpm we don't `bun build` into a bundle + vendor bun; we still bundle (one
   # self-contained JS, effect inlined) but the launcher execs `pkgs.bun` from the store.
@@ -488,6 +555,12 @@ in
       # Launcher: run the bundle on bun from the store (mirrors the deb/rpm /usr/bin/punktfunk-scripting).
       makeWrapper ${bun}/bin/bun $out/bin/punktfunk-scripting \
         --add-flags "$out/share/punktfunk-scripting/runner-cli.js"
+      # The user unit every channel ships, sandbox included. NixOS has no /bin/mkdir.
+      install -Dm0644 scripts/punktfunk-scripting.service \
+        $out/lib/systemd/user/punktfunk-scripting.service
+      substituteInPlace $out/lib/systemd/user/punktfunk-scripting.service \
+        --replace-fail /usr/bin/punktfunk-scripting $out/bin/punktfunk-scripting \
+        --replace-fail =+/bin/mkdir =+${coreutils}/bin/mkdir
       runHook postInstall
     '';
 

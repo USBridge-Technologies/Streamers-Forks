@@ -82,11 +82,16 @@ it.
 
 The trackpads don't move the pointer while Steam is closed. That's normal while the pad is captured.
 
+A 2015 Steam Controller takes the same steps on either host. A Windows host whose gamepad driver
+is older than the host gives it an Xbox 360 pad until the driver is reinstalled. On Bluetooth it
+needs Valve's Bluetooth firmware, which Steam installs over its cable; pair it in your device's
+Bluetooth settings by holding Y while you press the Steam button.
+
 ## Clipboard
 
 ### Copy and paste between host and client does nothing
 
-Sharing needs two switches: **Host → Settings → Shared clipboard** on the host, and the per-host
+Sharing needs two switches: **Host → Shared clipboard** on the host, and the per-host
 toggle in your client.
 [Why the toggle does nothing](/docs/clipboard#why-the-toggle-does-nothing-or-is-greyed-out) covers
 both, and the setups where nothing crosses.

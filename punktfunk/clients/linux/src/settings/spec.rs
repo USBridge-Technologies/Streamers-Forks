@@ -136,6 +136,7 @@ specs! {
         "Above 1\u{d7} supersamples for sharpness; below is lighter on the host",
         Display, true, Stream;
     CODEC: "codec", "Video codec", CODEC_CAPTION, Display, true, Stream;
+    PYROWAVE_QUALITY: "pyrowave_bpp", "PyroWave quality", "", Display, true, Stream;
     CHROMA: "enable_444", "Full chroma (4:4:4)",
         "Full-colour video: crisp small text and thin lines, at more bandwidth. HEVC only, and \
          only where the host can encode it.", Display, true, Stream;
@@ -156,6 +157,8 @@ specs! {
     DECODER: "decoder", "Video decoder",
         "Automatic picks the best hardware decode, then software", Display, true, Device;
     ADAPTER: "adapter", "GPU", "Decodes and presents the stream", Display, true, Device;
+    KEEP_AWAKE: "keep_awake", "Keep screen awake",
+        "Off, a stream keeps the screen awake only while you play", Display, true, Device;
 
     TOUCH: "touch_mode", "Touch input", TOUCH_MODE_CAPTIONS[0], Input, false, Stream;
     MOUSE: "mouse_mode", "Mouse input", MOUSE_MODE_CAPTIONS[0], Input, false, Stream;
@@ -191,6 +194,9 @@ specs! {
         "The virtual pad on the host \u{2014} Automatic matches your controller. An X-Box type \
          has no gyroscope, so pick a DualSense-class one if you want motion.",
         Controllers, false, Stream;
+    PAD_RUMBLE: "pad_rumble", "Controller rumble",
+        "Off, controllers don't vibrate from the stream or in the menus, whatever the game sends",
+        Controllers, false, Device;
     FORWARDING: "gamepad_forwarding", "Forward controllers",
         "Send this device's controllers to the host \u{2014} off if it already has them another \
          way", Controllers, true, Stream;
@@ -204,7 +210,7 @@ specs! {
         "Hold Select alone for the host's guide button \u{2014} a tap still goes through",
         Controllers, true, Stream;
     PAD_HAPTICS: "pad_haptics", "Controller haptics",
-        "Play a DualSense's voice-coil haptics on the pad itself \u{2014} wired pads only",
+        "Play a DualSense's voice-coil haptics on the pad itself",
         Controllers, true, Device;
     PAD_SPEAKER: "pad_speaker", "Controller speaker",
         "Play the audio a game sends to the pad's own speaker on the pad, not here",
@@ -233,11 +239,12 @@ mod tests {
         ("host_sort", "Sort on the Hosts header"),
         ("host_grouping", "Group on the Hosts header"),
         ("low_latency", "a MediaCodec decoder flag"),
+        ("second_screen", "an Android handheld's second screen"),
         ("audio_route", "webOS's own audio plane"),
         ("cursor_gestures", "a TV remote's missing second button"),
         ("rumble_on_phone", "a phone's own hardware"),
         ("gyro_on_phone", "a phone's own hardware"),
-        ("sc2_capture", "Android and Apple only"),
+        ("sc2_capture", "Apple only"),
         ("ds_capture", "Android and webOS only"),
     ];
 
