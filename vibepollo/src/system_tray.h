@@ -88,9 +88,4 @@ namespace system_tray {
   void update_tray_paired(std::string device_name);
 
   void update_tray_client_connected(std::string client_name);
-  /**
-   * @brief Spawns a notification when ViGEm is missing.
-   * Clicking it opens the Web UI Dashboard for more information.
-   */
-  void update_tray_vigem_missing();
 }  // namespace system_tray

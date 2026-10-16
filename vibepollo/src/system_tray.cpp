@@ -626,25 +626,6 @@ namespace system_tray {
     });
   }
 
-  void update_tray_vigem_missing() {
-    run_on_tray_thread([]() {
-      tray.notification_title = nullptr;
-      tray.notification_text = nullptr;
-      tray.notification_cb = nullptr;
-      tray.notification_icon = nullptr;
-      tray.icon = TRAY_ICON;
-
-      tray.notification_title = "Gamepad Input Unavailable";
-      tray.notification_text = "ViGEm is not installed. Click for setup info";
-      tray.notification_icon = TRAY_ICON;
-      tray.tooltip = PROJECT_NAME;
-      tray.notification_cb = []() {
-        launch_ui("/");
-      };
-      tray_update(&tray);
-    });
-  }
-
   // Threading functions available on all platforms
 #ifndef _WIN32
   static void tray_thread_worker() {

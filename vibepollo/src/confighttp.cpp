@@ -115,18 +115,6 @@ using namespace std::literals;
 namespace pt = boost::property_tree;
 
 namespace confighttp {
-#ifdef _WIN32
-  /**
-   * @brief Reports whether ViGEmBus is needed for the configured gamepad backend.
-   * @return `true` unless a selected VHF backend is ready to provide controllers.
-   */
-  static bool is_vigem_required() {
-    const bool vhf_allowed = config::input.gamepad == "auto" ||
-                             config::input.gamepad.starts_with("vhf");
-    return !vhf_allowed || !platf::is_virtual_gamepad_driver_available();
-  }
-#endif
-
   // Global MIME type lookup used for static file responses
   const std::map<std::string, std::string> mime_types = {
     {"css", "text/css"},
@@ -1264,7 +1252,8 @@ namespace confighttp {
       nlohmann::json out;
       out["installed"] = installed;
       // ViGEmBus is only a requirement when nothing else can provide a virtual controller.
-      out["required"] = is_vigem_required();
+      // usbridge: this build has no ViGEmBus support, so it is never required.
+      out["required"] = false;
       if (!version.empty()) {
         out["version"] = version;
       }
@@ -5976,10 +5965,9 @@ namespace confighttp {
     output_tree["installed"] = installed;
     output_tree["version"] = version_str;
     output_tree["version_compatible"] = version_compatible;
-    output_tree["packaged_version"] = VIGEMBUS_PACKAGED_VERSION;
-    // Drives whether the UI presents a missing ViGEmBus as a problem or as an
-    // unused option: Vibepollo's own driver provides controllers without it.
-    output_tree["required"] = is_vigem_required();
+    // usbridge: no bundled ViGEmBus and no ViGEmBus support in this build -- never required.
+    output_tree["packaged_version"] = "";
+    output_tree["required"] = false;
 #else
     output_tree["error"] = "ViGEmBus is only available on Windows";
     output_tree["installed"] = false;
@@ -6008,47 +5996,10 @@ namespace confighttp {
     print_req(request);
     nlohmann::json output_tree;
 
-#ifdef _WIN32
-    const std::filesystem::path installer_path = platf::appdata().parent_path() / "scripts" / "vigembus_installer.exe";
-
-    if (!std::filesystem::exists(installer_path)) {
-      output_tree["status"] = false;
-      output_tree["error"] = "ViGEmBus installer not found";
-      send_response(response, output_tree);
-      return;
-    }
-
-    std::error_code ec;
-    boost::filesystem::path working_dir = boost::filesystem::path(installer_path.string()).parent_path();
-    platf::bp::environment env = platf::bp::this_process::env();
-
-    const std::string install_cmd = std::format("{} /quiet", installer_path.string());
-    auto child = platf::run_command(true, false, install_cmd, working_dir, env, nullptr, ec, nullptr);
-
-    if (ec) {
-      output_tree["status"] = false;
-      output_tree["error"] = "Failed to start installer: " + ec.message();
-      send_response(response, output_tree);
-      return;
-    }
-
-    child.wait(ec);
-
-    if (ec) {
-      output_tree["status"] = false;
-      output_tree["error"] = "Installer failed: " + ec.message();
-    } else {
-      int exit_code = child.exit_code();
-      output_tree["status"] = (exit_code == 0);
-      output_tree["exit_code"] = exit_code;
-      if (exit_code != 0) {
-        output_tree["error"] = std::format("Installer exited with code {}", exit_code);
-      }
-    }
-#else
+    // usbridge: no ViGEmBus in this build. Gamepads come from the USBridge USB broker
+    // (usbip-win2) or Vibepollo's own drivers.
     output_tree["status"] = false;
-    output_tree["error"] = "ViGEmBus installation is only available on Windows";
-#endif
+    output_tree["error"] = "ViGEmBus is not supported in this build";
 
     send_response(response, output_tree);
   }
@@ -6378,7 +6329,11 @@ namespace confighttp {
     register_api_route("^/api/auth/sessions$", "GET", listSessions);
     register_api_route("^/api/auth/sessions/([A-Fa-f0-9]+)$", "DELETE", revokeSession);
     server.config.reuse_address = true;
-    server.config.address = net::get_bind_address(address_family);
+    // usbridge: web_bind_address overrides bind_address for the admin UI only
+    // (the agent sets "127.0.0.1" so the UI is never reachable off the host).
+    server.config.address = config::sunshine.web_bind_address.empty()
+      ? net::get_bind_address(address_family)
+      : config::sunshine.web_bind_address;
     server.config.port = port_https;
 
     auto accept_and_run = [&](auto *server) {

@@ -1541,11 +1541,12 @@ namespace stream {
       auto &cipher = session->control.cipher;
       auto &iv = session->control.legacy_input_enc_iv;
       if (cipher.decrypt(*tagged_cipher, plaintext, &iv)) {
-        // something went wrong :(
-
-        BOOST_LOG(error) << "Failed to verify tag"sv;
-
-        session::stop(*session);
+        // usbridge: a tag failure here is almost always a stray UDP packet
+        // from the previous session's control stream (encrypted with its key)
+        // arriving just after a fast reconnect, e.g. a client-initiated codec
+        // switch. Ending the new session over it turns one packet into a
+        // "video never starts" outage: drop it and carry on.
+        BOOST_LOG(warning) << "Failed to verify tag, dropping the packet"sv;
         return;
       }
 
@@ -1674,11 +1675,12 @@ namespace stream {
 
       std::vector<uint8_t> plaintext;
       if (cipher.decrypt(*tagged_cipher, plaintext, &iv)) {
-        // something went wrong :(
-
-        BOOST_LOG(error) << "Failed to verify tag"sv;
-
-        session::stop(*session);
+        // usbridge: a tag failure here is almost always a stray UDP packet
+        // from the previous session's control stream (encrypted with its key)
+        // arriving just after a fast reconnect, e.g. a client-initiated codec
+        // switch. Ending the new session over it turns one packet into a
+        // "video never starts" outage: drop it and carry on.
+        BOOST_LOG(warning) << "Failed to verify tag, dropping the packet"sv;
         return;
       }
 
@@ -3944,16 +3946,6 @@ namespace stream {
       if (first_rtsp_session) {
         system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
         update::on_stream_started();
-  #if defined(_WIN32)
-      // Notify only when neither virtual-gamepad backend is installed and usable.
-      try {
-        if (!platf::is_vigem_installed(nullptr) && !platf::is_virtual_gamepad_driver_available()) {
-          system_tray::update_tray_vigem_missing();
-        }
-      } catch (...) {
-        // best-effort: ignore any unexpected errors while checking
-      }
-  #endif
       }
 #endif
 

@@ -88,6 +88,7 @@
 #include "rtsp_pending_policy.h"
 #include "stream.h"
 #include "system_tray.h"
+#include "usbridge.h"
 #include "video.h"
 #include "webrtc_stream.h"
 #include "zwpad.h"
@@ -2885,6 +2886,15 @@ namespace nvhttp {
 
         launch_session->host_audio = host_audio;
 
+        // usbridge: the client's "Show Mouse" setting, sent on every /launch
+        // and /resume so a session starts with the cursor exactly as the user
+        // chose (display_cursor is otherwise process-global). Absent from stock
+        // Moonlight clients: left unchanged then.
+        if (const auto cursor = get_arg(args, "usbridgeDisplayCursor", ""); !cursor.empty()) {
+          display_cursor = cursor == "1" || cursor == "true";
+          BOOST_LOG(info) << "Client set display cursor: "sv << (display_cursor ? "shown"sv : "hidden"sv);
+        }
+
         // Encrypted RTSP is enabled with client reported corever >= 1
         auto corever = util::from_view(get_arg(args, "corever", "0"));
         if (corever >= 1) {
@@ -3433,7 +3443,9 @@ namespace nvhttp {
           std::lock_guard<std::mutex> lock(client_mutex);
           first_client = client_root.named_devices.empty();
         }
-        if (first_client) {
+        // usbridge: under the agent every client it pairs (its own PIN flow) is trusted
+        // fully, as on Sunshine; nobody is there to grant permissions in the web UI.
+        if (first_client || usbridge::under_agent()) {
           named_cert_p->perm = PERM::_all;
         } else {
           named_cert_p->perm = PERM::_default;
