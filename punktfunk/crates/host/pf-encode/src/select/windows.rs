@@ -21,19 +21,16 @@ pub(crate) fn open(p: &OpenParams) -> Result<(Box<dyn Encoder>, &'static str)> {
         fps,
         bitrate_bps,
         bit_depth,
+        hdr,
         chroma,
-        max_slices,
+        slices,
         ..
     } = *p;
-    let hdr = matches!(
-        format,
-        PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::RgbaF16
-    );
     let luid = pf_gpu::resolve_render_adapter_luid();
     match windows_resolved_backend() {
         #[cfg(feature = "nvenc")]
         WindowsBackend::Nvenc => nvenc::NvencD3d11Encoder::open(
-            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, max_slices.max(1), luid,
+            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, slices.max(1), luid,
         )
         .map(|e| (Box::new(e) as Box<dyn Encoder>, "nvenc")),
         WindowsBackend::Amf => amf::AmfEncoder::open(
