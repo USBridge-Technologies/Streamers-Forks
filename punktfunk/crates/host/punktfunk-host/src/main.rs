@@ -483,6 +483,11 @@ fn real_main() -> Result<()> {
         println!("punktfunk-host {}", crate::version::get());
         return Ok(());
     }
+    // The USBridge agent asks whether this build hands devices to its USB broker.
+    if args.first().map(String::as_str) == Some("usbridge-bridge") {
+        println!("{}", gamestream::usbridge::PROBE_LINE);
+        return Ok(());
+    }
 
     // Before `startup`: it skips the display and GPU work for the door.
     if args.first().map(String::as_str) == Some("serve") {

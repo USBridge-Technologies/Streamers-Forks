@@ -98,11 +98,16 @@ fn host_mac(reached: Option<std::net::IpAddr>) -> Option<String> {
 pub(super) fn codec_mode_support() -> u32 {
     use crate::encode::Codec;
     let hdr = crate::gamestream::host_hdr_capable();
-    apply_hdr(
+    let mask = apply_hdr(
         base_codec_mode_support(),
         hdr && crate::encode::can_encode_10bit(Codec::H265),
         hdr && crate::encode::can_encode_10bit(Codec::Av1),
-    )
+    );
+    if super::rtsp::pyrowave_offered() {
+        mask | super::SCM_USBRIDGE_PYROWAVE
+    } else {
+        mask
+    }
 }
 
 /// Pure so tests can pin HDR layering without a GPU.

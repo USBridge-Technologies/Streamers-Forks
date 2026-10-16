@@ -23,6 +23,10 @@ pub enum CaptureBackend {
     /// by a capture worker that runs as the signed-in user. It does not show the secure
     /// desktop.
     Wgc,
+    /// USBridge, Windows: DXGI Desktop Duplication of the shared MttVDD virtual monitor
+    /// (`pf_vdisplay::mttvdd`), encoded by the host's own encoders (NVENC/AMF/QSV/MF) --
+    /// no pf-vdisplay driver. Used whenever MttVDD is installed.
+    DxgiDup,
 }
 
 impl CaptureBackend {
@@ -32,6 +36,9 @@ impl CaptureBackend {
             CaptureBackend::Portal
         } else if mirrored() {
             CaptureBackend::Wgc
+        } else if pf_vdisplay::windows_uses_mttvdd() {
+            // USBridge: the shared MttVDD monitor, duplicated and encoded in this process.
+            CaptureBackend::DxgiDup
         } else {
             CaptureBackend::IddPush
         }
