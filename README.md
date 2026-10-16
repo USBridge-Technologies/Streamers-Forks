@@ -3,11 +3,11 @@
 Forks of third-party streaming hosts that the USBridge agent can run, one
 directory each, with the USBridge changes on top of an upstream snapshot.
 
-| Directory | Upstream | Snapshot |
+| Directory | Upstream | Snapshot (upstream commit date) |
 |---|---|---|
-| `punktfunk/` | https://git.unom.io/unom/punktfunk | `6988e5c229ffc7d5c45ec472d24a24285959cdfb` (2026-10-02, 0.42.0) |
-| `sunshine/` | https://github.com/LizardByte/Sunshine | `4429acd026f7942115c58aeaa7d0ea50a33d0ca9` |
-| `vibepollo/` | https://github.com/Nonary/Vibepollo | `66e169c3` (2026-10-13) |
+| `punktfunk/` | https://git.unom.io/unom/punktfunk | `6988e5c22` (2026-10-02, 0.42.0) |
+| `sunshine/` | https://github.com/LizardByte/Sunshine | `4429acd02` (2026-09-26) |
+| `vibepollo/` | https://github.com/Nonary/Vibepollo | `66e169c32` (2026-10-13) |
 
 Each directory keeps its upstream license. The first commit that adds a
 directory is the untouched upstream tree; later commits are the USBridge
