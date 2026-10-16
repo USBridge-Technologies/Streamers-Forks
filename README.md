@@ -5,13 +5,36 @@ directory each, with the USBridge changes on top of an upstream snapshot.
 
 | Directory | Upstream | Snapshot |
 |---|---|---|
-| `punktfunk/` | https://git.unom.io/unom/punktfunk | `6988e5c229ffc7d5c45ec472d24a24285959cdfb` (2026-10-02, 0.42.0) |
-| `sunshine/` | https://github.com/LizardByte/Sunshine | `4429acd026f7942115c58aeaa7d0ea50a33d0ca9` |
-| `vibepollo/` | https://github.com/Nonary/Vibepollo | `66e169c3` (2026-10-13) |
+| `punktfunk/` | https://git.unom.io/unom/punktfunk | `fda825fd79` (2026-10-15, 0.44.1) |
+| `sunshine/` | https://github.com/LizardByte/Sunshine | `3d890eadc` (2026-10-15) |
+| `vibepollo/` | https://github.com/Nonary/Vibepollo | `5cc307a3f` (2026-10-15) |
 
-Each directory keeps its upstream license. The first commit that adds a
-directory is the untouched upstream tree; later commits are the USBridge
-changes, so `git log -- <directory>` shows exactly what differs.
+Each directory keeps its upstream license. Each upstream update is a pair of
+commits: "<fork>: upstream snapshot at <hash>" holds the untouched upstream
+tree, and the next commit puts the USBridge changes back on top. So
+`git diff <snapshot commit> HEAD -- <directory>` shows exactly what differs
+from upstream.
+
+### Updating from upstream
+
+1. Fetch upstream into the repository:
+   `git fetch <upstream url> <branch>:refs/up/<fork>`.
+2. Take our changes as a patch: `git diff --binary --full-index <snapshot
+   commit> HEAD -- <fork>`. If the snapshot does not equal the upstream tree
+   exactly, diff from the upstream commit itself (`git diff
+   <upstream>:<path>`). That happened for `sunshine/`, whose first snapshot
+   lacked `src_assets/macos/build/`.
+3. Replace the directory with the new upstream tree and commit it as the new
+   snapshot: `git rm -r --cached <fork>`, then `git read-tree --prefix=<fork>/
+   -u refs/up/<fork>^{tree}`. `read-tree` keeps the submodule gitlinks. Check
+   that the root `.gitmodules` still lists the same submodules.
+4. Apply the patch with `git apply -3 --index` and resolve the conflicts. If
+   upstream moved files (Punktfunk 0.44 moved crates to `crates/host/`),
+   rewrite the paths in the patch first.
+5. Read what upstream changed around our hooks, beyond the conflicts. Look at
+   new functions our Windows input has to implement, new ViGEm code, new
+   capture backends, and new checks in front of the `usbridge::` calls. Then
+   build every fork (`release-all.yml` with an empty tag) before merging.
 
 ## USB through the USBridge USB broker
 
@@ -38,7 +61,7 @@ tells a build that has the change from a stock one by asking it
 `punktfunk-host` hands a USBridge client's USB devices to the USBridge USB
 broker instead of its own injectors: a raw HID device sent over the stream (a
 tablet) and, on Windows, gamepads. See
-`punktfunk/crates/punktfunk-host/src/gamestream/usbridge.rs`. Without
+`punktfunk/crates/host/punktfunk-host/src/gamestream/usbridge.rs`. Without
 `USBRIDGE_USB_BROKER_CONTROL` in its environment the host behaves as upstream.
 
 On Windows, upstream re-ACLs its config dir for the `%ProgramData%` dir a
@@ -47,7 +70,7 @@ Administrators only, read-only for Users. Run outside `%ProgramData%`, for
 example with `PUNKTFUNK_CONFIG_DIR` in a user's own `%APPDATA%`, that DACL
 locked the host out of its own dir. Its first write (`native-key.pem`) failed
 with "Access is denied" and it exited. The fork hardens only dirs under
-`%ProgramData%` (`punktfunk/crates/pf-paths/src/lib.rs`,
+`%ProgramData%` (`punktfunk/crates/host/pf-paths/src/lib.rs`,
 `is_under_program_data`).
 
 ### Windows: how the agent runs it
@@ -60,6 +83,11 @@ and RustShine: as SYSTEM in the active console session
 Run as a plain child of the service, the host was still in Session 0. It
 could not attach or capture the monitor, and clients got audio but "No video
 received from host".
+
+By default every session streams MttVDD (`CaptureBackend::DxgiDup`). When the
+user pins a physical monitor, the agent sets `PUNKTFUNK_CAPTURE_MONITOR`, and
+since 0.44 upstream then mirrors that monitor with Windows Graphics Capture
+(`CaptureBackend::Wgc`) instead.
 
 A monitor duplicated right after it is attached never gives a frame. The
 host attached MttVDD, made it primary and opened the duplication about 100 ms
@@ -168,6 +196,12 @@ What was removed and what stays:
 
 Without the USBridge agent (no `USBRIDGE_USB_BROKER_CONTROL`), Sunshine on
 Windows has no gamepads. Keyboard, mouse, touch and pen work as before.
+
+Nothing ViGEmBus-related is left either. That covers the `gamepad_driver =
+vigembus` choice, the driver status in `/api/virtual-input/status`, and the
+fallback in `virtualhid_input`. On Windows, the gamepad backend picker,
+license prompts and driver cards are also gone from the tray and the web UI.
+`gamepad_driver` remains for macOS only.
 
 ### Windows: the shared MttVDD monitor by name
 
