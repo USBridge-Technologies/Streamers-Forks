@@ -165,13 +165,6 @@ namespace confighttp {
    */
   nlohmann::json get_virtualhid_driver_status();
 
-  /**
-   * @brief Build ViGEmBus fallback driver version and installation status.
-   *
-   * @return ViGEmBus fallback driver status JSON.
-   */
-  nlohmann::json get_vigembus_driver_status();
-
   void getVirtualInputStatus(const resp_https_t &response, const req_https_t &request);
 
   /**

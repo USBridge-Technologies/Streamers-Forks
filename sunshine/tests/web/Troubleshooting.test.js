@@ -33,7 +33,6 @@ async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {},
             version_compatible: true,
             supported_versions: '>= 2026.914.1218',
           },
-          vigembus: { installed: false },
         }),
       }
     }
@@ -247,30 +246,13 @@ describe('virtual input troubleshooting', () => {
     wrapper.unmount()
   })
 
-  it.each(['macos', 'windows'])('shows only the license activation limit on %s', async platform => {
+  it.each(['macos'])('shows only the license activation limit on %s', async platform => {
     const wrapper = await mountTroubleshooting(platform, 'all', { activation_usage: 1, activation_limit: 5 })
 
     const activation = wrapper.findAll('.virtualhid-license-stat').find(stat =>
       stat.find('dt').text() === 'troubleshooting.virtualhid_license_activation_limit'
     )
     expect(activation.find('dd').text()).toBe('5')
-    wrapper.unmount()
-  })
-
-  it('keeps both backend rows on Windows when all backends are enabled', async () => {
-    const wrapper = await mountTroubleshooting('windows', 'all')
-
-    expect(wrapper.findAll('.driver-table-shell tbody tr')).toHaveLength(2)
-    const vigembusStatus = wrapper.get('#vigembus .driver-status-icon')
-    expect(vigembusStatus.classes()).toContain('status-icon-neutral')
-    expect(vigembusStatus.attributes('title')).toBe('troubleshooting.driver_status_not_installed')
-    expect(vigembusStatus.get('.visually-hidden').text()).toBe('troubleshooting.driver_status_not_installed')
-    wrapper.vm.virtualhid.version_compatible = false
-    await wrapper.vm.$nextTick()
-    const unsupportedStatus = wrapper.get('.driver-table-shell tbody tr:first-child .driver-status-icon')
-    expect(unsupportedStatus.classes()).toContain('status-icon-danger')
-    expect(unsupportedStatus.attributes('title')).toBe('troubleshooting.driver_status_unsupported')
-    expect(unsupportedStatus.get('.visually-hidden').text()).toBe('troubleshooting.driver_status_unsupported')
     wrapper.unmount()
   })
 

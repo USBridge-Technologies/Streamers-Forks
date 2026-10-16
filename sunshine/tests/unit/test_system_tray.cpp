@@ -415,40 +415,29 @@ TEST_F(SystemTrayTest, PreparesLicensedVirtualHidMenuBeforeInitialization) {
   EXPECT_STREQ(license_menu[3].text, "Machine activation limit: Not reported");
 }
 
-TEST_F(SystemTrayTest, PromptsForUnsetGamepadDriverEvenWhenLicensed) {
+// usbridge: Windows has no gamepad backend to choose or license (the pads are the USB broker's).
+TEST_F(SystemTrayTest, DoesNotPromptForAGamepadBackend) {
   lvh::LicenseStatus license;
   license.service_available = true;
   license.state = lvh::LicenseState::licensed;
   config::input.gamepad_driver.clear();
 
-  system_tray::update_tray_virtualhid_license(license, false);
+  system_tray::update_tray_virtualhid_license(license, true);
 
   const auto &tray_data = system_tray::tray_data_for_testing();
-  EXPECT_STREQ(tray_data.notification_title, "Choose a Gamepad Backend");
-  EXPECT_STREQ(
-    tray_data.notification_text,
-    "Choose a gamepad backend in Input settings. Virtual HID Broker is a paid upgrade; ViGEmBus is limited and has reached end of life."
-  );
-  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
-  EXPECT_NE(tray_data.notification_cb, nullptr);
+  EXPECT_EQ(tray_data.notification_title, nullptr);
+  EXPECT_EQ(tray_data.notification_text, nullptr);
+  EXPECT_EQ(tray_data.notification_cb, nullptr);
 }
 
-TEST_F(SystemTrayTest, NotifiesWhenVirtualHidDriverIsUnsupported) {
+TEST_F(SystemTrayTest, DoesNotNotifyAboutTheVirtualHidDriver) {
   const auto supported_versions = std::format(">= {}", LIBVIRTUALHID_MINIMUM_VERSION);
   system_tray::update_tray_virtualhid_driver(true, "2026.829.2338.54", false, supported_versions);  // NOSONAR(cpp:S1313): not an IP address
 
   const auto &tray_data = system_tray::tray_data_for_testing();
-  const auto expected_notification = std::format(
-    "Installed Virtual HID Broker v2026.829.2338.54 is not supported by this version of Sunshine. Supported versions: {}. Restart Sunshine after updating. Click for instructions.",
-    supported_versions
-  );
-  EXPECT_STREQ(tray_data.notification_title, "Update Virtual HID Broker");
-  EXPECT_STREQ(tray_data.notification_text, expected_notification.c_str());
-  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
-  EXPECT_NE(tray_data.notification_cb, nullptr);
-
-  system_tray::resolve_tray_icon_paths_for_testing();
-  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
+  EXPECT_EQ(tray_data.notification_title, nullptr);
+  EXPECT_EQ(tray_data.notification_text, nullptr);
+  EXPECT_EQ(tray_data.notification_cb, nullptr);
 }
 
 TEST_F(SystemTrayTest, PreservesExistingNotificationWhenVirtualHidDriverIsUsable) {
@@ -472,26 +461,6 @@ TEST_F(SystemTrayTest, PreservesExistingNotificationWhenVirtualHidDriverIsUsable
   EXPECT_EQ(tray_data.notification_title, notification_title);
   EXPECT_EQ(tray_data.notification_text, notification_text);
   EXPECT_EQ(tray_data.notification_cb, notification_callback);
-}
-
-TEST_F(SystemTrayTest, VigembusSelectionSuppressesVirtualHidNotifications) {
-  lvh::LicenseStatus license;
-  license.service_available = true;
-  license.state = lvh::LicenseState::invalid;
-  config::input.gamepad_driver = config::GAMEPAD_DRIVER_VIGEMBUS;
-
-  system_tray::update_tray_virtualhid_license(license, true);
-
-  const auto &tray_data = system_tray::tray_data_for_testing();
-  EXPECT_EQ(tray_data.notification_title, nullptr);
-  EXPECT_EQ(tray_data.notification_text, nullptr);
-  EXPECT_EQ(tray_data.notification_cb, nullptr);
-
-  const auto supported_versions = std::format(">= {}", LIBVIRTUALHID_MINIMUM_VERSION);
-  system_tray::update_tray_virtualhid_driver(true, "2026.829.2338.54", false, supported_versions);  // NOSONAR(cpp:S1313): not IP addresses
-  EXPECT_EQ(tray_data.notification_title, nullptr);
-  EXPECT_EQ(tray_data.notification_text, nullptr);
-  EXPECT_EQ(tray_data.notification_cb, nullptr);
 }
 
 TEST_F(SystemTrayTest, NoneSelectionSuppressesWindowsVirtualHidNotifications) {
@@ -536,16 +505,8 @@ TEST_P(UnlicensedVirtualHidTrayTest, PreparesMenuAndStartupNotification) {
   EXPECT_STREQ(license_menu[2].text, "Driver-backed keyboard, mouse, and gamepads are locked");
   EXPECT_STREQ(license_menu[3].text, service_available ? "License service: Available" : "License service: Unavailable");
   verify_virtualhid_actions_menu(license_menu);
-  EXPECT_STREQ(tray_data.notification_title, "Virtual HID Broker License");
-  EXPECT_STREQ(
-    tray_data.notification_text,
-    "Get or manage a license, or use the limited, end-of-life ViGEmBus driver."
-  );
-  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
-  EXPECT_NE(tray_data.notification_cb, nullptr);
-
-  system_tray::resolve_tray_icon_paths_for_testing();
-  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
+  // usbridge: no license notification on Windows, whatever the state.
+  EXPECT_EQ(tray_data.notification_title, nullptr);
 
   system_tray::update_tray_virtualhid_license(license, false);
   EXPECT_EQ(tray_data.notification_title, nullptr);

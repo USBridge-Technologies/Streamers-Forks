@@ -49,6 +49,9 @@ namespace input {
   void repeat_key(std::uint16_t key_code, std::uint8_t flags, std::byte synthetic_modifiers);
 }  // namespace input
 
+// The USBridge fork's Windows input has no libvirtualhid keyboard to record into
+// (src/platform/windows/input.cpp sends keys with SendInput).
+#ifndef _WIN32
 namespace {
   using namespace std::chrono_literals;
 
@@ -980,3 +983,4 @@ TEST_F(KeyboardPassthroughTest, ReleasesTheRemappedRightAltForKeyRightaltToKeyWi
 
   EXPECT_EQ(taken(), (std::vector<std::string> {released(VKEY_LWIN)}));
 }
+#endif
