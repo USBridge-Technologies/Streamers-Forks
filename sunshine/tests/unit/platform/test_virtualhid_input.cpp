@@ -290,6 +290,10 @@ TEST_F(VirtualHidDeviceTest, NoneSelectionHidesAvailableGamepads) {
   EXPECT_EQ(platf::get_capabilities() & platf::platform_caps::controller_touch, 0U);
 }
 
+#endif
+
+// usbridge: the Windows input has no libvirtualhid context (pads are the USB broker's).
+#ifdef __APPLE__
 TEST_F(VirtualHidDeviceTest, BrokerCreatesAndUpdatesEveryGamepadProfileWhenLicensed) {
   if (!lvh::get_license_status().license.licensed()) {
     GTEST_SKIP() << "Virtual HID Broker is not activated";
