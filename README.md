@@ -3,7 +3,7 @@
 Forks of third-party streaming hosts that the USBridge agent can run, one
 directory each, with the USBridge changes on top of an upstream snapshot.
 
-| Directory | Upstream | Snapshot |
+| Directory | Upstream | Snapshot (upstream commit date) |
 |---|---|---|
 | `punktfunk/` | https://git.unom.io/unom/punktfunk | `fda825fd79` (2026-10-15, 0.44.1) |
 | `sunshine/` | https://github.com/LizardByte/Sunshine | `3d890eadc` (2026-10-15) |
