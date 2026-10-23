@@ -309,9 +309,25 @@ namespace input {
      * @brief Send the rumble of a pad the USBridge USB broker built to the current feedback queue.
      */
     void bind_usbridge_rumble() {
-      usb_broker.set_rumble([queue = feedback_queue](std::uint8_t slot, std::uint16_t low, std::uint16_t high) {
+      usbridge::session_t::feedback_t fb;
+      fb.rumble = [queue = feedback_queue](std::uint8_t slot, std::uint16_t low, std::uint16_t high) {
         queue->raise(platf::gamepad_feedback_msg_t::make_rumble(slot, low, high));
-      });
+      };
+      fb.light = [queue = feedback_queue](std::uint8_t slot, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_rgb_led(slot, r, g, b));
+      };
+      fb.motion = [queue = feedback_queue](std::uint8_t slot, std::uint16_t rate) {
+        // Both sensors, as Sunshine asks for a virtual DualShock 4's.
+        queue->raise(platf::gamepad_feedback_msg_t::make_motion_event_state(slot, LI_MOTION_TYPE_ACCEL, rate));
+        queue->raise(platf::gamepad_feedback_msg_t::make_motion_event_state(slot, LI_MOTION_TYPE_GYRO, rate));
+      };
+      fb.triggers = [queue = feedback_queue](std::uint8_t slot, std::uint8_t flags, std::uint8_t type_left, std::uint8_t type_right, const std::array<std::uint8_t, 10> &left, const std::array<std::uint8_t, 10> &right) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_adaptive_triggers(slot, flags, type_left, type_right, left, right));
+      };
+      fb.packet = [queue = feedback_queue](std::uint8_t slot, std::uint8_t channel, std::uint16_t type, std::vector<std::uint8_t> payload) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_usbridge_packet(slot, channel, type, std::move(payload)));
+      };
+      usb_broker.set_feedback(std::move(fb));
     }
 
     // Keep track of alt+ctrl+shift key combo
@@ -1371,8 +1387,12 @@ namespace input {
    * @param packet The controller arrival packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_ARRIVAL_PACKET packet) {
-    // usbridge: the broker's pad is always an Xbox 360 one and appears with its first state.
-    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE || usbridge::pads_via_broker()) {
+    // usbridge: the arrival tells the broker which pad to build; it appears with its first state.
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_arrival(packet->controllerNumber, packet->type, util::endian::little(packet->capabilities), util::endian::little(packet->supportedButtonFlags));
+      return;
+    }
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -1522,7 +1542,11 @@ namespace input {
    * @param packet The controller touch packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_TOUCH_PACKET packet) {
-    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE || usbridge::pads_via_broker()) {
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_touch(packet->controllerNumber, packet->eventType, util::endian::little(packet->pointerId), from_clamped_netfloat(packet->x, 0.0f, 1.0f), from_clamped_netfloat(packet->y, 0.0f, 1.0f));
+      return;
+    }
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -1555,7 +1579,11 @@ namespace input {
    * @param packet The controller motion packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_MOTION_PACKET packet) {
-    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE || usbridge::pads_via_broker()) {
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_motion(packet->controllerNumber, packet->motionType, from_netfloat(packet->x), from_netfloat(packet->y), from_netfloat(packet->z));
+      return;
+    }
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -1587,7 +1615,11 @@ namespace input {
    * @param packet The controller battery packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_BATTERY_PACKET packet) {
-    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE || usbridge::pads_via_broker()) {
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_battery(packet->controllerNumber, packet->batteryState, packet->batteryPercentage);
+      return;
+    }
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -1622,9 +1654,9 @@ namespace input {
       return;
     }
 
-    // usbridge: under the USBridge agent the pad is the USB broker's, a virtual Xbox 360
-    // controller on a USB/IP port, not one of the injectors below -- whatever gamepad_driver
-    // says, since that only picks among those injectors.
+    // usbridge: under the USBridge agent the pad is the USB broker's, a virtual pad on a USB/IP
+    // port, not one of the injectors below -- whatever gamepad_driver says, since that only picks
+    // among those injectors.
     if (usbridge::pads_via_broker()) {
       for (int slot = 0; slot < usbridge::MAX_PADS; ++slot) {
         if (!(packet->activeGamepadMask & (1 << slot))) {
@@ -1635,7 +1667,7 @@ namespace input {
       if (slot >= 0 && slot < usbridge::MAX_PADS && (packet->activeGamepadMask & (1 << slot))) {
         input->usb_broker.pad_state(
           static_cast<std::uint8_t>(slot),
-          static_cast<std::uint16_t>(packet->buttonFlags),
+          static_cast<std::uint32_t>(packet->buttonFlags) | (static_cast<std::uint32_t>(packet->buttonFlags2) << 16),
           packet->leftTrigger,
           packet->rightTrigger,
           packet->leftStickX,

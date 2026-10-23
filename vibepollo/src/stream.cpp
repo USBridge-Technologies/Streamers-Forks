@@ -64,6 +64,7 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "update.h"
+#include "usbridge.h"
 #include "utility.h"
 #include "uuid.h"
 #include "video_send.h"
@@ -542,6 +543,24 @@ namespace stream {
       auto packet = enet_packet_create(payload.data(), payload.size(), haptics ? 0 : ENET_PACKET_FLAG_RELIABLE);
       if (!packet) return -1;
       if (enet_peer_send(peer, haptics ? ML_HAPTICS_CHANNEL : 0, packet)) {
+        enet_packet_destroy(packet);
+
+        return -1;
+      }
+
+      return 0;
+    }
+
+    /**
+     * @brief usbridge: send a packet unreliably on `channel` (a pad's sound: late is worse than lost).
+     */
+    int send_unreliable(const std::string_view &payload, net::peer_t peer, std::uint8_t channel) {
+      if (channel >= peer->channelCount) {
+        return 0;
+      }
+      auto packet = enet_packet_create(payload.data(), payload.size(), 0);
+      if (!packet) return -1;
+      if (enet_peer_send(peer, channel, packet)) {
         enet_packet_destroy(packet);
 
         return -1;
@@ -1363,6 +1382,25 @@ namespace stream {
         encrypted_payload;
 
       payload = encode_control(session, util::view(plaintext), encrypted_payload);
+    } else if (msg.type == platf::gamepad_feedback_e::usbridge_packet) {
+      // usbridge: the USB broker's ready packet of a pad's sound (haptics, speaker).
+      constexpr std::size_t max_payload = 1024;
+      if (!msg.usbridge_payload || msg.usbridge_payload->size() > max_payload) {
+        return -1;
+      }
+      std::array<std::uint8_t, sizeof(control_header_v2) + max_payload> plaintext;
+      const auto size = msg.usbridge_payload->size();
+      auto header = (control_header_v2 *) plaintext.data();
+      header->type = util::endian::little(msg.data.usbridge_packet.packet_type);
+      header->payloadLength = util::endian::little(static_cast<std::uint16_t>(size));
+      std::copy_n(msg.usbridge_payload->data(), size, plaintext.data() + sizeof(control_header_v2));
+      std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+        encrypted_payload;
+      auto packet = encode_control(session, std::string_view((const char *) plaintext.data(), sizeof(control_header_v2) + size), encrypted_payload);
+      if (session->broadcast_ref->control_server.send_unreliable(packet, session->control.peer, msg.data.usbridge_packet.channel)) {
+        return -1;
+      }
+      return 0;
     } else {
       BOOST_LOG(error) << "Unknown gamepad feedback message type"sv;
       return -1;
@@ -1888,7 +1926,8 @@ namespace stream {
       }
 
       // Haptic samples must keep flowing even when the player is not moving.
-      server->iterate(haptics_client ? 5ms : 150ms);
+      // usbridge: a broker pad's sound goes out as it comes too.
+      server->iterate(haptics_client || usbridge::sound_active() ? 5ms : 150ms);
     }
 
     // Let all remaining connections know the server is shutting down

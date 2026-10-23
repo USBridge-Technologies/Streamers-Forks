@@ -814,7 +814,7 @@ namespace platf {
   std::vector<supported_gamepad_t> &supported_gamepads(input_t * /*input*/) {
     static std::vector<supported_gamepad_t> gps;
 
-    // The broker's pads are Xbox 360 controllers.
+    // The broker picks each pad from the client's: an Xbox 360 one, or a DualShock 4 / DualSense.
     const auto available = usbridge::pads_via_broker();
     const auto *reason = available ? "" : "gamepads.usbridge-broker-not-available";
     gps = {
@@ -831,7 +831,10 @@ namespace platf {
   platform_caps::caps_t get_capabilities() {
     platform_caps::caps_t caps = 0;
 
-    // No controller touchpad or motion: the broker's pads are Xbox 360 controllers.
+    // The broker's PlayStation pads take the controller touchpad, motion and battery.
+    if (usbridge::pads_via_broker()) {
+      caps |= platform_caps::controller_touch;
+    }
 
     // We support pen and touch input on Win10 1809+
     if (GetProcAddress(GetModuleHandleA("user32.dll"), "CreateSyntheticPointerDevice") != nullptr) {

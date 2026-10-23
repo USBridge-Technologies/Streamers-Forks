@@ -150,7 +150,7 @@ enum SessionPads {
     /// Windows UMDF HID Xbox pad — the native plane's default.
     #[cfg(target_os = "windows")]
     Hid(crate::inject::xbox_windows::XboxWindowsManager),
-    /// Under the USBridge agent: Xbox 360 pads on its USB broker's USB/IP ports.
+    /// Under the USBridge agent: virtual pads on its USB broker's USB/IP ports.
     Usbridge(super::usbridge::Pads),
 }
 
@@ -173,6 +173,14 @@ impl SessionPads {
             #[cfg(target_os = "windows")]
             SessionPads::Hid(m) => m.handle(ev),
             SessionPads::Usbridge(p) => p.handle(ev),
+        }
+    }
+
+    /// The USB broker's pads, when they are this session's.
+    fn usbridge(&mut self) -> Option<&mut super::usbridge::Pads> {
+        match self {
+            SessionPads::Usbridge(p) => Some(p),
+            _ => None,
         }
     }
 
@@ -627,15 +635,32 @@ impl ControlPeer {
         // Handle motors only. `0x010B` has no trigger-rumble id on this plane, and uinput
         // `FF_RUMBLE` has two fields anyway.
         let seq = &mut self.host_seq;
-        self.pads.pump_rumble(|index, low, high, _lt, _rt| {
-            let pt = super::gamepad::rumble_plaintext(index, low, high);
-            out.push(encrypt_control(&key, &scheme, *seq, &pt));
-            *seq = seq.wrapping_add(1);
-        });
+        // usbridge: the broker's pads send back lights, motion requests, adaptive triggers
+        // and their sound too; the sound goes unreliably on its own channel.
+        let mut unreliable: Vec<(u8, Vec<u8>)> = Vec::new();
+        if let Some(pads) = self.pads.usbridge() {
+            pads.pump(|o| {
+                let wire = encrypt_control(&key, &scheme, *seq, &o.plaintext);
+                *seq = seq.wrapping_add(1);
+                match o.channel {
+                    Some(channel) => unreliable.push((channel, wire)),
+                    None => out.push(wire),
+                }
+            });
+        } else {
+            self.pads.pump_rumble(|index, low, high, _lt, _rt| {
+                let pt = super::gamepad::rumble_plaintext(index, low, high);
+                out.push(encrypt_control(&key, &scheme, *seq, &pt));
+                *seq = seq.wrapping_add(1);
+            });
+        }
         for wire in out {
             if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..])) {
                 tracing::warn!(error = ?e, "control send failed");
             }
+        }
+        for (channel, wire) in unreliable {
+            let _ = host.peer_mut(pid).send(channel, &Packet::unreliable(&wire[..]));
         }
     }
 }
@@ -777,6 +802,17 @@ fn on_receive(
                 if lost > 0 {
                     tracing::debug!(lost, "control: frame lost past FEC");
                 }
+            }
+            return;
+        }
+    }
+
+    // Under the USBridge agent the controller extensions go to the broker's pads.
+    if let Some(pads) = peer.pads.usbridge() {
+        if let Some(frame) = super::usbridge::controller_frame(&pt) {
+            crate::sleep_inhibit::note_input();
+            if peer.drops.permitted(grants, GrantClass::Gamepad) {
+                pads.extension(frame);
             }
             return;
         }

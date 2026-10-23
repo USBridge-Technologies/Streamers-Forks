@@ -8,9 +8,11 @@
 #include <bitset>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -122,6 +124,7 @@ namespace platf {
     set_rgb_led,  ///< Set RGB LED
     set_player_leds,  ///< Set player indicator LEDs
     set_adaptive_triggers,  ///< Set adaptive triggers
+    usbridge_packet,  ///< usbridge: a ready control packet of a pad's sound (see src/usbridge.h)
   };
 
   /**
@@ -229,8 +232,27 @@ namespace platf {
       return msg;
     }
 
+    /**
+     * @brief usbridge: a control packet the USB broker made of a pad's sound, sent unreliably.
+     *
+     * @param id Controller number.
+     * @param channel ENet channel to send it on.
+     * @param packet_type Control packet type.
+     * @param payload The packet's payload, after its type and length.
+     * @return Constructed message.
+     */
+    static gamepad_feedback_msg_t make_usbridge_packet(std::uint16_t id, std::uint8_t channel, std::uint16_t packet_type, std::vector<std::uint8_t> payload) {
+      gamepad_feedback_msg_t msg;
+      msg.type = gamepad_feedback_e::usbridge_packet;
+      msg.id = id;
+      msg.data.usbridge_packet = {channel, packet_type};
+      msg.usbridge_payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(payload));
+      return msg;
+    }
+
     gamepad_feedback_e type;  ///< Feedback command type stored in the union payload.
     std::uint16_t id;  ///< Controller identifier associated with this message.
+    std::shared_ptr<const std::vector<std::uint8_t>> usbridge_payload;  ///< usbridge_packet's payload.
 
     union {
       struct {
@@ -266,6 +288,11 @@ namespace platf {
         std::array<uint8_t, 10> left;  ///< Left adaptive-trigger effect parameters.
         std::array<uint8_t, 10> right;  ///< Right adaptive-trigger effect parameters.
       } adaptive_triggers;  ///< Adaptive-trigger effect payload.
+
+      struct {
+        std::uint8_t channel;  ///< ENet channel.
+        std::uint16_t packet_type;  ///< Control packet type.
+      } usbridge_packet;  ///< usbridge_packet's header.
     } data;  ///< Controller feedback payload for the selected feedback type.
   };
 

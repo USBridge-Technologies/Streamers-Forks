@@ -8,15 +8,21 @@
 //!   device (a Wacom tablet) sent as its model plus every input report. The body is forwarded
 //!   verbatim; the broker rebuilds the device on a virtual USB port so the native driver binds.
 //!   Offered to the client with [`SS_FF_USBRIDGE_RAW_HID`].
-//! - **Gamepads** ([`Pads`]): each controller becomes a virtual Xbox 360 pad on a USB/IP port.
-//!   The default on Windows, where the agent installs usbip-win2 and not this host's pad
-//!   drivers; `USBRIDGE_PAD_BRIDGE=1|0` overrides either way.
+//! - **Gamepads** ([`Pads`]): each controller becomes a virtual pad on a USB/IP port -- an
+//!   Xbox 360 pad, or for a PlayStation one a DualShock 4, DualSense or DualSense Edge (the
+//!   broker picks it from the arrival), with its touchpad, motion sensors, battery, light,
+//!   adaptive triggers and, when the client plays it, its sound device. The controller
+//!   extensions (`SS_CONTROLLER_ARRIVAL/TOUCH/MOTION/BATTERY`) go to the broker as they come
+//!   ([`controller_frame`]); what a game sends back comes from it as control packets to send
+//!   ([`Pads::pump`]). The default on Windows, where the agent installs usbip-win2 and not this
+//!   host's pad drivers; `USBRIDGE_PAD_BRIDGE=1|0` overrides either way.
 //!
 //! Without the variable nothing here runs and nothing is advertised.
 
 use punktfunk_core::input::{GamepadEvent, GamepadFrame};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -35,8 +41,33 @@ const FRAME_HEADER_LEN: usize = 10;
 const KIND_PAD_STATE: u8 = 0x10;
 const KIND_PAD_GONE: u8 = 0x11;
 const KIND_PAD_RUMBLE: u8 = 0x12;
-/// The broker builds this many pads.
-const MAX_PADS: u16 = 4;
+const KIND_PAD_ARRIVAL: u8 = 0x13;
+const KIND_PAD_TOUCH: u8 = 0x14;
+const KIND_PAD_MOTION: u8 = 0x15;
+const KIND_PAD_BATTERY: u8 = 0x16;
+const KIND_PAD_LIGHT: u8 = 0x17;
+const KIND_PAD_MOTION_REQUEST: u8 = 0x18;
+const KIND_PAD_TRIGGERS: u8 = 0x19;
+const KIND_PAD_PACKET: u8 = 0x1A;
+/// The broker builds this many pads (a Moonlight client's whole `activeGamepadMask`).
+const MAX_PADS: u16 = 16;
+
+/// `LI_FF_CONTROLLER_TOUCH_EVENTS`: the client may send controller touch, motion and battery.
+pub const SS_FF_CONTROLLER_TOUCH_EVENTS: u32 = 0x02;
+
+/// Sunshine controller extensions (`Input.h`).
+const MAGIC_CONTROLLER_ARRIVAL: u32 = 0x5500_0004;
+const MAGIC_CONTROLLER_TOUCH: u32 = 0x5500_0005;
+const MAGIC_CONTROLLER_MOTION: u32 = 0x5500_0006;
+const MAGIC_CONTROLLER_BATTERY: u32 = 0x5500_0007;
+
+/// Host -> client control packet types.
+const RUMBLE_TYPE: u16 = 0x010B;
+const SET_MOTION_EVENT_TYPE: u16 = 0x5501;
+const SET_RGB_LED_TYPE: u16 = 0x5502;
+const ADAPTIVE_TRIGGERS_TYPE: u16 = 0x5503;
+const LI_MOTION_TYPE_ACCEL: u8 = 0x01;
+const LI_MOTION_TYPE_GYRO: u8 = 0x02;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const REPLY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -110,6 +141,117 @@ pub fn raw_hid_frame(plaintext: &[u8]) -> Option<&[u8]> {
     body.get(..FRAME_HEADER_LEN + length)
 }
 
+/// A controller extension packet as the broker's frame `(kind, controller, data)`: an arrival
+/// as `type capabilities:LE16 supportedButtons:LE32`, a touch as `eventType pointerId x y`, a
+/// motion sample as `motionType x y z`, a battery report as `state percent` (floats LE, as on
+/// the wire). `None` for any other packet.
+pub fn controller_frame(plaintext: &[u8]) -> Option<(u8, u8, Vec<u8>)> {
+    if plaintext.len() < 4 || u16::from_le_bytes([plaintext[0], plaintext[1]]) != INPUT_DATA_TYPE {
+        return None;
+    }
+    let p = plaintext.get(4..)?;
+    let magic = u32::from_le_bytes(p.get(4..8)?.try_into().ok()?);
+    let b = p.get(8..)?;
+    let slot = *b.first()?;
+    match magic {
+        // controllerNumber type capabilities:16 supportedButtonFlags:32
+        MAGIC_CONTROLLER_ARRIVAL => Some((KIND_PAD_ARRIVAL, slot, b.get(1..8)?.to_vec())),
+        // controllerNumber eventType zero[2] pointerId:32 x y pressure
+        MAGIC_CONTROLLER_TOUCH => {
+            let mut d = vec![*b.get(1)?];
+            d.extend_from_slice(b.get(4..16)?);
+            Some((KIND_PAD_TOUCH, slot, d))
+        }
+        // controllerNumber motionType zero[2] x y z
+        MAGIC_CONTROLLER_MOTION => {
+            let mut d = vec![*b.get(1)?];
+            d.extend_from_slice(b.get(4..16)?);
+            Some((KIND_PAD_MOTION, slot, d))
+        }
+        // controllerNumber batteryState batteryPercentage zero
+        MAGIC_CONTROLLER_BATTERY => Some((KIND_PAD_BATTERY, slot, b.get(1..3)?.to_vec())),
+        _ => None,
+    }
+}
+
+/// One host -> client control packet a broker pad produced, before sealing: `plaintext` is
+/// `type:LE16 length:LE16 payload`. `channel` is where a pad's sound goes, unreliably; `None`
+/// is the generic channel, reliably.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Outgoing {
+    pub plaintext: Vec<u8>,
+    pub channel: Option<u8>,
+}
+
+fn control_plaintext(packet_type: u16, payload: &[u8]) -> Vec<u8> {
+    let mut pt = Vec::with_capacity(4 + payload.len());
+    pt.extend_from_slice(&packet_type.to_le_bytes());
+    pt.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    pt.extend_from_slice(payload);
+    pt
+}
+
+/// The broker's messages back: `kind slot` and a body whose size the kind says (a packet's
+/// carries its own length). An unknown kind ends the reading: the stream can't be followed.
+fn read_feedback(conn: &mut impl Read) -> Option<(u8, u8, Vec<u8>)> {
+    let mut head = [0u8; 2];
+    conn.read_exact(&mut head).ok()?;
+    let size = match head[0] {
+        KIND_PAD_RUMBLE | KIND_PAD_MOTION_REQUEST => 2,
+        KIND_PAD_LIGHT => 3,
+        KIND_PAD_TRIGGERS => 23,
+        KIND_PAD_PACKET => 5,
+        other => {
+            tracing::warn!(kind = other, "usbridge: unknown message from the USB broker");
+            return None;
+        }
+    };
+    let mut body = vec![0u8; size];
+    conn.read_exact(&mut body).ok()?;
+    if head[0] == KIND_PAD_PACKET {
+        let len = u16::from_le_bytes([body[3], body[4]]) as usize;
+        let mut payload = vec![0u8; len];
+        conn.read_exact(&mut payload).ok()?;
+        body.extend_from_slice(&payload);
+    }
+    Some((head[0], head[1], body))
+}
+
+/// What a broker message becomes on the control stream.
+fn outgoing(kind: u8, slot: u8, body: &[u8]) -> Vec<Outgoing> {
+    let cn = u16::from(slot).to_le_bytes();
+    let reliable = |packet_type: u16, payload: &[u8]| Outgoing {
+        plaintext: control_plaintext(packet_type, payload),
+        channel: None,
+    };
+    match kind {
+        KIND_PAD_RUMBLE => {
+            let wide = |v: u8| u16::from(v) << 8 | u16::from(v);
+            let mut p = 0x00C0_FFEEu32.to_le_bytes().to_vec();
+            p.extend_from_slice(&cn);
+            p.extend_from_slice(&wide(body[0]).to_le_bytes());
+            p.extend_from_slice(&wide(body[1]).to_le_bytes());
+            vec![reliable(RUMBLE_TYPE, &p)]
+        }
+        KIND_PAD_LIGHT => vec![reliable(SET_RGB_LED_TYPE, &[cn[0], cn[1], body[0], body[1], body[2]])],
+        // Both sensors, as Sunshine asks for a virtual DualShock 4's.
+        KIND_PAD_MOTION_REQUEST => [LI_MOTION_TYPE_ACCEL, LI_MOTION_TYPE_GYRO]
+            .into_iter()
+            .map(|t| reliable(SET_MOTION_EVENT_TYPE, &[cn[0], cn[1], body[0], body[1], t]))
+            .collect(),
+        KIND_PAD_TRIGGERS => {
+            let mut p = cn.to_vec();
+            p.extend_from_slice(body);
+            vec![reliable(ADAPTIVE_TRIGGERS_TYPE, &p)]
+        }
+        KIND_PAD_PACKET => vec![Outgoing {
+            plaintext: control_plaintext(u16::from_le_bytes([body[1], body[2]]), &body[5..]),
+            channel: Some(body[0]),
+        }],
+        _ => Vec::new(),
+    }
+}
+
 fn frame(kind: u8, slot: u8, data: &[u8]) -> Vec<u8> {
     let len = (data.len() as u16).to_le_bytes();
     let mut f = Vec::with_capacity(FRAME_HEADER_LEN + data.len());
@@ -122,9 +264,9 @@ fn frame(kind: u8, slot: u8, data: &[u8]) -> Vec<u8> {
 struct Link {
     broker: Option<SocketAddr>,
     conn: Option<TcpStream>,
-    /// Rumble the broker sends back, read on a thread of its own so the control loop
-    /// never waits on the socket.
-    rumble: Option<Receiver<[u8; 4]>>,
+    /// What the broker sends back, read on a thread of its own so the control loop never
+    /// waits on the socket.
+    feedback: Option<Receiver<(u8, u8, Vec<u8>)>>,
     retry_at: Option<Instant>,
 }
 
@@ -133,7 +275,7 @@ impl Link {
         Link {
             broker,
             conn: None,
-            rumble: None,
+            feedback: None,
             retry_at: None,
         }
     }
@@ -145,7 +287,7 @@ impl Link {
             }
             match self.broker.map(open) {
                 Some(Ok((conn, _))) => {
-                    self.rumble = conn.try_clone().ok().map(spawn_rumble_reader);
+                    self.feedback = conn.try_clone().ok().map(spawn_feedback_reader);
                     self.conn = Some(conn);
                     self.retry_at = None;
                     tracing::info!("usbridge: connected to the USB broker");
@@ -179,7 +321,7 @@ impl Link {
         if let Some(conn) = self.conn.take() {
             let _ = conn.shutdown(Shutdown::Both);
         }
-        self.rumble = None;
+        self.feedback = None;
     }
 }
 
@@ -189,13 +331,16 @@ impl Drop for Link {
     }
 }
 
-fn spawn_rumble_reader(mut conn: TcpStream) -> Receiver<[u8; 4]> {
+fn spawn_feedback_reader(mut conn: TcpStream) -> Receiver<(u8, u8, Vec<u8>)> {
     let (tx, rx) = mpsc::channel();
     let _ = std::thread::Builder::new()
-        .name("usbridge-rumble".into())
+        .name("usbridge-feedback".into())
         .spawn(move || {
-            let mut msg = [0u8; 4];
-            while conn.read_exact(&mut msg).is_ok() && tx.send(msg).is_ok() {}
+            while let Some(msg) = read_feedback(&mut conn) {
+                if tx.send(msg).is_err() {
+                    break;
+                }
+            }
         });
     rx
 }
@@ -218,11 +363,13 @@ impl RawHid {
     }
 }
 
-/// The session's gamepads as virtual Xbox 360 pads on the broker's side.
+/// The session's gamepads as virtual pads on the broker's side.
 pub struct Pads {
     link: Link,
     /// Controllers the broker holds a pad for.
     live: u16,
+    /// Each controller's arrival frame, sent again on a new connection (the broker forgot it).
+    arrivals: HashMap<u8, Vec<u8>>,
 }
 
 impl Pads {
@@ -234,11 +381,38 @@ impl Pads {
         Pads {
             link: Link::to(broker),
             live: 0,
+            arrivals: HashMap::new(),
+        }
+    }
+
+    /// Sends one frame; a connection this opens first gets the arrivals kept so far.
+    fn send(&mut self, bytes: &[u8]) -> bool {
+        if self.link.conn.is_none() && self.link.connect().is_some() {
+            let replay: Vec<Vec<u8>> = self.arrivals.values().cloned().collect();
+            for a in replay {
+                self.link.send(&a);
+            }
+        }
+        self.link.send(bytes)
+    }
+
+    /// One [`controller_frame`]: an arrival says which pad the controller becomes (kept for a
+    /// reconnect); touch, motion and battery go to a pad the broker holds.
+    pub fn extension(&mut self, (kind, slot, data): (u8, u8, Vec<u8>)) {
+        if u16::from(slot) >= MAX_PADS {
+            return;
+        }
+        let f = frame(kind, slot, &data);
+        if kind == KIND_PAD_ARRIVAL {
+            self.send(&f);
+            self.arrivals.insert(slot, f);
+        } else if self.live & (1 << slot) != 0 {
+            self.send(&f);
         }
     }
 
     pub fn handle(&mut self, ev: &GamepadEvent) {
-        // An arrival only describes the controller; the pad is always an Xbox 360 one.
+        // Arrivals come through `extension`, with their supported buttons.
         let GamepadEvent::State(f) = ev else {
             return;
         };
@@ -246,7 +420,9 @@ impl Pads {
             let bit = 1 << index;
             if self.live & bit != 0 && f.active_mask & bit == 0 {
                 self.live &= !bit;
-                self.link.send(&frame(KIND_PAD_GONE, index as u8, &[]));
+                // Only a pad that was there: an arrival can come a packet before its mask.
+                self.arrivals.remove(&(index as u8));
+                self.send(&frame(KIND_PAD_GONE, index as u8, &[]));
             }
         }
         let Ok(index) = u16::try_from(f.index) else {
@@ -255,7 +431,7 @@ impl Pads {
         if index >= MAX_PADS || f.active_mask & (1 << index) == 0 {
             return;
         }
-        if self.link.send(&frame(KIND_PAD_STATE, index as u8, &pad_state(f))) {
+        if self.send(&frame(KIND_PAD_STATE, index as u8, &pad_state(f))) {
             self.live |= 1 << index;
         } else {
             // The connection went, and every pad with it.
@@ -263,24 +439,37 @@ impl Pads {
         }
     }
 
-    /// `(index, low, high, 0, 0)` per rumble the broker passed back, motors as `0..=0xFFFF`.
-    pub fn pump_rumble(&mut self, mut rumble: impl FnMut(u16, u16, u16, u16, u16)) {
-        let Some(rx) = self.link.rumble.as_ref() else {
+    /// Everything the broker passed back since the last call, as control packets: rumble,
+    /// light, motion requests, adaptive triggers, and the pads' sound.
+    pub fn pump(&mut self, mut out: impl FnMut(Outgoing)) {
+        let Some(rx) = self.link.feedback.as_ref() else {
             return;
         };
-        while let Ok([kind, slot, left, right]) = rx.try_recv() {
+        while let Ok((kind, slot, body)) = rx.try_recv() {
+            outgoing(kind, slot, &body).into_iter().for_each(&mut out);
+        }
+    }
+
+    /// `(index, low, high, 0, 0)` per rumble the broker passed back, motors as `0..=0xFFFF`;
+    /// everything else it sent is dropped (no client to send it to).
+    pub fn pump_rumble(&mut self, mut rumble: impl FnMut(u16, u16, u16, u16, u16)) {
+        let Some(rx) = self.link.feedback.as_ref() else {
+            return;
+        };
+        while let Ok((kind, slot, body)) = rx.try_recv() {
             if kind == KIND_PAD_RUMBLE {
                 let wide = |v: u8| u16::from(v) << 8 | u16::from(v);
-                rumble(u16::from(slot), wide(left), wide(right), 0, 0);
+                rumble(u16::from(slot), wide(body[0]), wide(body[1]), 0, 0);
             }
         }
     }
 }
 
-/// `buttons:LE16 leftTrigger rightTrigger lx ly rx ry` — the XInput half of the frame; the
-/// extended buttons (paddles, Share) have no place on an Xbox 360 pad.
-fn pad_state(f: &GamepadFrame) -> [u8; 12] {
-    let mut d = [0u8; 12];
+/// `buttons:LE16 leftTrigger rightTrigger lx ly rx ry buttons2:LE16` — the XInput half of the
+/// frame, then the extended buttons (paddles, touchpad click, misc).
+fn pad_state(f: &GamepadFrame) -> [u8; 14] {
+    let mut d = [0u8; 14];
+    d[12..14].copy_from_slice(&((f.buttons >> 16) as u16).to_le_bytes());
     d[0..2].copy_from_slice(&(f.buttons as u16).to_le_bytes());
     d[2] = f.left_trigger;
     d[3] = f.right_trigger;
@@ -363,8 +552,8 @@ mod tests {
             })
         };
         pads.handle(&state(1, 0b10, 0x0001_1000));
-        // Controller 1 is gone from the mask; controller 7 is one the broker has no pad for.
-        pads.handle(&state(7, 0b1000_0000, 0));
+        // Controller 1 is gone from the mask; controller 20 is one the broker has no pad for.
+        pads.handle(&state(20, 0, 0));
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = None;
@@ -378,7 +567,7 @@ mod tests {
         let mut want = frame(
             KIND_PAD_STATE,
             1,
-            &[0x00, 0x10, 7, 0, 0, 0, 0xFE, 0xFF, 0, 0, 0, 0],
+            &[0x00, 0x10, 7, 0, 0, 0, 0xFE, 0xFF, 0, 0, 0, 0, 0x01, 0x00],
         );
         want.extend(frame(KIND_PAD_GONE, 1, &[]));
         assert_eq!(served.join().unwrap(), want);
@@ -408,5 +597,51 @@ mod tests {
         }));
         assert_eq!(pads.live, 0);
         pads.pump_rumble(|_, _, _, _, _| panic!("no rumble without a broker"));
+    }
+
+    #[test]
+    fn controller_extensions_become_broker_frames() {
+        let mut arrival = vec![3u8, 2];
+        arrival.extend_from_slice(&0x8000u16.to_le_bytes());
+        arrival.extend_from_slice(&0x0020_FFFFu32.to_le_bytes());
+        let (kind, slot, d) = controller_frame(&input_packet(MAGIC_CONTROLLER_ARRIVAL, &arrival)).unwrap();
+        assert_eq!((kind, slot), (KIND_PAD_ARRIVAL, 3));
+        assert_eq!(d, &arrival[1..]);
+
+        let mut touch = vec![1u8, 1, 0, 0];
+        touch.extend_from_slice(&9u32.to_le_bytes());
+        touch.extend_from_slice(&0.5f32.to_le_bytes());
+        touch.extend_from_slice(&0.25f32.to_le_bytes());
+        touch.extend_from_slice(&1f32.to_le_bytes());
+        let (kind, _, d) = controller_frame(&input_packet(MAGIC_CONTROLLER_TOUCH, &touch)).unwrap();
+        assert_eq!(kind, KIND_PAD_TOUCH);
+        assert_eq!(d.len(), 13);
+        assert_eq!(&d[1..5], &9u32.to_le_bytes());
+
+        let (kind, _, d) = controller_frame(&input_packet(MAGIC_CONTROLLER_BATTERY, &[1, 2, 50, 0])).unwrap();
+        assert_eq!((kind, d), (KIND_PAD_BATTERY, vec![2, 50]));
+        assert!(controller_frame(&input_packet(UB_RAW_HID_MAGIC, &[0; 16])).is_none());
+    }
+
+    #[test]
+    fn broker_messages_become_control_packets() {
+        let mut stream: &[u8] = &[KIND_PAD_LIGHT, 2, 1, 2, 3, KIND_PAD_PACKET, 2, 8, 0x01, 0x56, 2, 0, 7, 9];
+        let (k, s, b) = read_feedback(&mut stream).unwrap();
+        assert_eq!(
+            outgoing(k, s, &b),
+            vec![Outgoing { plaintext: vec![0x02, 0x55, 5, 0, 2, 0, 1, 2, 3], channel: None }]
+        );
+        let (k, s, b) = read_feedback(&mut stream).unwrap();
+        assert_eq!(
+            outgoing(k, s, &b),
+            vec![Outgoing { plaintext: vec![0x01, 0x56, 2, 0, 7, 9], channel: Some(8) }]
+        );
+        let mut motion: &[u8] = &[KIND_PAD_MOTION_REQUEST, 4, 250, 0];
+        let (k, s, b) = read_feedback(&mut motion).unwrap();
+        let out = outgoing(k, s, &b);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].plaintext, vec![0x01, 0x55, 5, 0, 4, 0, 250, 0, LI_MOTION_TYPE_GYRO]);
+        let mut unknown: &[u8] = &[0x7F, 0];
+        assert!(read_feedback(&mut unknown).is_none());
     }
 }

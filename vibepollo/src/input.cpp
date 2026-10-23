@@ -217,9 +217,24 @@ namespace input {
         accumulated_vscroll_delta {},
         accumulated_hscroll_delta {} {
       // usbridge: rumble of a pad the USB broker built goes to this client's feedback queue.
-      usb_broker.set_rumble([queue = this->feedback_queue](std::uint8_t slot, std::uint16_t low, std::uint16_t high) {
+      usbridge::session_t::feedback_t fb;
+      fb.rumble = [queue = this->feedback_queue](std::uint8_t slot, std::uint16_t low, std::uint16_t high) {
         queue->raise(platf::gamepad_feedback_msg_t::make_rumble(slot, low, high));
-      });
+      };
+      fb.light = [queue = this->feedback_queue](std::uint8_t slot, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_rgb_led(slot, r, g, b));
+      };
+      fb.motion = [queue = this->feedback_queue](std::uint8_t slot, std::uint16_t rate) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_motion_event_state(slot, LI_MOTION_TYPE_ACCEL, rate));
+        queue->raise(platf::gamepad_feedback_msg_t::make_motion_event_state(slot, LI_MOTION_TYPE_GYRO, rate));
+      };
+      fb.triggers = [queue = this->feedback_queue](std::uint8_t slot, std::uint8_t flags, std::uint8_t type_left, std::uint8_t type_right, const std::array<std::uint8_t, 10> &left, const std::array<std::uint8_t, 10> &right) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_adaptive_triggers(slot, flags, type_left, type_right, left, right));
+      };
+      fb.packet = [queue = this->feedback_queue](std::uint8_t slot, std::uint8_t channel, std::uint16_t type, std::vector<std::uint8_t> payload) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_usbridge_packet(slot, channel, type, std::move(payload)));
+      };
+      usb_broker.set_feedback(std::move(fb));
     }
 
     // Keep track of alt+ctrl+shift key combo
@@ -1072,8 +1087,12 @@ namespace input {
    * @param packet The controller arrival packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_ARRIVAL_PACKET packet) {
-    // usbridge: the broker's pad is always an Xbox 360 one and appears with its first state.
-    if (!config::input.controller || usbridge::pads_via_broker()) {
+    // usbridge: the arrival tells the broker which pad to build; it appears with its first state.
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_arrival(packet->controllerNumber, packet->type, util::endian::little(packet->capabilities), util::endian::little(packet->supportedButtonFlags));
+      return;
+    }
+    if (!config::input.controller) {
       return;
     }
 
@@ -1251,8 +1270,11 @@ namespace input {
    * @param packet The controller touch packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_TOUCH_PACKET packet) {
-    // usbridge: the broker's pad is always an Xbox 360 one and appears with its first state.
-    if (!config::input.controller || usbridge::pads_via_broker()) {
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_touch(packet->controllerNumber, packet->eventType, util::endian::little(packet->pointerId), from_clamped_netfloat(packet->x, 0.0f, 1.0f), from_clamped_netfloat(packet->y, 0.0f, 1.0f));
+      return;
+    }
+    if (!config::input.controller) {
       return;
     }
 
@@ -1285,8 +1307,11 @@ namespace input {
    * @param packet The controller motion packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_MOTION_PACKET packet) {
-    // usbridge: the broker's pad is always an Xbox 360 one and appears with its first state.
-    if (!config::input.controller || usbridge::pads_via_broker()) {
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_motion(packet->controllerNumber, packet->motionType, from_netfloat(packet->x), from_netfloat(packet->y), from_netfloat(packet->z));
+      return;
+    }
+    if (!config::input.controller) {
       return;
     }
 
@@ -1318,8 +1343,11 @@ namespace input {
    * @param packet The controller battery packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_BATTERY_PACKET packet) {
-    // usbridge: the broker's pad is always an Xbox 360 one and appears with its first state.
-    if (!config::input.controller || usbridge::pads_via_broker()) {
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_battery(packet->controllerNumber, packet->batteryState, packet->batteryPercentage);
+      return;
+    }
+    if (!config::input.controller) {
       return;
     }
 
@@ -1360,7 +1388,7 @@ namespace input {
       if (slot >= 0 && slot < usbridge::MAX_PADS && (packet->activeGamepadMask & (1 << slot))) {
         input->usb_broker.pad_state(
           static_cast<std::uint8_t>(slot),
-          static_cast<std::uint16_t>(packet->buttonFlags),
+          static_cast<std::uint32_t>(packet->buttonFlags) | (static_cast<std::uint32_t>(packet->buttonFlags2) << 16),
           packet->leftTrigger,
           packet->rightTrigger,
           packet->leftStickX,

@@ -581,6 +581,10 @@ fn describe_sdp(codecs: u32) -> String {
     if super::usbridge::raw_hid_offered() {
         feature_flags |= super::usbridge::SS_FF_USBRIDGE_RAW_HID;
     }
+    // Its pads take the controller touchpad, motion and battery.
+    if super::usbridge::pads_via_broker() {
+        feature_flags |= super::usbridge::SS_FF_CONTROLLER_TOUCH_EVENTS;
+    }
     let (supported, requested) = enc_flags(gs_encryption_offer());
     let mut lines: Vec<String> = vec![
         format!("a=x-ss-general.featureFlags:{feature_flags}"),

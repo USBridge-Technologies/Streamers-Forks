@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 #include <thread>
 
 // lib includes
@@ -107,6 +108,7 @@ namespace platf {
     set_rgb_led,  ///< Set RGB LED
     set_adaptive_triggers,  ///< Set adaptive triggers
     haptics_pcm,  ///< 5 ms of 48 kHz S16LE stereo actuator samples
+    usbridge_packet,  ///< usbridge: a ready control packet of a pad's sound (see src/usbridge.h)
   };
 
   struct gamepad_feedback_msg_t {
@@ -151,8 +153,21 @@ namespace platf {
       return msg;
     }
 
+    /**
+     * @brief usbridge: a control packet the USB broker made of a pad's sound, sent unreliably.
+     */
+    static gamepad_feedback_msg_t make_usbridge_packet(std::uint16_t id, std::uint8_t channel, std::uint16_t packet_type, std::vector<std::uint8_t> payload) {
+      gamepad_feedback_msg_t msg;
+      msg.type = gamepad_feedback_e::usbridge_packet;
+      msg.id = id;
+      msg.data.usbridge_packet = {channel, packet_type};
+      msg.usbridge_payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(payload));
+      return msg;
+    }
+
     gamepad_feedback_e type;
     std::uint16_t id;
+    std::shared_ptr<const std::vector<std::uint8_t>> usbridge_payload;  ///< usbridge_packet's payload.
 
     union {
       struct {
@@ -188,6 +203,11 @@ namespace platf {
         std::array<uint8_t, 10> left;
         std::array<uint8_t, 10> right;
       } adaptive_triggers;
+
+      struct {
+        std::uint8_t channel;
+        std::uint16_t packet_type;
+      } usbridge_packet;
     } data;
   };
 

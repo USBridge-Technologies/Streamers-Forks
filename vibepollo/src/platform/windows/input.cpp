@@ -21,6 +21,7 @@
 #include "src/globals.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/usbridge.h"
 #include "vhf_gamepad.h"
 #include "dualsense_usbip_gamepad.h"
 #include "dualsense_usbip_gamepad_policy.h"
@@ -1038,7 +1039,8 @@ namespace platf {
     platform_caps::caps_t caps = 0;
 
     const bool composite_dualsense = config::input.gamepad == "usbip_ds5"sv || dualsense_usbip_gamepad::enabled();
-    if (vhf_gamepad::supports_controller_touch(config::input.gamepad, composite_dualsense)) {
+    // usbridge: the broker's PlayStation pads take the controller touchpad, motion and battery.
+    if (vhf_gamepad::supports_controller_touch(config::input.gamepad, composite_dualsense) || usbridge::pads_via_broker()) {
       caps |= platform_caps::controller_touch;
     }
 

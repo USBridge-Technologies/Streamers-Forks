@@ -36,6 +36,7 @@ extern "C" {
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
+#include "usbridge.h"
 #include "utility.h"
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
@@ -450,6 +451,22 @@ namespace stream {
      */
     int send(const std::string_view &payload, net::peer_t peer) {
       if (auto packet = enet_packet_create(payload.data(), payload.size(), ENET_PACKET_FLAG_RELIABLE); enet_peer_send(peer, 0, packet)) {
+        enet_packet_destroy(packet);
+
+        return -1;
+      }
+
+      return 0;
+    }
+
+    /**
+     * @brief usbridge: send a packet unreliably on `channel` (a pad's sound: late is worse than lost).
+     */
+    int send_unreliable(const std::string_view &payload, net::peer_t peer, std::uint8_t channel) {
+      if (channel >= peer->channelCount) {
+        return 0;
+      }
+      if (auto packet = enet_packet_create(payload.data(), payload.size(), 0); enet_peer_send(peer, channel, packet)) {
         enet_packet_destroy(packet);
 
         return -1;
@@ -1118,6 +1135,25 @@ namespace stream {
         encrypted_payload;
 
       payload = encode_control(session, util::view(plaintext), encrypted_payload);
+    } else if (msg.type == platf::gamepad_feedback_e::usbridge_packet) {
+      // usbridge: the USB broker's ready packet of a pad's sound (haptics, speaker).
+      constexpr std::size_t max_payload = 1024;
+      if (!msg.usbridge_payload || msg.usbridge_payload->size() > max_payload) {
+        return -1;
+      }
+      std::array<std::uint8_t, sizeof(control_header_v2) + max_payload> plaintext;
+      const auto size = msg.usbridge_payload->size();
+      auto header = (control_header_v2 *) plaintext.data();
+      header->type = util::endian::little(msg.data.usbridge_packet.packet_type);
+      header->payloadLength = util::endian::little(static_cast<std::uint16_t>(size));
+      std::copy_n(msg.usbridge_payload->data(), size, plaintext.data() + sizeof(control_header_v2));
+      std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+        encrypted_payload;
+      auto packet = encode_control(session, std::string_view((const char *) plaintext.data(), sizeof(control_header_v2) + size), encrypted_payload);
+      if (session->broadcast_ref->control_server.send_unreliable(packet, session->control.peer, msg.data.usbridge_packet.channel)) {
+        return -1;
+      }
+      return 0;
     } else {
       BOOST_LOG(error) << "Unknown gamepad feedback message type"sv;
       return -1;
@@ -1403,7 +1439,8 @@ namespace stream {
         break;
       }
 
-      server->iterate(150ms);
+      // usbridge: a pad's sound goes out as it comes, not in 150 ms bursts.
+      server->iterate(usbridge::sound_active() ? 5ms : 150ms);
     }
 
     // Let all remaining connections know the server is shutting down

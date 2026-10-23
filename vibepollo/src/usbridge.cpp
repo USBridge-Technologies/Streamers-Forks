@@ -4,6 +4,7 @@
  * only, so it builds and tests on its own (`USBRIDGE_STANDALONE`).
  */
 // standard includes
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 // platform includes
 #ifdef _WIN32
@@ -50,11 +52,43 @@ namespace usbridge {
     constexpr std::uint8_t KIND_PAD_STATE = 0x10;
     constexpr std::uint8_t KIND_PAD_GONE = 0x11;
     constexpr std::uint8_t KIND_PAD_RUMBLE = 0x12;
+    constexpr std::uint8_t KIND_PAD_ARRIVAL = 0x13;
+    constexpr std::uint8_t KIND_PAD_TOUCH = 0x14;
+    constexpr std::uint8_t KIND_PAD_MOTION = 0x15;
+    constexpr std::uint8_t KIND_PAD_BATTERY = 0x16;
+    constexpr std::uint8_t KIND_PAD_LIGHT = 0x17;
+    constexpr std::uint8_t KIND_PAD_MOTION_REQUEST = 0x18;
+    constexpr std::uint8_t KIND_PAD_TRIGGERS = 0x19;
+    constexpr std::uint8_t KIND_PAD_PACKET = 0x1A;
+
+    void put16(std::uint8_t *at, std::uint16_t v) {
+      at[0] = static_cast<std::uint8_t>(v & 0xFF);
+      at[1] = static_cast<std::uint8_t>(v >> 8);
+    }
+
+    void put32(std::uint8_t *at, std::uint32_t v) {
+      put16(at, static_cast<std::uint16_t>(v & 0xFFFF));
+      put16(at + 2, static_cast<std::uint16_t>(v >> 16));
+    }
+
+    void put_float(std::uint8_t *at, float f) {
+      std::uint32_t v;
+      static_assert(sizeof(v) == sizeof(f));
+      std::memcpy(&v, &f, sizeof(v));
+      put32(at, v);
+    }
+
+    std::uint16_t get16(const std::uint8_t *at) {
+      return static_cast<std::uint16_t>(at[0] | (at[1] << 8));
+    }
 
     constexpr auto CONNECT_TIMEOUT = 300ms;
     constexpr auto REPLY_TIMEOUT = 500ms;
     constexpr auto WRITE_TIMEOUT = 200ms;
     constexpr auto RETRY_INTERVAL = 2s;
+
+    /// When a pad's sound last came, in steady-clock ticks.
+    std::atomic<std::int64_t> last_sound {0};
 
 #ifdef _WIN32
     using sock_t = SOCKET;
@@ -255,6 +289,11 @@ namespace usbridge {
     return enabled;
   }
 
+  bool sound_active() {
+    const auto last = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(last_sound.load()));
+    return std::chrono::steady_clock::now() - last < 1s;
+  }
+
   std::size_t raw_hid_frame_size(const std::uint8_t *body, std::size_t size) {
     if (size < FRAME_HEADER_LEN) {
       return 0;
@@ -267,35 +306,102 @@ namespace usbridge {
   struct session_t::impl_t {
     std::mutex mutex;  ///< Guards the socket and what goes out on it.
     sock_t sock = NO_SOCK;
-    std::thread reader;  ///< Rumble the broker sends back, read so that sending never waits on it.
+    std::thread reader;  ///< Feedback the broker sends back, read so that sending never waits on it.
     std::chrono::steady_clock::time_point retry_at {};
     std::uint16_t live = 0;  ///< Controllers the broker holds a pad for.
+    /// Each controller's arrival, sent again on a new connection (the broker forgot it).
+    std::array<std::vector<std::uint8_t>, MAX_PADS> arrivals;
 
-    std::mutex rumble_mutex;
-    rumble_fn rumble;
+    std::mutex feedback_mutex;
+    feedback_t feedback;
 
-    void read_rumble(sock_t s) {
-      std::uint8_t msg[4];
-      std::size_t have = 0;
-      while (true) {
-        const auto n = recv(s, reinterpret_cast<char *>(msg) + have, static_cast<int>(sizeof(msg) - have), 0);
+    /// Reads exactly `size` bytes. False when the connection is gone.
+    static bool recv_all(sock_t s, std::uint8_t *data, std::size_t size) {
+      while (size > 0) {
+        const auto n = recv(s, reinterpret_cast<char *>(data), static_cast<int>(size), 0);
         if (n <= 0) {
+          return false;
+        }
+        data += n;
+        size -= static_cast<std::size_t>(n);
+      }
+      return true;
+    }
+
+    /// The broker's messages: `kind slot` and a body whose size the kind says (a packet's carries
+    /// its own length). An unknown kind ends the reading; the stream can't be followed past it.
+    void read_feedback(sock_t s) {
+      std::uint8_t head[2];
+      std::vector<std::uint8_t> body;
+      while (recv_all(s, head, sizeof(head))) {
+        const auto kind = head[0];
+        const auto slot = head[1];
+        std::size_t size = 0;
+        switch (kind) {
+          case KIND_PAD_RUMBLE:
+          case KIND_PAD_MOTION_REQUEST:
+            size = 2;
+            break;
+          case KIND_PAD_LIGHT:
+            size = 3;
+            break;
+          case KIND_PAD_TRIGGERS:
+            size = 23;
+            break;
+          case KIND_PAD_PACKET:
+            size = 5;
+            break;
+          default:
+            USBRIDGE_LOG(warning) << "usbridge: unknown message 0x"sv << std::hex << static_cast<int>(kind) << std::dec << " from the USB broker"sv;
+            return;
+        }
+        body.resize(size);
+        if (!recv_all(s, body.data(), size)) {
           return;
         }
-        have += static_cast<std::size_t>(n);
-        if (have < sizeof(msg)) {
-          continue;
-        }
-        have = 0;
-        if (msg[0] != KIND_PAD_RUMBLE) {
-          continue;
+        std::vector<std::uint8_t> payload;
+        if (kind == KIND_PAD_PACKET) {
+          payload.resize(get16(body.data() + 3));
+          if (!recv_all(s, payload.data(), payload.size())) {
+            return;
+          }
         }
         const auto wide = [](std::uint8_t v) {
           return static_cast<std::uint16_t>((v << 8) | v);
         };
-        std::lock_guard lg {rumble_mutex};
-        if (rumble) {
-          rumble(msg[1], wide(msg[2]), wide(msg[3]));
+        std::lock_guard lg {feedback_mutex};
+        const auto &fb = feedback;
+        switch (kind) {
+          case KIND_PAD_RUMBLE:
+            if (fb.rumble) {
+              fb.rumble(slot, wide(body[0]), wide(body[1]));
+            }
+            break;
+          case KIND_PAD_MOTION_REQUEST:
+            if (fb.motion) {
+              fb.motion(slot, get16(body.data()));
+            }
+            break;
+          case KIND_PAD_LIGHT:
+            if (fb.light) {
+              fb.light(slot, body[0], body[1], body[2]);
+            }
+            break;
+          case KIND_PAD_TRIGGERS:
+            if (fb.triggers) {
+              std::array<std::uint8_t, 10> left {};
+              std::array<std::uint8_t, 10> right {};
+              std::memcpy(left.data(), body.data() + 3, left.size());
+              std::memcpy(right.data(), body.data() + 13, right.size());
+              fb.triggers(slot, body[0], body[1], body[2], left, right);
+            }
+            break;
+          case KIND_PAD_PACKET:
+            last_sound = std::chrono::steady_clock::now().time_since_epoch().count();
+            if (fb.packet) {
+              fb.packet(slot, body[0], get16(body.data() + 1), std::move(payload));
+            }
+            break;
         }
       }
     }
@@ -332,8 +438,14 @@ namespace usbridge {
         }
         USBRIDGE_LOG(info) << "usbridge: connected to the USB broker"sv;
         reader = std::thread {[this, s = sock] {
-          read_rumble(s);
+          read_feedback(s);
         }};
+        for (std::size_t slot = 0; slot < arrivals.size(); ++slot) {
+          if (!arrivals[slot].empty()) {
+            const auto frame = make_frame(KIND_PAD_ARRIVAL, static_cast<std::uint8_t>(slot), arrivals[slot].data(), static_cast<std::uint16_t>(arrivals[slot].size()));
+            send_all(sock, frame.data(), frame.size());
+          }
+        }
       }
       if (!send_all(sock, data, size)) {
         USBRIDGE_LOG(warning) << "usbridge: USB broker connection lost"sv;
@@ -344,16 +456,21 @@ namespace usbridge {
       return true;
     }
 
-    bool send_frame_locked(std::uint8_t kind, std::uint8_t slot, const std::uint8_t *data, std::uint16_t size) {
-      std::uint8_t frame[FRAME_HEADER_LEN + 16] {};
+    static std::vector<std::uint8_t> make_frame(std::uint8_t kind, std::uint8_t slot, const std::uint8_t *data, std::uint16_t size) {
+      std::vector<std::uint8_t> frame(FRAME_HEADER_LEN + size);
       frame[0] = kind;
       frame[1] = slot;
-      frame[4] = frame[8] = static_cast<std::uint8_t>(size & 0xFF);
-      frame[5] = frame[9] = static_cast<std::uint8_t>(size >> 8);
+      put16(frame.data() + 4, size);
+      put16(frame.data() + 8, size);
       if (size > 0) {
-        std::memcpy(frame + FRAME_HEADER_LEN, data, size);
+        std::memcpy(frame.data() + FRAME_HEADER_LEN, data, size);
       }
-      return send_locked(frame, FRAME_HEADER_LEN + size);
+      return frame;
+    }
+
+    bool send_frame_locked(std::uint8_t kind, std::uint8_t slot, const std::uint8_t *data, std::uint16_t size) {
+      const auto frame = make_frame(kind, slot, data, size);
+      return send_locked(frame.data(), frame.size());
     }
   };
 
@@ -365,9 +482,9 @@ namespace usbridge {
     close();
   }
 
-  void session_t::set_rumble(rumble_fn fn) {
-    std::lock_guard lg {impl->rumble_mutex};
-    impl->rumble = std::move(fn);
+  void session_t::set_feedback(feedback_t fb) {
+    std::lock_guard lg {impl->feedback_mutex};
+    impl->feedback = std::move(fb);
   }
 
   void session_t::raw_hid(const std::uint8_t *frame, std::size_t size) {
@@ -375,27 +492,79 @@ namespace usbridge {
     impl->send_locked(frame, size);
   }
 
-  void session_t::pad_state(std::uint8_t slot, std::uint16_t buttons, std::uint8_t lt, std::uint8_t rt, std::int16_t lx, std::int16_t ly, std::int16_t rx, std::int16_t ry) {
+  void session_t::pad_arrival(std::uint8_t slot, std::uint8_t type, std::uint16_t capabilities, std::uint32_t supported_buttons) {
     if (slot >= MAX_PADS) {
       return;
     }
-    const auto le = [](std::uint8_t *at, std::uint16_t v) {
-      at[0] = static_cast<std::uint8_t>(v & 0xFF);
-      at[1] = static_cast<std::uint8_t>(v >> 8);
-    };
-    // The XInput half of the state; the extended buttons have no place on an Xbox 360 pad.
-    std::uint8_t d[12];
-    le(d, buttons);
+    std::uint8_t d[7];
+    d[0] = type;
+    put16(d + 1, capabilities);
+    put32(d + 3, supported_buttons);
+    std::lock_guard lg {impl->mutex};
+    // Kept after sending: a connection this opens replays the ones kept before it.
+    impl->send_frame_locked(KIND_PAD_ARRIVAL, slot, d, sizeof(d));
+    impl->arrivals[slot].assign(d, d + sizeof(d));
+  }
+
+  void session_t::pad_state(std::uint8_t slot, std::uint32_t buttons, std::uint8_t lt, std::uint8_t rt, std::int16_t lx, std::int16_t ly, std::int16_t rx, std::int16_t ry) {
+    if (slot >= MAX_PADS) {
+      return;
+    }
+    // The XInput half of the state, then the extended buttons (paddles, touchpad, misc).
+    std::uint8_t d[14];
+    put16(d, static_cast<std::uint16_t>(buttons & 0xFFFF));
     d[2] = lt;
     d[3] = rt;
-    le(d + 4, static_cast<std::uint16_t>(lx));
-    le(d + 6, static_cast<std::uint16_t>(ly));
-    le(d + 8, static_cast<std::uint16_t>(rx));
-    le(d + 10, static_cast<std::uint16_t>(ry));
+    put16(d + 4, static_cast<std::uint16_t>(lx));
+    put16(d + 6, static_cast<std::uint16_t>(ly));
+    put16(d + 8, static_cast<std::uint16_t>(rx));
+    put16(d + 10, static_cast<std::uint16_t>(ry));
+    put16(d + 12, static_cast<std::uint16_t>(buttons >> 16));
 
     std::lock_guard lg {impl->mutex};
     if (impl->send_frame_locked(KIND_PAD_STATE, slot, d, sizeof(d))) {
       impl->live |= static_cast<std::uint16_t>(1U << slot);
+    }
+  }
+
+  void session_t::pad_touch(std::uint8_t slot, std::uint8_t event_type, std::uint32_t pointer_id, float x, float y) {
+    if (slot >= MAX_PADS) {
+      return;
+    }
+    std::uint8_t d[13];
+    d[0] = event_type;
+    put32(d + 1, pointer_id);
+    put_float(d + 5, x);
+    put_float(d + 9, y);
+    std::lock_guard lg {impl->mutex};
+    if (impl->live & (1U << slot)) {
+      impl->send_frame_locked(KIND_PAD_TOUCH, slot, d, sizeof(d));
+    }
+  }
+
+  void session_t::pad_motion(std::uint8_t slot, std::uint8_t motion_type, float x, float y, float z) {
+    if (slot >= MAX_PADS) {
+      return;
+    }
+    std::uint8_t d[13];
+    d[0] = motion_type;
+    put_float(d + 1, x);
+    put_float(d + 5, y);
+    put_float(d + 9, z);
+    std::lock_guard lg {impl->mutex};
+    if (impl->live & (1U << slot)) {
+      impl->send_frame_locked(KIND_PAD_MOTION, slot, d, sizeof(d));
+    }
+  }
+
+  void session_t::pad_battery(std::uint8_t slot, std::uint8_t state, std::uint8_t percent) {
+    if (slot >= MAX_PADS) {
+      return;
+    }
+    const std::uint8_t d[2] {state, percent};
+    std::lock_guard lg {impl->mutex};
+    if (impl->live & (1U << slot)) {
+      impl->send_frame_locked(KIND_PAD_BATTERY, slot, d, sizeof(d));
     }
   }
 
@@ -406,6 +575,8 @@ namespace usbridge {
     std::lock_guard lg {impl->mutex};
     const auto bit = static_cast<std::uint16_t>(1U << slot);
     if (impl->live & bit) {
+      // Only a pad that was there: an arrival can come a packet before the mask that has it.
+      impl->arrivals[slot].clear();
       impl->live &= static_cast<std::uint16_t>(~bit);
       impl->send_frame_locked(KIND_PAD_GONE, slot, nullptr, 0);
     }
