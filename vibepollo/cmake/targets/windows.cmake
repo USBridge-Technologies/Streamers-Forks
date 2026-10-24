@@ -10,6 +10,10 @@ endforeach()
 target_link_options(vibepollo_dualsense_haptics PRIVATE -municode)
 target_link_libraries(vibepollo_dualsense_haptics PRIVATE setupapi)
 target_link_libraries(vibepollo_dualsense_audio PRIVATE minhook::minhook ole32 propsys uuid shell32)
+# mingw-w64 crt 14.0.0.r532+ defines __mingw_fe_dfl_env in libmingw32's
+# CRT_fp10.o; a static DLL scans libmingw32 before libmingwex's fesetenv
+# needs it, so ask for it up front.
+target_link_options(vibepollo_dualsense_audio PRIVATE -Wl,--undefined=__mingw_fe_dfl_env)
 add_dependencies(sunshine vibepollo_dualsense_haptics vibepollo_dualsense_audio)
 if(DEFINED _MINHOOK_DLL)
     add_custom_command(TARGET vibepollo_dualsense_audio POST_BUILD
