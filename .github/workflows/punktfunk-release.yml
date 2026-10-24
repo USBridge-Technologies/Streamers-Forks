@@ -117,12 +117,22 @@ jobs:
           cargo build --release --locked -p punktfunk-host --features nvenc,qsv --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE) { throw "host build" }
 
+      # Streams a monitor the host did not create (a pinned physical one): the host
+      # starts it beside itself and fails every such session without it.
+      - name: Build capture worker
+        run: |
+          cargo build --release --locked -p punktfunk-capture-worker --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { throw "capture worker build" }
+
       - name: Package zip
         run: |
-          $exe = "C:\t\x86_64-pc-windows-msvc\release\punktfunk-host.exe"
+          $dir = "C:\t\x86_64-pc-windows-msvc\release"
+          $exe = "$dir\punktfunk-host.exe"
+          $worker = "$dir\punktfunk-capture-worker.exe"
           & $exe --version
+          if (-not (Test-Path $worker)) { throw "punktfunk-capture-worker.exe missing" }
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          Compress-Archive -Path $exe -DestinationPath artifacts/punktfunk-host-Windows-x64.zip
+          Compress-Archive -Path $exe, $worker -DestinationPath artifacts/punktfunk-host-Windows-x64.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
