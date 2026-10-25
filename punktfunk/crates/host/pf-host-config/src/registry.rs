@@ -474,7 +474,9 @@ pub static SETTINGS: &[Setting] = &[
         .advanced()
         .only(LINUX)
         .spellings(&[("composited", "embedded"), ("meta", "metadata"), ("none", "hidden")]),
-    row("vulkan_encode", "PUNKTFUNK_VULKAN_ENCODE", Kind::Bool, D::Bool(true), Video, NextSession, "Vulkan encoding", "configuration").advanced().only(LINUX),
+    // usbridge: off by default. Vulkan Video HEVC on AMD/Intel streamed smeared,
+    // flickering colours where VAAPI on the same box is clean; opt in per host.
+    row("vulkan_encode", "PUNKTFUNK_VULKAN_ENCODE", Kind::Bool, D::Bool(false), Video, NextSession, "Vulkan encoding", "configuration").advanced().only(LINUX),
     row("direct_capture", "PUNKTFUNK_DIRECT_CAPTURE", Kind::Bool, D::Bool(true), Video, NextSession, "Direct capture", "configuration").advanced().only(LINUX),
     row("lazy_capture", "PUNKTFUNK_LAZY_CAPTURE", Kind::Bool, D::Bool(true), Video, NextSession, "On-demand capture", "configuration").advanced().only(LINUX),
     row("kwin_paced", "PUNKTFUNK_KWIN_PACED", Kind::Bool, D::Bool(false), Video, NextSession, "KWin capture pacing", "kde").advanced().only(LINUX),

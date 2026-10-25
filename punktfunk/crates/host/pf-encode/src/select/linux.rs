@@ -281,8 +281,8 @@ fn open_nvenc(p: &OpenParams) -> Result<Box<dyn Encoder>> {
     }
 }
 
-/// Vulkan Video HEVC/AV1 on AMD/Intel. Default on.
-/// The `PUNKTFUNK_VULKAN_ENCODE` row off is the VAAPI hatch.
+/// Vulkan Video HEVC/AV1 on AMD/Intel. Default off in the usbridge fork
+/// (colour artifacts); the `PUNKTFUNK_VULKAN_ENCODE` row turns it on.
 /// A failed open falls back to VAAPI. See `design/linux-vulkan-video-encode.md`.
 #[cfg(feature = "vulkan-encode")]
 fn vulkan_encode_enabled() -> bool {
