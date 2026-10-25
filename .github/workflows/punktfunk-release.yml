@@ -32,7 +32,9 @@ jobs:
     defaults:
       run:
         working-directory: punktfunk
-    runs-on: ubuntu-24.04
+    # 22.04 so the binaries need only glibc 2.34 and run on Ubuntu 22.04,
+    # Debian 12 and RHEL 10 like the rest of USBridge, not just 24.04+.
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,7 +42,12 @@ jobs:
       # Same packages as upstream's ci/rust-ci-noble.Dockerfile (the image its
       # .deb is built in); libva and CUDA are dlopen'd, so neither is needed.
       - name: Install build dependencies
+        # The libspa/pipewire crates need pipewire >= 0.3.65 headers; 22.04
+        # ships 0.3.48, so they come from the pipewire-upstream PPA. Only the
+        # headers matter: every pw_/spa_ symbol the host imports exists in
+        # 22.04's stock libpipewire 0.3.48, checked with ldd -r.
         run: |
+          sudo add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             build-essential clang libclang-dev pkg-config cmake git \
@@ -56,6 +63,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: punktfunk
+          # The key ignores the runner image; a 24.04 cache would bring
+          # back pipewire bindings generated from other headers.
+          key: ubuntu-22.04-pipewire-ppa
 
       - name: Build host and encode worker
         run: |
