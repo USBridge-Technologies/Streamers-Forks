@@ -112,7 +112,7 @@ pub(crate) struct ResolveInputs {
     pub(crate) pref: String,
     /// [`pf_gpu::selection_key`]: the selected GPU, a manual pick included.
     pub(crate) gpu: String,
-    /// The Vulkan encoding row (`PUNKTFUNK_VULKAN_ENCODE`, default on). Linux only.
+    /// The Vulkan encoding row (`PUNKTFUNK_VULKAN_ENCODE`, default off in the usbridge fork). Linux only.
     pub(crate) vulkan_row: bool,
     /// NVIDIA's device nodes exist, which `auto` reads. Linux only.
     pub(crate) nvidia: bool,

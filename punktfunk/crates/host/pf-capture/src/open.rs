@@ -320,6 +320,28 @@ pub struct IddPushOpts {
     pub encode_ctl: EncodeCtlSender,
 }
 
+/// USBridge: DXGI Desktop Duplication capturer on an existing monitor (the MttVDD virtual
+/// monitor, a target with `wudf_pid == 0`). BGRA frames for the host encoders. On failure
+/// `keepalive` is handed back.
+#[cfg(target_os = "windows")]
+pub fn open_dxgi_dup(
+    target: pf_frame::dxgi::WinCaptureTarget,
+    keepalive: Box<dyn Send>,
+) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
+    // `open` consumes the keepalive only on success; keep a way to hand it back.
+    let mut keep = Some(keepalive);
+    let target_c = target.clone();
+    match crate::windows::dxgi_dup::DxgiDupCapturer::open(target, Box::new(())) {
+        Ok(mut c) => {
+            // Swap the placeholder for the real lease now that the capture is open.
+            let _ = c.take_keepalive();
+            c.set_keepalive(keep.take().unwrap());
+            Ok(Box::new(c) as Box<dyn Capturer>)
+        }
+        Err(e) => Err((e.context(format!("DXGI duplication of {}", target_c.gdi_name)), keep.take().unwrap())),
+    }
+}
+
 /// Windows IDD direct-push capturer on a pf-vdisplay target. On failure `keepalive` is handed
 /// back so the caller can retire the display.
 #[cfg(target_os = "windows")]

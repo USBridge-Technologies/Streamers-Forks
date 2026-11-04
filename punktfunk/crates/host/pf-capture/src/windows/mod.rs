@@ -21,6 +21,9 @@ mod cursor_state;
 mod cursor_witness;
 #[path = "idd/depth_pin.rs"]
 mod depth_pin;
+// USBridge: DXGI Desktop Duplication of the shared MttVDD virtual monitor.
+#[cfg(target_os = "windows")]
+pub(crate) mod dxgi_dup;
 #[cfg(target_os = "windows")]
 pub mod gpu_pref;
 #[cfg(target_os = "windows")]

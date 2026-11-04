@@ -156,10 +156,15 @@ enum SessionPads {
     /// Windows UMDF HID Xbox pad — the native plane's default.
     #[cfg(target_os = "windows")]
     Hid(crate::inject::xbox_windows::XboxWindowsManager),
+    /// Under the USBridge agent: virtual pads on its USB broker's USB/IP ports.
+    Usbridge(super::usbridge::Pads),
 }
 
 impl SessionPads {
     fn new() -> SessionPads {
+        if super::usbridge::pads_via_broker() {
+            return SessionPads::Usbridge(super::usbridge::Pads::new());
+        }
         #[cfg(target_os = "windows")]
         if crate::native::gamepad::windows_xbox_hid() {
             return SessionPads::Hid(crate::inject::xbox_windows::XboxWindowsManager::new());
@@ -173,6 +178,15 @@ impl SessionPads {
             SessionPads::Xusb(m) => m.handle(ev),
             #[cfg(target_os = "windows")]
             SessionPads::Hid(m) => m.handle(ev),
+            SessionPads::Usbridge(p) => p.handle(ev),
+        }
+    }
+
+    /// The USB broker's pads, when they are this session's.
+    fn usbridge(&mut self) -> Option<&mut super::usbridge::Pads> {
+        match self {
+            SessionPads::Usbridge(p) => Some(p),
+            _ => None,
         }
     }
 
@@ -184,6 +198,7 @@ impl SessionPads {
             SessionPads::Xusb(m) => m.pump_rumble(rumble),
             #[cfg(target_os = "windows")]
             SessionPads::Hid(m) => m.pump(rumble, |_| {}),
+            SessionPads::Usbridge(p) => p.pump_rumble(rumble),
         }
     }
 }
@@ -505,6 +520,9 @@ struct ControlPeer {
     /// What the client last heard over HDR-mode (0x010e). A client starts in SDR.
     hdr_signalled: Option<HdrMeta>,
     pads: SessionPads,
+    /// Raw HID devices of a USBridge client, built by the agent's USB broker. Clients send
+    /// them only after seeing `SS_FF_USBRIDGE_RAW_HID` (rtsp.rs).
+    raw_hid: super::usbridge::RawHid,
     /// SS_PEN/SS_TOUCH → tablet / wire touch. Clients send these only after seeing
     /// `SS_FF_PEN_TOUCH_EVENTS` (rtsp.rs).
     pointer: super::pen::GsPointer,
@@ -531,6 +549,7 @@ impl ControlPeer {
             decrypt_fails: 0,
             hdr_signalled: None,
             pads: SessionPads::new(),
+            raw_hid: super::usbridge::RawHid::new(),
             pointer: super::pen::GsPointer::new(),
             held: Default::default(),
             repeat: super::input::KeyRepeat::for_this_host(),
@@ -595,6 +614,8 @@ impl ControlPeer {
         self.hdr_signalled = None;
         self.pads = SessionPads::new();
         self.pads_active = 0;
+        // Closing the broker connection unplugs the session's devices.
+        self.raw_hid = super::usbridge::RawHid::new();
         self.pointer = super::pen::GsPointer::new();
         self.repeat = super::input::KeyRepeat::for_this_host();
         for ev in self.held.release() {
@@ -662,15 +683,32 @@ impl ControlPeer {
         // Handle motors only. `0x010B` has no trigger-rumble id on this plane, and uinput
         // `FF_RUMBLE` has two fields anyway.
         let seq = &mut self.host_seq;
-        self.pads.pump_rumble(|index, low, high, _lt, _rt| {
-            let pt = super::gamepad::rumble_plaintext(index, low, high);
-            out.push(encrypt_control(&key, &scheme, *seq, &pt));
-            *seq = seq.wrapping_add(1);
-        });
+        // usbridge: the broker's pads send back lights, motion requests, adaptive triggers
+        // and their sound too; the sound goes unreliably on its own channel.
+        let mut unreliable: Vec<(u8, Vec<u8>)> = Vec::new();
+        if let Some(pads) = self.pads.usbridge() {
+            pads.pump(|o| {
+                let wire = encrypt_control(&key, &scheme, *seq, &o.plaintext);
+                *seq = seq.wrapping_add(1);
+                match o.channel {
+                    Some(channel) => unreliable.push((channel, wire)),
+                    None => out.push(wire),
+                }
+            });
+        } else {
+            self.pads.pump_rumble(|index, low, high, _lt, _rt| {
+                let pt = super::gamepad::rumble_plaintext(index, low, high);
+                out.push(encrypt_control(&key, &scheme, *seq, &pt));
+                *seq = seq.wrapping_add(1);
+            });
+        }
         for wire in out {
             if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..])) {
                 tracing::warn!(error = ?e, "control send failed");
             }
+        }
+        for (channel, wire) in unreliable {
+            let _ = host.peer_mut(pid).send(channel, &Packet::unreliable(&wire[..]));
         }
     }
 
@@ -711,6 +749,16 @@ impl ControlPeer {
     /// Decodable input lifts the suspend veto whether or not it is granted; a keepalive is
     /// not input and lifts nothing.
     fn inject(&mut self, state: &AppState, pt: &[u8], inj_tx: &Sender<InputEvent>, grants: u32) {
+        // Under the USBridge agent the controller extensions go to the broker's pads.
+        if let Some(pads) = self.pads.usbridge() {
+            if let Some(frame) = super::usbridge::controller_frame(pt) {
+                crate::sleep_inhibit::note_input();
+                if self.drops.permitted(grants, GrantClass::Gamepad) {
+                    pads.extension(frame);
+                }
+                return;
+            }
+        }
         // Gate gamepad before the manager sees it: without GAMEPAD the creating event never
         // arrives, so no uinput node and no pad-audio streamer.
         if let Some(gp) = super::gamepad::decode(pt) {
@@ -721,6 +769,16 @@ impl ControlPeer {
                     self.pads_active = f.active_mask;
                 }
                 self.pads.handle(&gp);
+            }
+            return;
+        }
+        // A USBridge client's HID device (only after our feature flag): pointer-class, as the
+        // pen is -- what it sends is a tablet.
+        if let Some(frame) = super::usbridge::raw_hid_frame(pt) {
+            crate::sleep_inhibit::note_input();
+            if self.drops.permitted(grants, GrantClass::Pointer) {
+                state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
+                self.raw_hid.forward(frame);
             }
             return;
         }

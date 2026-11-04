@@ -573,11 +573,19 @@ fn describe_sdp(codecs: u32) -> String {
     // Advertise pen/touch only where we can inject. Else 0 so Moonlight keeps
     // client-side mouse emulation. gamescope gets the pen as touch (`GsPointer`).
     // `PUNKTFUNK_PEN=0` is the kill-switch inside `pen_supported`.
-    let feature_flags: u32 = if crate::inject::pen_supported() {
+    let mut feature_flags: u32 = if crate::inject::pen_supported() {
         SS_FF_PEN_TOUCH_EVENTS
     } else {
         0
     };
+    // Under the USBridge agent: its client may send a HID device over this stream.
+    if super::usbridge::raw_hid_offered() {
+        feature_flags |= super::usbridge::SS_FF_USBRIDGE_RAW_HID;
+    }
+    // Its pads take the controller touchpad, motion and battery.
+    if super::usbridge::pads_via_broker() {
+        feature_flags |= super::usbridge::SS_FF_CONTROLLER_TOUCH_EVENTS;
+    }
     let (supported, requested) = enc_flags(gs_encryption_offer());
     let mut lines: Vec<String> = vec![
         format!("a=x-ss-general.featureFlags:{feature_flags}"),
@@ -1395,6 +1403,9 @@ mod tests {
     fn describe_advertises_codecs_and_surround() {
         let h264_only = describe_sdp(super::super::SCM_H264);
         assert!(!h264_only.contains("AAAAAU") && !h264_only.contains("AV1/90000"));
+        assert!(!h264_only.contains("PYROWAVE/90000"), "PyroWave only when the bit is set");
+        let pyrowave = describe_sdp(super::super::SCM_H264 | super::super::SCM_PYROWAVE);
+        assert!(pyrowave.contains("a=rtpmap:99 PYROWAVE/90000"), "PyroWave indicator");
         let sdp = describe_sdp(
             super::super::SCM_H264 | super::super::SCM_HEVC | super::super::SCM_AV1_MAIN8,
         );
