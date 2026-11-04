@@ -626,7 +626,6 @@ namespace platf::virtualhid {
 
   std::vector<supported_gamepad_t> supported_gamepads(
     lvh::Runtime *runtime,
-    const bool fallback_vigem_available,
     const bool virtualhid_licensed,
     const bool require_license
   ) {
@@ -643,14 +642,13 @@ namespace platf::virtualhid {
     } else if (!license_valid) {
       reason = "gamepads.virtualhid-license-invalid";
     }
-    const auto auto_enabled = libvirtualhid_available || fallback_vigem_available;
+    const auto auto_enabled = libvirtualhid_available;
     std::vector gamepads {
       supported_gamepad_t {"auto", auto_enabled, auto_enabled ? "" : reason},
     };
 
     for (const auto &profile : gamepad_profiles) {
-      const auto fallback_supported = fallback_vigem_available && (profile.name == "x360"sv || profile.name == "ds4"sv);
-      const auto enabled = libvirtualhid_available || fallback_supported;
+      const auto enabled = libvirtualhid_available;
       gamepads.emplace_back(std::string {profile.name}, enabled, enabled ? "" : reason);
     }
 
@@ -668,24 +666,8 @@ namespace platf::virtualhid {
     const std::string_view gamepad_driver,
     const bool virtualhid_licensed
   ) {
-    return gamepad_driver != config::GAMEPAD_DRIVER_VIGEMBUS && gamepad_driver != config::GAMEPAD_DRIVER_NONE && capabilities.supports_gamepad &&
+    return gamepad_driver != config::GAMEPAD_DRIVER_NONE && capabilities.supports_gamepad &&
            (!capabilities.requires_installed_driver || virtualhid_licensed);
-  }
-
-  bool should_try_vigembus_fallback(
-    const std::string_view configured_gamepad,
-    const bool virtualhid_selected,
-    const std::string_view gamepad_driver
-  ) {
-    if (gamepad_driver == config::GAMEPAD_DRIVER_VIRTUALHID || gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
-      return false;
-    }
-    if (gamepad_driver == config::GAMEPAD_DRIVER_VIGEMBUS || !virtualhid_selected) {
-      return true;
-    }
-    return configured_gamepad == "auto"sv ||
-           configured_gamepad == "x360"sv ||
-           configured_gamepad == "ds4"sv;
   }
 
   int alloc_gamepad(input_context_t &context, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue) {
@@ -1149,7 +1131,6 @@ namespace platf {
   virtualhid::client_context_t &virtualhid::get_client_context(client_input_t *input) {
     return static_cast<client_input_raw_t *>(input)->virtualhid;
   }
-#endif
 
   void move_mouse(input_t &input, int deltaX, int deltaY) {
     virtualhid::move_mouse(virtualhid::get_input_context(input), deltaX, deltaY);
@@ -1191,7 +1172,6 @@ namespace platf {
     virtualhid::pen_update(virtualhid::get_client_context(input), touch_port, pen);
   }
 
-#ifndef _WIN32
   int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue) {
     return virtualhid::alloc_gamepad(virtualhid::get_input_context(input), id, metadata, std::move(feedback_queue));
   }

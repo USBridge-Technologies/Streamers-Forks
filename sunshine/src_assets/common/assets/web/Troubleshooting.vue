@@ -71,8 +71,8 @@
         </div>
       </div>
     </div>
-    <!-- Virtual gamepad broker and license -->
-    <div class="card my-4 virtual-gamepad-card" v-if="platform === 'windows' || platform === 'macos'">
+    <!-- Virtual gamepad broker and license. usbridge: macOS only; on Windows the pads are the USBridge USB broker's. -->
+    <div class="card my-4 virtual-gamepad-card" v-if="platform === 'macos'">
       <div class="card-body">
         <header class="virtual-gamepad-hero">
           <div class="virtual-gamepad-heading-icon" aria-hidden="true">
@@ -81,12 +81,6 @@
           <div>
             <h2 id="virtualhid" class="mb-1">{{ $t('troubleshooting.virtual_gamepad') }}</h2>
             <p class="mb-0">{{ $t(virtualInputDescriptionKey) }}</p>
-            <RouterLink v-if="platform === 'windows' && gamepadDriver === 'vigembus'"
-               class="btn btn-primary mt-3"
-               to="/config#gamepad_driver">
-              <gamepad-2 :size="18" class="icon"></gamepad-2>
-              {{ $t('troubleshooting.change_gamepad_driver') }}
-            </RouterLink>
           </div>
         </header>
 
@@ -193,35 +187,6 @@
                   <td class="driver-download-column">
                     <a class="btn btn-outline-primary driver-download-button"
                        :href="virtualhidRelease.url"
-                       target="_blank"
-                       rel="noopener noreferrer">
-                      <download :size="17"></download>
-                      {{ $t('troubleshooting.driver_download') }}
-                    </a>
-                  </td>
-                </tr>
-                <tr id="vigembus" v-if="showVigembus">
-                  <th scope="row">{{ $t('troubleshooting.vigembus_driver') }}</th>
-                  <td>{{ driverVersion(vigembus) }}</td>
-                  <td>
-                    <div class="driver-release-state driver-release-neutral">
-                      <alert-circle :size="17"></alert-circle>
-                      <span>{{ $t('troubleshooting.driver_release_eol') }}</span>
-                    </div>
-                  </td>
-                  <td>{{ vigembus.supported_versions }}</td>
-                  <td>
-                    <span class="status-icon driver-status-icon" :class="driverStatusClass(vigembus)"
-                          :title="driverStatusText(vigembus)">
-                      <alert-circle v-if="!vigembus.installed" :size="20" aria-hidden="true"></alert-circle>
-                      <check-circle v-else-if="vigembus.version_compatible" :size="20" aria-hidden="true"></check-circle>
-                      <x-circle v-else :size="20" aria-hidden="true"></x-circle>
-                      <span class="visually-hidden">{{ driverStatusText(vigembus) }}</span>
-                    </span>
-                  </td>
-                  <td class="driver-download-column">
-                    <a class="btn btn-outline-primary driver-download-button"
-                       href="https://github.com/nefarius/ViGEmBus/releases/latest"
                        target="_blank"
                        rel="noopener noreferrer">
                       <download :size="17"></download>
@@ -627,13 +592,6 @@
             url: 'https://github.com/LizardByte/libvirtualhid/releases/latest',
             error: false,
           },
-          vigembus: {
-            installed: false,
-            version: '',
-            version_compatible: false,
-            minimum_version: '',
-            supported_versions: '',
-          },
           currentLogIndex: -1,
           logLines: [],
         };
@@ -650,11 +608,7 @@
         },
 
         showVirtualhid() {
-          return this.gamepadDriver !== 'none' && (this.platform === 'macos' || this.gamepadDriver !== 'vigembus');
-        },
-
-        showVigembus() {
-          return this.platform === 'windows' && this.gamepadDriver !== 'none' && this.gamepadDriver !== 'virtualhid';
+          return this.gamepadDriver !== 'none';
         },
 
         showVirtualhidBenefits() {
@@ -670,9 +624,6 @@
           }
           if (!this.gamepadDriver) {
             return 'troubleshooting.virtual_gamepad_unset_desc';
-          }
-          if (this.gamepadDriver === 'vigembus') {
-            return 'troubleshooting.virtual_gamepad_vigembus_desc';
           }
           if (this.virtualhid.installed && this.virtualhidLicense.licensed) {
             return this.gamepadDriver === 'all' ?
@@ -1088,20 +1039,12 @@
             .then((r) => r.json())
             .then((r) => {
               const virtualhid = r.virtualhid || {};
-              const vigembus = r.vigembus || {};
               this.virtualhid = {
                 installed: virtualhid.installed || false,
                 version: virtualhid.version || '',
                 version_compatible: virtualhid.version_compatible || false,
                 minimum_version: virtualhid.minimum_version || '',
                 supported_versions: virtualhid.supported_versions || '',
-              };
-              this.vigembus = {
-                installed: vigembus.installed || false,
-                version: vigembus.version || '',
-                version_compatible: vigembus.version_compatible || false,
-                minimum_version: vigembus.minimum_version || '',
-                supported_versions: vigembus.supported_versions || '',
               };
             })
             .catch((err) => {

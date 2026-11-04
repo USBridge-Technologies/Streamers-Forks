@@ -226,7 +226,6 @@ namespace confighttp {
 #ifdef __APPLE__
   constexpr std::string_view libvirtualhid_macos_minimum_version = LIBVIRTUALHID_MACOS_MINIMUM_VERSION;  ///< Minimum supported macOS broker bundle version.
 #endif
-  constexpr auto VIGEMBUS_MINIMUM_VERSION = "1.17.0.0"sv;  ///< Minimum supported ViGEmBus fallback driver version.  // NOSONAR(cpp:S1313): not an IP address
 
   /**
    * @brief Parse one dotted driver-version component.
@@ -2135,35 +2134,6 @@ namespace confighttp {
   }
 
   /**
-   * @brief Build ViGEmBus fallback driver version and installation status.
-   *
-   * @return ViGEmBus fallback driver status JSON.
-   */
-  nlohmann::json get_vigembus_driver_status() {
-#ifdef _WIN32
-    std::string version_str;
-
-    // Check if ViGEmBus driver exists
-    std::string system_root;
-    if (!lizardbyte::common::get_env("SystemRoot", system_root)) {
-      system_root = "C:\\Windows";
-    }
-    const std::filesystem::path driver_path = std::filesystem::path(system_root) / "System32" / "drivers" / "ViGEmBus.sys";
-    const auto installed = std::filesystem::exists(driver_path);
-    if (installed) {
-      platf::getFileVersionInfo(driver_path, version_str);
-    }
-
-    auto output_tree = build_driver_status(installed, version_str, VIGEMBUS_MINIMUM_VERSION);
-#else
-    auto output_tree = build_driver_status(false, "", VIGEMBUS_MINIMUM_VERSION);
-    output_tree["error"] = "ViGEmBus is only available on Windows";
-#endif
-
-    return output_tree;
-  }
-
-  /**
    * @brief Get virtual input driver version and installation status.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -2179,7 +2149,6 @@ namespace confighttp {
 
     nlohmann::json output_tree;
     output_tree["virtualhid"] = get_virtualhid_driver_status();
-    output_tree["vigembus"] = get_vigembus_driver_status();
     send_response(response, output_tree);
   }
 
@@ -2518,10 +2487,16 @@ namespace confighttp {
     server.resource["^/assets\\/.+$"]["GET"] = getAsset;
 
     server.config.reuse_address = true;
-    server.config.address = net::get_bind_address(address_family);
+    // web_bind_address overrides bind_address for the admin UI only (e.g. "127.0.0.1" to keep it localhost-only)
+    server.config.address = config::sunshine.web_bind_address.empty()
+      ? net::get_bind_address(address_family)
+      : config::sunshine.web_bind_address;
     server.config.port = port_https;
 
-    const auto display_addr = net::get_bind_address_url_host();
+    // web_bind_address is shown as-is (IPv6 literals bracketed); otherwise fall back to upstream's bind_address-derived host.
+    const std::string display_addr = config::sunshine.web_bind_address.empty()
+      ? net::get_bind_address_url_host()
+      : (config::sunshine.web_bind_address.find(':') != std::string::npos ? "[" + config::sunshine.web_bind_address + "]" : config::sunshine.web_bind_address);
 
     auto accept_and_run = [&](auto *https_server) {
       try {

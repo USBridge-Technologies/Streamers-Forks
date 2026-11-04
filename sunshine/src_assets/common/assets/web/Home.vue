@@ -182,7 +182,6 @@
         gamepadDriver: '',
         virtualhid: null,
         virtualhidLicense: null,
-        vigembus: null,
         permissions: [],
       }
     },
@@ -211,9 +210,6 @@
           try {
             const virtualInputStatus = await fetch("./api/virtual-input/status").then((r) => r.json());
             this.virtualhid = virtualInputStatus.virtualhid;
-            if (this.platform === 'windows') {
-              this.vigembus = virtualInputStatus.vigembus;
-            }
           } catch (e) {
             console.error("Failed to fetch virtual input driver status:", e);
           }
@@ -253,43 +249,9 @@
           return this.buildMacosVirtualInputNotice();
         }
 
-        if (this.platform !== 'windows' || !this.virtualhid || !this.vigembus) {
-          return null;
-        }
-
-        const vigembusUsable = this.vigembus.installed && this.vigembus.version_compatible;
-
-        if (!this.gamepadDriver) {
-          return this.buildVirtualInputNotice(false, 'index.gamepad_driver_choice_title', [{
-            key: 'index.gamepad_driver_choice_desc',
-          }], {
-            action: 'index.choose_gamepad_driver',
-            chooseDriver: true,
-            to: '/config#gamepad_driver',
-          });
-        }
-
-        if (this.gamepadDriver === 'vigembus') {
-          return this.buildVigembusNotice(vigembusUsable);
-        }
-
-        if (this.virtualhid.installed) {
-          return this.buildInstalledVirtualhidNotice(vigembusUsable);
-        }
-
-        if (this.gamepadDriver === 'virtualhid') {
-          return this.buildVirtualInputNotice(true, 'index.virtualhid_broker_unavailable_title', [{ key: 'index.virtualhid_required_desc' }]);
-        }
-
-        if (this.controllerEnabled && !vigembusUsable) {
-          return this.buildVirtualInputNotice(true, 'index.virtual_input_unavailable_title', [{ key: 'index.virtual_input_unavailable_desc' }]);
-        }
-
-        return this.buildVirtualInputNotice(
-          false,
-          'index.virtualhid_optional_title',
-          [{ key: this.controllerEnabled ? 'index.virtualhid_optional_vigembus_desc' : 'index.virtualhid_optional_desc' }],
-        );
+        // usbridge: no notice on Windows. Its pads are the USBridge USB broker's, with no
+        // gamepad driver to choose, install or license.
+        return null;
       },
       installedVersionNotStable() {
         if (!this.githubVersion || !this.version) {
@@ -361,49 +323,6 @@
           title,
           warning,
         };
-      },
-      /**
-       * Build the notice for an explicitly selected ViGEmBus backend.
-       *
-       * @param {boolean} vigembusUsable Whether ViGEmBus is installed and compatible.
-       * @returns {object|null} Warning data, or no notice when ViGEmBus is usable.
-       */
-      buildVigembusNotice(vigembusUsable) {
-        if (!this.controllerEnabled || vigembusUsable) {
-          return null;
-        }
-        return this.buildVirtualInputNotice(true, 'index.vigembus_required_title', [{
-          key: this.vigembus.installed ? 'index.vigembus_outdated_desc' : 'index.vigembus_not_installed_desc',
-          params: { version: this.vigembus.version, supported_versions: this.vigembus.supported_versions },
-        }]);
-      },
-      /**
-       * Build the notice for an installed Virtual HID Driver.
-       *
-       * @param {boolean} vigembusUsable Whether ViGEmBus is available as a fallback.
-       * @returns {object|null} Warning or informational data, or no notice when fully usable.
-       */
-      buildInstalledVirtualhidNotice(vigembusUsable) {
-        const messages = [];
-        if (!this.virtualhid.version_compatible && !this.virtualhid.development_version) {
-          messages.push({
-            key: 'index.virtualhid_outdated_desc',
-            params: { version: this.virtualhid.version, supported_versions: this.virtualhid.supported_versions },
-          });
-        }
-        if (this.virtualhidLicense && !this.virtualhidLicense.licensed) {
-          const licenseMessageKey = this.gamepadDriver === 'all' && vigembusUsable ?
-            'index.virtualhid_license_invalid_fallback_desc' :
-            'index.virtualhid_license_invalid_desc';
-          messages.push({ key: licenseMessageKey });
-        }
-        if (messages.length) {
-          return this.buildVirtualInputNotice(true, 'index.virtualhid_attention_title', messages);
-        }
-        if (this.virtualhid.development_version) {
-          return this.buildVirtualInputNotice(false, 'index.virtualhid_development_title', [{ key: 'index.virtualhid_development_desc' }]);
-        }
-        return null;
       },
       convertMarkdownToHtml(markdown) {
         if (!markdown) return '';

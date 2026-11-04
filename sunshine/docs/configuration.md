@@ -331,12 +331,9 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Description</td>
         <td colspan="2">
-            Controls which virtual gamepad backend Sunshine may use on Windows and macOS. On Windows, the Web UI and
-            startup notification request a choice while this option is not set. If Sunshine detects an active Virtual
-            HID Broker license on Windows, it automatically sets this option to `all` when it is missing.
-            @warning{ViGEmBus has limited gamepad features, supports only Xbox 360 and DualShock 4 emulation, and has
-            reached end of life. Selecting `vigembus` also suppresses Virtual HID Broker startup notifications.}
-            @note{`all` and `vigembus` apply only to Windows. On macOS, an unset value uses Virtual HID Broker.}
+            Controls which virtual gamepad backend Sunshine may use on macOS. An unset value uses Virtual HID Broker.
+            @note{USBridge fork: on Windows there is no gamepad backend to choose. Gamepads are the USBridge USB
+            broker's, Xbox 360 controllers on usbip-win2; ViGEmBus and Virtual HID Broker are not used.}
         </td>
     </tr>
     <tr>
@@ -348,25 +345,17 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            gamepad_driver = all
+            gamepad_driver = virtualhid
             @endcode</td>
     </tr>
     <tr>
-        <td rowspan="4">Choices</td>
-        <td>all</td>
-        <td>Windows only: prefer Virtual HID Broker when it is available and licensed, with ViGEmBus as a limited fallback.</td>
-    </tr>
-    <tr>
+        <td rowspan="2">Choices</td>
         <td>virtualhid</td>
-        <td>Use Virtual HID Broker for gamepads. An active paid license is required; Windows ViGEmBus fallback is disabled.</td>
-    </tr>
-    <tr>
-        <td>vigembus</td>
-        <td>Windows only: use ViGEmBus for gamepads and hide Virtual HID Broker status and licensing details.</td>
+        <td>Use Virtual HID Broker for gamepads. An active paid license is required.</td>
     </tr>
     <tr>
         <td>none</td>
-        <td>Disable virtual gamepads on Windows and macOS without changing keyboard or mouse input. Suppress broker and driver choice notices.</td>
+        <td>Disable virtual gamepads on macOS without changing keyboard or mouse input. Suppress broker and driver choice notices.</td>
     </tr>
 </table>
 
@@ -379,7 +368,6 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             The type of gamepad to emulate on the host. Automatic selection uses the controller type
             reported by the client. If the type is unknown, Sunshine can select a PlayStation-style
             controller from reported motion or touchpad support; otherwise it uses an Xbox-style controller.
-            @note{When gamepad_driver is `vigembus` on Windows, only auto, x360, and ds4 are available.}
         </td>
     </tr>
     <tr>

@@ -240,9 +240,11 @@ namespace wl {
       return true;
     }
 
+#ifdef SUNSHINE_BUILD_VULKAN
     if (hwdevice_type == vulkan) {
       return true;
     }
+#endif
 
 #ifdef SUNSHINE_BUILD_CUDA
     if (hwdevice_type == cuda) {
@@ -868,6 +870,11 @@ namespace wl {
      * @param hwdevice_type Hardware device type requested for capture or encode.
      */
     void init_encoder_modifiers(platf::mem_type_e hwdevice_type) {
+#ifndef SUNSHINE_BUILD_VULKAN
+      // usbridge: built without the Vulkan encoder (SUNSHINE_ENABLE_VULKAN=OFF), as kmsgrab
+      // and pipewire already allow; upstream's wlroots Vulkan path assumed it.
+      (void) hwdevice_type;
+#else
       if (hwdevice_type == platf::mem_type_e::vulkan) {
 #ifdef SUNSHINE_BUILD_VULKAN
         encoder_modifiers = vk::get_supported_capture_modifiers();
@@ -879,6 +886,7 @@ namespace wl {
         }
 #endif
       }
+#endif
     }
 
     std::uint64_t sequence {};  ///< Monotonic capture sequence assigned to Wayland frames.

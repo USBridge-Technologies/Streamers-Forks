@@ -63,7 +63,7 @@ namespace platf {
     }
 
     const auto licensed = lvh::get_license_status().license.licensed();
-    gamepads = virtualhid::supported_gamepads(virtualhid::get_input_context(*input).runtime.get(), false, licensed, true);
+    gamepads = virtualhid::supported_gamepads(virtualhid::get_input_context(*input).runtime.get(), licensed, true);
     return gamepads;
   }
 

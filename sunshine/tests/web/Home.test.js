@@ -19,7 +19,6 @@ async function mountHome(platform, { developmentVersion = true, licensed = true,
       return {
         json: async () => ({
           virtualhid: { installed: true, development_version: developmentVersion, version_compatible: true },
-          vigembus: { installed: false, version_compatible: false },
         }),
       }
     }
@@ -75,7 +74,7 @@ describe('development broker home notice', () => {
     wrapper.unmount()
   })
 
-  it.each(['windows', 'macos'])('shows the development card on %s', async platform => {
+  it.each(['macos'])('shows the development card on %s', async platform => {
     const wrapper = await mountHome(platform)
 
     expect(fetch).toHaveBeenCalledWith('./api/virtual-input/status')

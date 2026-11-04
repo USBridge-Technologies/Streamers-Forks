@@ -172,7 +172,8 @@ describe('gamepad input configuration', () => {
   it.each(['freebsd', 'linux', 'macos', 'windows'])('offers all profiles and automatic detection on %s', platform => {
     const wrapper = mountInputs(platform, platform === 'windows' ? 'virtualhid' : '')
 
-    expect(wrapper.find('#gamepad_driver').exists()).toBe(platform === 'windows' || platform === 'macos')
+    // usbridge: the backend choice is macOS only; Windows pads are the USB broker's.
+    expect(wrapper.find('#gamepad_driver').exists()).toBe(platform === 'macos')
     expect(wrapper.get('#gamepad').findAll('option').map(option => option.attributes('value'))).toEqual([
       'auto', 'generic', 'x360', 'xone', 'xseries', 'ds4', 'ds5', 'switch',
     ])
@@ -193,7 +194,7 @@ describe('gamepad input configuration', () => {
     expect(disabled.find('#mouse').exists()).toBe(true)
   })
 
-  it.each(['macos', 'windows'])('offers None to disable gamepads on %s', async platform => {
+  it.each(['macos'])('offers None to disable gamepads on %s', async platform => {
     const wrapper = mountInputs(platform)
 
     const backend = wrapper.get('#gamepad_driver')
@@ -208,16 +209,5 @@ describe('gamepad input configuration', () => {
     expect(wrapper.find('#back_button_timeout').exists()).toBe(false)
     expect(wrapper.find('#keyboard').exists()).toBe(true)
     expect(wrapper.find('#mouse').exists()).toBe(true)
-  })
-
-  it('limits Windows ViGEmBus to Xbox 360 and DualShock 4', async () => {
-    const wrapper = mountInputs('windows', 'virtualhid', 'xone')
-
-    await wrapper.get('#gamepad_driver').setValue('vigembus')
-
-    expect(wrapper.get('#gamepad').findAll('option').map(option => option.attributes('value'))).toEqual([
-      'auto', 'x360', 'ds4',
-    ])
-    expect(wrapper.get('#gamepad').element.value).toBe('auto')
   })
 })
