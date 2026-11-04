@@ -6,8 +6,10 @@ name: Vibepollo Build
 # the portable zip the USBridge agent downloads: Vibepollo-Windows-x86_64-portable.zip, all
 # files under one top directory, sunshine.exe at its root.
 #
-# Windows only. The Linux KMS launcher runs a root-owned copy of Sunshine's tree and has no
-# Vibepollo equivalent, so the agent offers Vibepollo on Windows only.
+# Linux: Vibepollo-Linux-x86_64.tar.gz, the cmake install tree (usr/bin/vibepollo,
+# usr/share/vibepollo) with every non-system library bundled by linuxdeploy, built on Ubuntu
+# 22.04 like the Sunshine tarball, so it runs on any distro with glibc 2.35 or newer -- not
+# just the Arch packages upstream publishes. libva stays the host's (driver ABI).
 #
 # What is left out: the WebRTC build (libwebrtc is a separate multi-hour build, the agent's
 # clients use GameStream), the Playnite .NET plugin, the virtual display driver and its
@@ -18,11 +20,135 @@ on:
   workflow_call:
     inputs:
       platform:
-        description: 'all, windows, or none'
+        description: 'all, linux, windows, or none'
         required: true
         type: string
 
 jobs:
+  linux:
+    name: Linux x86_64
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
+    defaults:
+      run:
+        working-directory: vibepollo
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Upstream's own dependency step (gcc 14 from the toolchain PPA, cmake, the CUDA 12.9
+      # runfile into build/cuda), as its AppImage CI runs it on 22.04. libva comes from the
+      # host at run time, so only its headers are built here, the latest release, as upstream.
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository universe -y
+          sudo apt-get update -qq
+          sudo apt-get install -y libdrm-dev libgl-dev libwayland-dev libx11-xcb-dev \
+            libxcb-dri3-dev libxfixes-dev
+          chmod +x scripts/linux_build.sh
+          ./scripts/linux_build.sh --step=deps --appimage-build --ubuntu-test-repo --skip-cleanup
+
+      - name: Build latest libva
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download --archive=tar.gz --repo=intel/libva
+          tar xzf libva-*.tar.gz && rm libva-*.tar.gz
+          cd libva-*
+          ./autogen.sh --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu \
+            --enable-drm --enable-x11 --enable-glx --enable-wayland --without-legacy
+          make -j "$(nproc)"
+          sudo make install
+          cd .. && rm -rf libva-*
+
+      - name: Configure
+        env:
+          CC: gcc-14
+          CXX: g++-14
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          # As on Windows: the fork carries no upstream tags.
+          export BUILD_VERSION="2.0.1+usbridge.$(git rev-parse --short HEAD)"
+          nvcc="$(pwd)/build/cuda/bin/nvcc"
+          test -x "$nvcc"
+          cmake -B build -S . -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_WERROR=OFF \
+            -DSUNSHINE_BUILD_APPIMAGE=ON \
+            -DSUNSHINE_ASSETS_DIR=share/vibepollo \
+            -DSUNSHINE_EXECUTABLE_PATH=/usr/bin/vibepollo \
+            -DSUNSHINE_ENABLE_DRM=ON \
+            -DSUNSHINE_ENABLE_KWIN=ON \
+            -DSUNSHINE_ENABLE_PORTAL=ON \
+            -DSUNSHINE_ENABLE_WAYLAND=ON \
+            -DSUNSHINE_ENABLE_TRAY=OFF \
+            -DSUNSHINE_ENABLE_WEBRTC=OFF \
+            -DSUNSHINE_ENABLE_CUDA=ON \
+            -DSUNSHINE_REQUIRE_CUDA_PASCAL=ON \
+            -DCMAKE_CUDA_COMPILER:PATH="$nvcc" \
+            -DCMAKE_CUDA_HOST_COMPILER=gcc-14 \
+            -DSUNSHINE_PUBLISHER_NAME="usbridge_agent" \
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/itsme228/usbridge_agent" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/itsme228/usbridge_agent/issues"
+
+      - name: Build
+        run: cmake --build build --parallel "$(nproc)"
+
+      # The layout the agent expects (forkrelease.PrepareVibepollo on Linux): usr/bin/vibepollo
+      # and usr/share/vibepollo at the root of the tarball, its libraries in usr/lib.
+      - name: Install to staging and package tarball
+        run: |
+          set -euo pipefail
+          rm -rf build/cuda
+          DESTDIR="$(pwd)/staging" cmake --install build
+          test -x staging/usr/bin/vibepollo
+
+          curl -fL --progress-bar -o /tmp/linuxdeploy-x86_64.AppImage \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          chmod +x /tmp/linuxdeploy-x86_64.AppImage
+
+          desktop_file="$(find staging/usr/share/applications -name '*.desktop' | head -1)"
+          icon_file="$(find staging/usr/share/icons -name '*.svg' -o -name '*.png' | head -1)"
+          ARCH=x86_64 /tmp/linuxdeploy-x86_64.AppImage \
+            --appimage-extract-and-run \
+            --appdir staging \
+            --executable staging/usr/bin/vibepollo \
+            ${icon_file:+--icon-file "$icon_file"} \
+            ${desktop_file:+--desktop-file "$desktop_file"} \
+            --exclude-library="libva.so*" \
+            --exclude-library="libva-drm.so*" \
+            --exclude-library="libva-x11.so*" \
+            --exclude-library="libva-wayland.so*"
+
+          missing_libs="$(ldd staging/usr/bin/vibepollo 2>/dev/null | awk '/not found/ {print $1}' | grep -v '^libva' || true)"
+          if [[ -n "$missing_libs" ]]; then
+            echo "::error::vibepollo still misses shared libraries after bundling: $missing_libs"
+            exit 1
+          fi
+
+          mkdir -p artifacts
+          tar -czf artifacts/Vibepollo-Linux-x86_64.tar.gz -C staging .
+          ls -la artifacts
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vibepollo-Linux-x86_64.tar.gz
+          path: vibepollo/artifacts/Vibepollo-Linux-x86_64.tar.gz
+
   windows:
     name: Windows x86_64
     if: inputs.platform == 'all' || inputs.platform == 'windows'

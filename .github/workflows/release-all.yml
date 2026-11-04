@@ -58,6 +58,7 @@ on:
         type: choice
         options:
           - all
+          - linux
           - windows
           - none
         default: all
@@ -158,7 +159,9 @@ jobs:
 
             Vibepollo fork (Nonary/Vibepollo): USB devices handed to the USBridge USB
             broker (gamepads, raw HID), web_bind_address, the client's cursor setting.
-            Windows x64 portable zip; no virtual display driver or Playnite plugin.
+            Windows x64 portable zip (no virtual display driver or Playnite plugin) and a
+            Linux x86_64 tarball built on Ubuntu 22.04 with its libraries bundled, for any
+            distro with glibc 2.35+.
           files: |
             artifacts/Sunshine-macOS-arm64.dmg
             artifacts/Sunshine-Windows-x86_64-portable.zip
@@ -166,6 +169,7 @@ jobs:
             artifacts/punktfunk-host-Linux-x86_64.tar.gz
             artifacts/punktfunk-host-Windows-x64.zip
             artifacts/Vibepollo-Windows-x86_64-portable.zip
+            artifacts/Vibepollo-Linux-x86_64.tar.gz
             artifacts/manifest.json
             artifacts/manifest.json.sig
           fail_on_unmatched_files: false
