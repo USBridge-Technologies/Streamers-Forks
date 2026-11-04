@@ -15,7 +15,7 @@
 //! desktop delivers a `CursorRegen` frame so the pointer never freezes.
 
 use pf_frame::dxgi::{make_device, D3d11Frame};
-use crate::{CapturedFrame, Capturer, FramePayload, PixelFormat};
+use crate::{CapturedFrame, Capturer, Feed, FirstFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{FrameOrigin, Provenance};
 use std::sync::Arc;
@@ -427,12 +427,7 @@ impl DxgiDupCapturer {
     }
 }
 
-impl Capturer for DxgiDupCapturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        let budget = if self.last.is_none() { FIRST_FRAME_BUDGET } else { Duration::from_secs(2) };
-        self.next_frame_within(budget)
-    }
-
+impl DxgiDupCapturer {
     /// The next new frame, waiting up to `budget`; past that a repeat of the newest one
     /// when there is one (a static desktop presents nothing).
     fn next_frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
@@ -454,13 +449,40 @@ impl Capturer for DxgiDupCapturer {
         }
     }
 
-    /// The encode loop then follows the desktop's presents instead of its own tick, whose
-    /// phase drifts against vsync: on a fixed 120 Hz tick about a sixth of the 120 new images
-    /// a second arrived two per tick and only the newest was sent (measured: 99 unique/s).
-    fn supports_arrival_wait(&self) -> bool {
-        true
+    /// The capture's keepalive (the MttVDD monitor's lease), handed back on a failed open.
+    pub(crate) fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
+        self.keepalive.take()
+    }
+}
+
+impl Capturer for DxgiDupCapturer {
+    fn next_frame(&mut self, budget: FirstFrame) -> Result<CapturedFrame> {
+        let budget = match budget {
+            FirstFrame::Within(d) | FirstFrame::Provisional(d) => d,
+            FirstFrame::Default if self.last.is_none() => FIRST_FRAME_BUDGET,
+            FirstFrame::Default => Duration::from_secs(2),
+        };
+        self.next_frame_within(budget)
     }
 
+    fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
+        // The parked frame, or anything newer, without waiting.
+        let mut newest = self.pending.take();
+        while let Some(f) = self.acquire(0)? {
+            newest = Some(f);
+        }
+        Ok(newest)
+    }
+
+    /// A feed: the encode loop then follows the desktop's presents instead of its own tick,
+    /// whose phase drifts against vsync (on a fixed 120 Hz tick about a sixth of the 120 new
+    /// images a second arrived two per tick and only the newest was sent: 99 unique/s).
+    fn feed(&mut self) -> Option<&mut dyn Feed> {
+        Some(self)
+    }
+}
+
+impl Feed for DxgiDupCapturer {
     fn wait_arrival(&mut self, deadline: Instant) {
         while self.pending.is_none() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -478,16 +500,8 @@ impl Capturer for DxgiDupCapturer {
         }
     }
 
-    fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        // The parked frame, or anything newer, without waiting.
-        let mut newest = self.pending.take();
-        while let Some(f) = self.acquire(0)? {
-            newest = Some(f);
-        }
-        Ok(newest)
-    }
-
     fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
         self.keepalive.take()
     }
 }
+

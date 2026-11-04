@@ -63,6 +63,9 @@ bitflags = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 pf-paths-win = { path = "../pf-paths-win" }
+# USBridge: the DXGI duplication source (src/windows/dxgi_dup.rs) blends the pointer with its
+# CursorBlendPass.
+pf-encode-win = { path = "../pf-encode-win" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
