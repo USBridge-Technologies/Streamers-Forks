@@ -67,7 +67,7 @@
 	branch = master
 [submodule "vibepollo/third-party/build-deps"]
 	path = vibepollo/third-party/build-deps
-	url = https://github.com/LizardByte/build-deps.git
+	url = https://github.com/Nonary/build-deps.git
 	branch = master
 [submodule "vibepollo/third-party/doxyconfig"]
 	path = vibepollo/third-party/doxyconfig
@@ -110,7 +110,7 @@
 	branch = master
 [submodule "vibepollo/third-party/Simple-Web-Server"]
 	path = vibepollo/third-party/Simple-Web-Server
-	url = https://github.com/LizardByte-infrastructure/Simple-Web-Server.git
+	url = https://github.com/Nonary/Simple-Web-Server.git
 	branch = master
 [submodule "vibepollo/third-party/TPCircularBuffer"]
 	path = vibepollo/third-party/TPCircularBuffer
