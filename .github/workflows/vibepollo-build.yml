@@ -9,7 +9,8 @@ name: Vibepollo Build
 # Linux: Vibepollo-Linux-x86_64.tar.gz, the cmake install tree (usr/bin/vibepollo,
 # usr/share/vibepollo) with every non-system library bundled by linuxdeploy, built on Ubuntu
 # 22.04 like the Sunshine tarball, so it runs on any distro with glibc 2.35 or newer -- not
-# just the Arch packages upstream publishes. libva stays the host's (driver ABI).
+# just the Arch packages upstream publishes. libva stays the host's (driver ABI). No NVIDIA
+# TrueHDR: its pinned runtime (cuDNN, NPP, VFX) is several hundred MB.
 #
 # What is left out: the WebRTC build (libwebrtc is a separate multi-hour build, the agent's
 # clients use GameStream), the Playnite .NET plugin, the virtual display driver and its
@@ -96,6 +97,7 @@ jobs:
             -DSUNSHINE_ENABLE_WAYLAND=ON \
             -DSUNSHINE_ENABLE_TRAY=OFF \
             -DSUNSHINE_ENABLE_WEBRTC=OFF \
+            -DSUNSHINE_ENABLE_NV_TRUEHDR=OFF \
             -DSUNSHINE_ENABLE_CUDA=ON \
             -DSUNSHINE_REQUIRE_CUDA_PASCAL=ON \
             -DCMAKE_CUDA_COMPILER:PATH="$nvcc" \
