@@ -9,10 +9,16 @@
 #include <Windows.h>
 
 // standard includes
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <mutex>
 #include <thread>
 #include <vector>
+
+// lib includes
+#include <ViGEm/Client.h>
 
 // local includes
 #include "keylayout.h"
@@ -21,11 +27,12 @@
 #include "src/globals.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
-#include "src/usbridge.h"
+#include "src/steam_controller_protocol.h"
 #include "vhf_gamepad.h"
 #include "dualsense_usbip_gamepad.h"
 #include "dualsense_usbip_gamepad_policy.h"
 #include "vhf_gamepad_policy.h"
+#include "vhf_keyboard_mouse_policy.h"
 
 #ifdef __MINGW32__
 // DECLARE_HANDLE(HSYNTHETICPOINTERDEVICE);
@@ -43,23 +50,476 @@ namespace platf {
     65535
   };
 
+  using client_t = util::safe_ptr<_VIGEM_CLIENT_T, vigem_free>;
+  using target_t = util::safe_ptr<_VIGEM_TARGET_T, vigem_target_free>;
+
+  void CALLBACK x360_notify(
+    client_t::pointer client,
+    target_t::pointer target,
+    std::uint8_t largeMotor,
+    std::uint8_t smallMotor,
+    std::uint8_t /* led_number */,
+    void *userdata
+  );
+
+  void CALLBACK ds4_notify(
+    client_t::pointer client,
+    target_t::pointer target,
+    std::uint8_t largeMotor,
+    std::uint8_t smallMotor,
+    DS4_LIGHTBAR_COLOR /* led_color */,
+    void *userdata
+  );
+
+  struct gp_touch_context_t {
+    uint8_t pointerIndex;
+    uint16_t x;
+    uint16_t y;
+  };
+
+  struct gamepad_context_t {
+    target_t gp;
+    feedback_queue_t feedback_queue;
+
+    union {
+      XUSB_REPORT x360;
+      DS4_REPORT_EX ds4;
+    } report;
+
+    // Map from pointer ID to pointer index
+    std::map<uint32_t, uint8_t> pointer_id_map;
+    uint8_t available_pointers;
+
+    uint8_t client_relative_index;
+
+    thread_pool_util::ThreadPool::task_id_t repeat_task {};
+    std::chrono::steady_clock::time_point last_report_ts;
+    std::chrono::steady_clock::time_point last_accel_motion_ts;
+    std::chrono::steady_clock::time_point last_gyro_motion_ts;
+    std::chrono::steady_clock::time_point last_motion_request_ts;
+
+    gamepad_feedback_msg_t last_rumble;
+    gamepad_feedback_msg_t last_rgb_led;
+  };
+
+  constexpr float EARTH_G = 9.80665f;
+  constexpr float DS4_MAX_ACCEL_MPS2 = 200.0f;
+  constexpr float DS4_MAX_GYRO_DPS = 4000.0f;
+  constexpr auto DS4_KEEPALIVE_INTERVAL = 100ms;
+  constexpr auto DS4_MOTION_STALE_TIMEOUT = 750ms;
+  constexpr auto DS4_MOTION_RE_REQUEST_AFTER = 2s;
+  constexpr auto DS4_MOTION_RE_REQUEST_COOLDOWN = 5s;
+
+#define MPS2_TO_DS4_ACCEL(x) (int32_t) (((x) / EARTH_G) * 8192)
+#define DPS_TO_DS4_GYRO(x) (int32_t) ((x) * (1024 / 64))
+
+#define APPLY_CALIBRATION(val, bias, scale) (int32_t) (((float) (val) + (bias)) / (scale))
+
+  constexpr DS4_TOUCH ds4_touch_unused = {
+    .bPacketCounter = 0,
+    .bIsUpTrackingNum1 = 0x80,
+    .bTouchData1 = {0x00, 0x00, 0x00},
+    .bIsUpTrackingNum2 = 0x80,
+    .bTouchData2 = {0x00, 0x00, 0x00},
+  };
+
+  // See https://github.com/ViGEm/ViGEmBus/blob/22835473d17fbf0c4d4bb2f2d42fd692b6e44df4/sys/Ds4Pdo.cpp#L153-L164
+  constexpr DS4_REPORT_EX ds4_report_init_ex = {
+    {{.bThumbLX = 0x80,
+      .bThumbLY = 0x80,
+      .bThumbRX = 0x80,
+      .bThumbRY = 0x80,
+      .wButtons = DS4_BUTTON_DPAD_NONE,
+      .bSpecial = 0,
+      .bTriggerL = 0,
+      .bTriggerR = 0,
+      .wTimestamp = 0,
+      .bBatteryLvl = 0xFF,
+      .wGyroX = 0,
+      .wGyroY = 0,
+      .wGyroZ = 0,
+      .wAccelX = 0,
+      .wAccelY = 0,
+      .wAccelZ = 0,
+      ._bUnknown1 = {0x00, 0x00, 0x00, 0x00, 0x00},
+      .bBatteryLvlSpecial = 0x1A,  // Wired - Full battery
+      ._bUnknown2 = {0x00, 0x00},
+      .bTouchPacketsN = 1,
+      .sCurrentTouch = ds4_touch_unused,
+      .sPreviousTouch = {ds4_touch_unused, ds4_touch_unused}}}
+  };
+
+  /**
+   * @brief Updates the DS4 input report with the provided motion data.
+   * @details Acceleration is in m/s^2 and gyro is in deg/s.
+   * @param gamepad The gamepad to update.
+   * @param motion_type The type of motion data.
+   * @param x X component of motion.
+   * @param y Y component of motion.
+   * @param z Z component of motion.
+   */
+  static void ds4_update_motion(gamepad_context_t &gamepad, uint8_t motion_type, float x, float y, float z) {
+    auto &report = gamepad.report.ds4.Report;
+
+    x = std::isfinite(x) ? x : 0.0f;
+    y = std::isfinite(y) ? y : 0.0f;
+    z = std::isfinite(z) ? z : 0.0f;
+
+    // Use int32 to process this data, so we can clamp if needed.
+    int32_t intX;
+    int32_t intY;
+    int32_t intZ;
+
+    switch (motion_type) {
+      case LI_MOTION_TYPE_ACCEL:
+        x = std::clamp(x, -DS4_MAX_ACCEL_MPS2, DS4_MAX_ACCEL_MPS2);
+        y = std::clamp(y, -DS4_MAX_ACCEL_MPS2, DS4_MAX_ACCEL_MPS2);
+        z = std::clamp(z, -DS4_MAX_ACCEL_MPS2, DS4_MAX_ACCEL_MPS2);
+
+        // Convert to the DS4's accelerometer scale
+        intX = MPS2_TO_DS4_ACCEL(x);
+        intY = MPS2_TO_DS4_ACCEL(y);
+        intZ = MPS2_TO_DS4_ACCEL(z);
+
+        // Apply the inverse of ViGEmBus's calibration data
+        intX = APPLY_CALIBRATION(intX, -297, 1.010796f);
+        intY = APPLY_CALIBRATION(intY, -42, 1.014614f);
+        intZ = APPLY_CALIBRATION(intZ, -512, 1.024768f);
+        break;
+      case LI_MOTION_TYPE_GYRO:
+        x = std::clamp(x, -DS4_MAX_GYRO_DPS, DS4_MAX_GYRO_DPS);
+        y = std::clamp(y, -DS4_MAX_GYRO_DPS, DS4_MAX_GYRO_DPS);
+        z = std::clamp(z, -DS4_MAX_GYRO_DPS, DS4_MAX_GYRO_DPS);
+
+        // Convert to the DS4's gyro scale
+        intX = DPS_TO_DS4_GYRO(x);
+        intY = DPS_TO_DS4_GYRO(y);
+        intZ = DPS_TO_DS4_GYRO(z);
+
+        // Apply the inverse of ViGEmBus's calibration data
+        intX = APPLY_CALIBRATION(intX, 1, 0.977596f);
+        intY = APPLY_CALIBRATION(intY, 0, 0.972370f);
+        intZ = APPLY_CALIBRATION(intZ, 0, 0.971550f);
+        break;
+      default:
+        return;
+    }
+
+    // Clamp the values to the range of the data type
+    intX = std::clamp(intX, INT16_MIN, INT16_MAX);
+    intY = std::clamp(intY, INT16_MIN, INT16_MAX);
+    intZ = std::clamp(intZ, INT16_MIN, INT16_MAX);
+
+    // Populate the report
+    switch (motion_type) {
+      case LI_MOTION_TYPE_ACCEL:
+        report.wAccelX = (int16_t) intX;
+        report.wAccelY = (int16_t) intY;
+        report.wAccelZ = (int16_t) intZ;
+        break;
+      case LI_MOTION_TYPE_GYRO:
+        report.wGyroX = (int16_t) intX;
+        report.wGyroY = (int16_t) intY;
+        report.wGyroZ = (int16_t) intZ;
+        break;
+      default:
+        return;
+    }
+  }
+
+  class vigem_t {
+  private:
+    bool driver_available {false};
+    std::array<std::atomic_bool, MAX_GAMEPADS> first_rumble_callback_logged {};
+
+  public:
+    // Set before init() so the ViGEmBus diagnostics can tell "no gamepad support at all" from
+    // "a different driver is providing it".
+    bool vhf_gamepad_available {false};
+
+    [[nodiscard]] bool available() const noexcept {
+      return driver_available;
+    }
+
+    int init() {
+      // Probe ViGEm during startup to see if we can successfully attach gamepads. The web UI exposes a
+      // dedicated health endpoint and warning banner when ViGEm is missing, so avoid fatal logs here.
+      client_t client {vigem_alloc()};
+      VIGEM_ERROR status = vigem_connect(client.get());
+      if (!VIGEM_SUCCESS(status)) {
+        // Only a problem if nothing else can provide a gamepad. With Vibepollo's own driver
+        // present, ViGEmBus is simply not in use, and warning about it sends people chasing a
+        // dependency they no longer need.
+        if (vhf_gamepad_available) {
+          BOOST_LOG(info) << "ViGEmBus is not installed; the Vibepollo virtual gamepad driver is available."sv;
+        } else {
+          BOOST_LOG(warning) << "ViGEmBus is not installed or running; gamepad emulation will be unavailable until installed."sv;
+        }
+      } else {
+        driver_available = true;
+        vigem_disconnect(client.get());
+      }
+
+      gamepads.resize(MAX_GAMEPADS);
+
+      return 0;
+    }
+
+    /**
+     * @brief Attaches a new gamepad.
+     * @param id The gamepad ID.
+     * @param feedback_queue The queue for posting messages back to the client.
+     * @param gp_type The type of gamepad.
+     * @return 0 on success.
+     */
+    int alloc_gamepad_internal(const gamepad_id_t &id, feedback_queue_t &feedback_queue, VIGEM_TARGET_TYPE gp_type) {
+      auto &gamepad = gamepads[id.globalIndex];
+      assert(!gamepad.gp);
+      first_rumble_callback_logged[id.globalIndex].store(false, std::memory_order_relaxed);
+
+      gamepad.client_relative_index = id.clientRelativeIndex;
+      gamepad.last_report_ts = std::chrono::steady_clock::now();
+      gamepad.last_accel_motion_ts = gamepad.last_report_ts;
+      gamepad.last_gyro_motion_ts = gamepad.last_report_ts;
+      gamepad.last_motion_request_ts = gamepad.last_report_ts;
+
+      // Establish a connect to the ViGEm driver if we don't have one yet
+      if (!client) {
+        BOOST_LOG(debug) << "Connecting to ViGEmBus driver"sv;
+        client.reset(vigem_alloc());
+
+        auto status = vigem_connect(client.get());
+        if (!VIGEM_SUCCESS(status)) {
+          BOOST_LOG(warning) << "Couldn't setup connection to ViGEm for gamepad support ["sv << util::hex(status).to_string_view() << ']';
+          client.reset();
+          return -1;
+        }
+      }
+
+      if (gp_type == Xbox360Wired) {
+        gamepad.gp.reset(vigem_target_x360_alloc());
+        XUSB_REPORT_INIT(&gamepad.report.x360);
+      } else {
+        gamepad.gp.reset(vigem_target_ds4_alloc());
+
+        // There is no equivalent DS4_REPORT_EX_INIT()
+        gamepad.report.ds4 = ds4_report_init_ex;
+
+        // Set initial accelerometer and gyro state
+        ds4_update_motion(gamepad, LI_MOTION_TYPE_ACCEL, 0.0f, EARTH_G, 0.0f);
+        ds4_update_motion(gamepad, LI_MOTION_TYPE_GYRO, 0.0f, 0.0f, 0.0f);
+
+        // Request motion events from the client at 100 Hz (coalesced: one pending request per type)
+        static_cast<void>(raise_gamepad_feedback(*feedback_queue, gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_ACCEL, 100)));
+        static_cast<void>(raise_gamepad_feedback(*feedback_queue, gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_GYRO, 100)));
+        gamepad.last_motion_request_ts = std::chrono::steady_clock::now();
+
+        // We support pointer index 0 and 1
+        gamepad.available_pointers = 0x3;
+      }
+
+      auto status = vigem_target_add(client.get(), gamepad.gp.get());
+      if (!VIGEM_SUCCESS(status)) {
+        BOOST_LOG(error) << "Couldn't add Gamepad to ViGEm connection ["sv << util::hex(status).to_string_view() << ']';
+
+        return -1;
+      }
+
+      gamepad.feedback_queue = std::move(feedback_queue);
+
+      if (gp_type == Xbox360Wired) {
+        status = vigem_target_x360_register_notification(client.get(), gamepad.gp.get(), x360_notify, this);
+      } else {
+        status = vigem_target_ds4_register_notification(client.get(), gamepad.gp.get(), ds4_notify, this);
+      }
+
+      if (!VIGEM_SUCCESS(status)) {
+        BOOST_LOG(warning) << "Couldn't register notifications for rumble support ["sv << util::hex(status).to_string_view() << ']';
+      }
+
+      return 0;
+    }
+
+    /**
+     * @brief Detaches the specified gamepad
+     * @param nr The gamepad.
+     */
+    void free_target(int nr) {
+      auto &gamepad = gamepads[nr];
+
+      if (gamepad.repeat_task) {
+        task_pool.cancel(gamepad.repeat_task);
+        gamepad.repeat_task = nullptr;
+      }
+
+      if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
+        auto status = vigem_target_remove(client.get(), gamepad.gp.get());
+        if (!VIGEM_SUCCESS(status)) {
+          BOOST_LOG(warning) << "Couldn't detach gamepad from ViGEm ["sv << util::hex(status).to_string_view() << ']';
+        }
+      }
+
+      gamepad.gp.reset();
+
+      // Disconnect from ViGEm if we just removed the last gamepad
+      bool disconnect = true;
+      for (auto &gamepad : gamepads) {
+        if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
+          disconnect = false;
+          break;
+        }
+      }
+      if (disconnect) {
+        BOOST_LOG(debug) << "Disconnecting from ViGEmBus driver"sv;
+        vigem_disconnect(client.get());
+        client.reset();
+      }
+    }
+
+    /**
+     * @brief Pass rumble data back to the client.
+     * @param target The gamepad.
+     * @param largeMotor The large motor.
+     * @param smallMotor The small motor.
+     */
+    void rumble(target_t::pointer target, std::uint8_t largeMotor, std::uint8_t smallMotor) {
+      // config::input.forward_rumble - Default is true so ignore rumble messages when false
+      if (config::input.forward_rumble == false) {
+        // Do nothing; just return
+        return;
+      }
+      for (int x = 0; x < gamepads.size(); ++x) {
+        auto &gamepad = gamepads[x];
+
+        if (gamepad.gp.get() == target) {
+          if (!first_rumble_callback_logged[x].exchange(true, std::memory_order_relaxed)) {
+            BOOST_LOG(info) << "ViGEm rumble output callback observed for gamepad slot "sv << x;
+          }
+
+          // Convert from 8-bit to 16-bit values
+          uint16_t normalizedLargeMotor = largeMotor << 8;
+          uint16_t normalizedSmallMotor = smallMotor << 8;
+
+          // We have to use the client-relative index when communicating back to the client.
+          // Coalesced admission, deduplicated against the last rumble this backend delivered; the
+          // cache follows acceptance, so a message the mailbox refused is retried by the next
+          // callback instead of being suppressed as already delivered.
+          gamepad_feedback_msg_t msg = gamepad_feedback_msg_t::make_rumble(
+            gamepad.client_relative_index,
+            normalizedLargeMotor,
+            normalizedSmallMotor
+          );
+          msg.from_vigem = true;
+          static_cast<void>(raise_gamepad_feedback_deduped(*gamepad.feedback_queue, msg, gamepad.last_rumble));
+          return;
+        }
+      }
+    }
+
+    /**
+     * @brief Pass RGB LED data back to the client.
+     * @param target The gamepad.
+     * @param r The red channel.
+     * @param g The red channel.
+     * @param b The red channel.
+     */
+    void set_rgb_led(target_t::pointer target, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+      for (int x = 0; x < gamepads.size(); ++x) {
+        auto &gamepad = gamepads[x];
+
+        if (gamepad.gp.get() == target) {
+          // We have to use the client-relative index when communicating back to the client.
+          // Coalesced admission, deduplicated against the last LED state this backend delivered;
+          // the cache follows acceptance (see raise_gamepad_feedback_deduped).
+          gamepad_feedback_msg_t msg = gamepad_feedback_msg_t::make_rgb_led(gamepad.client_relative_index, r, g, b);
+          static_cast<void>(raise_gamepad_feedback_deduped(*gamepad.feedback_queue, msg, gamepad.last_rgb_led));
+          return;
+        }
+      }
+    }
+
+    /**
+     * @brief vigem_t destructor.
+     */
+    ~vigem_t() {
+      if (client) {
+        for (auto &gamepad : gamepads) {
+          if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
+            auto status = vigem_target_remove(client.get(), gamepad.gp.get());
+            if (!VIGEM_SUCCESS(status)) {
+              BOOST_LOG(warning) << "Couldn't detach gamepad from ViGEm ["sv << util::hex(status).to_string_view() << ']';
+            }
+          }
+        }
+
+        vigem_disconnect(client.get());
+      }
+    }
+
+    std::vector<gamepad_context_t> gamepads;
+
+    client_t client;
+  };
+
+  void CALLBACK x360_notify(
+    client_t::pointer client,
+    target_t::pointer target,
+    std::uint8_t largeMotor,
+    std::uint8_t smallMotor,
+    std::uint8_t /* led_number */,
+    void *userdata
+  ) {
+    BOOST_LOG(verbose)
+      << "largeMotor: "sv << (int) largeMotor << std::endl
+      << "smallMotor: "sv << (int) smallMotor;
+
+    task_pool.push(&vigem_t::rumble, (vigem_t *) userdata, target, largeMotor, smallMotor);
+  }
+
+  void CALLBACK ds4_notify(
+    client_t::pointer client,
+    target_t::pointer target,
+    std::uint8_t largeMotor,
+    std::uint8_t smallMotor,
+    DS4_LIGHTBAR_COLOR led_color,
+    void *userdata
+  ) {
+    BOOST_LOG(verbose)
+      << "largeMotor: "sv << (int) largeMotor << std::endl
+      << "smallMotor: "sv << (int) smallMotor << std::endl
+      << "LED: "sv << util::hex(led_color.Red).to_string_view() << ' '
+      << util::hex(led_color.Green).to_string_view() << ' '
+      << util::hex(led_color.Blue).to_string_view() << std::endl;
+
+    task_pool.push(&vigem_t::rumble, (vigem_t *) userdata, target, largeMotor, smallMotor);
+    task_pool.push(&vigem_t::set_rgb_led, (vigem_t *) userdata, target, led_color.Red, led_color.Green, led_color.Blue);
+  }
+
   /**
    * @brief The virtual gamepad driver backing a given gamepad slot.
    */
   enum class gamepad_backend_e {
     none,
+    vigem,
     vhf,
     usbip
   };
 
   struct input_raw_t {
     ~input_raw_t() {
+      delete vigem;
       delete vhf;
       delete usbip;
     }
 
+    vigem_t *vigem;
     vhf_gamepad_t *vhf;
     usbip_gamepad_t *usbip;
+    bool vhf_keyboard_mouse {false};
+    std::uint8_t vhf_held_buttons {0};
+    // Pin a key's physical usage (or its Win32 fallback) from press to release,
+    // even if the active keyboard layout changes while it is held.
+    vhf_keyboard_mouse::keyboard_routes vhf_key_routes {};
 
     // Slots are allocated one at a time, so both backends can own gamepads simultaneously.
     std::array<gamepad_backend_e, MAX_GAMEPADS> gamepad_backend {};
@@ -71,7 +531,7 @@ namespace platf {
 
   /**
    * @brief Reports whether Vibepollo's own virtual gamepad driver is the configured backend.
-   * @return `true` when one of the VHF profiles is selected explicitly.
+   * @return `true` when the VHF driver should be used instead of ViGEmBus.
    */
   static bool vhf_gamepad_selected() {
     return config::input.gamepad == "vhf"sv ||
@@ -79,7 +539,8 @@ namespace platf {
            config::input.gamepad == "vhf_xbox_one"sv ||
            config::input.gamepad == "vhf_ds4"sv ||
            config::input.gamepad == "vhf_ds5"sv ||
-           config::input.gamepad == "vhf_switch"sv;
+           config::input.gamepad == "vhf_switch"sv ||
+           config::input.gamepad == "vhf_steam"sv;
   }
 
   /**
@@ -115,16 +576,27 @@ namespace platf {
     input_t result {new input_raw_t {}};
     auto &raw = *(input_raw_t *) result.get();
 
-    // usbridge: no ViGEmBus. Under the USBridge agent the pads are the USB broker's (usbip-win2,
-    // see src/usbridge.cpp); without it Vibepollo's own drivers are the only ones left.
+    // Probe the VHF driver first: whether it is available decides how loudly a missing
+    // ViGEmBus should be reported.
     raw.vhf = new vhf_gamepad_t {};
     const bool vhf_available = raw.vhf->probe();
+    if (config::input.keyboard_mouse_backend == "auto"sv ||
+        config::input.keyboard_mouse_backend == "vhf"sv) {
+      raw.vhf_keyboard_mouse = raw.vhf->open_keyboard_mouse();
+    }
 
     raw.usbip = new usbip_gamepad_t {};
     const bool usbip_available = raw.usbip->probe();
 
-    if (!vhf_available && !usbip_available) {
-      BOOST_LOG(info) << "No virtual gamepad driver; controllers need the USBridge USB broker"sv;
+    raw.vigem = new vigem_t {};
+    raw.vigem->vhf_gamepad_available = vhf_available &&
+                                         (config::input.gamepad == "auto" || vhf_gamepad_selected());
+    raw.vigem->vhf_gamepad_available = raw.vigem->vhf_gamepad_available ||
+                                     (usbip_available && (config::input.gamepad == "usbip_ds5" ||
+                                                          dualsense_usbip_gamepad::enabled()));
+    if (raw.vigem->init()) {
+      delete raw.vigem;
+      raw.vigem = nullptr;
     }
 
     // Get pointers to virtual touch/pen input functions (Win10 1809+)
@@ -150,6 +622,15 @@ namespace platf {
       return;
     }
     BOOST_LOG(error) << "Couldn't send input"sv;
+  }
+
+  // Do not replay the event that failed. A later event may use SendInput once
+  // the driver has confirmed synchronous removal of the VHF child.
+  static bool use_vhf_keyboard_mouse(input_raw_t *raw) {
+    if (raw->vhf_keyboard_mouse && raw->vhf->keyboard_mouse_fallback_safe()) {
+      raw->vhf_keyboard_mouse = false;
+    }
+    return raw->vhf_keyboard_mouse;
   }
 
   /**
@@ -190,10 +671,23 @@ namespace platf {
     mi.dx = scaled_x;
     mi.dy = scaled_y;
 
+    auto *raw = (input_raw_t *) input.get();
+    if (use_vhf_keyboard_mouse(raw)) {
+      if (raw->vhf->keyboard_mouse_absolute(
+            static_cast<std::uint16_t>(std::clamp<long>(scaled_x, 0, 65535)),
+            static_cast<std::uint16_t>(std::clamp<long>(scaled_y, 0, 65535)))) return;
+      (void) raw->vhf->keyboard_mouse_fallback([&] { send_input(i); });
+      return;
+    }
     send_input(i);
   }
 
   void move_mouse(input_t &input, int deltaX, int deltaY) {
+    auto *raw = (input_raw_t *) input.get();
+    if (use_vhf_keyboard_mouse(raw)) {
+      raw->vhf->keyboard_mouse_relative(deltaX, deltaY, 0, 0);
+      return;
+    }
     INPUT i {};
 
     i.type = INPUT_MOUSE;
@@ -221,6 +715,18 @@ namespace platf {
   }
 
   void button_mouse(input_t &input, int button, bool release) {
+    auto *raw = (input_raw_t *) input.get();
+    const auto hid_button = vhf_keyboard_mouse::mouse_button(button);
+    const auto mask = hid_button ? static_cast<std::uint8_t>(1u << (hid_button - 1)) : 0;
+    if (use_vhf_keyboard_mouse(raw) && hid_button != 0) {
+      if (release) raw->vhf_held_buttons &= ~mask;
+      else raw->vhf_held_buttons |= mask;
+      raw->vhf->keyboard_mouse_button(hid_button, !release);
+      return;
+    }
+    // The virtual child has already been removed. Do not inject an unmatched
+    // release (or repeat) for a button that belonged to that child.
+    if (vhf_keyboard_mouse::consume_removed_button(raw->vhf_held_buttons, mask, release)) return;
     INPUT i {};
 
     i.type = INPUT_MOUSE;
@@ -244,6 +750,11 @@ namespace platf {
   }
 
   void scroll(input_t &input, int distance) {
+    auto *raw = (input_raw_t *) input.get();
+    if (use_vhf_keyboard_mouse(raw)) {
+      raw->vhf->keyboard_mouse_relative(0, 0, distance, 0);
+      return;
+    }
     INPUT i {};
 
     i.type = INPUT_MOUSE;
@@ -256,6 +767,11 @@ namespace platf {
   }
 
   void hscroll(input_t &input, int distance) {
+    auto *raw = (input_raw_t *) input.get();
+    if (use_vhf_keyboard_mouse(raw)) {
+      raw->vhf->keyboard_mouse_relative(0, 0, 0, distance);
+      return;
+    }
     INPUT i {};
 
     i.type = INPUT_MOUSE;
@@ -267,7 +783,59 @@ namespace platf {
     send_input(i);
   }
 
+  bool mouse_requires_scroll_ticks(input_t &input) {
+    return use_vhf_keyboard_mouse((input_raw_t *) input.get());
+  }
+
+  bool keyboard_uses_native_repeat(input_t &input, std::uint16_t key) {
+    auto *raw = (input_raw_t *) input.get();
+    use_vhf_keyboard_mouse(raw);
+    const auto route = raw->vhf_key_routes.keys[key];
+    // A key from a removed VHF child (or one suppressed during teardown) is
+    // still logically held by the client. Do not emit software repeats or
+    // temporary modifiers until its matching release arrives.
+    return route != 0 && route != vhf_keyboard_mouse::win32_fallback;
+  }
+
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags) {
+    auto *raw = (input_raw_t *) input.get();
+    const bool vhf_active = use_vhf_keyboard_mouse(raw);
+    const bool first_press = !release && raw->vhf_key_routes.keys[modcode] == 0;
+    if (vhf_active) {
+      const auto route = raw->vhf_key_routes.keys[modcode];
+      if (route == vhf_keyboard_mouse::suppressed_fallback) {
+        if (release) raw->vhf_key_routes.keys[modcode] = 0;
+        return;
+      }
+      std::uint16_t usage = 0;
+      if (!release && route == 0) {
+        const auto consumer = vhf_keyboard_mouse::consumer_usage(modcode);
+        if (consumer && raw->vhf->keyboard_mouse_consumer_supported()) {
+          usage = vhf_keyboard_mouse::consumer_route | consumer;
+        } else {
+          usage = (flags & SS_KBE_FLAG_NON_NORMALIZED) ?
+                    vhf_keyboard_mouse::scan_usage(static_cast<std::uint16_t>(MapVirtualKeyW(modcode, MAPVK_VK_TO_VSC_EX))) :
+                    vhf_keyboard_mouse::key_usage(modcode);
+        }
+      }
+      const auto transition = raw->vhf_key_routes.update(modcode, release, usage);
+      if (transition.route != 0 && transition.route != vhf_keyboard_mouse::win32_fallback) {
+        if (transition.emit) {
+          if (transition.route & vhf_keyboard_mouse::consumer_route) {
+            raw->vhf->keyboard_mouse_consumer(transition.route & 0xff, !release);
+          } else {
+            raw->vhf->keyboard_mouse_key(transition.route, !release);
+          }
+        }
+        return;
+      }
+    }
+    else {
+      // Held VHF keys have been released by child removal. Suppress their
+      // remaining repeats and key-up packets rather than replaying them via
+      // SendInput. A key originally routed to SendInput still needs its up.
+      if (vhf_keyboard_mouse::consume_removed_key(raw->vhf_key_routes, modcode, release)) return;
+    }
     INPUT i {};
     i.type = INPUT_KEYBOARD;
     auto &ki = i.ki;
@@ -319,20 +887,53 @@ namespace platf {
       ki.dwFlags |= KEYEVENTF_KEYUP;
     }
 
-    send_input(i);
+    // An already-injected fallback key must still be released during teardown.
+    // Pin a suppressed first press until its matching release arrives.
+    if (vhf_active && !release) {
+      if (!raw->vhf->keyboard_mouse_fallback([&] { send_input(i); }) && first_press) {
+        raw->vhf_key_routes.keys[modcode] = vhf_keyboard_mouse::suppressed_fallback;
+      }
+    } else {
+      send_input(i);
+    }
   }
+
+  struct client_input_raw_t;
+
+  struct pointer_repeat_state_t {
+    std::mutex mutex;
+    std::uint64_t generation = 0;
+    bool enabled = false;
+    thread_pool_util::ThreadPool::task_id_t task {};
+    client_input_raw_t *owner = nullptr;
+  };
 
   struct client_input_raw_t: public client_input_t {
     client_input_raw_t(input_t &input) {
       global = (input_raw_t *) input.get();
+      penRepeatState->owner = this;
+      touchRepeatState->owner = this;
     }
 
     ~client_input_raw_t() override {
-      if (penRepeatTask) {
-        task_pool.cancel(penRepeatTask);
+      {
+        std::lock_guard lock {penRepeatState->mutex};
+        penRepeatState->enabled = false;
+        ++penRepeatState->generation;
+        if (penRepeatState->task) task_pool.cancel(penRepeatState->task);
+        penRepeatState->task = nullptr;
+        // A task already popped from the pool can still run after cancel().
+        // It retains the control block and sees a null owner before touching
+        // this object or its Windows pointer device.
+        penRepeatState->owner = nullptr;
       }
-      if (touchRepeatTask) {
-        task_pool.cancel(touchRepeatTask);
+      {
+        std::lock_guard lock {touchRepeatState->mutex};
+        touchRepeatState->enabled = false;
+        ++touchRepeatState->generation;
+        if (touchRepeatState->task) task_pool.cancel(touchRepeatState->task);
+        touchRepeatState->task = nullptr;
+        touchRepeatState->owner = nullptr;
       }
 
       if (pen) {
@@ -352,12 +953,12 @@ namespace platf {
 
     HSYNTHETICPOINTERDEVICE pen {};
     POINTER_TYPE_INFO penInfo {};
-    thread_pool_util::ThreadPool::task_id_t penRepeatTask {};
+    std::shared_ptr<pointer_repeat_state_t> penRepeatState {std::make_shared<pointer_repeat_state_t>()};
 
     HSYNTHETICPOINTERDEVICE touch {};
     POINTER_TYPE_INFO touchInfo[10] {};
     UINT32 activeTouchSlots {};
-    thread_pool_util::ThreadPool::task_id_t touchRepeatTask {};
+    std::shared_ptr<pointer_repeat_state_t> touchRepeatState {std::make_shared<pointer_repeat_state_t>()};
   };
 
   /**
@@ -501,30 +1102,79 @@ namespace platf {
   // the injected input periodically.
   constexpr auto ISPI_REPEAT_INTERVAL = 50ms;
 
+  void repeat_touch(std::shared_ptr<pointer_repeat_state_t> state, std::uint64_t generation);
+  void repeat_pen(std::shared_ptr<pointer_repeat_state_t> state, std::uint64_t generation);
+
+  void schedule_touch_repeat_locked(const std::shared_ptr<pointer_repeat_state_t> &state, const std::uint64_t generation) {
+    state->enabled = true;
+    state->task = task_pool.pushDelayed(repeat_touch, ISPI_REPEAT_INTERVAL, state, generation).task_id;
+  }
+
+  void schedule_touch_repeat(client_input_raw_t *raw) {
+    auto state = raw->touchRepeatState;
+    std::lock_guard lock {state->mutex};
+    if (state->owner) schedule_touch_repeat_locked(state, state->generation);
+  }
+
+  void stop_touch_repeat(client_input_raw_t *raw) {
+    auto state = raw->touchRepeatState;
+    std::lock_guard lock {state->mutex};
+    state->enabled = false;
+    ++state->generation;
+    if (state->task) task_pool.cancel(state->task);
+    state->task = nullptr;
+  }
+
+  void schedule_pen_repeat_locked(const std::shared_ptr<pointer_repeat_state_t> &state, const std::uint64_t generation) {
+    state->enabled = true;
+    state->task = task_pool.pushDelayed(repeat_pen, ISPI_REPEAT_INTERVAL, state, generation).task_id;
+  }
+
+  void schedule_pen_repeat(client_input_raw_t *raw) {
+    auto state = raw->penRepeatState;
+    std::lock_guard lock {state->mutex};
+    if (state->owner) schedule_pen_repeat_locked(state, state->generation);
+  }
+
+  void stop_pen_repeat(client_input_raw_t *raw) {
+    auto state = raw->penRepeatState;
+    std::lock_guard lock {state->mutex};
+    state->enabled = false;
+    ++state->generation;
+    if (state->task) task_pool.cancel(state->task);
+    state->task = nullptr;
+  }
+
   /**
    * @brief Repeats the current touch state to avoid the interactions timing out.
    * @param raw The raw client-specific input context.
    */
-  void repeat_touch(client_input_raw_t *raw) {
+  void repeat_touch(std::shared_ptr<pointer_repeat_state_t> state, const std::uint64_t generation) {
+    std::lock_guard lock {state->mutex};
+    auto raw = state->owner;
+    if (!raw || !state->enabled || generation != state->generation) return;
     if (!inject_synthetic_pointer_input(raw->global, raw->touch, raw->touchInfo, raw->activeTouchSlots)) {
       auto err = GetLastError();
       BOOST_LOG(warning) << "Failed to refresh virtual touch input: "sv << err;
     }
 
-    raw->touchRepeatTask = task_pool.pushDelayed(repeat_touch, ISPI_REPEAT_INTERVAL, raw).task_id;
+    schedule_touch_repeat_locked(state, generation);
   }
 
   /**
    * @brief Repeats the current pen state to avoid the interactions timing out.
    * @param raw The raw client-specific input context.
    */
-  void repeat_pen(client_input_raw_t *raw) {
+  void repeat_pen(std::shared_ptr<pointer_repeat_state_t> state, const std::uint64_t generation) {
+    std::lock_guard lock {state->mutex};
+    auto raw = state->owner;
+    if (!raw || !state->enabled || generation != state->generation) return;
     if (!inject_synthetic_pointer_input(raw->global, raw->pen, &raw->penInfo, 1)) {
       auto err = GetLastError();
       BOOST_LOG(warning) << "Failed to refresh virtual pen input: "sv << err;
     }
 
-    raw->penRepeatTask = task_pool.pushDelayed(repeat_pen, ISPI_REPEAT_INTERVAL, raw).task_id;
+    schedule_pen_repeat_locked(state, generation);
   }
 
   /**
@@ -532,12 +1182,6 @@ namespace platf {
    * @param raw The raw client-specific input context.
    */
   void cancel_all_active_touches(client_input_raw_t *raw) {
-    // Cancel touch repeat callbacks
-    if (raw->touchRepeatTask) {
-      task_pool.cancel(raw->touchRepeatTask);
-      raw->touchRepeatTask = nullptr;
-    }
-
     // Compact touches to update activeTouchSlots
     perform_touch_compaction(raw);
 
@@ -594,11 +1238,7 @@ namespace platf {
       }
     }
 
-    // Cancel touch repeat callbacks
-    if (raw->touchRepeatTask) {
-      task_pool.cancel(raw->touchRepeatTask);
-      raw->touchRepeatTask = nullptr;
-    }
+    stop_touch_repeat(raw);
 
     // If this is a special request to cancel all touches, do that and return
     if (touch.eventType == LI_TOUCH_EVENT_CANCEL_ALL) {
@@ -683,7 +1323,7 @@ namespace platf {
 
     // If we still have an active touch, refresh the touch state periodically
     if (raw->activeTouchSlots > 1 || touchInfo.pointerInfo.pointerFlags != POINTER_FLAG_NONE) {
-      raw->touchRepeatTask = task_pool.pushDelayed(repeat_touch, ISPI_REPEAT_INTERVAL, raw).task_id;
+      schedule_touch_repeat(raw);
     }
   }
 
@@ -720,11 +1360,7 @@ namespace platf {
       }
     }
 
-    // Cancel pen repeat callbacks
-    if (raw->penRepeatTask) {
-      task_pool.cancel(raw->penRepeatTask);
-      raw->penRepeatTask = nullptr;
-    }
+    stop_pen_repeat(raw);
 
     raw->penInfo.type = PT_PEN;
 
@@ -802,11 +1438,14 @@ namespace platf {
 
     // If we still have an active pen interaction, refresh the pen state periodically
     if (penInfo.pointerInfo.pointerFlags != POINTER_FLAG_NONE) {
-      raw->penRepeatTask = task_pool.pushDelayed(repeat_pen, ISPI_REPEAT_INTERVAL, raw).task_id;
+      schedule_pen_repeat(raw);
     }
   }
 
   void unicode(input_t &input, char *utf8, int size) {
+    auto *raw = (input_raw_t *) input.get();
+    const bool vhf_active = use_vhf_keyboard_mouse(raw);
+
     // We can do no worse than one UTF-16 character per byte of UTF-8
     std::vector<WCHAR> wide(size);
 
@@ -815,22 +1454,29 @@ namespace platf {
       return;
     }
 
-    // Send all key down events
-    for (int i = 0; i < chars; i++) {
-      INPUT input {};
-      input.type = INPUT_KEYBOARD;
-      input.ki.wScan = wide[i];
-      input.ki.dwFlags = KEYEVENTF_UNICODE;
-      send_input(input);
-    }
+    auto send_unicode = [&] {
+      // Send all key down events
+      for (int i = 0; i < chars; i++) {
+        INPUT input {};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wScan = wide[i];
+        input.ki.dwFlags = KEYEVENTF_UNICODE;
+        send_input(input);
+      }
 
-    // Send all key up events
-    for (int i = 0; i < chars; i++) {
-      INPUT input {};
-      input.type = INPUT_KEYBOARD;
-      input.ki.wScan = wide[i];
-      input.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-      send_input(input);
+      // Send all key up events
+      for (int i = 0; i < chars; i++) {
+        INPUT input {};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wScan = wide[i];
+        input.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        send_input(input);
+      }
+    };
+    if (vhf_active) {
+      (void) raw->vhf->keyboard_mouse_fallback(send_unicode);
+    } else {
+      send_unicode();
     }
   }
 
@@ -857,21 +1503,126 @@ namespace platf {
       return -1;
     }
 
+    const bool vigem_available = raw->vigem != nullptr && raw->vigem->available();
     const bool vhf_available = raw->vhf != nullptr && raw->vhf->available();
-    if (!vhf_available) {
-      BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " has no virtual gamepad driver to go to"sv;
+    const bool automatic_vhf_fallback =
+      config::input.gamepad == "auto"sv &&
+      vhf_gamepad::select_automatic_backend(vigem_available, vhf_available) == vhf_gamepad::backend_e::vhf;
+    // Only the VHF driver can present a Steam Controller; under `auto` with ViGEmBus installed
+    // the client would otherwise silently become an Xbox 360 pad and lose both pads, grips,
+    // motion, battery and haptics. ViGEmBus remains the fallback if the allocation fails.
+    const bool steam_client_prefers_vhf =
+      config::input.gamepad == "auto"sv && vhf_available &&
+      vhf_gamepad::is_steam_controller_client(metadata.type, metadata.capabilities);
+
+    if (vhf_gamepad_selected() || automatic_vhf_fallback || steam_client_prefers_vhf) {
+      const auto desired = vhf_desired_profile(metadata);
+
+      if (config::input.gamepad == "vhf_steam"sv && desired != vhf_profile_e::steam_controller) {
+        BOOST_LOG(info) << "Gamepad " << id.globalIndex << " is not a Steam Controller (2026) client controller (type "sv
+                        << static_cast<int>(metadata.type) << ", capabilities "sv << metadata.capabilities
+                        << "); vhf_steam is kept for Steam Controllers and this one gets the automatic choice"sv;
+      }
+
+      if (vhf_available) {
+        BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will use the Vibepollo virtual gamepad driver"sv
+                        << (automatic_vhf_fallback ? " (automatic fallback)"sv :
+                            steam_client_prefers_vhf ? " (Steam Controller client)"sv : ""sv);
+
+        if (raw->vhf->alloc(id, feedback_queue, desired, metadata.capabilities) == 0) {
+          raw->gamepad_backend[id.globalIndex] = gamepad_backend_e::vhf;
+          return 0;
+        }
+      }
+
+      // Only a vhf_* config value is an explicit choice. A profile inferred from the
+      // client's controller type (Steam Controller, Switch, PlayStation) under plain
+      // `vhf` is a preference: when the installed driver does not offer it, retry with
+      // the driver's automatic profile rather than leaving the client with no controller.
+      const bool explicit_profile = config::input.gamepad != "vhf"sv && config::input.gamepad != "auto"sv;
+      if (vhf_available && desired != vhf_profile_e::automatic && !explicit_profile) {
+        BOOST_LOG(warning) << "Gamepad " << id.globalIndex
+                           << " could not get the profile its controller type suggests; retrying with the driver's automatic profile"sv;
+        if (raw->vhf->alloc(id, feedback_queue, vhf_profile_e::automatic, metadata.capabilities) == 0) {
+          raw->gamepad_backend[id.globalIndex] = gamepad_backend_e::vhf;
+          return 0;
+        }
+      }
+
+      // With no ViGEm backend, exhaust the driver's automatic profile before
+      // failing. The client-derived profile above is only a preference under auto.
+      if (automatic_vhf_fallback) {
+        BOOST_LOG(error) << "Gamepad " << id.globalIndex << " could not be created on the Vibepollo virtual gamepad driver"sv;
+        return -1;
+      }
+
+      // An explicit profile must not be replaced by an automatic/client-selected profile or by
+      // ViGEmBus. Otherwise a failed Switch Pro allocation makes the client override appear to
+      // win even though the user selected a specific VHF profile. A Steam Controller client
+      // under `auto` chose nothing explicitly, so it may still fall back to ViGEmBus.
+      if (explicit_profile && desired != vhf_profile_e::automatic && !steam_client_prefers_vhf) {
+        BOOST_LOG(error) << "Gamepad " << id.globalIndex << " could not create the requested Vibepollo controller profile; refusing to substitute another profile"sv;
+        return -1;
+      }
+
+      // The generic VHF option is allowed to fall back when the driver cannot create a device.
+      BOOST_LOG(error) << "Gamepad " << id.globalIndex << " could not be created on the Vibepollo virtual gamepad driver; falling back to ViGEmBus"sv;
+    }
+
+    if (!raw->vigem) {
       return 0;
     }
 
-    const auto desired = vhf_desired_profile(metadata);
-    BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will use the Vibepollo virtual gamepad driver"sv;
-    if (raw->vhf->alloc(id, feedback_queue, desired) == 0) {
-      raw->gamepad_backend[id.globalIndex] = gamepad_backend_e::vhf;
-      return 0;
+    VIGEM_TARGET_TYPE selectedGamepadType;
+
+    if (config::input.gamepad == "x360"sv) {
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be Xbox 360 controller (manual selection)"sv;
+      selectedGamepadType = Xbox360Wired;
+    } else if (config::input.gamepad == "ds4"sv) {
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (manual selection)"sv;
+      selectedGamepadType = DualShock4Wired;
+    } else if (metadata.type == LI_CTYPE_PS) {
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (auto-selected by client-reported type)"sv;
+      selectedGamepadType = DualShock4Wired;
+    } else if (metadata.type == LI_CTYPE_XBOX) {
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be Xbox 360 controller (auto-selected by client-reported type)"sv;
+      selectedGamepadType = Xbox360Wired;
+    } else if (config::input.motion_as_ds4 && (metadata.capabilities & (LI_CCAP_ACCEL | LI_CCAP_GYRO))) {
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (auto-selected by motion sensor presence)"sv;
+      selectedGamepadType = DualShock4Wired;
+    } else if (config::input.touchpad_as_ds4 && (metadata.capabilities & LI_CCAP_TOUCHPAD)) {
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (auto-selected by touchpad presence)"sv;
+      selectedGamepadType = DualShock4Wired;
+    } else {
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be Xbox 360 controller (default)"sv;
+      selectedGamepadType = Xbox360Wired;
     }
 
-    BOOST_LOG(error) << "Gamepad " << id.globalIndex << " could not be created on the Vibepollo virtual gamepad driver"sv;
-    return -1;
+    if (selectedGamepadType == Xbox360Wired) {
+      if (metadata.capabilities & (LI_CCAP_ACCEL | LI_CCAP_GYRO)) {
+        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " has motion sensors, but they are not usable when emulating an Xbox 360 controller"sv;
+      }
+      if (metadata.capabilities & LI_CCAP_TOUCHPAD) {
+        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " has a touchpad, but it is not usable when emulating an Xbox 360 controller"sv;
+      }
+      if (metadata.capabilities & LI_CCAP_RGB_LED) {
+        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " has an RGB LED, but it is not usable when emulating an Xbox 360 controller"sv;
+      }
+    } else if (selectedGamepadType == DualShock4Wired) {
+      if (!(metadata.capabilities & (LI_CCAP_ACCEL | LI_CCAP_GYRO))) {
+        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " is emulating a DualShock 4 controller, but the client gamepad doesn't have motion sensors active"sv;
+      }
+      if (!(metadata.capabilities & LI_CCAP_TOUCHPAD)) {
+        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " is emulating a DualShock 4 controller, but the client gamepad doesn't have a touchpad"sv;
+      }
+    }
+
+    const auto result = raw->vigem->alloc_gamepad_internal(id, feedback_queue, selectedGamepadType);
+    if (result == 0) {
+      raw->gamepad_backend[id.globalIndex] = gamepad_backend_e::vigem;
+    }
+
+    return result;
   }
 
   void free_gamepad(input_t &input, int nr) {
@@ -891,8 +1642,287 @@ namespace platf {
       return;
     }
 
-    if (backend == gamepad_backend_e::vhf && raw->vhf) {
-      raw->vhf->free(nr);
+    if (backend == gamepad_backend_e::vhf) {
+      if (raw->vhf) {
+        raw->vhf->free(nr);
+      }
+      return;
+    }
+
+    if (!raw->vigem) {
+      return;
+    }
+
+    raw->vigem->free_target(nr);
+  }
+
+  /**
+   * @brief Converts the standard button flags into X360 format.
+   * @param gamepad_state The gamepad button/axis state sent from the client.
+   * @return XUSB_BUTTON flags.
+   */
+  static XUSB_BUTTON x360_buttons(const gamepad_state_t &gamepad_state) {
+    int buttons {};
+
+    auto flags = gamepad_state.buttonFlags;
+    if (flags & DPAD_UP) {
+      buttons |= XUSB_GAMEPAD_DPAD_UP;
+    }
+    if (flags & DPAD_DOWN) {
+      buttons |= XUSB_GAMEPAD_DPAD_DOWN;
+    }
+    if (flags & DPAD_LEFT) {
+      buttons |= XUSB_GAMEPAD_DPAD_LEFT;
+    }
+    if (flags & DPAD_RIGHT) {
+      buttons |= XUSB_GAMEPAD_DPAD_RIGHT;
+    }
+    if (flags & START) {
+      buttons |= XUSB_GAMEPAD_START;
+    }
+    if (flags & BACK) {
+      buttons |= XUSB_GAMEPAD_BACK;
+    }
+    if (flags & LEFT_STICK) {
+      buttons |= XUSB_GAMEPAD_LEFT_THUMB;
+    }
+    if (flags & RIGHT_STICK) {
+      buttons |= XUSB_GAMEPAD_RIGHT_THUMB;
+    }
+    if (flags & LEFT_BUTTON) {
+      buttons |= XUSB_GAMEPAD_LEFT_SHOULDER;
+    }
+    if (flags & RIGHT_BUTTON) {
+      buttons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
+    }
+    if (flags & (HOME | MISC_BUTTON)) {
+      buttons |= XUSB_GAMEPAD_GUIDE;
+    }
+    if (flags & A) {
+      buttons |= XUSB_GAMEPAD_A;
+    }
+    if (flags & B) {
+      buttons |= XUSB_GAMEPAD_B;
+    }
+    if (flags & X) {
+      buttons |= XUSB_GAMEPAD_X;
+    }
+    if (flags & Y) {
+      buttons |= XUSB_GAMEPAD_Y;
+    }
+
+    return (XUSB_BUTTON) buttons;
+  }
+
+  /**
+   * @brief Updates the X360 input report with the provided gamepad state.
+   * @param gamepad The gamepad to update.
+   * @param gamepad_state The gamepad button/axis state sent from the client.
+   */
+  static void x360_update_state(gamepad_context_t &gamepad, const gamepad_state_t &gamepad_state) {
+    auto &report = gamepad.report.x360;
+
+    report.wButtons = x360_buttons(gamepad_state);
+    report.bLeftTrigger = gamepad_state.lt;
+    report.bRightTrigger = gamepad_state.rt;
+    report.sThumbLX = gamepad_state.lsX;
+    report.sThumbLY = gamepad_state.lsY;
+    report.sThumbRX = gamepad_state.rsX;
+    report.sThumbRY = gamepad_state.rsY;
+  }
+
+  static DS4_DPAD_DIRECTIONS ds4_dpad(const gamepad_state_t &gamepad_state) {
+    auto flags = gamepad_state.buttonFlags;
+    if (flags & DPAD_UP) {
+      if (flags & DPAD_RIGHT) {
+        return DS4_BUTTON_DPAD_NORTHEAST;
+      } else if (flags & DPAD_LEFT) {
+        return DS4_BUTTON_DPAD_NORTHWEST;
+      } else {
+        return DS4_BUTTON_DPAD_NORTH;
+      }
+    }
+
+    else if (flags & DPAD_DOWN) {
+      if (flags & DPAD_RIGHT) {
+        return DS4_BUTTON_DPAD_SOUTHEAST;
+      } else if (flags & DPAD_LEFT) {
+        return DS4_BUTTON_DPAD_SOUTHWEST;
+      } else {
+        return DS4_BUTTON_DPAD_SOUTH;
+      }
+    }
+
+    else if (flags & DPAD_RIGHT) {
+      return DS4_BUTTON_DPAD_EAST;
+    }
+
+    else if (flags & DPAD_LEFT) {
+      return DS4_BUTTON_DPAD_WEST;
+    }
+
+    return DS4_BUTTON_DPAD_NONE;
+  }
+
+  /**
+   * @brief Converts the standard button flags into DS4 format.
+   * @param gamepad_state The gamepad button/axis state sent from the client.
+   * @return DS4_BUTTONS flags.
+   */
+  static DS4_BUTTONS ds4_buttons(const gamepad_state_t &gamepad_state) {
+    int buttons {};
+
+    auto flags = gamepad_state.buttonFlags;
+    if (flags & LEFT_STICK) {
+      buttons |= DS4_BUTTON_THUMB_LEFT;
+    }
+    if (flags & RIGHT_STICK) {
+      buttons |= DS4_BUTTON_THUMB_RIGHT;
+    }
+    if (flags & LEFT_BUTTON) {
+      buttons |= DS4_BUTTON_SHOULDER_LEFT;
+    }
+    if (flags & RIGHT_BUTTON) {
+      buttons |= DS4_BUTTON_SHOULDER_RIGHT;
+    }
+    if (flags & START) {
+      buttons |= DS4_BUTTON_OPTIONS;
+    }
+    if (flags & BACK) {
+      buttons |= DS4_BUTTON_SHARE;
+    }
+    if (flags & A) {
+      buttons |= DS4_BUTTON_CROSS;
+    }
+    if (flags & B) {
+      buttons |= DS4_BUTTON_CIRCLE;
+    }
+    if (flags & X) {
+      buttons |= DS4_BUTTON_SQUARE;
+    }
+    if (flags & Y) {
+      buttons |= DS4_BUTTON_TRIANGLE;
+    }
+
+    if (gamepad_state.lt > 0) {
+      buttons |= DS4_BUTTON_TRIGGER_LEFT;
+    }
+    if (gamepad_state.rt > 0) {
+      buttons |= DS4_BUTTON_TRIGGER_RIGHT;
+    }
+
+    return (DS4_BUTTONS) buttons;
+  }
+
+  static DS4_SPECIAL_BUTTONS ds4_special_buttons(const gamepad_state_t &gamepad_state) {
+    int buttons {};
+
+    if (gamepad_state.buttonFlags & HOME) {
+      buttons |= DS4_SPECIAL_BUTTON_PS;
+    }
+
+    // Allow either PS4/PS5 clickpad button or Xbox Series X share button to activate DS4 clickpad
+    if (gamepad_state.buttonFlags & (TOUCHPAD_BUTTON | MISC_BUTTON)) {
+      buttons |= DS4_SPECIAL_BUTTON_TOUCHPAD;
+    }
+
+    // Manual DS4 emulation: check if BACK button should also trigger DS4 touchpad click
+    if (config::input.gamepad == "ds4"sv && config::input.ds4_back_as_touchpad_click && (gamepad_state.buttonFlags & BACK)) {
+      buttons |= DS4_SPECIAL_BUTTON_TOUCHPAD;
+    }
+
+    return (DS4_SPECIAL_BUTTONS) buttons;
+  }
+
+  static std::uint8_t to_ds4_triggerX(std::int16_t v) {
+    return (v + std::numeric_limits<std::uint16_t>::max() / 2 + 1) / 257;
+  }
+
+  static std::uint8_t to_ds4_triggerY(std::int16_t v) {
+    auto new_v = -((std::numeric_limits<std::uint16_t>::max() / 2 + v - 1)) / 257;
+
+    return new_v == 0 ? 0xFF : (std::uint8_t) new_v;
+  }
+
+  /**
+   * @brief Updates the DS4 input report with the provided gamepad state.
+   * @param gamepad The gamepad to update.
+   * @param gamepad_state The gamepad button/axis state sent from the client.
+   */
+  static void ds4_update_state(gamepad_context_t &gamepad, const gamepad_state_t &gamepad_state) {
+    auto &report = gamepad.report.ds4.Report;
+
+    report.wButtons = static_cast<uint16_t>(ds4_buttons(gamepad_state)) | static_cast<uint16_t>(ds4_dpad(gamepad_state));
+    report.bSpecial = ds4_special_buttons(gamepad_state);
+
+    report.bTriggerL = gamepad_state.lt;
+    report.bTriggerR = gamepad_state.rt;
+
+    report.bThumbLX = to_ds4_triggerX(gamepad_state.lsX);
+    report.bThumbLY = to_ds4_triggerY(gamepad_state.lsY);
+
+    report.bThumbRX = to_ds4_triggerX(gamepad_state.rsX);
+    report.bThumbRY = to_ds4_triggerY(gamepad_state.rsY);
+  }
+
+  /**
+   * @brief Sends DS4 input with updated timestamps and repeats to keep timestamp updated.
+   * @details Some applications require updated timestamps values to register DS4 input.
+   * @param vigem The global ViGEm context object.
+   * @param nr The global gamepad index.
+   */
+  void ds4_update_ts_and_send(vigem_t *vigem, int nr);
+
+  static void ds4_keepalive_send(vigem_t *vigem, int nr) {
+    auto &gamepad = vigem->gamepads[nr];
+    gamepad.repeat_task = nullptr;
+    ds4_update_ts_and_send(vigem, nr);
+  }
+
+  void ds4_update_ts_and_send(vigem_t *vigem, int nr) {
+    auto &gamepad = vigem->gamepads[nr];
+
+    if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
+      auto now = std::chrono::steady_clock::now();
+
+      const auto gyro_stale = now - gamepad.last_gyro_motion_ts;
+      if (gyro_stale > DS4_MOTION_STALE_TIMEOUT) {
+        auto &report = gamepad.report.ds4.Report;
+        if (report.wGyroX != 0 || report.wGyroY != 0 || report.wGyroZ != 0) {
+          ds4_update_motion(gamepad, LI_MOTION_TYPE_GYRO, 0.0f, 0.0f, 0.0f);
+        }
+
+        if (gyro_stale > DS4_MOTION_RE_REQUEST_AFTER && now - gamepad.last_motion_request_ts > DS4_MOTION_RE_REQUEST_COOLDOWN) {
+          if (gamepad.feedback_queue) {
+            BOOST_LOG(debug) << "DS4 gyro stale for "sv
+                             << std::chrono::duration_cast<std::chrono::milliseconds>(gyro_stale).count()
+                             << "ms; re-requesting motion events from client"sv;
+            static_cast<void>(raise_gamepad_feedback(*gamepad.feedback_queue, gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_ACCEL, 100)));
+            static_cast<void>(raise_gamepad_feedback(*gamepad.feedback_queue, gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_GYRO, 100)));
+            gamepad.last_motion_request_ts = now;
+          }
+        }
+      }
+
+      auto delta_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - gamepad.last_report_ts);
+
+      // Timestamp is reported in 5.333us units
+      gamepad.report.ds4.Report.wTimestamp += (uint16_t) (delta_ns.count() / 5333);
+
+      // Send the report to the virtual device
+      auto status = vigem_target_ds4_update_ex(vigem->client.get(), gamepad.gp.get(), gamepad.report.ds4);
+      if (!VIGEM_SUCCESS(status)) {
+        BOOST_LOG(warning) << "Couldn't send gamepad input to ViGEm ["sv << util::hex(status).to_string_view() << ']';
+        return;
+      }
+
+      // Repeat at least every 100ms to keep the 16-bit timestamp field from overflowing
+      gamepad.last_report_ts = now;
+      if (gamepad.repeat_task) {
+        task_pool.delay(gamepad.repeat_task, DS4_KEEPALIVE_INTERVAL);
+      } else {
+        gamepad.repeat_task = task_pool.pushDelayed(ds4_keepalive_send, DS4_KEEPALIVE_INTERVAL, vigem, nr).task_id;
+      }
     }
   }
 
@@ -912,6 +1942,32 @@ namespace platf {
 
     if (vhf_owns_gamepad(raw, nr)) {
       raw->vhf->update(nr, gamepad_state);
+      return;
+    }
+
+    auto vigem = raw->vigem;
+
+    // If there is no gamepad support
+    if (!vigem) {
+      return;
+    }
+
+    auto &gamepad = vigem->gamepads[nr];
+    if (!gamepad.gp) {
+      return;
+    }
+
+    VIGEM_ERROR status;
+
+    if (vigem_target_get_type(gamepad.gp.get()) == Xbox360Wired) {
+      x360_update_state(gamepad, gamepad_state);
+      status = vigem_target_x360_update(vigem->client.get(), gamepad.gp.get(), gamepad.report.x360);
+      if (!VIGEM_SUCCESS(status)) {
+        BOOST_LOG(warning) << "Couldn't send gamepad input to ViGEm ["sv << util::hex(status).to_string_view() << ']';
+      }
+    } else {
+      ds4_update_state(gamepad, gamepad_state);
+      ds4_update_ts_and_send(vigem, nr);
     }
   }
 
@@ -931,7 +1987,107 @@ namespace platf {
     if (vhf_owns_gamepad(raw, touch.id.globalIndex)) {
       // Dropped when the slot's controller has no touchpad.
       raw->vhf->touch(touch.id.globalIndex, touch);
+      return;
     }
+
+    auto vigem = raw->vigem;
+
+    // If there is no gamepad support
+    if (!vigem) {
+      return;
+    }
+
+    auto &gamepad = vigem->gamepads[touch.id.globalIndex];
+    if (!gamepad.gp) {
+      return;
+    }
+
+    // Touch is only supported on DualShock 4 controllers
+    if (vigem_target_get_type(gamepad.gp.get()) != DualShock4Wired) {
+      return;
+    }
+
+    auto &report = gamepad.report.ds4.Report;
+
+    uint8_t pointerIndex;
+    if (touch.eventType == LI_TOUCH_EVENT_DOWN) {
+      if (gamepad.available_pointers & 0x1) {
+        // Reserve pointer index 0 for this touch
+        gamepad.pointer_id_map[touch.pointerId] = pointerIndex = 0;
+        gamepad.available_pointers &= ~(1 << pointerIndex);
+
+        // Set pointer 0 down
+        report.sCurrentTouch.bIsUpTrackingNum1 &= ~0x80;
+        report.sCurrentTouch.bIsUpTrackingNum1++;
+      } else if (gamepad.available_pointers & 0x2) {
+        // Reserve pointer index 1 for this touch
+        gamepad.pointer_id_map[touch.pointerId] = pointerIndex = 1;
+        gamepad.available_pointers &= ~(1 << pointerIndex);
+
+        // Set pointer 1 down
+        report.sCurrentTouch.bIsUpTrackingNum2 &= ~0x80;
+        report.sCurrentTouch.bIsUpTrackingNum2++;
+      } else {
+        BOOST_LOG(warning) << "No more free pointer indices! Did the client miss an touch up event?"sv;
+        return;
+      }
+    } else if (touch.eventType == LI_TOUCH_EVENT_CANCEL_ALL) {
+      // Raise both pointers
+      report.sCurrentTouch.bIsUpTrackingNum1 |= 0x80;
+      report.sCurrentTouch.bIsUpTrackingNum2 |= 0x80;
+
+      // Remove all pointer index mappings
+      gamepad.pointer_id_map.clear();
+
+      // All pointers are now available
+      gamepad.available_pointers = 0x3;
+    } else {
+      auto i = gamepad.pointer_id_map.find(touch.pointerId);
+      if (i == gamepad.pointer_id_map.end()) {
+        BOOST_LOG(warning) << "Pointer ID not found! Did the client miss a touch down event?"sv;
+        return;
+      }
+
+      pointerIndex = (*i).second;
+
+      if (touch.eventType == LI_TOUCH_EVENT_UP || touch.eventType == LI_TOUCH_EVENT_CANCEL) {
+        // Remove the pointer index mapping
+        gamepad.pointer_id_map.erase(i);
+
+        // Set pointer up
+        if (pointerIndex == 0) {
+          report.sCurrentTouch.bIsUpTrackingNum1 |= 0x80;
+        } else {
+          report.sCurrentTouch.bIsUpTrackingNum2 |= 0x80;
+        }
+
+        // Free the pointer index
+        gamepad.available_pointers |= (1 << pointerIndex);
+      } else if (touch.eventType != LI_TOUCH_EVENT_MOVE) {
+        BOOST_LOG(warning) << "Unsupported touch event for gamepad: "sv << (uint32_t) touch.eventType;
+        return;
+      }
+    }
+
+    // Touchpad is 1920x943 according to ViGEm
+    uint16_t x = touch.x * 1920;
+    uint16_t y = touch.y * 943;
+    uint8_t touchData[] = {
+      (uint8_t) (x & 0xFF),  // Low 8 bits of X
+      (uint8_t) ((x >> 8 & 0x0F) | (y & 0x0F) << 4),  // High 4 bits of X and low 4 bits of Y
+      (uint8_t) (y >> 4 & 0xFF)  // High 8 bits of Y
+    };
+
+    report.sCurrentTouch.bPacketCounter++;
+    if (touch.eventType != LI_TOUCH_EVENT_CANCEL_ALL) {
+      if (pointerIndex == 0) {
+        memcpy(report.sCurrentTouch.bTouchData1, touchData, sizeof(touchData));
+      } else {
+        memcpy(report.sCurrentTouch.bTouchData2, touchData, sizeof(touchData));
+      }
+    }
+
+    ds4_update_ts_and_send(vigem, touch.id.globalIndex);
   }
 
   /**
@@ -950,6 +2106,49 @@ namespace platf {
     if (vhf_owns_gamepad(raw, motion.id.globalIndex)) {
       // Dropped when the slot's controller has no motion sensors.
       raw->vhf->motion(motion.id.globalIndex, motion);
+      return;
+    }
+
+    auto vigem = raw->vigem;
+
+    // If there is no gamepad support
+    if (!vigem) {
+      return;
+    }
+
+    auto &gamepad = vigem->gamepads[motion.id.globalIndex];
+    if (!gamepad.gp) {
+      return;
+    }
+
+    // Motion is only supported on DualShock 4 controllers
+    if (vigem_target_get_type(gamepad.gp.get()) != DualShock4Wired) {
+      return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (motion.motionType == LI_MOTION_TYPE_ACCEL) {
+      gamepad.last_accel_motion_ts = now;
+    } else if (motion.motionType == LI_MOTION_TYPE_GYRO) {
+      gamepad.last_gyro_motion_ts = now;
+    }
+
+    ds4_update_motion(gamepad, motion.motionType, motion.x, motion.y, motion.z);
+    ds4_update_ts_and_send(vigem, motion.id.globalIndex);
+  }
+
+  /**
+   * @brief Hands the real Steam Controller's firmware attributes to the virtual controller.
+   * @details Only the VHF driver presents a Steam Controller; ViGEmBus and the DualSense USB/IP
+   *          backend have no device that answers Steam's attribute reads, so they get nothing.
+   * @param input The global input context.
+   * @param attributes The attributes.
+   */
+  void gamepad_attributes(input_t &input, const steam_controller_attributes_t &attributes) {
+    auto raw = (input_raw_t *) input.get();
+
+    if (vhf_owns_gamepad(raw, attributes.id.globalIndex)) {
+      raw->vhf->attributes(attributes.id.globalIndex, attributes);
     }
   }
 
@@ -969,7 +2168,74 @@ namespace platf {
     if (vhf_owns_gamepad(raw, battery.id.globalIndex)) {
       // Dropped when the slot's controller has no battery.
       raw->vhf->battery(battery.id.globalIndex, battery);
+      return;
     }
+
+    auto vigem = raw->vigem;
+
+    // If there is no gamepad support
+    if (!vigem) {
+      return;
+    }
+
+    auto &gamepad = vigem->gamepads[battery.id.globalIndex];
+    if (!gamepad.gp) {
+      return;
+    }
+
+    // Battery is only supported on DualShock 4 controllers
+    if (vigem_target_get_type(gamepad.gp.get()) != DualShock4Wired) {
+      return;
+    }
+
+    // For details on the report format of these battery level fields, see:
+    // https://github.com/torvalds/linux/blob/946c6b59c56dc6e7d8364a8959cb36bf6d10bc37/drivers/hid/hid-playstation.c#L2305-L2314
+
+    auto &report = gamepad.report.ds4.Report;
+
+    // Update the battery state if it is known
+    switch (battery.state) {
+      case LI_BATTERY_STATE_CHARGING:
+      case LI_BATTERY_STATE_DISCHARGING:
+        if (battery.state == LI_BATTERY_STATE_CHARGING) {
+          report.bBatteryLvlSpecial |= 0x10;  // Connected via USB
+        } else {
+          report.bBatteryLvlSpecial &= ~0x10;  // Not connected via USB
+        }
+
+        // If there was a special battery status set before, clear that and
+        // initialize the battery level to 50%. It will be overwritten below
+        // if the actual percentage is known.
+        if ((report.bBatteryLvlSpecial & 0xF) > 0xA) {
+          report.bBatteryLvlSpecial = (report.bBatteryLvlSpecial & ~0xF) | 0x5;
+        }
+        break;
+
+      case LI_BATTERY_STATE_FULL:
+        report.bBatteryLvlSpecial = 0x1B;  // USB + Battery Full
+        report.bBatteryLvl = 0xFF;
+        break;
+
+      case LI_BATTERY_STATE_NOT_PRESENT:
+      case LI_BATTERY_STATE_NOT_CHARGING:
+        report.bBatteryLvlSpecial = 0x1F;  // USB + Charging Error
+        break;
+
+      default:
+        break;
+    }
+
+    // Update the battery level if it is known
+    if (battery.percentage != LI_BATTERY_PERCENTAGE_UNKNOWN) {
+      report.bBatteryLvl = battery.percentage * 255 / 100;
+
+      // Don't overwrite low nibble if there's a special status there (see above)
+      if ((report.bBatteryLvlSpecial & 0x10) && (report.bBatteryLvlSpecial & 0xF) <= 0xA) {
+        report.bBatteryLvlSpecial = (report.bBatteryLvlSpecial & ~0xF) | ((battery.percentage + 5) / 10);
+      }
+    }
+
+    ds4_update_ts_and_send(vigem, battery.id.globalIndex);
   }
 
   void freeInput(void *p) {
@@ -982,6 +2248,8 @@ namespace platf {
     if (!input) {
       static std::vector gps {
         supported_gamepad_t {"auto", true, ""},
+        supported_gamepad_t {"x360", false, ""},
+        supported_gamepad_t {"ds4", false, ""},
         supported_gamepad_t {"vhf", false, ""},
         supported_gamepad_t {"vhf_xbox", false, ""},
         supported_gamepad_t {"vhf_xbox_one", false, ""},
@@ -989,12 +2257,16 @@ namespace platf {
         supported_gamepad_t {"vhf_ds5", false, ""},
         supported_gamepad_t {"usbip_ds5", false, ""},
         supported_gamepad_t {"vhf_switch", false, ""},
+        supported_gamepad_t {"vhf_steam", false, ""},
       };
 
       return gps;
     }
 
     auto raw = (input_raw_t *) input;
+    auto enabled = raw->vigem != nullptr && raw->vigem->available();
+    auto reason = enabled ? "" : "gamepads.vigem-not-available";
+
     auto vhf_enabled = raw->vhf != nullptr && raw->vhf->available();
     auto vhf_reason = vhf_enabled ? "" : "gamepads.vhf-not-available";
 
@@ -1003,20 +2275,23 @@ namespace platf {
 
     // ds4 == ps4
     static std::vector gps {
-      supported_gamepad_t {"auto", vhf_enabled, vhf_reason},
+      supported_gamepad_t {"auto", enabled || vhf_enabled, enabled || vhf_enabled ? "" : reason},
+      supported_gamepad_t {"x360", enabled, reason},
+      supported_gamepad_t {"ds4", enabled, reason},
       supported_gamepad_t {"vhf", vhf_enabled, vhf_reason},
       supported_gamepad_t {"vhf_xbox", vhf_enabled, vhf_reason},
       supported_gamepad_t {"vhf_xbox_one", vhf_enabled, vhf_reason},
       supported_gamepad_t {"vhf_ds4", vhf_enabled, vhf_reason},
       supported_gamepad_t {"vhf_ds5", vhf_enabled, vhf_reason},
       supported_gamepad_t {"usbip_ds5", usbip_enabled, usbip_reason},
-      supported_gamepad_t {"vhf_switch", vhf_enabled, vhf_reason}
+      supported_gamepad_t {"vhf_switch", vhf_enabled, vhf_reason},
+      supported_gamepad_t {"vhf_steam", vhf_enabled, vhf_reason}
     };
 
     // A gamepad type that is unavailable only because its backend is not installed is not
     // worth a warning when another backend is providing controllers; it is just an option the
     // user is not using.
-    const bool any_backend = vhf_enabled || usbip_enabled;
+    const bool any_backend = enabled || vhf_enabled || usbip_enabled;
     for (auto &[name, is_enabled, reason_disabled] : gps) {
       if (is_enabled) {
         continue;
@@ -1038,9 +2313,14 @@ namespace platf {
   platform_caps::caps_t get_capabilities() {
     platform_caps::caps_t caps = 0;
 
+    // Controller touch depends on which controller the client will get (see
+    // vhf_gamepad::supports_controller_touch): plain `vhf` selects a pad-bearing profile
+    // from the client's controller type (Steam Controller, PlayStation) whatever
+    // motion_as_ds4/touchpad_as_ds4 say, so only x360 and the explicit Xbox and Switch
+    // selections rule a touchpad out. Withholding the flag silences both Steam Controller
+    // trackpads: the client never sends a touch packet without it.
     const bool composite_dualsense = config::input.gamepad == "usbip_ds5"sv || dualsense_usbip_gamepad::enabled();
-    // usbridge: the broker's PlayStation pads take the controller touchpad, motion and battery.
-    if (vhf_gamepad::supports_controller_touch(config::input.gamepad, composite_dualsense) || usbridge::pads_via_broker()) {
+    if (vhf_gamepad::supports_controller_touch(config::input.gamepad, composite_dualsense)) {
       caps |= platform_caps::controller_touch;
     }
 

@@ -41,6 +41,17 @@ function daily(date: string, base = '2.0.0'): UpdateRelease {
     },
   };
 }
+function nightly(date: string, sha = 'a'.repeat(40), base = '2.0.1'): UpdateRelease {
+  const compact = date.replaceAll('-', '');
+  const tag = base + '-nightly.d' + compact + '.' + sha.slice(0, 12);
+  return {
+    ...release(tag, true),
+    assets: [...assets, { name: 'nightly-metadata.json', state: 'uploaded', size: 100 },
+      { name: 'SHA256SUMS', state: 'uploaded', size: 100 }],
+    nightly_metadata: { schema_version: 1, channel: 'nightly', tag, version: tag,
+      source_commit: sha, nightly_sequence: Number(compact) },
+  };
+}
 const releases = [
   release('v2.0.0-beta.10', true),
   release('v1.9.0-stable.2'),
@@ -228,6 +239,25 @@ test('SemVer GitHub nightly tags notify shipped stable clients and retain metada
   ]) assert.equal(selectAvailableUpdate('2.0.0', [changed], true), null);
 });
 
+test('new nightly updates preserve legacy upgrade, date order and SHA-as-identity', () => {
+  const old = '2.0.1-daily.d20261022.2+aaaaaaaaaaaa';
+  const current = nightly('2026-10-22', 'b'.repeat(40));
+  const sameDate = nightly('2026-10-22', 'c'.repeat(40));
+  const tomorrow = nightly('2026-10-23', '0'.repeat(40));
+  assert.equal(selectAvailableUpdate(old, [current], true)?.tag, current.tag_name);
+  assert.equal(selectAvailableUpdate(current.tag_name!, [current], true), null);
+  assert.equal(selectAvailableUpdate(current.tag_name!, [sameDate], true), null);
+  assert.equal(selectAvailableUpdate(current.tag_name!, [tomorrow], true)?.tag, tomorrow.tag_name);
+  assert.equal(selectAvailableUpdate('2.0.0', [tomorrow], false), null);
+  assert.equal(selectAvailableUpdate('2.0.1', [tomorrow], true), null);
+  assert.equal(selectAvailableUpdate(current.tag_name!, [release('2.0.1')], true)?.tag, '2.0.1');
+  for (const tamper of [
+    { ...current, nightly_metadata: { ...current.nightly_metadata, source_commit: 'c'.repeat(40) } },
+    { ...current, nightly_metadata: { ...current.nightly_metadata, version: current.tag_name + '+bbbb' } },
+    { ...current, assets },
+  ]) assert.equal(selectAvailableUpdate('2.0.0', [tamper], true), null);
+});
+
 test('daily availability uses only release API requests and embedded validated identity', async () => {
   const previous = globalThis.fetch;
   const next = daily('2026-10-12', '2.0.1');
@@ -249,4 +279,48 @@ test('daily availability uses only release API requests and embedded validated i
     assert.equal(selectWireUpdate('2.0.0', [{...next, body: next.body + next.body}], true), null);
     assert.equal(selectWireUpdate('2.0.0', [{...next, body: ''}], true), null);
   } finally { globalThis.fetch = previous; }
+});
+
+function revisedNightly(date: string, revision: number, sha = 'b'.repeat(40)): UpdateRelease {
+  const result = nightly(date, sha);
+  const compact = date.replaceAll('-', '');
+  const tag = `2.0.1-nightly.d${compact}.r.${revision}.${sha.slice(0,12)}`;
+  result.tag_name = tag;
+  Object.assign(result.nightly_metadata!, {tag, version: tag, nightly_sequence: Number(compact)*1000+revision});
+  return result;
+}
+
+test('same-day revised nightly UI ordering matches backend and ignores SHA order', () => {
+  const old = nightly('2026-10-22', 'f'.repeat(40));
+  const first = revisedNightly('2026-10-22', 1, '0'.repeat(40));
+  const second = revisedNightly('2026-10-22', 2, 'a'.repeat(40));
+  const tenth = revisedNightly('2026-10-22', 10, '1'.repeat(40));
+  const releases = [old, tenth, second, first];
+  assert.equal(selectAvailableUpdate(old.tag_name!, releases, true)?.tag, tenth.tag_name);
+  assert.equal(selectAvailableUpdate(first.tag_name!, releases, true)?.tag, tenth.tag_name);
+  assert.equal(selectAvailableUpdate(tenth.tag_name!, releases, true), null);
+  assert.equal(selectAvailableUpdate(first.tag_name!, [old], true), null);
+  assert.equal(selectAvailableUpdate('2.0.1', releases, true), null);
+  assert.equal(selectAvailableUpdate('2.0.0', releases, false), null);
+  assert.equal(selectAvailableUpdate('2.0.1-daily.d20261021.999+aaaaaaaaaaaa', [first], true)?.tag, first.tag_name);
+  assert.equal(selectAvailableUpdate('2.0.1-daily.d20261023.1+aaaaaaaaaaaa', [first], true), null);
+  assert.equal(selectAvailableUpdate(first.tag_name!, [daily('2026-10-23','2.0.1')], true)?.tag, 'daily-2026-10-23');
+});
+
+test('revised nightly UI qualification requires metadata, checksums, exact source and calendar', () => {
+  const first = revisedNightly('2026-10-22', 1);
+  assert.equal(validNightlyMetadata(first.tag_name!, first.nightly_metadata), true);
+  const wire = {...first, body: `<!-- nightly-identity: ${JSON.stringify(first.nightly_metadata)} -->\n`};
+  assert.equal(selectWireUpdate('2.0.0', [wire], true)?.tag, first.tag_name);
+  assert.equal(selectWireUpdate('2.0.0', [{...wire, body: ''}], true), null);
+  assert.equal(selectWireUpdate('2.0.0', [{...wire, assets: assets}], true), null);
+  for (const changed of [{source_commit:'c'.repeat(40)}, {nightly_sequence:20261022}, {version:'2.0.1'}]) {
+    const metadata = {...first.nightly_metadata, ...changed};
+    assert.equal(validNightlyMetadata(first.tag_name!, metadata), false);
+    assert.equal(selectWireUpdate('2.0.0', [{...wire, body:`<!-- nightly-identity: ${JSON.stringify(metadata)} -->\n`}], true), null);
+  }
+  for (const invalid of [revisedNightly('2026-02-30',1), revisedNightly('2026-10-22',0), revisedNightly('2026-10-22',1000)]) {
+    assert.equal(validNightlyMetadata(invalid.tag_name!, invalid.nightly_metadata), false);
+    assert.equal(selectAvailableUpdate('2.0.0', [invalid], true), null);
+  }
 });

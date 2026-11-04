@@ -8,8 +8,8 @@
 	branch = master
 [submodule "third-party/build-deps"]
 	path = third-party/build-deps
-	url = https://github.com/LizardByte/build-deps.git
-	branch = master
+	url = https://github.com/Nonary/build-deps.git
+	branch = maintainer/native-dolby
 [submodule "third-party/doxyconfig"]
 	path = third-party/doxyconfig
 	url = https://github.com/LizardByte/doxyconfig.git
@@ -51,11 +51,15 @@
 	branch = master
 [submodule "third-party/Simple-Web-Server"]
 	path = third-party/Simple-Web-Server
-	url = https://github.com/LizardByte-infrastructure/Simple-Web-Server.git
-	branch = master
+	url = https://github.com/Nonary/Simple-Web-Server.git
+	branch = main
 [submodule "third-party/TPCircularBuffer"]
 	path = third-party/TPCircularBuffer
 	url = https://github.com/michaeltyson/TPCircularBuffer.git
+	branch = master
+[submodule "third-party/ViGEmClient"]
+	path = third-party/ViGEmClient
+	url = https://github.com/LizardByte/Virtual-Gamepad-Emulation-Client.git
 	branch = master
 [submodule "third-party/wayland-protocols"]
 	path = third-party/wayland-protocols

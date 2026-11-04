@@ -12,6 +12,7 @@ list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-misleading-indentation)
 # Disable warnings for Windows ARM64
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64")
     list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-dll-attribute-on-redeclaration)  # Boost
+    list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-unknown-warning-option)  # ViGEmClient
     list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-unused-variable)  # Boost
 endif()
 
@@ -36,6 +37,8 @@ file(GLOB NVPREFS_FILES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/platform/windows/nvprefs/*.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/nvprefs/*.h")
 
+# vigem
+include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include")
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party")
 
 # libvirtualgamepad: the control-protocol client for Vibepollo's own UMDF/VHF gamepad driver.
@@ -155,12 +158,18 @@ foreach(_sunshine_versioned_tool IN ITEMS
         sunshinesvc
         playnite-launcher
         sunshine_wgc_capture
+        sunshine_end_stream_hotkey
         sunshine_display_helper)
     if(TARGET "${_sunshine_versioned_tool}")
         sunshine_add_windows_versioninfo("${_sunshine_versioned_tool}")
     endif()
 endforeach()
 unset(_sunshine_versioned_tool)
+
+# ViGEmBus version
+set(VIGEMBUS_PACKAGED_V "1.21.442")
+set(VIGEMBUS_PACKAGED_V_2 "${VIGEMBUS_PACKAGED_V}.0")
+list(APPEND SUNSHINE_DEFINITIONS VIGEMBUS_PACKAGED_VERSION="${VIGEMBUS_PACKAGED_V_2}")
 
 # NVIDIA TrueHDR (RTX HDR) SDR->HDR synthesis. The host code is SDK-free and loads the
 # MSVC-built shim (vibeshine_truehdr.dll, see tools/truehdr_shim) at runtime, so this is
@@ -216,6 +225,7 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_cleanup.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/hotkey_manager.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/hotkey_manager.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/end_stream_hotkey.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/playnite_ipc.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/playnite_ipc.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/playnite_protocol.h"
@@ -290,6 +300,11 @@ set(PLATFORM_TARGET_FILES
         "${SUNSHINE_LIBVIRTUALGAMEPAD_SOURCE_DIR}/driver/src/dualsense.cpp"
         "${SUNSHINE_LIBVIRTUALGAMEPAD_INCLUDE_DIR}/libvirtualgamepad/client.h"
         "${SUNSHINE_LIBVIRTUALGAMEPAD_INCLUDE_DIR}/libvirtualgamepad/protocol.h"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Client.h"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Common.h"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Util.h"
+        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/km/BusShared.h"
         # Native AMD AMF encoder (D3D11). AMF SDK headers are provided by the
         # bundled FFmpeg build-deps (include/AMF), so no extra dependency is
         # required - the runtime (amfrt64.dll) is loaded dynamically.
@@ -299,6 +314,22 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/amf/amf_d3d11.h"
         "${CMAKE_SOURCE_DIR}/src/amf/amf_d3d11.cpp"
         ${NVPREFS_FILES})
+
+if(SUNSHINE_ENABLE_FRAME_PUSH_CAPTURE)
+    list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_ENABLE_FRAME_PUSH_CAPTURE=1)
+    list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_push_io.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_push_io.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_push_windows_io.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_push_windows_io.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_push_transport.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_push_transport.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_push_d3d11.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_push_d3d11.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/display_frame_push.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/display_frame_push.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_push_capture_policy.h")
+endif()
 
 set(OPENSSL_LIBRARIES
         libssl.a
@@ -322,6 +353,7 @@ list(PREPEND PLATFORM_LIBRARIES
         ntdll
         ole32
         pdh
+        powrprof
         setupapi
         shlwapi
         shell32
@@ -330,6 +362,7 @@ list(PREPEND PLATFORM_LIBRARIES
         synchronization.lib
         Windowscodecs
         userenv
+        wintrust
         ws2_32
         wsock32
 )
@@ -346,6 +379,13 @@ if(SUNSHINE_ENABLE_PYROWAVE)
             "${CMAKE_SOURCE_DIR}/src/platform/windows/pyrowave_d3d11_core.h"
             "${CMAKE_SOURCE_DIR}/src/platform/windows/pyrowave_d3d11_core.cpp"
             "${CMAKE_SOURCE_DIR}/src/platform/windows/pyrowave_encode.cpp")
+    if(SUNSHINE_EXPERIMENTAL_PYROWAVE_D3D12)
+        list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_EXPERIMENTAL_PYROWAVE_D3D12=1)
+        list(APPEND PLATFORM_LIBRARIES d3d12)
+        list(APPEND PLATFORM_TARGET_FILES
+                "${CMAKE_SOURCE_DIR}/src/platform/windows/pyrowave_d3d12_conversion.h"
+                "${CMAKE_SOURCE_DIR}/src/platform/windows/pyrowave_d3d12_conversion.cpp")
+    endif()
 endif()
 
 list(APPEND PLATFORM_TARGET_FILES "${CMAKE_SOURCE_DIR}/src/platform/windows/managed_app_focus.cpp")

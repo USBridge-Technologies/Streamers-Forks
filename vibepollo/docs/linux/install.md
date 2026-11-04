@@ -5,6 +5,10 @@ and it is developed and tested on **CachyOS with KDE Plasma 6 on Wayland**. Othe
 distributions should work but get less testing. There is no AppImage, Flatpak, Debian, Fedora, or
 Docker build in this beta.
 
+An explicit, experimental [Hyprland physical-display subset](hyprland.md) is available through
+the manual native-package path. It requires UWSM and does not provide private outputs, HDR
+or Steam/Xwayland application launching.
+
 ## Requirements
 
 | Requirement | Detail |
@@ -161,6 +165,27 @@ sudo vibepollo configure USER
 sudo systemctl enable --now vibepollo-session-controller.service
 ```
 
+### Authorizing application commands
+
+Custom application commands and per-app preparation commands require administrator approval.
+After reviewing the commands saved in `/var/lib/vibepollo/apps.json`, approve that snapshot:
+
+```bash
+sudo vibepollo authorize-commands
+```
+
+Run this again after adding or changing commands. Saving an application in the Web UI does
+not approve it. This command collects application launch, detached and preparation commands
+from `apps.json`; it does not authorize global preparation commands from `vibepollo.conf`.
+An unapproved command is rejected by the session broker and can exit with status 126.
+
+Managed Steam and Lutris launches use fixed numeric-ID operations instead of approving
+arbitrary commands. The exact reserved helper syntax, such as
+`/usr/libexec/vibeshine/vibepollo-session-exec lutris 16`, selects that fixed operation even
+when entered manually. It does not approve other command strings or shell arguments.
+On a Linux machine-service host, run Lutris synchronization once after upgrading to refresh
+older managed entries. Other custom launch and preparation commands still require approval.
+
 ## Verify
 
 ```bash
@@ -303,6 +328,49 @@ upgrades from those affected builds are no longer supported; future exceptions b
 separate named, condition-scoped scripts under `scripts/linux/migrations`.
 
 The separate `upgrade-2.0.1-lifecycle-v1` step applies to `2.0.1` builds with the qualified helper-first selector and old fence without `Restart=no`. Both repository baselines are exactly tagged `2.0.1`; the tests retain their original hooks, reproduce the direct fence-preparation mismatch, and verify the scoped override. Complete historical removal callbacks accept the proven incoming fence through their preserved-quiescence shortcut, keep the fence and masks intact, and reach driver cleanup. Epochs and package revisions are included in version matching. Unknown versions and already fixed hooks keep their outgoing checks.
+
+The temporary `upgrade-2.0.2-fuse-scan-v1` step supports the published
+`2.0.2daily.d20261017.2` Arch/CachyOS packages (package release `1`). It matches
+that daily, its published short commit suffix (with optional full `.r` suffix),
+and the complete installed `arch-package-hooks` SHA-256 for
+its qualified source commit. The new installer stages the corrected incoming
+full guard under `00-vibepollo-quiesce.hook` in its private HookDir, with
+`AbortOnFail` retained. It never sources or edits the old installed library. The preflight rechecks
+the version, complete fingerprint and file type under the package transaction
+lock; a changed installed guard aborts before any new shutdown begins.
+Edited, symlinked, already fixed, unknown-version, or different-revision hooks
+are not given this override. Administrator same-name hook collisions still
+abort before a transaction. Retire this step when upgrades from this daily
+are no longer supported; qualify additional versions and artifacts separately.
+
+Use a new installer containing this step with a fixed package containing both
+the migration and corrected executable proof. The signed repository route and
+`--package FILE` route both stage the guard before starting the package
+transaction. For an already downloaded trusted fixed package, the route is:
+
+```bash
+sudo bash ./linux_install.sh --package ./vibepollo-FIXED_VERSION-1-x86_64.pkg.tar.zst
+```
+
+An installed failing `AbortOnFail` guard runs before an incoming package's
+scriptlet can repair it. Direct `pacman -U` therefore cannot bootstrap this
+fix while that installed guard still fails. Do not disable transaction hooks,
+rename the installed library, or unmask uncertain generations to get past it.
+The bootstrap must pass the corrected full process/session/cgroup proof before
+replacement, and a failed proof still blocks file-security finalization.
+
+Cleanup treats a nonempty reported cgroup as absent only after an errno-aware
+lookup confirms it is missing. Permission and I/O errors remain blocked; a
+real missing cgroup and a readable `populated 0` group retain their behavior.
+The same check covers the controller, machine-host helper and package hooks.
+
+Controller cleanup also accepts a masked failed unit only when its MainPID is
+zero and its cgroup is empty or absent. Active, populated, malformed or
+uninspectable units remain blocked. A later cleanup failure now reports its
+actual step; older hooks could retain the label of a controller check that
+had already passed. The reported label alone does not establish which runtime
+resource prevented cleanup. These changes do not justify removing unknown
+fences or administrator masks.
 
 The published 2.0.0 metadata failure compared translated `stat %F` text with `regular file`.
 Locale-independent metadata checks are already present in the qualified primary source. The

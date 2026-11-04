@@ -31,6 +31,7 @@ interface PairedDevice {
   name: string;
   uuid: string;
   enabled: boolean;
+  allow_sleep?: boolean;
   connected: boolean;
   perm?: number | string;
   enable_legacy_ordering?: boolean;
@@ -44,6 +45,8 @@ interface PairedDevice {
   virtual_display_mode?: string;
   virtual_display_layout?: string;
   always_use_virtual_display?: boolean;
+  requested_resolution_only?: boolean;
+  requested_resolution_catalog_supported?: boolean;
   prefer_10bit_sdr?: boolean;
   config_overrides?: Record<string, unknown>;
 }
@@ -55,6 +58,7 @@ interface ClientsResponse {
 }
 
 interface MutationResponse {
+  allow_sleep_updated?: boolean;
   status?: boolean;
 }
 
@@ -177,6 +181,7 @@ function normalizeDevice(device: unknown, index: number): PairedDevice {
     uuid: stringValue(raw.uuid) || `unknown-device-${fallbackIdentity || index + 1}`,
     name: stringValue(raw.name),
     enabled: booleanValue(raw.enabled, true),
+    allow_sleep: raw.allow_sleep === true,
     connected: booleanValue(raw.connected, false),
     last_seen:
       typeof raw.last_seen === 'number' || typeof raw.last_seen === 'string' ? raw.last_seen : null,
@@ -186,6 +191,11 @@ function normalizeDevice(device: unknown, index: number): PairedDevice {
     virtual_display_mode: stringValue(raw.virtual_display_mode),
     virtual_display_layout: stringValue(raw.virtual_display_layout),
     always_use_virtual_display: booleanValue(raw.always_use_virtual_display, false),
+    requested_resolution_only: booleanValue(raw.requested_resolution_only, false),
+    requested_resolution_catalog_supported: booleanValue(
+      raw.requested_resolution_catalog_supported,
+      false,
+    ),
     prefer_10bit_sdr: booleanValue(raw.prefer_10bit_sdr, false),
     config_overrides: configOverrides ? structuredClone(toRaw(configOverrides)) : {},
   };
@@ -259,8 +269,6 @@ const filteredDevices = computed(() => {
   return list;
 });
 
-const PERMISSION_VIEW = 0x02000000;
-const PERMISSION_LAUNCH = 0x04000000;
 const PERMISSION_ALL = 0x071f1f00;
 
 function permissionMask(device: PairedDevice): number {
@@ -268,8 +276,8 @@ function permissionMask(device: PairedDevice): number {
   return Number.isFinite(parsed) ? parsed & PERMISSION_ALL : 0;
 }
 
-function canViewStream(device: PairedDevice): boolean {
-  return Boolean(permissionMask(device) & (PERMISSION_VIEW | PERMISSION_LAUNCH));
+function hasClientAccess(device: PairedDevice): boolean {
+  return device.enabled && permissionMask(device) !== 0;
 }
 
 const hasDeviceFilters = computed(
@@ -282,9 +290,9 @@ function clearDeviceFilters(): void {
 }
 
 const deviceCounts = computed(() => ({
-  streaming: devices.value.filter((device) => device.connected && canViewStream(device)).length,
-  blocked: devices.value.filter((device) => !canViewStream(device)).length,
-  offline: devices.value.filter((device) => !device.connected && canViewStream(device)).length,
+  streaming: devices.value.filter((device) => device.connected && hasClientAccess(device)).length,
+  blocked: devices.value.filter((device) => !hasClientAccess(device)).length,
+  offline: devices.value.filter((device) => !device.connected && hasClientAccess(device)).length,
 }));
 
 const confirmTitle = computed(() => {
@@ -378,6 +386,7 @@ function draftFromDevice(device: PairedDevice): ClientDeviceDraft {
 
   return {
     name: device.name,
+    allowSleep: device.allow_sleep === true,
     permissions: permissionMask(device),
     enableLegacyOrdering: device.enable_legacy_ordering !== false,
     allowClientCommands: device.allow_client_commands !== false,
@@ -391,6 +400,7 @@ function draftFromDevice(device: PairedDevice): ClientDeviceDraft {
     virtualDisplayLayout,
     hdrProfile: device.hdr_profile?.trim() ?? '',
     prefer10BitSdr: Boolean(device.prefer_10bit_sdr),
+    requestedResolutionOnly: Boolean(device.requested_resolution_only),
     configOverrides:
       device.config_overrides && typeof device.config_overrides === 'object'
         ? structuredClone(toRaw(device.config_overrides))
@@ -491,12 +501,17 @@ async function loadHdrProfiles(force = false): Promise<void> {
   }
 }
 
-async function loadDevices(silent = false): Promise<void> {
-  if (refreshing.value) return;
+let devicesLoadRevision = 0;
+let accessMutationPending = false;
+
+async function loadDevices(silent = false, force = false): Promise<void> {
+  if (!force && (refreshing.value || accessMutationPending)) return;
+  const revision = ++devicesLoadRevision;
   refreshing.value = true;
   if (!silent) error.value = '';
   try {
     const response = await apiGet<ClientsResponse>('/api/clients/list');
+    if (revision !== devicesLoadRevision) return;
     if (response.status === false) throw new Error(t('ui.devices.error.list_rejected'));
     const incoming = Array.isArray(response.named_certs)
       ? response.named_certs.map((device, index) => normalizeDevice(device, index))
@@ -509,6 +524,7 @@ async function loadDevices(silent = false): Promise<void> {
     devices.value = reconcileStable(devices.value, incoming);
     if (!silent) notice.value = '';
   } catch (cause) {
+    if (revision !== devicesLoadRevision) return;
     error.value =
       cause instanceof ApiError
         ? t('ui.devices.error.load')
@@ -516,13 +532,42 @@ async function loadDevices(silent = false): Promise<void> {
           ? cause.message
           : t('ui.devices.error.load');
   } finally {
-    refreshing.value = false;
-    loading.value = false;
+    if (revision === devicesLoadRevision) {
+      refreshing.value = false;
+      loading.value = false;
+    }
+  }
+}
+
+async function toggleEnabled(device: PairedDevice, event: Event): Promise<void> {
+  (event.target as HTMLInputElement).checked = device.enabled;
+  if (busyUuid.value) return;
+  busyUuid.value = device.uuid;
+  accessMutationPending = true;
+  ++devicesLoadRevision; // Fence a list request that started before this mutation.
+  error.value = '';
+  try {
+    const response = await apiPost<MutationResponse>('/api/clients/update', {
+      uuid: device.uuid,
+      enabled: !device.enabled,
+    });
+    if (!response.status) throw new Error('client-update-rejected');
+  } catch {
+    error.value = t('_common.error');
+  } finally {
+    // Failed revocation saves still disable access in memory. Keep controls
+    // busy through readback and preserve dirty drafts through syncDrafts.
+    try {
+      await loadDevices(true, true);
+    } finally {
+      accessMutationPending = false;
+      busyUuid.value = '';
+    }
   }
 }
 
 function statusFor(device: PairedDevice): { label: string; tone: StatusTone } {
-  if (!canViewStream(device)) return { label: t('ui.devices.status.blocked'), tone: 'danger' };
+  if (!hasClientAccess(device)) return { label: t('ui.devices.status.blocked'), tone: 'danger' };
   if (device.connected) return { label: t('ui.devices.status.streaming'), tone: 'success' };
   return { label: t('clients.offline'), tone: 'neutral' };
 }
@@ -554,6 +599,7 @@ function hasCustomSettings(device: PairedDevice): boolean {
       device.always_use_virtual_display ||
       device.hdr_profile ||
       device.prefer_10bit_sdr ||
+      device.requested_resolution_only ||
       Object.keys(device.config_overrides ?? {}).length,
   );
 }
@@ -592,11 +638,15 @@ function updatePayload(device: PairedDevice, draft: ClientDeviceDraft): Record<s
   const payload: Record<string, unknown> = {
     uuid: device.uuid,
     name: draft.name.trim(),
+    allow_sleep: draft.allowSleep,
     perm: draft.permissions & PERMISSION_ALL,
     enable_legacy_ordering: draft.enableLegacyOrdering,
     allow_client_commands: draft.allowClientCommands,
     do: draft.doCommands.map((entry) => ({ cmd: entry.command.trim(), elevated: entry.elevated })),
-    undo: draft.undoCommands.map((entry) => ({ cmd: entry.command.trim(), elevated: entry.elevated })),
+    undo: draft.undoCommands.map((entry) => ({
+      cmd: entry.command.trim(),
+      elevated: entry.elevated,
+    })),
     display_mode: draft.displayMode.trim(),
     output_name_override: outputName,
     always_use_virtual_display:
@@ -612,6 +662,7 @@ function updatePayload(device: PairedDevice, draft: ClientDeviceDraft): Record<s
         : '',
     virtual_display_layout: useVirtualDisplay ? (draft.virtualDisplayLayout ?? '') : '',
     prefer_10bit_sdr: draft.prefer10BitSdr,
+    requested_resolution_only: draft.requestedResolutionOnly,
     hdr_profile: draft.hdrProfile.trim(),
     config_overrides: cleanOverrides(draft.configOverrides),
   };
@@ -620,6 +671,7 @@ function updatePayload(device: PairedDevice, draft: ClientDeviceDraft): Record<s
 
 const draftScalarKeys = [
   'name',
+  'allowSleep',
   'permissions',
   'enableLegacyOrdering',
   'allowClientCommands',
@@ -633,6 +685,7 @@ const draftScalarKeys = [
   'virtualDisplayLayout',
   'hdrProfile',
   'prefer10BitSdr',
+  'requestedResolutionOnly',
 ] as const satisfies ReadonlyArray<Exclude<keyof ClientDeviceDraft, 'configOverrides'>>;
 
 function serializedValue(value: unknown): string {
@@ -718,7 +771,7 @@ async function saveDevice(device: PairedDevice): Promise<void> {
       '/api/clients/update',
       updatePayload(device, saveDraft),
     );
-    if (response.status !== true) {
+    if (response.status !== true || response.allow_sleep_updated !== true) {
       throw new Error(t('ui.devices.error.partial_update'));
     }
     drafts.value[device.uuid] = cloneDraft(saveDraft);
@@ -959,6 +1012,11 @@ onBeforeUnmount(() => {
                 <code>{{ device.uuid }}</code>
               </div>
               <div class="device-row__actions">
+                <label class="vs-button vs-button--tertiary">
+                  <input type="checkbox" :checked="device.enabled" :disabled="Boolean(busyUuid)"
+                    @change="toggleEnabled(device, $event)" />
+                  {{ t('_common.enabled') }}
+                </label>
                 <AppButton
                   :label="t('clients.disconnect')"
                   icon="stop"
@@ -1002,6 +1060,9 @@ onBeforeUnmount(() => {
                   v-model="drafts[device.uuid]"
                   :common-settings="commonSettings"
                   :metadata="{ ...metadata, platform: metadata.platform || platform }"
+                  :requested-resolution-catalog-supported="
+                    device.requested_resolution_catalog_supported
+                  "
                   :display-devices="displayDevices"
                   :display-devices-loading="displayDevicesLoading"
                   :display-devices-loaded="displayDevicesLoaded"

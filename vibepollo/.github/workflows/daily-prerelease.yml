@@ -12,18 +12,46 @@ on:
         type: boolean
         default: false
 
-# Both schedule and manual dispatch remain inert until explicitly activated.
+# The default branch owns the cron launcher. This workflow owns qualification
+# and publication, whether dispatched by that launcher or manually from Canary.
 concurrency:
-  group: daily-windows-prerelease
+  group: ${{ github.ref_name == github.event.repository.default_branch && 'daily-windows-launcher' || 'daily-windows-prerelease' }}
   cancel-in-progress: false
 
 jobs:
-  prepare:
+  dispatch:
     if: >-
       (github.event_name == 'workflow_dispatch' || vars.DAILY_RELEASE_ENABLED == 'true') &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
       github.repository == 'Nonary/Vibepollo' &&
       github.ref_type == 'branch' &&
-      github.ref_name == github.event.repository.default_branch
+      github.ref_name == github.event.repository.default_branch &&
+      vars.DAILY_RELEASE_SOURCE_BRANCH == 'canary' &&
+      vars.DAILY_RELEASE_SOURCE_CONFIRMED == 'Nonary/Vibepollo:canary'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the same Canary-owned nightly workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish == true }}
+        run: |
+          set -euo pipefail
+          payload="$(mktemp)"
+          trap 'rm -f "$payload"' EXIT
+          jq -n --argjson publish "$PUBLISH" '{ref:"canary",inputs:{publish:$publish}}' > "$payload"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/daily-prerelease.yml/dispatches" --input "$payload"
+          echo 'Canary nightly dispatch accepted. Build and publication outcomes belong to the child run.' >> "$GITHUB_STEP_SUMMARY"
+
+  prepare:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'Nonary/Vibepollo' &&
+      github.ref_type == 'branch' &&
+      github.ref_name == 'canary' &&
+      vars.DAILY_RELEASE_SOURCE_BRANCH == 'canary' &&
+      vars.DAILY_RELEASE_SOURCE_CONFIRMED == 'Nonary/Vibepollo:canary'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -37,10 +65,14 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          # Version tags must be reachable through the primary's complete ancestry.
+          ref: ${{ github.sha }}
+          # The resolver requires the confirmed remote Canary to still name
+          # this exact dispatched workflow/source commit.
           fetch-depth: 0
       - name: Test daily release contracts
-        run: python -m unittest discover -s scripts/tests -p test_daily_release.py
+        run: |
+          python -m unittest discover -s scripts/tests -p test_daily_release.py
+          python -m unittest discover -s .github/scripts -p test_vhf_release_identity.py
       - name: Test nightly notes and immutable metadata
         run: python -m unittest discover -s scripts/tests -p test_nightly_notes.py
       - name: Resolve explicitly confirmed remote source and immutable identity
@@ -50,18 +82,22 @@ jobs:
           DAILY_PRIMARY_BRANCH: ${{ github.event.repository.default_branch }}
           DAILY_RELEASE_SOURCE_BRANCH: ${{ vars.DAILY_RELEASE_SOURCE_BRANCH }}
           DAILY_RELEASE_SOURCE_CONFIRMED: ${{ vars.DAILY_RELEASE_SOURCE_CONFIRMED }}
-          DAILY_RELEASE_MIGRATION_CONFIRMED: ${{ vars.DAILY_RELEASE_MIGRATION_CONFIRMED }}
         run: python scripts/daily_release.py resolve
       - name: Reserve exact qualified source identity before builds
-        if: steps.identity.outputs.should_build == 'true' && (github.event_name == 'schedule' || inputs.publish == true)
+        if: steps.identity.outputs.should_build == 'true' && vars.DAILY_RELEASE_ENABLED == 'true' && inputs.publish == true
         env:
           GH_TOKEN: ${{ github.token }}
           DAILY_TAG: ${{ steps.identity.outputs.tag }}
           DAILY_COMMIT: ${{ steps.identity.outputs.commit }}
         run: |
           set -euo pipefail
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$DAILY_TAG" -f sha="$DAILY_COMMIT"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$DAILY_TAG" --jq .object.sha)" = "$DAILY_COMMIT"
+          # A failed run may already have reserved this exact immutable ref.
+          # Reuse it only when it still names the identical qualified commit.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$DAILY_TAG" --jq .object.sha > reserved-sha.txt 2>/dev/null; then
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$DAILY_TAG" -f sha="$DAILY_COMMIT"
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$DAILY_TAG" --jq .object.sha > reserved-sha.txt
+          fi
+          test "$(cat reserved-sha.txt)" = "$DAILY_COMMIT"
 
   build:
     needs: prepare
@@ -83,7 +119,7 @@ jobs:
       symbol_product_name: Vibepollo
       symbol_release_prefix: polo
       publish_symbols: false
-      upload_symbols_artifact: false
+      upload_symbols_artifact: true
       release_artifact_retention_days: 7
     # Only scoped runtime and reusable gamepad signing secrets; no SignPath or inherit.
     secrets:
@@ -110,7 +146,7 @@ jobs:
     needs: [prepare, build, linux]
     if: >-
       needs.build.result == 'success' && needs.linux.result == 'success' && vars.DAILY_RELEASE_ENABLED == 'true' &&
-      (github.event_name == 'schedule' || inputs.publish == true)
+      inputs.publish == true
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -124,12 +160,31 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          ref: ${{ needs.prepare.outputs.commit }}
           fetch-depth: 0
       - name: Download finalized installer from this run
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: build-Windows
           path: daily-assets
+      - name: Download exact-build Windows symbols from this run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: windows-symbols-Windows
+          path: symbol-assets
+      - name: Verify exact-build Windows symbols
+        run: |
+          set -euo pipefail
+          symbol_pack="VibepolloSymbols-${DAILY_VERSION}-windows-x64.7z"
+          test -s "symbol-assets/$symbol_pack"
+      - name: Retain exact-build Windows symbols
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-windows-symbols
+          path: symbol-assets/
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
       - name: Verify finalized provenance, identity and complete asset set
         run: python scripts/daily_release.py verify --assets daily-assets --product Vibepollo
       - name: Download qualified Linux package from this run
@@ -158,14 +213,30 @@ jobs:
       - name: Create once, upload all assets, then expose prerelease
         run: |
           set -euo pipefail
-          # The reserved tag pins the tested source even if master advances.
+          # Partial reruns must not publish a duplicate or older qualified source.
+          python scripts/daily_release.py publication
+          # The reserved tag pins the tested source even if canary advances.
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$DAILY_TAG" --jq .object.sha)" = "$DAILY_COMMIT"
-          gh release create "$DAILY_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Nightly ${DAILY_TAG#daily-}" --notes-file daily-notes.md --draft --prerelease --latest=false
+          gh release create "$DAILY_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$DAILY_TAG" --notes-file daily-notes.md --draft --prerelease --latest=false
           gh release upload "$DAILY_TAG" public-assets/* --repo "$GITHUB_REPOSITORY"
           gh release view "$DAILY_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | sort' > uploaded-assets.json
           python -c 'import json; from pathlib import Path; assert json.loads(Path("uploaded-assets.json").read_text()) == sorted(p.name for p in Path("public-assets").iterdir()), "Uploaded release asset set is incomplete"'
           gh release edit "$DAILY_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
-          gh release view "$DAILY_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease,isDraft --jq 'if .isPrerelease and (.isDraft | not) then "Published prerelease" else error("Incorrect release state") end'
+          release_json="$(gh release view "$DAILY_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,publishedAt)"
+          jq -e --arg tag "$DAILY_TAG" '.tagName == $tag and .isPrerelease == true and .isDraft == false and (.publishedAt | type == "string" and length > 0)' <<< "$release_json" >/dev/null
+          echo "$release_json" | jq -r 'if .isPrerelease and (.isDraft | not) then "Published prerelease" else error("Incorrect release state") end'
+
+          dispatch_payload="$(mktemp)"
+          jq -n \
+            --arg tag "$DAILY_TAG" \
+            --arg source_commit "$DAILY_COMMIT" \
+            --arg published_at "$(jq -r '.publishedAt' <<< "$release_json")" \
+            '{event_type:"daily-release-published",client_payload:{tag_name:$tag,source_commit:$source_commit,published_at:$published_at,draft:false,prerelease:true}}' \
+            > "$dispatch_payload"
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" --input "$dispatch_payload" >/dev/null; then
+            echo "::warning::Could not queue the verification-only issue follow-up. The issue remains open; inspect the published daily and complete the reporter follow-up manually if needed."
+          fi
+          rm -f "$dispatch_payload"
 
   summary:
     needs: [prepare, build, linux, publish]
