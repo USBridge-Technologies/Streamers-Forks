@@ -24,7 +24,25 @@ pub struct SeatDefaults {
     pub library_writable: bool,
     /// A seat's DualSense is a USB/IP device with a real sound card, as the box's is.
     pub dualsense_usbip: bool,
+    /// The box streams to browsers, so each seat runs a browser plane of its own.
+    pub browser: bool,
+    /// The browser origins the box admits, which each seat's plane admits too.
+    pub browser_origins: Vec<String>,
+    /// Every app a Windows seat starts reads GameInput in the background.
+    pub background_input: bool,
 }
+
+/// The rows [`SeatDefaults::of`] reads. On a door they are the door's own: its file is the one
+/// the seats' copies come from.
+pub const ROWS: &[&str] = &[
+    "seat_end_on_game_exit",
+    "seat_max_mode",
+    "seat_library_writable",
+    "dualsense_usbip",
+    "webtransport",
+    "webtransport_origins",
+    "seat_background_input",
+];
 
 impl SeatDefaults {
     pub fn of(config: &crate::HostConfig) -> Self {
@@ -33,6 +51,9 @@ impl SeatDefaults {
             max_mode: config.seat_max_mode.clone(),
             library_writable: config.seat_library_writable,
             dualsense_usbip: config.dualsense_usbip,
+            browser: config.webtransport,
+            browser_origins: config.webtransport_origins.clone(),
+            background_input: config.seat_background_input,
         }
     }
 
@@ -42,6 +63,9 @@ impl SeatDefaults {
             "max_mode": self.max_mode,
             "library_writable": self.library_writable,
             "dualsense_usbip": self.dualsense_usbip,
+            "browser": self.browser,
+            "browser_origins": self.browser_origins,
+            "background_input": self.background_input,
         })
     }
 
@@ -56,6 +80,14 @@ impl SeatDefaults {
                 .map(str::to_string),
             library_writable: v["library_writable"].as_bool().unwrap_or(true),
             dualsense_usbip: v["dualsense_usbip"].as_bool().unwrap_or(false),
+            browser: v["browser"].as_bool().unwrap_or(false),
+            browser_origins: v["browser_origins"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o.as_str().map(str::to_string))
+                .collect(),
+            background_input: v["background_input"].as_bool().unwrap_or(true),
         }
     }
 }
@@ -79,6 +111,15 @@ static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
 /// contract, and while the box has written none: the seat then keeps its built-in defaults.
 pub fn current() -> Option<SeatDefaults> {
     if !pf_paths::seat::role().follows_contract() {
+        return None;
+    }
+    of_box()
+}
+
+/// The defaults the box last wrote, as any seat host reads them, the owner's included. Only
+/// [`current`] decides which of them a seat applies as its own settings. `None` off a seat host.
+pub fn of_box() -> Option<SeatDefaults> {
+    if !pf_paths::seat::role().is_seat_host() {
         return None;
     }
     read_cached(&pf_paths::seat::trust_dir()?.join(FILE))
@@ -109,6 +150,9 @@ mod tests {
             max_mode: Some("2560x1440@120".into()),
             library_writable: false,
             dualsense_usbip: true,
+            browser: true,
+            browser_origins: vec!["https://box:47992".into()],
+            background_input: false,
         };
         assert_eq!(SeatDefaults::from_json(&d.to_json()), d);
         assert_eq!(
@@ -118,6 +162,9 @@ mod tests {
                 max_mode: None,
                 library_writable: true,
                 dualsense_usbip: false,
+                browser: false,
+                browser_origins: Vec::new(),
+                background_input: true,
             }
         );
     }

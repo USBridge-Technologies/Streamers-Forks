@@ -36,6 +36,8 @@ pub(crate) struct Asker<'a> {
     pub follows_redirects: bool,
     /// Its overlay on the box joins a live session instead of refusing.
     pub joins: bool,
+    /// A browser: it lands on the seat's browser plane, not its native port.
+    pub browser: bool,
 }
 
 /// Where `profile` plays for `asker`. Blocking (the supervisor's pipe and the seat's loopback
@@ -49,11 +51,17 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
     if plays_here(pf_paths::seat::role(), own_row) {
         return Placement::Here;
     }
-    let snap = super::snapshot();
+    // The ledger and the profile's own seat host: a hung host of another seat costs this
+    // connect nothing.
+    let snap = super::ledger();
     let Some(seat_id) = snap.row_of(&profile.os_account) else {
         return Placement::Refuse(RejectReason::SeatUnavailable);
     };
-    let occupants = snap.occupants.get(seat_id).map_or(&[][..], Vec::as_slice);
+    let occupants = snap
+        .seat(seat_id)
+        .filter(|(seat, _)| seat.runtime.state == RuntimeState::Running)
+        .and_then(|(seat, _)| super::occupants(seat))
+        .unwrap_or_default();
     let mut held = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
     held.retain(|_, (_, until)| *until > Instant::now());
     let held_by = held.get(seat_id).map(|(fp, _)| fp.as_str());
@@ -62,16 +70,63 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
         asker,
         snap.on,
         snap.seat(seat_id),
-        occupants,
+        &occupants,
         held_by,
     );
-    if let (Placement::Redirect(_), Some(fp)) = (&placed, asker.fp) {
-        held.insert(
-            seat_id.to_string(),
-            (fp.to_string(), Instant::now() + RESERVE),
-        );
+    let placed = match (placed, snap.seat(seat_id)) {
+        (Placement::Redirect(to), Some((seat, _))) if asker.browser => with_browser_plane(to, seat),
+        (placed, _) => placed,
+    };
+    if matches!(placed, Placement::Redirect(_)) {
+        PLACED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(seat_id.to_string(), Instant::now());
+        if let Some(fp) = asker.fp {
+            held.insert(
+                seat_id.to_string(),
+                (fp.to_string(), Instant::now() + RESERVE),
+            );
+        }
     }
     placed
+}
+
+/// `to` with the certificate hash `seat`'s browser plane serves under, which the browser pins
+/// and binds its credential to. A seat whose plane doesn't answer on the port the redirect names,
+/// as one started before the box streamed to browsers, is unavailable.
+fn with_browser_plane(mut to: Redirect, seat: &Seat) -> Placement {
+    let call = crate::mgmt::owner::Forwarded::get("webtransport".into());
+    let plane = match super::forward(seat, call) {
+        Some(crate::mgmt::owner::Answer::Reply(200, _, body)) => {
+            serde_json::from_slice::<serde_json::Value>(&body).ok()
+        }
+        _ => None,
+    };
+    let hash = plane
+        .filter(|p| p["port"].as_u64() == Some(u64::from(to.port)))
+        .and_then(|p| p["cert_hash_sha256"].as_str().map(str::to_ascii_lowercase));
+    match hash {
+        Some(hash) => {
+            to.cert_hash = hash;
+            Placement::Redirect(to)
+        }
+        None => Placement::Refuse(RejectReason::SeatUnavailable),
+    }
+}
+
+/// Seat id → when a device was last redirected to it.
+static PLACED: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
+
+/// When a device was last redirected to `seat_id`. A seat's idle clock starts no earlier: a
+/// player who lands and leaves between two of its checks still counts.
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn last_placed(seat_id: &str) -> Option<Instant> {
+    PLACED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(seat_id)
+        .copied()
 }
 
 /// Whether the host that was asked plays the profile itself. A seat host does: resolving the
@@ -88,12 +143,10 @@ fn plays_here(role: HostRole, own_row: bool) -> bool {
 /// Seat id → the device redirected to it and until when it holds it.
 static RESERVED: Mutex<BTreeMap<String, (String, Instant)>> = Mutex::new(BTreeMap::new());
 
-/// A profile whose seat is a ledger row of its own.
+/// A profile whose seat is a ledger row of its own: the row [`row_in`](super::row_in) names
+/// with no owner row, so the owner's profile has none.
 fn ledger_seat(account: &crate::profiles::OsAccount) -> Option<&str> {
-    match account {
-        crate::profiles::OsAccount::Seat { seat: Some(id) } => Some(id),
-        _ => None,
-    }
+    super::row_in(account, None, false)
 }
 
 /// The rule, without IO. `seat` is the profile's ledger row and its seat number, `occupants`
@@ -131,14 +184,23 @@ fn decide(
     if (other.is_some() || held_by_other) && !asker.joins {
         return Placement::Refuse(RejectReason::SeatOccupied);
     }
+    let port = if asker.browser {
+        match seat.browser_port() {
+            Some(port) => port,
+            None => return Placement::Refuse(RejectReason::SeatUnavailable),
+        }
+    } else {
+        seat.native_port
+    };
     Placement::Redirect(Redirect {
         addr: String::new(),
-        port: seat.native_port,
+        port,
         profile: profile_id.to_string(),
         seat_no,
         seat_name: seat.name.clone(),
         occupant: other.and_then(|o| o.name.clone()).unwrap_or_default(),
         pin,
+        cert_hash: String::new(),
     })
 }
 
@@ -161,6 +223,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The door's owner row is the owner's, never a profile's own: placement reads one mapping.
+    #[test]
+    fn only_a_full_seat_has_a_ledger_row_of_its_own() {
+        use crate::profiles::OsAccount::{Operator, Seat as Full};
+        let row = "0123456789abcdef0123456789abcdef";
+        let full = Full {
+            seat: Some(row.into()),
+        };
+        assert_eq!(ledger_seat(&full), Some(row));
+        assert_eq!(ledger_seat(&Full { seat: None }), None);
+        assert_eq!(ledger_seat(&Operator), None);
+        let mut owner = seat(RuntimeState::Running);
+        owner.owner = true;
+        assert_eq!(
+            crate::seats::row_in(&Operator, Some(&owner), true),
+            Some(row)
+        );
+        assert_eq!(crate::seats::row_in(&full, Some(&owner), true), Some(row));
     }
 
     fn seat(state: RuntimeState) -> Seat {
@@ -220,7 +302,29 @@ mod tests {
             fp: Some(ME),
             follows_redirects: follows,
             joins,
+            browser: false,
         }
+    }
+
+    /// A browser lands on its seat's browser plane; a seat with no browser port has none to
+    /// send it to.
+    #[test]
+    fn a_browser_goes_to_its_seat_s_browser_plane() {
+        let browser = Asker {
+            browser: true,
+            ..asker(true, false)
+        };
+        let mut s = seat(RuntimeState::Running);
+        s.native_port = 9780;
+        let Placement::Redirect(r) = decide("kid", &browser, true, on(&s), &[], None) else {
+            panic!("a running seat is redirected to");
+        };
+        assert_eq!((r.port, r.pin.as_str()), (9784, PIN));
+        s.native_port = 9778;
+        assert_eq!(
+            decide("kid", &browser, true, on(&s), &[], None),
+            Placement::Refuse(RejectReason::SeatUnavailable)
+        );
     }
 
     fn on(seat: &Seat) -> Option<(&Seat, u8)> {

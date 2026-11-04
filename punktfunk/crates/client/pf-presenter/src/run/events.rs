@@ -2,39 +2,148 @@
 
 use super::pace::bump_stats_tier;
 use super::*;
+use crate::route::{route, Kind, RouteFacts, Target};
 use sdl3::keyboard::{Keycode, Scancode};
 
 impl Shell {
-    /// One SDL event: the console sees it first, then capture, touch, the chords and the
-    /// window. `Break` is the window closing.
+    /// One SDL event: the console's verdict, then [`route`] picks who takes it, and this
+    /// performs. `Break` ends the session.
     pub(super) fn on_event(
         &mut self,
         stream: &mut Option<StreamState>,
         event: Event,
     ) -> Result<ControlFlow<Outcome>> {
-        // Console UI sees input first: a consumed event never reaches capture/forwarding.
-        if let Some(o) = self.overlay.as_mut() {
-            if o.handle_event(&event) {
-                self.scroll_routing.consumed(&event);
-                return Ok(ControlFlow::Continue(()));
-            }
-            // Mouse/touch: console hit-tests in its own pixel space. Consumed while
-            // the console is up; ignored while streaming (those belong to `Capture`).
-            if let Some(input) = overlay_pointer(&event, &self.window) {
-                if o.handle_pointer(input) {
-                    self.scroll_routing.consumed(&event);
-                    return Ok(ControlFlow::Continue(()));
+        let screen = event
+            .get_window_id()
+            .and_then(|id| stream.as_ref()?.screens.screen_of(id));
+        let overlay_took = self.overlay_takes(&event, screen.is_none());
+        let facts = RouteFacts {
+            on_primary: event.get_window_id() == Some(self.window.id()),
+            on_screen: screen.is_some(),
+            overlay_took,
+            ring_open: self.ring_was_open,
+            inhibit_shortcuts: self.opts.inhibit_shortcuts,
+            native_scroll: self.scroll_routing.native_active,
+            wheel_blocked: self.scroll_routing.blocked,
+            captured: self.scroll_routing.captured_before,
+        };
+        match route(kind_of(&event), &facts) {
+            Target::Overlay => self.scroll_routing.consumed(&event),
+            Target::Screen => {
+                if let Some(screen) = screen {
+                    self.on_screen_event(stream, screen, event);
                 }
             }
-        }
-        match event {
-            Event::Quit { .. } => {
+            Target::Chord => {
+                if let Some(chord) = chord_in(&event) {
+                    self.on_chord(stream, chord);
+                }
+            }
+            Target::Capture => self.on_capture_event(stream, event),
+            Target::Gesture => self.on_finger_event(stream, event),
+            Target::Window => {
+                if let Event::Window { win_event, .. } = event {
+                    self.on_window_event(stream, win_event)?;
+                }
+            }
+            Target::Loop => self.on_loop_event(stream, event),
+            Target::Quit => {
                 if let Some(st) = stream {
                     st.request_quit();
                 }
                 return Ok(ControlFlow::Break(Outcome::Ended(None)));
             }
-            Event::Window { win_event, .. } => self.on_window_event(stream, win_event)?,
+            Target::Drop => {}
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// The console's verdict, asked before routing: keys and text anywhere; the pointer and
+    /// fingers in its own pixels, off a further screen's window.
+    fn overlay_takes(&mut self, event: &Event, off_screen: bool) -> bool {
+        let Some(o) = self.overlay.as_mut() else {
+            return false;
+        };
+        o.handle_event(event)
+            || (off_screen
+                && overlay_pointer(event, &self.window)
+                    .is_some_and(|input| o.handle_pointer(input)))
+    }
+
+    /// A further screen's window event or pointer move; its close button gives that
+    /// monitor back.
+    fn on_screen_event(&mut self, stream: &mut Option<StreamState>, screen: u8, event: Event) {
+        match event {
+            Event::Window {
+                win_event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                if let Some(st) = stream.as_mut() {
+                    self.close_screen(st, screen);
+                }
+            }
+            Event::Window { win_event, .. } => {
+                if let Some(st) = stream.as_mut() {
+                    st.screens.on_window_event(screen, win_event);
+                }
+            }
+            Event::MouseMotion { x, y, .. } => self.on_screen_motion(stream, screen, x, y),
+            _ => {}
+        }
+    }
+
+    /// The stream's keys, buttons, motion and SDL wheel. Windows never auto-repeats injected
+    /// input, so a held key needs its repeats. A left click on a released stream engages
+    /// capture and is not forwarded; other buttons stay with the desktop (a side button
+    /// starts a desktop gesture). `engage` refuses without pointer or keyboard access.
+    fn on_capture_event(&mut self, stream: &mut Option<StreamState>, event: Event) {
+        if let Event::MouseMotion {
+            which,
+            x,
+            y,
+            xrel,
+            yrel,
+            ..
+        } = event
+        {
+            self.on_mouse_motion(stream, which, x, y, xrel, yrel);
+            return;
+        }
+        let Some(cap) = capture_mut(stream) else {
+            return;
+        };
+        match event {
+            Event::KeyDown {
+                scancode: Some(sc),
+                repeat: true,
+                ..
+            } => cap.on_key_repeat(sc),
+            Event::KeyDown {
+                scancode: Some(sc), ..
+            } => cap.on_key_down(sc),
+            Event::KeyUp {
+                scancode: Some(sc), ..
+            } => cap.on_key_up(sc),
+            Event::MouseButtonDown { mouse_btn, .. } if cap.captured() => {
+                cap.on_button_down(mouse_btn);
+            }
+            Event::MouseButtonDown {
+                mouse_btn: sdl3::mouse::MouseButton::Left,
+                ..
+            } => {
+                if cap.engage() {
+                    self.capture_on(cap);
+                }
+            }
+            Event::MouseButtonUp { mouse_btn, .. } => cap.on_button_up(mouse_btn),
+            Event::MouseWheel { x, y, .. } => cap.on_wheel(x, y),
+            _ => {}
+        }
+    }
+
+    /// The loop's own events: the panel's mode, the client's monitors, frame wakes, pads.
+    fn on_loop_event(&mut self, stream: &mut Option<StreamState>, event: Event) {
+        match event {
             // The panel's rate changed under the window (60 ↔ 165 Hz in the OS
             // settings): no window event fires, and the grid describes the old rate.
             Event::Display {
@@ -50,116 +159,19 @@ impl Shell {
                     st.relearn_grid(&self.window);
                 }
             }
-            // Windows never auto-repeats injected input, so a held key needs these.
-            // Chords and toggles fire on the first press only.
-            Event::KeyDown {
-                scancode: Some(sc),
-                repeat: true,
+            // A monitor came, went or moved: the screens follow the client's monitors.
+            Event::Display {
+                display_event: DisplayEvent::Added | DisplayEvent::Removed | DisplayEvent::Moved,
                 ..
-            } => {
-                if let Some(cap) = capture_mut(stream) {
-                    cap.on_key_repeat(sc);
+            } if stream.as_ref().is_some_and(|st| st.params.shows_screens) => {
+                if let Some(st) = stream.as_mut() {
+                    self.replan_screens(st);
                 }
             }
-            Event::KeyDown {
-                keycode,
-                scancode: Some(sc),
-                keymod,
-                repeat: false,
-                ..
-            } => self.on_key_down(stream, keycode, sc, keymod),
-            Event::KeyUp {
-                scancode: Some(sc), ..
-            } => {
-                if let Some(cap) = capture_mut(stream) {
-                    cap.on_key_up(sc);
-                }
-            }
-            Event::MouseMotion {
-                which,
-                x,
-                y,
-                xrel,
-                yrel,
-                ..
-            } => self.on_mouse_motion(stream, which, x, y, xrel, yrel),
-            Event::MouseButtonDown { mouse_btn, .. } => {
-                if let Some(cap) = capture_mut(stream) {
-                    if !cap.captured() {
-                        // The engaging click is not forwarded. `engage` refuses when
-                        // access covers neither pointer nor keyboard — the click then
-                        // does nothing.
-                        if cap.engage() {
-                            self.capture_on(cap);
-                        }
-                    } else {
-                        cap.on_button_down(mouse_btn);
-                    }
-                }
-            }
-            Event::MouseButtonUp { mouse_btn, .. } => {
-                if let Some(cap) = capture_mut(stream) {
-                    cap.on_button_up(mouse_btn);
-                }
-            }
-            Event::MouseWheel { x, y, .. } => {
-                // The overlay consumes SDL wheels before native/fallback routing.
-                self.scroll_routing.wheel(capture_mut(stream), x, y);
-            }
-            Event::FingerDown {
-                touch_id,
-                finger_id,
-                x,
-                y,
-                timestamp,
-                ..
-            } => self.on_finger(
-                stream,
-                FingerPhase::Down,
-                touch_id,
-                finger_id,
-                x,
-                y,
-                timestamp,
-            ),
-            Event::FingerMotion {
-                touch_id,
-                finger_id,
-                x,
-                y,
-                timestamp,
-                ..
-            } => self.on_finger(
-                stream,
-                FingerPhase::Move,
-                touch_id,
-                finger_id,
-                x,
-                y,
-                timestamp,
-            ),
-            Event::FingerUp {
-                touch_id,
-                finger_id,
-                x,
-                y,
-                timestamp,
-                ..
-            } => self.on_finger(
-                stream,
-                FingerPhase::Up,
-                touch_id,
-                finger_id,
-                x,
-                y,
-                timestamp,
-            ),
-            // FrameWake (and any other user event): pure wake-up — the frame drain
-            // runs this iteration either way.
+            // A frame wake only wakes: the frame drain runs this pass either way.
             Event::User { .. } => {}
             other => self.pump.handle_event(other),
         }
-        Ok(ControlFlow::Continue(()))
     }
 
     fn on_window_event(
@@ -231,7 +243,7 @@ impl Shell {
                 )?;
                 // Match-window: restamp the debounce. The request fires once
                 // ~400 ms pass with no further size events, never per drag-frame.
-                if self.opts.match_window.is_some() {
+                if self.opts.match_window {
                     if let Some(st) = stream.as_mut() {
                         st.resize_pending = Some(Instant::now());
                     }
@@ -247,6 +259,14 @@ impl Shell {
                 }
                 if let Some(st) = stream.as_mut() {
                     st.relearn_grid(&self.window);
+                    // Screen 0 stands for this window's monitor: off the planned one, replan.
+                    let moved = self
+                        .window
+                        .get_display()
+                        .is_ok_and(|d| st.screens.first_display() != Some(d));
+                    if st.params.shows_screens && moved {
+                        self.replan_screens(st);
+                    }
                 }
             }
             WindowEvent::Exposed => {
@@ -261,25 +281,8 @@ impl Shell {
         Ok(())
     }
 
-    /// A first press: one of the loop's own chords, else a key for the host. Super stays
-    /// local while shortcut capture is off: the local shell acts on it, so forwarding it
-    /// opens the host's launcher as well. Its up and repeats follow the down.
-    fn on_key_down(
-        &mut self,
-        stream: &mut Option<StreamState>,
-        keycode: Option<Keycode>,
-        sc: Scancode,
-        keymod: Mod,
-    ) {
-        let Some(chord) = chord_of(keycode, sc, keymod) else {
-            if !self.opts.inhibit_shortcuts && matches!(sc, Scancode::LGui | Scancode::RGui) {
-                return;
-            }
-            if let Some(cap) = capture_mut(stream) {
-                cap.on_key_down(sc);
-            }
-            return;
-        };
+    /// One of the loop's own chords, answered here and never forwarded.
+    fn on_chord(&mut self, stream: &mut Option<StreamState>, chord: Chord) {
         match chord {
             Chord::Capture => {
                 if let Some(cap) = capture_mut(stream) {
@@ -427,6 +430,38 @@ impl Shell {
         }
     }
 
+    /// A touchscreen finger event, unpacked for [`Shell::on_finger`].
+    fn on_finger_event(&mut self, stream: &mut Option<StreamState>, event: Event) {
+        let (phase, touch_id, finger_id, x, y, timestamp) = match event {
+            Event::FingerDown {
+                touch_id,
+                finger_id,
+                x,
+                y,
+                timestamp,
+                ..
+            } => (FingerPhase::Down, touch_id, finger_id, x, y, timestamp),
+            Event::FingerMotion {
+                touch_id,
+                finger_id,
+                x,
+                y,
+                timestamp,
+                ..
+            } => (FingerPhase::Move, touch_id, finger_id, x, y, timestamp),
+            Event::FingerUp {
+                touch_id,
+                finger_id,
+                x,
+                y,
+                timestamp,
+                ..
+            } => (FingerPhase::Up, touch_id, finger_id, x, y, timestamp),
+            _ => return,
+        };
+        self.on_finger(stream, phase, touch_id, finger_id, x, y, timestamp);
+    }
+
     /// Touchscreen fingers → the session's touch model. `x`/`y` are window-normalized;
     /// only DIRECT devices (an INDIRECT trackpad drives the mouse). A three-finger tap
     /// bumps the stats tier.
@@ -517,11 +552,14 @@ impl Shell {
             let p = video_fit::place(self.opts.video_fit, self.window.size_in_pixels(), video);
             p.scale_x.min(p.scale_y) as f32 / cursor_surface_scale(&self.window)
         });
+        // Over a further screen's window the host's pointer is in the picture.
+        let over_screen = self.over_screen(st);
         if let (Some(chan), Some(c)) = (st.cursor_chan.as_mut(), st.connector.as_ref()) {
-            let desktop_active = st
-                .capture
-                .as_ref()
-                .is_some_and(|cap| cap.captured() && cap.desktop());
+            let desktop_active = !over_screen
+                && st
+                    .capture
+                    .as_ref()
+                    .is_some_and(|cap| cap.captured() && cap.desktop());
             chan.pump(c, &self.mouse, desktop_active, cursor_scale);
         }
         let hint_state = st.cursor_chan.as_ref().and_then(|ch| ch.state());
@@ -578,6 +616,7 @@ impl Shell {
                 desktop: cap.desktop(),
                 buttons_held: cap.buttons_held(),
                 pointer: cap.grants() & punktfunk_core::quic::GRANT_POINTER != 0,
+                abs_ok: cap.abs_ok(),
                 last_abs: cap.last_abs(),
             }),
             over_us: self.mouse.focused_window_id() == Some(self.window.id()),
@@ -599,9 +638,11 @@ impl Shell {
         self.mouse.warp_mouse_in_window(&self.window, wx, wy);
     }
 
-    /// SDL text input tracks overlay editing (IME / Steam OSK), edge-wise.
+    /// SDL text input tracks overlay editing and the ring's Keyboard slot (IME / Steam
+    /// OSK), edge-wise.
     pub(super) fn text_input_tick(&mut self) {
-        let want_text = self.overlay.as_ref().is_some_and(|o| o.text_input_active());
+        let want_text =
+            self.ring_keyboard || self.overlay.as_ref().is_some_and(|o| o.text_input_active());
         if want_text != self.text_input_on {
             self.text_input_on = want_text;
             let ti = self.sdl_video.text_input();
@@ -753,6 +794,53 @@ pub(super) fn chord_of(keycode: Option<Keycode>, sc: Scancode, keymod: Mod) -> O
         }
     }
     (sc == Scancode::F11 || (sc == Scancode::Return && alt)).then_some(Chord::Fullscreen)
+}
+
+/// The chord a first press makes. Repeats never fire one.
+fn chord_in(event: &Event) -> Option<Chord> {
+    match event {
+        Event::KeyDown {
+            keycode,
+            scancode: Some(sc),
+            keymod,
+            repeat: false,
+            ..
+        } => chord_of(*keycode, *sc, *keymod),
+        _ => None,
+    }
+}
+
+/// What [`route`] knows of an SDL event. A key without a scancode is the pump's.
+fn kind_of(event: &Event) -> Kind {
+    match event {
+        Event::Quit { .. } => Kind::Quit,
+        Event::Window { win_event, .. } => match win_event {
+            WindowEvent::CloseRequested => Kind::Close,
+            WindowEvent::FocusLost | WindowEvent::FocusGained => Kind::Focus,
+            _ => Kind::Window,
+        },
+        Event::KeyDown {
+            scancode: Some(_),
+            repeat: true,
+            ..
+        } => Kind::KeyRepeat,
+        Event::KeyDown {
+            scancode: Some(sc), ..
+        } => Kind::Key {
+            chord: chord_in(event).is_some(),
+            super_key: matches!(sc, Scancode::LGui | Scancode::RGui),
+        },
+        Event::KeyUp {
+            scancode: Some(_), ..
+        } => Kind::KeyUp,
+        Event::MouseButtonDown { .. } | Event::MouseButtonUp { .. } => Kind::Button,
+        Event::MouseMotion { .. } => Kind::Motion,
+        Event::MouseWheel { .. } => Kind::Wheel,
+        Event::FingerDown { .. } | Event::FingerMotion { .. } | Event::FingerUp { .. } => {
+            Kind::Finger
+        }
+        _ => Kind::Other,
+    }
 }
 
 pub(super) fn ui_wants_pad_mask(

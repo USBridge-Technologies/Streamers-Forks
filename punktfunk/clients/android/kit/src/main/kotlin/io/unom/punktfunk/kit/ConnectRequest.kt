@@ -73,6 +73,8 @@ data class ConnectRequest(
     /** Advertise `CLIENT_CAP_KEEP_HOST_AUDIO` — the host taps its default playback device
      *  instead of parking it on a silent endpoint. REQUEST-only: an older host ignores it. */
     val keepHostAudio: Boolean,
+    /** Advertise `CLIENT_CAP_CURSOR`: this client wears the host's pointer (Desktop mode, a mouse). */
+    val clientCursor: Boolean = false,
     /** The `video_fit` setting (`"fit"`/`"crop"`/`"stretch"`). Rides the Hello, so a host that
      *  frames the picture for another device (a join, a mirrored head) reframes it for this one. */
     val videoFit: String = "fit",
@@ -91,6 +93,9 @@ data class ConnectRequest(
     val profile: String? = null,
     /** PyroWave quality in hundredths of a bit per pixel, 50 to 200; `0` leaves the host's own. */
     val pyrowaveBppX100: Int = 0,
+    /** This display shows full-range video as studio ([VideoDecoders.showsFullRangeAsStudio]):
+     *  asks the host for studio-range SDR. An older host ignores it. */
+    val studioRange: Boolean = false,
 ) {
     fun toJson(): String = JSONObject()
         .put("host", host)
@@ -120,10 +125,12 @@ data class ConnectRequest(
         .put("device_name", deviceName ?: JSONObject.NULL)
         .put("pad_audio_ok", padAudioOk)
         .put("keep_host_audio", keepHostAudio)
+        .put("client_cursor", clientCursor)
         .put("video_fit", videoFit)
         .put("dialer", dialer)
         .put("preset_id", presetId ?: JSONObject.NULL)
         .put("preset_name", presetName ?: JSONObject.NULL)
         .put("profile", profile ?: JSONObject.NULL)
+        .put("studio_range", studioRange)
         .toString()
 }

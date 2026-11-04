@@ -28,7 +28,7 @@ pub(crate) fn preflight(management_cli: bool) {
     if !management_cli {
         // SAFETY: `startup` runs this before any subcommand, and nothing earlier in `real_main`
         // creates a DXGI factory.
-        unsafe { crate::capture::dxgi::install_gpu_pref_hook() };
+        unsafe { crate::capture::gpu_pref::install_gpu_pref_hook() };
     }
 }
 
@@ -66,6 +66,7 @@ pub(crate) fn subcommand(cmd: &str, args: &[String]) -> Option<Result<()>> {
         "driver" => crate::install::driver_main(&args[1..]),
         "web" => crate::install::web_main(&args[1..]),
         "seats" => seats_cli(&args[1..]),
+        "hooks" => hooks_cli(&args[1..]),
         // HKLM Run fires only at sign-in; this is how an upgrade/crash gets the icon back.
         "tray" => crate::tray::main(&args[1..]),
         _ => return None,
@@ -79,6 +80,24 @@ fn seats_cli(args: &[String]) -> Result<()> {
     }
     pf_seats::windows::turn_off().map_err(|e| anyhow::anyhow!("turn seats off: {}", e.message))?;
     println!("Seats are off.");
+    Ok(())
+}
+
+/// `hooks elevated on|off`: whether commands marked `elevated` may run as administrator.
+fn hooks_cli(args: &[String]) -> Result<()> {
+    let on = match args {
+        [what, state] if what == "elevated" && state == "on" => true,
+        [what, state] if what == "elevated" && state == "off" => false,
+        _ => anyhow::bail!("usage: punktfunk-host hooks elevated on|off"),
+    };
+    crate::hooks::set_elevated(on)?;
+    println!(
+        "{}",
+        match on {
+            true => "Hooks and prep steps marked elevated now run as administrator.",
+            false => "Hooks and prep steps marked elevated no longer run.",
+        }
+    );
     Ok(())
 }
 
@@ -106,7 +125,7 @@ fn hdr_p010_selftest(args: &[String]) -> Result<()> {
             }
         }
     }
-    crate::capture::dxgi::hdr_p010_selftest_at(size.0, size.1, vendor)
+    crate::encode::convert::hdr_p010_selftest_at(size.0, size.1, vendor)
 }
 
 pub(crate) fn print_usage() {
@@ -116,6 +135,8 @@ pub(crate) fn print_usage() {
         \x20   punktfunk-host service uninstall  remove the service + firewall rules\n\
         \x20   punktfunk-host service start|stop|restart|status\n\
         \x20   config: %ProgramData%\\punktfunk\\host.env\n\
+        \x20   punktfunk-host hooks elevated on|off  let hooks and prep steps marked elevated run as\n\
+        \x20                                     administrator (run it from an administrator prompt)\n\
         \nWINDOWS DIAGNOSTICS:\n\
         \x20   punktfunk-host hdr-p010-selftest  GPU colour check for the PUNKTFUNK_HDR_SHADER_P010 path\n\
         \x20                                     (scRGB FP16 -> P010 BT.2020 PQ shader vs an f64 reference)"

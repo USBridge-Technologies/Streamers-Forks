@@ -790,9 +790,40 @@ pub struct PunktfunkConnectOpts {
     /// ([`punktfunk_pyrowave_kbps`]). `0`, which a shorter prefix defaults to, leaves the
     /// host's own.
     pub pyrowave_bpp_x100: u16,
-    /// Always `0`. Fills what would otherwise be tail padding.
-    pub reserved4: [u8; 6],
+    /// `PUNKTFUNK_REFORMAT_*` bits: what this caller rebuilds when the host changes the stream's
+    /// format mid-session. `0`, which a shorter prefix defaults to, keeps the format fixed.
+    pub reformat: u8,
+    /// Always `0`. Fills what would otherwise be padding.
+    pub reserved4: [u8; 5],
+    /// Called once, on the connecting thread, when the host answers that its operator is
+    /// deciding about this device: show "waiting for approval". The connect then waits for the
+    /// host's verdict, up to ten minutes, not `timeout_ms`. Null: `timeout_ms` stands.
+    pub on_pending: Option<unsafe extern "C" fn(ctx: *mut std::os::raw::c_void)>,
+    /// Handed back to `on_pending` untouched.
+    pub on_pending_ctx: *mut std::os::raw::c_void,
+    /// The screens this caller shows, screen 0 first at the connect's mode, read for
+    /// `screen_count` records during the call; null for one. Further screens' access units come
+    /// from [`punktfunk_connection_next_screen_au`].
+    pub screens: *const PunktfunkScreen,
+    /// See `screens`; at most `PUNKTFUNK_SCREENS_MAX` are read.
+    pub screen_count: u8,
+    /// `1`: this caller opens a picture per screen, so it may ask for screens later
+    /// ([`punktfunk_connection_request_screens`]) with none asked here.
+    pub shows_screens: u8,
+    /// Always `0`. Fills what would otherwise be padding.
+    pub reserved5: [u8; 6],
 }
+
+/// [`PunktfunkConnectOpts::reformat`]: this caller rebuilds its decoder on a frame flagged
+/// [`FRAME_NEW_FORMAT`](punktfunk_core::packet::FRAME_NEW_FORMAT), from the codec, colour and
+/// chroma getters read right after it.
+#[cfg(feature = "quic")]
+pub const PUNKTFUNK_REFORMAT_VIDEO: u8 = 1;
+
+/// [`PunktfunkConnectOpts::reformat`]: this caller reopens its audio player when
+/// `punktfunk_connection_next_audio_pcm` returns `PUNKTFUNK_STATUS_AUDIO_FORMAT`.
+#[cfg(feature = "quic")]
+pub const PUNKTFUNK_REFORMAT_AUDIO: u8 = 2;
 
 // No tail padding (append contract). On grow: freeze `CONNECT_OPTS_MIN_SIZE`, update these sizes.
 // `video_fit` sits in the byte v35–v40 callers zeroed as `reserved0`.
@@ -801,19 +832,27 @@ const _: () = {
     use core::mem::{offset_of, size_of};
     #[cfg(target_pointer_width = "64")]
     assert!(
-        size_of::<PunktfunkConnectOpts>() == 144
+        size_of::<PunktfunkConnectOpts>() == 176
             && offset_of!(PunktfunkConnectOpts, video_fit) == 100
             && offset_of!(PunktfunkConnectOpts, delivery_flags) == 121
             && offset_of!(PunktfunkConnectOpts, profile_id) == 128
             && offset_of!(PunktfunkConnectOpts, pyrowave_bpp_x100) == 136
+            && offset_of!(PunktfunkConnectOpts, reformat) == 138
+            && offset_of!(PunktfunkConnectOpts, on_pending) == 144
+            && offset_of!(PunktfunkConnectOpts, screens) == 160
+            && offset_of!(PunktfunkConnectOpts, shows_screens) == 169
     );
     #[cfg(target_pointer_width = "32")]
     assert!(
-        size_of::<PunktfunkConnectOpts>() == 104
+        size_of::<PunktfunkConnectOpts>() == 124
             && offset_of!(PunktfunkConnectOpts, video_fit) == 72
             && offset_of!(PunktfunkConnectOpts, delivery_flags) == 85
             && offset_of!(PunktfunkConnectOpts, profile_id) == 92
             && offset_of!(PunktfunkConnectOpts, pyrowave_bpp_x100) == 96
+            && offset_of!(PunktfunkConnectOpts, reformat) == 98
+            && offset_of!(PunktfunkConnectOpts, on_pending) == 104
+            && offset_of!(PunktfunkConnectOpts, screens) == 112
+            && offset_of!(PunktfunkConnectOpts, shows_screens) == 117
     );
 };
 
@@ -854,8 +893,57 @@ impl Default for PunktfunkConnectOpts {
             reserved2: [0; 6],
             profile_id: ptr::null(),
             pyrowave_bpp_x100: 0,
-            reserved4: [0; 6],
+            reformat: 0,
+            reserved4: [0; 5],
+            on_pending: None,
+            on_pending_ctx: ptr::null_mut(),
+            screens: ptr::null(),
+            screen_count: 0,
+            shows_screens: 0,
+            reserved5: [0; 6],
         }
+    }
+}
+
+#[cfg(feature = "quic")]
+thread_local! {
+    /// The sentence the host sent with the last connect it refused on this thread.
+    static REFUSAL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The sentence the host sent when it refused the last connect on this thread, for a caller
+/// holding a `PUNKTFUNK_STATUS_REJECTED_*` status: a host can name what only it knows, such as
+/// who holds the seat. Empty when it said nothing. Read on the connecting thread, right after
+/// the failed connect. `INVALID_ARG` when `out` is null or `cap` too small for it and a NUL.
+///
+/// # Safety
+/// `out` is null or writable for `cap` bytes.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connect_refusal(
+    out: *mut std::os::raw::c_char,
+    cap: usize,
+) -> PunktfunkStatus {
+    crate::guard(|| {
+        let said = REFUSAL.with(|r| r.borrow().clone());
+        // SAFETY: the caller passes `out` null or writable for `cap` bytes.
+        match unsafe { crate::write_cstr(out, cap, &said) } {
+            true => PunktfunkStatus::Ok,
+            false => PunktfunkStatus::InvalidArg,
+        }
+    })
+}
+
+/// A caller's `on_pending` and its context, carried to the connecting thread that calls it.
+#[cfg(feature = "quic")]
+struct PendingHook(unsafe extern "C" fn(*mut std::os::raw::c_void), usize);
+
+#[cfg(feature = "quic")]
+impl PendingHook {
+    fn call(&self) {
+        // SAFETY: the caller's contract on `PunktfunkConnectOpts::on_pending`: the function
+        // takes back the context it registered, on the thread inside the connect call.
+        unsafe { (self.0)(self.1 as *mut std::os::raw::c_void) }
     }
 }
 
@@ -990,6 +1078,7 @@ unsafe fn connect_ex_impl(
                 Box::into_raw(Box::new(PunktfunkConnection {
                     inner: c,
                     last: std::sync::Mutex::new(None),
+                    last_screens: std::sync::Mutex::default(),
                     last_audio: std::sync::Mutex::new(None),
                     audio_pcm: std::sync::Mutex::new(AudioPcmState::default()),
                     last_clip: std::sync::Mutex::new(None),
@@ -999,6 +1088,11 @@ unsafe fn connect_ex_impl(
             }
             Err(e) => {
                 set_status(e.status());
+                let said = match &e {
+                    punktfunk_core::error::PunktfunkError::Rejected(_, said) => said.clone(),
+                    _ => String::new(),
+                };
+                REFUSAL.with(|r| *r.borrow_mut() = said);
                 std::ptr::null_mut()
             }
         }
@@ -1079,6 +1173,9 @@ unsafe fn connect_params(
         height: o.height,
         refresh_hz: o.refresh_hz,
     };
+    let n = usize::from(o.screen_count).min(PUNKTFUNK_SCREENS_MAX);
+    // SAFETY: `screens` is null or readable for `screen_count >= n` records (caller contract).
+    let screens = unsafe { super::screens::screens_at(o.screens, n) };
     Ok(punktfunk_core::client::ConnectParams {
         compositor,
         gamepad,
@@ -1101,6 +1198,14 @@ unsafe fn connect_params(
         preset,
         profile,
         probe_only: o.delivery_flags & punktfunk_core::quic::EXT_DELIVERY_PROBE_ONLY != 0,
+        rebuilds_decoder: o.reformat & PUNKTFUNK_REFORMAT_VIDEO != 0,
+        reopens_audio: o.reformat & PUNKTFUNK_REFORMAT_AUDIO != 0,
+        screens,
+        shows_screens: o.shows_screens != 0,
+        on_pending: o.on_pending.map(|f| {
+            let hook = PendingHook(f, o.on_pending_ctx as usize);
+            std::sync::Arc::new(move || hook.call()) as std::sync::Arc<dyn Fn() + Send + Sync>
+        }),
         // The rest stays default: Legacy coupling (embedders decode what the host answers),
         // no display volume, whole AUs (`PunktfunkFrame` cannot tell a part), no abort.
         ..punktfunk_core::client::ConnectParams::new(
@@ -1445,6 +1550,79 @@ mod tests {
     }
 
     /// The quality reaches the dial as asked; the row's rate and warning come from core.
+    /// `on_pending` reaches the dial, and calling it hands the caller its context back.
+    #[test]
+    fn connect_opts_carry_the_pending_callback() {
+        unsafe extern "C" fn mark(ctx: *mut std::os::raw::c_void) {
+            // SAFETY: the test registers a live `AtomicU32` as the context.
+            let n = unsafe { &*ctx.cast::<std::sync::atomic::AtomicU32>() };
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let o = PunktfunkConnectOpts {
+            host: c"127.0.0.1".as_ptr(),
+            on_pending: Some(mark),
+            on_pending_ctx: std::ptr::addr_of!(calls).cast_mut().cast(),
+            ..Default::default()
+        };
+        // SAFETY: every pointer field is null, a C-string literal, or `calls`, live here.
+        let p = unsafe { connect_params(&o) }.unwrap();
+        (p.on_pending.expect("the callback is carried"))();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let none = PunktfunkConnectOpts {
+            host: c"127.0.0.1".as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: as above.
+        assert!(unsafe { connect_params(&none) }
+            .unwrap()
+            .on_pending
+            .is_none());
+    }
+
+    /// The screens ask and the promise reach the dial; a count past the cap reads the cap.
+    #[test]
+    fn connect_opts_carry_the_screens() {
+        let asked = [
+            PunktfunkScreen {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+                primary: 1,
+                ..Default::default()
+            },
+            PunktfunkScreen {
+                index: 1,
+                width: 2560,
+                height: 1440,
+                refresh_hz: 144,
+                x: 1920,
+                ..Default::default()
+            },
+        ];
+        let o = PunktfunkConnectOpts {
+            host: c"127.0.0.1".as_ptr(),
+            screens: asked.as_ptr(),
+            screen_count: 2,
+            shows_screens: 1,
+            ..Default::default()
+        };
+        // SAFETY: every pointer field is null, a live C-string literal or `asked`.
+        let p = unsafe { connect_params(&o) }.unwrap();
+        assert!(p.shows_screens);
+        assert_eq!(p.screens.len(), 2);
+        assert!(p.screens[0].primary);
+        assert_eq!((p.screens[1].index, p.screens[1].x), (1, 1920));
+        assert_eq!(p.screens[1].mode.refresh_hz, 144);
+        let one = PunktfunkConnectOpts {
+            host: c"127.0.0.1".as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: as above.
+        let p = unsafe { connect_params(&one) }.unwrap();
+        assert!(!p.shows_screens && p.screens.is_empty());
+    }
+
     #[test]
     fn connect_opts_carry_the_pyrowave_quality() {
         let o = PunktfunkConnectOpts {

@@ -143,6 +143,7 @@ fn catalog_key(id: RowId) -> Option<&'static str> {
         RowId::Bitrate => "bitrate_kbps",
         RowId::PyroWaveQuality => "pyrowave_bpp",
         RowId::VideoFit => "video_fit",
+        RowId::Screens => "screens",
         RowId::Hdr => "hdr_enabled",
         RowId::PresentPriority => "present_priority",
         RowId::SmoothBuffer => "smooth_buffer",
@@ -172,6 +173,8 @@ fn catalog_key(id: RowId) -> Option<&'static str> {
         RowId::PadType => "gamepad",
         RowId::PadRumble => "pad_rumble",
         RowId::PhoneRumble => "rumble_on_phone",
+        RowId::SpatialAudio => "spatial_audio",
+        RowId::Screen => "screen",
         RowId::PhoneGyro => "gyro_on_phone",
         RowId::PadForward => "gamepad_forwarding",
         RowId::Pad => "forward_pad",
@@ -679,7 +682,7 @@ fn echo_cancellation_follows_the_microphone() {
     assert!(ctx.settings.echo_cancel);
 }
 
-/// The TV's codec row wraps from H.264 back to Automatic: no AV1, no PyroWave.
+/// The TV's codec row wraps from AV1 back to Automatic: no PyroWave.
 #[test]
 fn webos_offers_only_the_codecs_ndl_decodes() {
     let mut settings = Settings {
@@ -697,15 +700,17 @@ fn webos_offers_only_the_codecs_ndl_decodes() {
         ..Ctx::test(&mut settings, &library)
     };
     assert!(adjust(RowId::Codec, 1, true, &mut ctx));
+    assert_eq!(ctx.settings.codec, "av1");
+    assert!(adjust(RowId::Codec, 1, true, &mut ctx));
     assert_eq!(ctx.settings.codec, "auto");
     let desktop = crate::screens::Device::test();
     let mut ctx = Ctx {
         device: &desktop,
         ..ctx
     };
-    ctx.settings.codec = "h264".into();
+    ctx.settings.codec = "av1".into();
     assert!(adjust(RowId::Codec, 1, true, &mut ctx));
-    assert_eq!(ctx.settings.codec, "av1");
+    assert_eq!(ctx.settings.codec, "pyrowave");
 }
 
 /// A GPU without the codec's compute set says so on the row, in both places a user
@@ -806,8 +811,9 @@ fn av1_reads_unsupported_without_a_hardware_decoder() {
     );
 }
 
-/// Under PyroWave the quality stands where Bitrate stood, priced at the stream's mode, and
-/// steps a tenth at a time inside its bounds. The stored bitrate is kept for the other codecs.
+/// Under PyroWave the quality stands in for Bitrate's rate, priced at the stream's mode, and
+/// steps a tenth at a time inside its bounds. Bitrate stays as Automatic or Fixed, and the
+/// stored rate is kept for the other codecs until the player flips it.
 #[test]
 fn pyrowave_quality_takes_the_bitrate_rows_place() {
     let mut settings = Settings {
@@ -821,7 +827,9 @@ fn pyrowave_quality_takes_the_bitrate_rows_place() {
     };
     let library = crate::library::LibraryShared::default();
     let mut ctx = Ctx::test(&mut settings, &library);
-    assert!(!row_applies(RowId::Bitrate, &ctx));
+    assert!(row_applies(RowId::Bitrate, &ctx));
+    let spec = row_spec(RowId::Bitrate, &ctx, &[], &Default::default());
+    assert_eq!(spec.value.as_deref(), Some("Fixed"));
     assert!(row_applies(RowId::PyroWaveQuality, &ctx));
     assert!(
         changed(&[RowId::PyroWaveQuality], &ctx).is_empty(),
@@ -851,6 +859,25 @@ fn pyrowave_quality_takes_the_bitrate_rows_place() {
     assert!(!row_applies(RowId::PyroWaveQuality, &ctx));
     assert_eq!(ctx.settings.bitrate_kbps, 80_000, "the stored rate is kept");
     assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
+
+    ctx.settings.codec = "pyrowave".into();
+    assert!(adjust(RowId::Bitrate, -1, false, &mut ctx));
+    assert_eq!(ctx.settings.bitrate_kbps, 0);
+    let spec = row_spec(RowId::Bitrate, &ctx, &[], &Default::default());
+    assert_eq!(spec.value.as_deref(), Some("Automatic"));
+    assert!(
+        !adjust(RowId::Bitrate, -1, false, &mut ctx),
+        "Automatic is the bottom"
+    );
+    assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
+    assert_eq!(
+        ctx.settings.bitrate_kbps,
+        pf_client_core::settings::PYROWAVE_FIXED_KBPS
+    );
+    assert_eq!(
+        detail(RowId::Bitrate, &ctx),
+        pf_client_core::settings::PYROWAVE_BITRATE_HINT
+    );
 }
 
 #[test]
@@ -1178,8 +1205,9 @@ fn a_typed_size_is_stored_through_the_shared_rule() {
     );
 }
 
-/// Advanced rows stay out of a tab until Show advanced. A changed one surfaces as a count at
-/// the tab's end, which shows them and lands on it; the first advanced row carries the heading.
+/// Advanced rows stay out of a tab until Show advanced; the codec is not one. A changed one
+/// surfaces as a count at the tab's end, which shows them and lands on it; the first advanced
+/// row carries the heading.
 #[test]
 fn advanced_rows_hide_until_shown_and_a_changed_one_is_counted() {
     let mut settings = Settings::default();
@@ -1190,15 +1218,16 @@ fn advanced_rows_hide_until_shown_and_a_changed_one_is_counted() {
         ..Ctx::test(&mut settings, &library)
     };
     let mut s = SettingsScreen::with_presets(Vec::new());
-    s.tab = tab_of(RowId::Codec);
+    s.tab = tab_of(RowId::Chroma444);
     let ids = s.row_ids(&ctx);
     assert!(ids.iter().all(|id| !advanced(*id)), "{ids:?}");
+    assert!(ids.contains(&RowId::Codec), "{ids:?}");
     assert!(
         !ids.contains(&RowId::AdvancedChanged),
         "nothing changed yet"
     );
 
-    ctx.settings.codec = "av1".into();
+    ctx.settings.enable_444 = true;
     let ids = s.row_ids(&ctx);
     assert_eq!(ids.last(), Some(&RowId::AdvancedChanged));
     assert_eq!(
@@ -1211,7 +1240,11 @@ fn advanced_rows_hide_until_shown_and_a_changed_one_is_counted() {
     s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
     assert!(ctx.settings.show_advanced);
     let ids = s.row_ids(&ctx);
-    assert_eq!(ids.get(s.list.cursor), Some(&RowId::Codec), "lands on it");
+    assert_eq!(
+        ids.get(s.list.cursor),
+        Some(&RowId::Chroma444),
+        "lands on it"
+    );
     let first = ids.iter().copied().find(|id| advanced(*id)).unwrap();
     assert_eq!(s.spec(first, &ids, &ctx).header, Some("Advanced"));
 }
@@ -1363,8 +1396,10 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::GamepadUi,
             RowId::GamepadUiMode,
             RowId::ReduceUiResolution,
+            RowId::Screen,
             RowId::SecondScreen,
             RowId::LowLatency,
+            RowId::SpatialAudio,
             RowId::AudioRoute,
             RowId::CursorGestures,
             RowId::Controllers,
@@ -1384,12 +1419,15 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
         vec![
             RowId::FullscreenMode,
             RowId::Fullscreen,
+            RowId::Screens,
+            RowId::Screen,
             RowId::Chroma444,
             // TenBitSdr is NOT here: MediaCodec decodes Main10 from the SPS and the depth
             // asks nothing of the panel, so Android obeys it.
             RowId::Vsync,
             RowId::AllowVrr,
             RowId::Decoder,
+            RowId::SpatialAudio,
             RowId::AudioRoute,
             RowId::Shortcuts,
             RowId::CursorGestures,
@@ -1432,19 +1470,20 @@ fn every_platform_offers_rows() {
     }
 }
 
-/// The PS5 offers PyroWave and no AV1, no HDR until its swapchain can scan PQ out, no mouse
-/// rows, and it can quit.
+/// The PS5 offers PyroWave and no AV1, the HDR row its HDR10 swapchain honours, no mouse rows,
+/// and it can quit.
 #[test]
 fn ps5_rows_follow_what_the_title_reads() {
     use crate::platform::Platform;
     let offered: Vec<&str> = codecs(Platform::Ps5).iter().map(|(id, _)| *id).collect();
     assert_eq!(offered, ["auto", "hevc", "h264", "pyrowave"]);
-    for id in [RowId::Hdr, RowId::Mouse, RowId::InvertScroll, RowId::Touch] {
+    for id in [RowId::Mouse, RowId::InvertScroll, RowId::Touch] {
         assert!(!row_on(id, Platform::Ps5), "{id:?}");
     }
     for id in [
         RowId::Codec,
         RowId::Resolution,
+        RowId::Hdr,
         RowId::TenBitSdr,
         RowId::Licenses,
     ] {
@@ -1516,6 +1555,59 @@ fn android_rows_live_in_extra() {
         after.extra = before.extra.clone();
         assert_eq!(after, before);
     }
+}
+
+/// Only a Vision Pro has a room to place the sound and the picture in; each row is its own
+/// key, the platform's default until written.
+#[test]
+fn spatial_rows_are_the_headsets_alone() {
+    let mut settings = Settings::default();
+    let library = crate::library::LibraryShared::default();
+    let phone = crate::screens::Device {
+        platform: crate::platform::Platform::Apple,
+        ..crate::screens::Device::test()
+    };
+    let headset = crate::screens::Device {
+        spatial: true,
+        ..phone.clone()
+    };
+    assert!(!row_applies(
+        RowId::Screen,
+        &Ctx {
+            device: &phone,
+            ..Ctx::test(&mut settings, &library)
+        }
+    ));
+    assert!(!row_applies(
+        RowId::SpatialAudio,
+        &Ctx {
+            device: &phone,
+            ..Ctx::test(&mut settings, &library)
+        }
+    ));
+    let ctx = &mut Ctx {
+        device: &headset,
+        ..Ctx::test(&mut settings, &library)
+    };
+    assert!(row_applies(RowId::SpatialAudio, ctx));
+    assert!(extra_bool(ctx.settings, device_keys::SPATIAL_AUDIO, true));
+    assert!(adjust(RowId::SpatialAudio, 1, true, ctx));
+    assert_eq!(
+        ctx.settings.extra.get("visionos.spatial_audio"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert!(row_applies(RowId::Screen, ctx));
+    assert_eq!(
+        row_spec(RowId::Screen, ctx, &[], &Default::default())
+            .value
+            .as_deref(),
+        Some("Flat")
+    );
+    assert!(adjust(RowId::Screen, 1, true, ctx));
+    assert_eq!(
+        extra_str(ctx.settings, device_keys::SCREEN, "flat"),
+        "4000r"
+    );
 }
 
 /// A Mac's tab offers the picker instead of the toggle; its preset editor keeps the toggle,
@@ -1654,7 +1746,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 70, "{seen:?}");
+    assert_eq!(seen.len(), 73, "{seen:?}");
     assert!(
         !seen.contains(&RowId::AdvancedChanged),
         "built per tab, never listed"

@@ -1,6 +1,6 @@
 {
 	"name": "@punktfunk/plugin-kit",
-	"version": "0.13.0",
+	"version": "0.14.0",
 	"description": "Effect-based framework for punktfunk plugins: lifecycle runtime, config/state, sync engine, UI serving, CLI scaffold, and browser helpers.",
 	"type": "module",
 	"license": "MIT OR Apache-2.0",
@@ -11,7 +11,7 @@
 		"directory": "plugin-kit"
 	},
 	"bugs": {
-		"url": "https://git.unom.io/unom/punktfunk/issues"
+		"url": "https://punktfunk.unom.io/community#bugs"
 	},
 	"keywords": [
 		"punktfunk",
@@ -60,7 +60,7 @@
 	},
 	"peerDependencies": {
 		"effect": "^4.0.1",
-		"@punktfunk/host": "^0.4.0",
+		"@punktfunk/host": "^0.4.0 || ^0.5.0",
 		"react": "^19.2.0"
 	},
 	"peerDependenciesMeta": {
@@ -75,5 +75,8 @@
 		"@types/react": "^19.3.0",
 		"effect": "4.0.1",
 		"typescript": "^7.0.2"
+	},
+	"overrides": {
+		"undici": "^8.12.2"
 	}
 }

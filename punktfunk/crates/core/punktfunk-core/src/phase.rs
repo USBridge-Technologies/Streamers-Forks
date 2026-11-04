@@ -164,6 +164,8 @@ pub struct CadenceHealth {
     pub skew_ns: i64,
     pub jitter_ns: i64,
     pub cushion_ns: i64,
+    /// Decaying maximum of late arrival past the offset; the tail cushion's input.
+    pub tail_ns: i64,
 }
 
 /// Type-2 playout: due time is `src_pts + offset + cushion` on the source
@@ -184,6 +186,11 @@ pub struct CadenceClock {
     skew_ns: i64,
     /// EMA of |residual|, the cushion's input.
     mad_ns: i64,
+    /// Decaying maximum of late arrival (positive residual): a link whose jitter has a
+    /// long tail needs the hold sized from the tail, not the typical frame.
+    tail_ns: i64,
+    /// Cushion covers `tail_ns` too, not only a multiple of the MAD.
+    tail_cushion: bool,
     /// `None` until the first sample anchors the loop.
     last_pts_ns: Option<u64>,
     /// Last interval seen, so [`cushion_ns`](Self::cushion_ns) can apply its ceiling.
@@ -198,10 +205,17 @@ impl CadenceClock {
             offset_ns: 0,
             skew_ns: 0,
             mad_ns: 0,
+            tail_ns: 0,
+            tail_cushion: false,
             last_pts_ns: None,
             frame_interval_ns: 0,
             health: CadenceHealth::default(),
         }
+    }
+
+    /// Size the cushion from the late tail as well as the MAD.
+    pub fn set_tail_cushion(&mut self, on: bool) {
+        self.tail_cushion = on;
     }
 
     /// Re-anchor on the next sample. Call on known discontinuities: codec
@@ -255,6 +269,12 @@ impl CadenceClock {
                 .saturating_add(shr_toward_zero(err, self.tuning.skew_shift));
             let dev = err.abs() - self.mad_ns;
             self.mad_ns += shr_toward_zero(dev, self.tuning.jitter_shift);
+            // Adopt a later arrival at once; forget it over ~128 frames.
+            if err > self.tail_ns {
+                self.tail_ns = err;
+            } else {
+                self.tail_ns -= self.tail_ns >> 7;
+            }
         } else {
             self.offset_ns = raw;
             self.skew_ns = 0;
@@ -287,9 +307,13 @@ impl CadenceClock {
 
     /// Ceiling of one frame interval is an invariant, not a tunable: past a
     /// whole frame the source cannot supply that smoothness — deepen the buffer.
+    /// With the tail cushion, the hold also covers the latest late arrival plus the floor.
     pub fn cushion_ns(&self) -> i64 {
         let den = self.tuning.cushion_den.max(1) as i64;
-        let want = self.mad_ns.saturating_mul(self.tuning.cushion_num as i64) / den;
+        let mut want = self.mad_ns.saturating_mul(self.tuning.cushion_num as i64) / den;
+        if self.tail_cushion {
+            want = want.max(self.tail_ns.saturating_add(self.tuning.cushion_floor_ns));
+        }
         let ceiling = if self.frame_interval_ns > 0 {
             self.frame_interval_ns
         } else {
@@ -304,6 +328,7 @@ impl CadenceClock {
         h.skew_ns = self.skew_ns;
         h.jitter_ns = self.mad_ns;
         h.cushion_ns = self.cushion_ns();
+        h.tail_ns = self.tail_ns;
         h
     }
 
@@ -311,6 +336,7 @@ impl CadenceClock {
         self.health.offset_ns = self.offset_ns;
         self.health.skew_ns = self.skew_ns;
         self.health.jitter_ns = self.mad_ns;
+        self.health.tail_ns = self.tail_ns;
     }
 }
 
@@ -324,21 +350,26 @@ const fn shr_toward_zero(v: i64, shift: u8) -> i64 {
     }
 }
 
-/// Lead samples beyond this are a stalled compositor, not a work duration.
+/// A present − latch span beyond this while no period is known is a stalled
+/// compositor, not a lead.
 const LEAD_MAX_NS: i64 = 50_000_000;
 
-/// Present-phased vsync grid plus the lead the compositor needs ahead of it.
+/// Vsync grid phased on the compositor's cycle, plus the lead it needs.
 ///
-/// Phase is the last real present (a present fence), never a latch: the latch
-/// is the compositor's wakeup, one work duration before the vsync, and that
-/// duration differs per device. The period is the panel's as the compositor
-/// states it ([`SlotClock::set_period`]); presents may narrow it, never widen
-/// it — a source below the panel rate presents on every Nth vsync and must
-/// not teach a slower panel. Slots are integer indices on the grid; a
-/// presenter that targets `present_ns(slot) − period/2` is ready for `slot`
-/// and not for `slot − 1` with half a period of tolerance either side.
-/// `lead_ns` is a decaying maximum of present − latch, the apply-ahead a slot
-/// needs.
+/// Phase is where the compositor presents: its latch plus `lead_ns`. That is
+/// the instant its readiness check for a desired present time reads, and the
+/// latch alone is not it: the latch is its wakeup, one work duration before
+/// the vsync, and that duration differs per device. The present fence says
+/// when the frame reached glass, which a display queue can put whole
+/// refreshes later (a Shield TV: one or two, for minutes) or wobble; it never
+/// phases the grid. The period is the panel's as the compositor states it
+/// ([`SlotClock::set_period`]); presents may narrow it, never widen it — a
+/// source below the panel rate presents on every Nth vsync and must not
+/// teach a slower panel. Slots are integer indices on the grid; a presenter
+/// that targets `present_ns(slot) − period/2` is ready for `slot` and not for
+/// `slot − 1` with half a period of tolerance either side. `lead_ns` is a
+/// decaying maximum of present − latch folded into one period: the apply-ahead
+/// a slot needs, with the display's whole refreshes removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotClock {
     period_ns: i64,
@@ -383,12 +414,18 @@ impl SlotClock {
         }
     }
 
-    /// One real present and the latch that produced it. Returns the slot the
-    /// present landed on; the grid re-phases onto it. A spacing under nine
-    /// tenths of the period is the panel running faster than stated and
-    /// narrows it; anything closer is fence jitter (250 µs on the A024).
+    /// One real present (a fence) and the latch that produced it. Returns the
+    /// slot the compositor presented on, its latch one lead on; the grid
+    /// re-phases onto that instant. A spacing under nine tenths of the period
+    /// is the panel running faster than stated and narrows it; anything closer
+    /// is jitter (250 µs on the A024). Without a lead yet, the fence stands in.
     pub fn observe(&mut self, present_ns: i64, latch_ns: i64) -> i64 {
-        let sample = present_ns - latch_ns;
+        let span = present_ns - latch_ns;
+        let sample = match self.period_ns {
+            // Folded into (0, period]: a whole period reads as one, not none.
+            p if p > 0 && span > 0 => (span - 1).rem_euclid(p) + 1,
+            _ => span,
+        };
         if (0..=LEAD_MAX_NS).contains(&sample) {
             if sample > self.lead_ns {
                 self.lead_ns = sample;
@@ -396,7 +433,12 @@ impl SlotClock {
                 self.lead_ns -= (self.lead_ns - sample) >> 4;
             }
         }
-        let spacing = present_ns - self.phase_ns;
+        let anchor = if self.lead_ns > 0 {
+            latch_ns + self.lead_ns
+        } else {
+            present_ns
+        };
+        let spacing = anchor - self.phase_ns;
         if self.phase_ns > 0
             && PANEL_PERIOD_RANGE_NS.contains(&spacing)
             && (self.period_ns == 0 || spacing < self.period_ns / 10 * 9)
@@ -404,12 +446,12 @@ impl SlotClock {
             self.period_ns = spacing;
         }
         if !self.phased() {
-            self.phase_ns = present_ns;
+            self.phase_ns = anchor;
             self.phase_slot = 0;
             return 0;
         }
-        let slot = self.slot_nearest(present_ns);
-        self.phase_ns = present_ns;
+        let slot = self.slot_nearest(anchor);
+        self.phase_ns = anchor;
         self.phase_slot = slot;
         slot
     }
@@ -712,6 +754,44 @@ mod tests {
         }
     }
 
+    /// A link whose arrivals are mostly tight but occasionally late: the MAD cushion leaves
+    /// those frames late; the tail cushion covers the latest of them, then lets go.
+    #[test]
+    fn the_tail_cushion_covers_the_late_tail_and_decays() {
+        let mut c = settled(400, 300_000);
+        c.set_tail_cushion(true);
+        let before = c.cushion_ns();
+        let k = 400;
+        // One frame 6 ms late on a 0.3 ms link.
+        c.due_ns(pts_at(k), pts_at(k) as i64 + DOMAIN + DELAY + 6_000_000, P);
+        let h = c.health();
+        assert!(
+            h.tail_ns > 5_000_000,
+            "tail {} must adopt the late frame",
+            h.tail_ns
+        );
+        assert!(
+            c.cushion_ns() >= h.tail_ns && c.cushion_ns() > before,
+            "cushion {} must cover the tail {}",
+            c.cushion_ns(),
+            h.tail_ns
+        );
+        for i in 1..600 {
+            c.due_ns(pts_at(k + i), pts_at(k + i) as i64 + DOMAIN + DELAY, P);
+        }
+        assert!(
+            c.health().tail_ns < 100_000,
+            "a quiet link forgets the tail, {} left",
+            c.health().tail_ns
+        );
+        let mut off = settled(400, 300_000);
+        off.due_ns(pts_at(k), pts_at(k) as i64 + DOMAIN + DELAY + 6_000_000, P);
+        assert!(
+            off.cushion_ns() < 3_000_000,
+            "off, the MAD cushion stays small"
+        );
+    }
+
     #[test]
     fn cushion_respects_ceiling() {
         let mut c = CadenceClock::new(CadenceTuning::free_running());
@@ -1007,7 +1087,30 @@ mod slot_clock_tests {
     }
 
     #[test]
-    fn lead_is_a_decaying_maximum() {
+    fn the_grid_phases_on_the_compositor_not_the_fence() {
+        let mut c = phased();
+        let v = 1_000_000_000;
+        // A display queue shows each frame two refreshes after the compositor presented it:
+        // the grid stays on the compositor's cycle and the fence reads two slots on.
+        for i in 1..=20 {
+            let latch = v + i * P - LEAD;
+            assert_eq!(c.observe(v + i * P + 2 * P, latch), i);
+            assert_eq!(c.present_ns(i), v + i * P);
+            assert_eq!(c.slot_nearest(v + i * P + 2 * P), i + 2);
+        }
+        assert_eq!(c.lead_ns(), LEAD);
+        // A fence wobbling a third of a period either way moves the grid by at most the
+        // lead's growth, never onto the fence.
+        for i in 21..=40 {
+            let latch = v + i * P - LEAD;
+            let wobble = if i % 2 == 0 { P / 3 } else { -P / 3 };
+            assert_eq!(c.observe(v + i * P + wobble, latch), i);
+            assert!((c.present_ns(i) - (v + i * P)).abs() <= P / 3, "slot {i}");
+        }
+    }
+
+    #[test]
+    fn lead_is_a_decaying_maximum_within_one_period() {
         let mut c = phased();
         let v = 1_000_000_000;
         c.observe(v + P, v + P - 6_000_000);
@@ -1016,8 +1119,22 @@ mod slot_clock_tests {
             c.observe(v + i * P, v + i * P - LEAD);
         }
         assert!(c.lead_ns() < 4_500_000 && c.lead_ns() >= LEAD);
-        c.observe(v + 40 * P, v + 40 * P - LEAD_MAX_NS - 1);
-        assert!(c.lead_ns() < 4_500_000, "a stalled sample is ignored");
+        // On glass two refreshes after a latch one lead ahead of its own vsync: the display's
+        // delay, not a longer lead.
+        c.observe(v + 40 * P, v + 40 * P - LEAD - 2 * P);
+        assert!(
+            c.lead_ns() < 4_500_000,
+            "whole periods beyond are the display's"
+        );
+        c.observe(v + 41 * P, v + 41 * P - P);
+        assert_eq!(c.lead_ns(), P, "a whole period is a whole period, not none");
+        let mut unphased = SlotClock::seeded(0);
+        unphased.observe(v, v - LEAD_MAX_NS - 1);
+        assert_eq!(
+            unphased.lead_ns(),
+            0,
+            "no period: a stalled span is ignored"
+        );
     }
 
     #[test]

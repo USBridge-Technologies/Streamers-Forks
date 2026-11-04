@@ -49,10 +49,13 @@ pub struct ClientHello {
     pub preset: Option<SessionPreset>,
     /// What this client's OS says about its end of the path. The default is unknown.
     pub link: LinkFacts,
-    /// A diagnostic session: serve probes from the punched data plane, never build a pipeline.
+    /// A diagnostic session: serve probes from the bound data plane, never build a pipeline.
     pub probe_only: bool,
     /// The player's PyroWave quality in hundredths of a bit per pixel; `0` leaves the host's.
     pub pyrowave_bpp_x100: u16,
+    /// H.264/HEVC slices per picture this client's decoder wants, read only under
+    /// [`VIDEO_CAP_MULTI_SLICE`](crate::quic::VIDEO_CAP_MULTI_SLICE); `0` leaves the host's.
+    pub slices: u8,
     /// The session this client held, to take back after a drop.
     pub resume: Option<[u8; 16]>,
     /// Media AEADs the client takes, most wanted first. Empty on a carrier that encrypts.
@@ -64,6 +67,9 @@ pub struct ClientHello {
     /// Ask for access only: the host closes with [`crate::reject::ACCESS_GRANTED_CLOSE_CODE`]
     /// once this device may connect, and starts no session. An older host streams instead.
     pub access_only: bool,
+    /// Every screen this client shows, screen 0 first and matching `hello.mode`; empty for
+    /// one. Under [`reg::FEATURE_SCREENS`].
+    pub screens: Vec<super::msg::Screen>,
 }
 
 impl V2Message for ClientHello {
@@ -133,6 +139,9 @@ impl V2Message for ClientHello {
             })
             .when(profile.is_some(), |f| f.str(23, profile.unwrap_or("")))
             .when(self.access_only, |f| f.u8(26, 1))
+            .when(!self.screens.is_empty(), |f| self.screens.put(f, 27))
+            .when(self.slices != 0, |f| f.u8(28, self.slices))
+            .when(h.audio_bitstreams != 0, |f| f.u8(29, h.audio_bitstreams))
     }
 
     fn from_body(body: &[u8]) -> Result<Self> {
@@ -154,13 +163,15 @@ impl V2Message for ClientHello {
             audio_bits: 0,
             audio_layout: 0,
             video_fit: 0,
+            audio_bitstreams: 0,
         };
         let (mut resume, mut suites) = (None, Vec::new());
         let (mut client_label, mut abr_features, mut preset) = (None, 0, None);
         let (mut link, mut probe_only) = (LinkFacts::default(), false);
-        let mut pyrowave_bpp_x100 = 0u16;
+        let (mut pyrowave_bpp_x100, mut slices) = (0u16, 0u8);
         let mut features = FeatureSet::default();
         let (mut profile, mut access_only) = (None, false);
+        let mut screens = Vec::new();
         let mut seen = Vec::new();
         let mut r = FieldReader::new(body);
         while let Some((tag, v)) = r.next_field()? {
@@ -214,6 +225,9 @@ impl V2Message for ClientHello {
                         .unwrap_or(0)
                 }
                 26 => access_only = v.first() == Some(&1),
+                27 => screens = <Vec<super::msg::Screen> as FieldValue>::get(v).unwrap_or_default(),
+                28 => slices = v.first().copied().unwrap_or(0),
+                29 => h.audio_bitstreams = u8_of(v)?,
                 _ => {}
             }
         }
@@ -233,11 +247,13 @@ impl V2Message for ClientHello {
             link,
             probe_only,
             pyrowave_bpp_x100,
+            slices,
             resume,
             suites,
             features,
             profile,
             access_only,
+            screens,
         })
     }
 }
@@ -477,6 +493,7 @@ mod tests {
                 any::<u8>(),
                 any::<u8>(),
                 any::<u8>(),
+                any::<u8>(),
             ),
         )
             .prop_map(|(a, b, c)| Hello {
@@ -502,13 +519,14 @@ mod tests {
                     max_cll: p[3],
                     max_fall: p[2],
                 }),
-                // `CLIENT_CAP_EXT`'s neighbour 0x80 is the last free bit; any byte works.
+                // Any byte works: an unknown bit rides through.
                 client_caps: c.1,
                 max_shard_payload: c.2,
                 audio_rate_hz: c.3,
                 audio_bits: c.4,
                 audio_layout: c.5,
                 video_fit: c.6,
+                audio_bitstreams: c.7,
             })
     }
 
@@ -600,7 +618,7 @@ mod tests {
         /// changes nothing.
         #[test]
         fn hellos_settle_after_one_trip(h in hello_strategy(), w in welcome_strategy()) {
-            let ch = ClientHello { hello: h, client_label: None, abr_features: 0, preset: None, link: LinkFacts::default(), probe_only: false, pyrowave_bpp_x100: 0, resume: None, suites: vec![], features: FeatureSet::default(), profile: None, access_only: false };
+            let ch = ClientHello { hello: h, client_label: None, abr_features: 0, preset: None, link: LinkFacts::default(), probe_only: false, pyrowave_bpp_x100: 0, slices: 0, resume: None, suites: vec![], features: FeatureSet::default(), profile: None, access_only: false, screens: vec![] };
             let once = ClientHello::from_body(&ch.fields().into_body()).unwrap();
             let twice = ClientHello::from_body(&once.fields().into_body()).unwrap();
             prop_assert_eq!(twice, once);
@@ -665,6 +683,12 @@ mod tests {
         assert!(tags(&ch).contains(&24));
         ch.pyrowave_bpp_x100 = 120;
         assert!(tags(&ch).contains(&25));
+        assert!(!tags(&ch).contains(&28));
+        ch.slices = 8;
+        assert!(tags(&ch).contains(&28));
+        assert!(!tags(&ch).contains(&29));
+        ch.hello.audio_bitstreams = 0x03;
+        assert!(tags(&ch).contains(&29));
 
         let read = |tag, v: &[u8]| {
             ClientHello::from_body(&Fields::new().bytes(tag, v).into_body()).unwrap()
@@ -680,6 +704,9 @@ mod tests {
         assert_eq!(read(25, &[120, 0]).pyrowave_bpp_x100, 120);
         // A short value is no ask, never a failed handshake.
         assert_eq!(read(25, &[7]).pyrowave_bpp_x100, 0);
+        assert_eq!(read(28, &[8]).slices, 8);
+        assert_eq!(read(28, &[]).slices, 0);
+        assert_eq!(read(29, &[0x02]).hello.audio_bitstreams, 0x02);
         assert!(read(26, &[1]).access_only);
         assert!(!read(26, &[0]).access_only);
         assert!(!read(24, &[]).access_only);
@@ -704,12 +731,13 @@ mod tests {
                 video_codecs: CODEC_HEVC,
                 preferred_codec: 0,
                 display_hdr: None,
-                client_caps: CLIENT_CAP_EXT,
+                client_caps: 0x40,
                 max_shard_payload: 1408,
                 audio_rate_hz: crate::audio::SAMPLE_RATE_HZ,
                 audio_bits: crate::audio::pcm::BITS_16,
                 audio_layout: 0,
                 video_fit: 0,
+                audio_bitstreams: 0,
             },
             client_label: Some("android 0.43".into()),
             abr_features: EXT_ABR_ACK_REASON,
@@ -720,11 +748,13 @@ mod tests {
             },
             probe_only: true,
             pyrowave_bpp_x100: 120,
+            slices: 0,
             resume: Some([3; 16]),
             suites: vec![MediaSuite::ChaCha20Poly1305, MediaSuite::Aes128Gcm],
             features: FeatureSet::default().with(reg::FEATURE_STREAM_CONFIG),
             profile: None,
             access_only: false,
+            screens: vec![],
         };
         // The bytes on the wire are pinned: a change here is a wire change.
         let frame: String = ch.encode_v2().iter().map(|b| format!("{b:02x}")).collect();
@@ -737,6 +767,30 @@ mod tests {
         );
         let back = ClientHello::from_body(&ch.fields().into_body()).unwrap();
         assert_eq!(back, ch);
+
+        // Screens ride along; a torn list reads as one screen, never a failed handshake.
+        let two = ClientHello {
+            screens: vec![
+                super::super::msg::Screen {
+                    mode: ch.hello.mode,
+                    primary: true,
+                    ..Default::default()
+                },
+                super::super::msg::Screen {
+                    index: 1,
+                    mode: ch.hello.mode,
+                    x: 1920,
+                    ..Default::default()
+                },
+            ],
+            ..ch.clone()
+        };
+        assert_eq!(
+            ClientHello::from_body(&two.fields().into_body()).unwrap(),
+            two
+        );
+        let torn = ch.fields().bytes(27, &[1, 2, 3]).into_body();
+        assert!(ClientHello::from_body(&torn).unwrap().screens.is_empty());
 
         let sh = ServerHello {
             welcome: ServerHello::from_body(&Fields::new().bytes(1, &[0; 16]).into_body())

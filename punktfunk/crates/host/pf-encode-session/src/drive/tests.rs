@@ -255,6 +255,18 @@ fn run(
     script: Vec<Step>,
     frees: bool,
 ) -> (Vec<(u32, u32)>, u64) {
+    drive(mem, session, enc, script, frees, true)
+}
+
+/// [`run`] on a thread that is `live`, or on one its successor detached.
+fn drive(
+    mem: &Arc<Mem>,
+    session: &EncodeSession,
+    enc: FakeEncoder,
+    script: Vec<Step>,
+    frees: bool,
+    live: bool,
+) -> (Vec<(u32, u32)>, u64) {
     let pool = ScriptedPool {
         session,
         mem: mem.clone(),
@@ -266,7 +278,7 @@ fn run(
             ..PoolState::default()
         }),
     };
-    let live = AtomicBool::new(true);
+    let live = AtomicBool::new(live);
     let rates = Rates {
         fps: 1000,
         panel_hz: 1000,
@@ -327,6 +339,30 @@ fn a_loss_during_a_wave_is_published_as_a_queued_wave() {
     );
 }
 
+/// A detached thread back from its wedge owns nothing: it leaves at the loop top, and the op
+/// queued meanwhile stays for the thread that replaced it.
+#[test]
+fn a_detached_thread_drains_no_mailbox() {
+    let mem = Mem::new();
+    let session = session(&mem, 100);
+    session.push_ctl(Ctl::RequestKeyframe);
+    let (aus, taken) = drive(
+        &mem,
+        &session,
+        FakeEncoder::new(WAVE),
+        frames(2),
+        true,
+        false,
+    );
+    assert!(aus.is_empty());
+    assert_eq!(taken, 0);
+    assert_eq!(
+        session.take_ctl().len(),
+        1,
+        "the keyframe request is the successor's"
+    );
+}
+
 /// The host's reset: the thread stops, the session rebases, a fresh encoder starts. The old
 /// slots are freed and the next stream opens with an IDR on the new base.
 #[test]
@@ -342,6 +378,34 @@ fn a_reset_frees_the_slots_and_restamps_from_the_new_base() {
     assert_eq!(mem.word(offset_of!(AuHeader, wire_seq_base)), 500);
     let (aus, _) = run(&mem, &session, FakeEncoder::new(WAVE), frames(2), false);
     assert_eq!(aus, [(500, KEY), (501, WHOLE)]);
+}
+
+/// A slot the host is still copying out across a reset keeps its bytes: the next stream's
+/// first access unit lands past them, not at the heap's start.
+#[test]
+fn a_reset_places_past_a_slot_the_host_still_reads() {
+    let mem = Mem::new();
+    let session = session(&mem, 100);
+    run(&mem, &session, FakeEncoder::new(WAVE), frames(3), false);
+    let held = session.section.slot(0);
+    assert_eq!(held.offset, au::HEAP_OFFSET as u32);
+    let taken = session.section.slot_state(0).compare_exchange(
+        au::PUBLISHED,
+        au::READING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    assert_eq!(taken, Ok(au::PUBLISHED));
+
+    session.rebase(500);
+    let (aus, _) = run(&mem, &session, FakeEncoder::new(WAVE), frames(2), false);
+    assert_eq!(aus, [(500, KEY), (501, WHOLE)]);
+    let idr = (0..au::AU_SLOTS as usize)
+        .map(|i| session.section.slot(i))
+        .find(|s| s.state == au::PUBLISHED && s.wire_seq == 500)
+        .expect("the IDR's slot");
+    println!("held {}..+{}, IDR at {}", held.offset, held.len, idr.offset);
+    assert!(idr.offset >= held.offset + held.len, "IDR over held bytes");
 }
 
 /// A terminal submit error ends the thread on the first submit. Any other error is retried on

@@ -2,13 +2,12 @@
 //! (`EGL_LINUX_DMA_BUF_EXT`). The DRM modifier is mandatory — NVIDIA buffers are tiled; omitting
 //! it is `EGL_BAD_MATCH` or a corrupt image.
 //!
-//! Desktop NVIDIA cannot register a dmabuf `EGLImage` with CUDA (`cuGraphicsEGLRegisterImage` is
-//! Tegra-only; `cuGraphicsGLRegisterImage` rejects EGLImage-backed textures). Bind the image to a
-//! GL texture (`glEGLImageTargetTexture2DOES`), blit into an immutable `GL_RGBA8` (or NV12 / YUV444
-//! convert targets), register that texture, then device-copy into an owned [`DeviceBuffer`] so the
-//! dmabuf can return to the compositor immediately.
+//! Tiled dmabufs de-tile through GL: bind the image to a texture (`glEGLImageTargetTexture2DOES`),
+//! blit into an immutable `GL_RGBA8` (or NV12 / YUV444 convert targets), register that texture,
+//! then device-copy into an owned [`DeviceBuffer`] so the dmabuf can return to the compositor
+//! immediately. LINEAR dmabufs go through [`super::vulkan`], or [`super::direct`] for NVENC.
 //!
-//! Pin: `picks_the_nvidia_node_not_the_first_one`. LINEAR dmabufs go through [`super::vulkan`].
+//! Pin: `picks_the_nvidia_node_not_the_first_one`.
 
 #![allow(non_upper_case_globals)]
 
@@ -20,14 +19,14 @@ use khronos_egl as egl;
 use std::os::raw::{c_int, c_void};
 
 // Not in khronos-egl: EGL_EXT_image_dma_buf_import(_modifiers) and the GBM platform enum.
-const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
+pub(super) const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
 const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
-const EGL_LINUX_DRM_FOURCC_EXT: egl::Attrib = 0x3271;
-const EGL_DMA_BUF_PLANE0_FD_EXT: egl::Attrib = 0x3272;
-const EGL_DMA_BUF_PLANE0_OFFSET_EXT: egl::Attrib = 0x3273;
-const EGL_DMA_BUF_PLANE0_PITCH_EXT: egl::Attrib = 0x3274;
-const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: egl::Attrib = 0x3443;
-const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Attrib = 0x3444;
+pub(super) const EGL_LINUX_DRM_FOURCC_EXT: egl::Attrib = 0x3271;
+pub(super) const EGL_DMA_BUF_PLANE0_FD_EXT: egl::Attrib = 0x3272;
+pub(super) const EGL_DMA_BUF_PLANE0_OFFSET_EXT: egl::Attrib = 0x3273;
+pub(super) const EGL_DMA_BUF_PLANE0_PITCH_EXT: egl::Attrib = 0x3274;
+pub(super) const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: egl::Attrib = 0x3443;
+pub(super) const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Attrib = 0x3444;
 
 #[path = "egl/gl.rs"]
 mod gl;
@@ -155,20 +154,20 @@ struct Pass {
 /// Each pass's fragment shader, target format and bytes per texel, in plane order.
 ///
 /// Packed32 swizzles to BGRx (`GL_RGBA8`, dest linear so CUDA can register it). NV12 writes
-/// BT.709 limited full-res `GL_R8` luma and half-res `GL_RG8` chroma (R=U, G=V), so NVENC
-/// skips its own CSC. YUV444 writes three full-res `GL_R8` planes, studio or full range.
-fn pass_specs(layout: cuda::PlaneLayout) -> Vec<(std::borrow::Cow<'static, [u8]>, u32, usize)> {
+/// BT.709 full-res `GL_R8` luma and half-res `GL_RG8` chroma (R=U, G=V), so NVENC skips its
+/// own CSC. YUV444 writes three full-res `GL_R8` planes. Both YUV layouts write `full_range`
+/// or studio.
+fn pass_specs(
+    layout: cuda::PlaneLayout,
+    full_range: bool,
+) -> Vec<(std::borrow::Cow<'static, [u8]>, u32, usize)> {
     match layout {
         cuda::PlaneLayout::Packed32 => vec![(FRAG_SRC.into(), GL_RGBA8, 4)],
-        cuda::PlaneLayout::Nv12 => vec![
-            (FRAG_Y_SRC.into(), GL_R8, 1),
-            (FRAG_UV_SRC.into(), GL_RG8, 2),
-        ],
+        cuda::PlaneLayout::Nv12 => {
+            let (y, uv) = nv12_frag_sources(full_range);
+            vec![(y.into(), GL_R8, 1), (uv.into(), GL_RG8, 2)]
+        }
         cuda::PlaneLayout::Yuv444 => {
-            let full_range = yuv444_full_range();
-            if full_range {
-                tracing::info!("YUV444 zero-copy convert: FULL range (PUNKTFUNK_444_FULLRANGE=1)");
-            }
             let (y, u, v) = yuv444_frag_sources(full_range);
             [y, u, v]
                 .into_iter()
@@ -194,7 +193,13 @@ struct GlConvert {
 }
 
 impl GlConvert {
-    unsafe fn new(layout: cuda::PlaneLayout, width: u32, height: u32) -> Result<GlConvert> {
+    /// # Safety: GL and the shared CUDA context are current on this thread.
+    unsafe fn new(
+        layout: cuda::PlaneLayout,
+        full_range: bool,
+        width: u32,
+        height: u32,
+    ) -> Result<GlConvert> {
         // SAFETY: caller contract (`convert_for`): GL and the shared CUDA context are current
         // on this thread. GL calls pass live locals; every created name is owned by `guard`
         // until the struct exists.
@@ -217,7 +222,7 @@ impl GlConvert {
             glBindTexture(GL_TEXTURE_2D, 0);
 
             let mut passes = Vec::new();
-            for ((frag, format, texel_bytes), (row_bytes, rows)) in pass_specs(layout)
+            for ((frag, format, texel_bytes), (row_bytes, rows)) in pass_specs(layout, full_range)
                 .into_iter()
                 .zip(layout.planes(width, height))
             {
@@ -334,12 +339,6 @@ impl Drop for GlConvert {
     }
 }
 
-/// `PUNKTFUNK_444_FULLRANGE=1`: the YUV444 convert writes full range. The encoder signals the
-/// same answer in the VUI, so both read it here.
-pub fn yuv444_full_range() -> bool {
-    std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1")
-}
-
 /// One PipeWire dmabuf plane (BGRx is single-plane).
 #[derive(Clone, Copy, Debug)]
 pub struct DmabufPlane {
@@ -348,11 +347,62 @@ pub struct DmabufPlane {
     pub stride: u32,
 }
 
-type Egl = egl::DynamicInstance<egl::EGL1_5>;
+pub(super) type Egl = egl::DynamicInstance<egl::EGL1_5>;
+
+/// libEGL, an initialized GBM `EGLDisplay` on the NVIDIA render node, and that node. The
+/// display has dma-buf import with modifiers.
+pub(super) fn gbm_display() -> Result<(Egl, egl::Display, GbmDevice, std::path::PathBuf)> {
+    // GBM on the NVIDIA render node so the EGLDisplay shares the DRM device CUDA-GL interop
+    // uses. The EGL *device* platform does not — `cuGraphicsGLRegisterImage` rejects those textures.
+    let node = nvidia_render_node();
+    let render_node = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&node)
+        .with_context(|| format!("open {} for GBM", node.display()))?;
+    let gbm = GbmDevice::open(render_node)
+        .with_context(|| format!("open the GBM device on {}", node.display()))?;
+
+    // SAFETY: `Egl::load_required` dlopens libEGL and binds EGL 1.5 entry points matching
+    // the `khronos_egl` `EGL1_5` ABI. No Rust memory is passed; later use is through the
+    // safe wrappers.
+    let egl: Egl =
+        unsafe { Egl::load_required() }.context("load libEGL (EGL 1.5 dynamic instance)")?;
+    // SAFETY: `gbm.as_ptr()` is the live `gbm_device*` just created; `EGL_PLATFORM_GBM_KHR`
+    // is the platform enum that pairs with a GBM device as native display. `&[ATTRIB_NONE]`
+    // is a terminated empty attrib list borrowed for this call; EGL does not retain it.
+    let display = unsafe {
+        egl.get_platform_display(
+            EGL_PLATFORM_GBM_KHR,
+            gbm.as_ptr() as egl::NativeDisplayType,
+            &[egl::ATTRIB_NONE],
+        )
+    }
+    .with_context(|| format!("eglGetPlatformDisplay(GBM) on {}", node.display()))?;
+    egl.initialize(display).context("eglInitialize")?;
+
+    let exts = egl
+        .query_string(Some(display), egl::EXTENSIONS)
+        .context("query EGL extensions")?
+        .to_string_lossy()
+        .into_owned();
+    ensure!(
+        exts.contains("EGL_EXT_image_dma_buf_import"),
+        "EGL lacks EGL_EXT_image_dma_buf_import"
+    );
+    ensure!(
+        exts.contains("EGL_EXT_image_dma_buf_import_modifiers"),
+        "EGL lacks EGL_EXT_image_dma_buf_import_modifiers (needed for NVIDIA tiled dmabufs)"
+    );
+
+    Ok((egl, display, gbm, node))
+}
 
 /// Headless GBM EGLDisplay plus a surfaceless desktop-GL context. Lives on the capture thread;
 /// the GL context is made current there once and never released.
 pub struct EglImporter {
+    /// The range every YUV convert of this importer writes; `false` is studio.
+    full_range: bool,
     /// One tiled convert per [`cuda::PlaneLayout`], indexed by it and recreated on a size
     /// change. Kept apart so an RGB fallback mid-stream does not rebuild the NV12 one.
     converts: [Option<GlConvert>; 3],
@@ -381,53 +431,11 @@ unsafe impl Send for EglImporter {}
 
 impl EglImporter {
     /// Open a headless EGLDisplay on the NVIDIA GBM device. Creates the shared CUDA context so
-    /// later `import` is hot-path only.
-    pub fn new() -> Result<EglImporter> {
-        // GBM on the NVIDIA render node so the EGLDisplay shares the DRM device CUDA-GL interop
-        // uses. The EGL *device* platform does not — `cuGraphicsGLRegisterImage` rejects those textures.
-        let node = nvidia_render_node();
-        let render_node = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&node)
-            .with_context(|| format!("open {} for GBM", node.display()))?;
-        let gbm = GbmDevice::open(render_node)
-            .with_context(|| format!("open the GBM device on {}", node.display()))?;
+    /// later `import` is hot-path only. Every YUV convert writes `full_range`, or studio.
+    pub fn new(full_range: bool) -> Result<EglImporter> {
+        let (egl, display, gbm, node) = gbm_display()?;
 
-        // SAFETY: `Egl::load_required` dlopens libEGL and binds EGL 1.5 entry points matching
-        // the `khronos_egl` `EGL1_5` ABI. No Rust memory is passed; later use is through the
-        // safe wrappers.
-        let egl: Egl =
-            unsafe { Egl::load_required() }.context("load libEGL (EGL 1.5 dynamic instance)")?;
-        // SAFETY: `gbm.as_ptr()` is the live `gbm_device*` just created; `EGL_PLATFORM_GBM_KHR`
-        // is the platform enum that pairs with a GBM device as native display. `&[ATTRIB_NONE]`
-        // is a terminated empty attrib list borrowed for this call; EGL does not retain it.
-        let display = unsafe {
-            egl.get_platform_display(
-                EGL_PLATFORM_GBM_KHR,
-                gbm.as_ptr() as egl::NativeDisplayType,
-                &[egl::ATTRIB_NONE],
-            )
-        }
-        .with_context(|| format!("eglGetPlatformDisplay(GBM) on {}", node.display()))?;
-        egl.initialize(display).context("eglInitialize")?;
-
-        let exts = egl
-            .query_string(Some(display), egl::EXTENSIONS)
-            .context("query EGL extensions")?
-            .to_string_lossy()
-            .into_owned();
-        ensure!(
-            exts.contains("EGL_EXT_image_dma_buf_import"),
-            "EGL lacks EGL_EXT_image_dma_buf_import"
-        );
-        ensure!(
-            exts.contains("EGL_EXT_image_dma_buf_import_modifiers"),
-            "EGL lacks EGL_EXT_image_dma_buf_import_modifiers (needed for NVIDIA tiled dmabufs)"
-        );
-
-        // Surfaceless desktop-GL so we can bind the dmabuf EGLImage to a texture.
-        // `cuGraphicsEGLRegisterImage` is Tegra-only; desktop CUDA interop goes through GL.
+        // Surfaceless desktop-GL so we can bind the dmabuf EGLImage to a texture for the de-tile.
         egl.bind_api(egl::OPENGL_API)
             .context("eglBindAPI(OpenGL)")?;
         // Default SURFACE_TYPE is WINDOW_BIT; a headless display has none. Ask pbuffer first
@@ -495,6 +503,7 @@ impl EglImporter {
             "zero-copy EGL importer ready (GBM platform + GL texture interop, dma_buf_import + modifiers)"
         );
         Ok(EglImporter {
+            full_range,
             converts: [None, None, None],
             vk: None,
             linear_pool: None,
@@ -508,10 +517,10 @@ impl EglImporter {
         })
     }
 
-    /// The Vulkan bridge, brought up on first use.
+    /// The Vulkan bridge at this importer's range, brought up on first use.
     fn vk_bridge(&mut self) -> Result<&mut super::vulkan::VkBridge> {
         if self.vk.is_none() {
-            self.vk = Some(super::vulkan::VkBridge::new()?);
+            self.vk = Some(super::vulkan::VkBridge::new(self.full_range)?);
         }
         Ok(self.vk.as_mut().expect("set above"))
     }
@@ -575,7 +584,7 @@ impl EglImporter {
         }
         let pool = pool.as_ref().expect("set above");
         if self.vk.is_none() {
-            self.vk = Some(super::vulkan::VkBridge::new()?);
+            self.vk = Some(super::vulkan::VkBridge::new(self.full_range)?);
         }
         let vk = self.vk.as_mut().expect("set above");
         if nv12 {
@@ -729,7 +738,8 @@ impl EglImporter {
         result
     }
 
-    /// The tiled convert for `layout` at this size, rebuilt when the size changed.
+    /// The tiled convert for `layout` at this size and the importer's range, rebuilt when the
+    /// size changed.
     fn convert_for(
         &mut self,
         layout: cuda::PlaneLayout,
@@ -742,7 +752,7 @@ impl EglImporter {
             // SAFETY: `GlConvert::new` needs GL and CUDA current. Both hold: the thread that
             // owns this importer, GL made current in `EglImporter::new` and never released;
             // `cuda::make_current()?` ran above.
-            *slot = Some(unsafe { GlConvert::new(layout, width, height)? });
+            *slot = Some(unsafe { GlConvert::new(layout, self.full_range, width, height)? });
         }
         Ok(slot.as_mut().expect("set above"))
     }

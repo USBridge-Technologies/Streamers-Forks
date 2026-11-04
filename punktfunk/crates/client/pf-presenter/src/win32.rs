@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Must match the WinUI shell (`clients/windows/src/main.rs`) or the two windows stop grouping.
-const APP_USER_MODEL_ID: *const u16 = w!("unom.punktfunk.client");
+const APP_USER_MODEL_ID: *const u16 = w!("io.unom.punktfunk.client");
 
 /// Unpackaged runs only. Call before any window exists; later calls do not re-tag existing windows.
 pub(crate) fn set_app_user_model_id() {
@@ -42,7 +42,7 @@ pub(crate) fn set_app_user_model_id() {
 }
 
 /// The `HWND` SDL owns for this window; `None` before SDL has created it.
-fn window_hwnd(window: &sdl3::video::Window) -> Option<HWND> {
+pub(crate) fn window_hwnd(window: &sdl3::video::Window) -> Option<HWND> {
     // SAFETY: the SDL property lookups only read the live `window` borrow's property set.
     let hwnd = unsafe {
         sdl3::sys::properties::SDL_GetPointerProperty(

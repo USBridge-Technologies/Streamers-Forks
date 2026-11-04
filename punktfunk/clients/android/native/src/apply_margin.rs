@@ -5,10 +5,13 @@
 const START_NS: i64 = 0;
 /// One slot miss widens the margin by this much.
 const STEP_NS: i64 = 500_000;
-/// The widest margin.
-const MAX_NS: i64 = 2_500_000;
-/// Clean presents in a row that narrow the margin one step: about a second at 120 Hz.
-const DECAY_PRESENTS: u32 = 120;
+/// The widest margin: the desktop presenter's cap. A Shield TV's apply can take over 2.5 ms to
+/// reach SurfaceFlinger's latch; the A024 never needed that.
+const MAX_NS: i64 = 8_000_000;
+/// Clean presents in a row that narrow the margin one step: a minute at 60 Hz. Narrowing is a
+/// probe, and a probe that fails costs a repeated frame and a dropped one, so it runs no more
+/// often than the clock beat's own drop.
+const DECAY_PRESENTS: u32 = 3600;
 
 /// Apply-ahead beyond the learned lead: the binder hop plus SurfaceFlinger's wakeup-to-latch gap.
 /// A miss widens it one step, up to [`MAX_NS`]; [`DECAY_PRESENTS`] clean presents narrow it one.
@@ -31,11 +34,17 @@ impl ApplyMargin {
         self.ns
     }
 
-    /// One present with a real vsync. `missed`: it landed after the slot it was aimed at.
-    pub(crate) fn observe(&mut self, missed: bool) {
+    /// One present with a real vsync. `missed`: SurfaceFlinger latched it a cycle after the one
+    /// it was aimed at. `slack_ns`: how far ahead of that aimed latch the apply was. Only a miss
+    /// with the apply within a step of the margin widens it; one with more slack is the
+    /// compositor's own slip (a display queue changing depth, on a Shield TV every half minute),
+    /// which no apply-ahead covers and must not ratchet the margin to its cap.
+    pub(crate) fn observe(&mut self, missed: bool, slack_ns: i64) {
         if missed {
-            self.clean = 0;
-            self.ns = (self.ns + STEP_NS).min(MAX_NS);
+            if slack_ns < self.ns + STEP_NS {
+                self.clean = 0;
+                self.ns = (self.ns + STEP_NS).min(MAX_NS);
+            }
             return;
         }
         self.clean += 1;
@@ -50,27 +59,36 @@ impl ApplyMargin {
 mod tests {
     use super::{ApplyMargin, DECAY_PRESENTS, MAX_NS, STEP_NS};
 
-    /// A session's presents replayed in runs: (missed, how many, the margin after the run).
+    /// A session's presents replayed in runs: (missed, the apply's slack, how many, the margin
+    /// after the run). A tight miss has the apply right at the margin; a slip has it 5 ms ahead.
     #[test]
-    fn a_replayed_session_widens_on_misses_then_narrows_a_step_a_second() {
-        let replay: &[(bool, u32, i64)] = &[
-            (false, 300, 0),
-            (true, 1, STEP_NS),
-            (true, 2, 3 * STEP_NS),
-            (true, 5, MAX_NS),
-            (false, DECAY_PRESENTS - 1, MAX_NS),
-            (false, 1, MAX_NS - STEP_NS),
+    fn a_replayed_session_widens_on_its_own_misses_then_narrows_a_step_a_minute() {
+        let steps = (MAX_NS / STEP_NS) as u32;
+        const SLIP: i64 = 5_000_000;
+        let replay: &[(bool, i64, u32, i64)] = &[
+            (false, 0, 300, 0),
+            (true, 0, 1, STEP_NS),
+            (true, STEP_NS, 2, 3 * STEP_NS),
+            // The compositor's own slips, the apply well ahead: nothing moves, not even the
+            // clean count.
+            (true, 3 * STEP_NS + SLIP, 50, 3 * STEP_NS),
+            (true, 3 * STEP_NS, steps - 3, MAX_NS),
+            (true, 0, 4, MAX_NS),
+            (false, 0, DECAY_PRESENTS - 1, MAX_NS),
+            (false, 0, 1, MAX_NS - STEP_NS),
             // A miss one present short of the decay starts the count again.
-            (false, DECAY_PRESENTS - 1, MAX_NS - STEP_NS),
-            (true, 1, MAX_NS),
-            (false, DECAY_PRESENTS - 1, MAX_NS),
-            (false, 4 * DECAY_PRESENTS + 1, 0),
-            (false, 10 * DECAY_PRESENTS, 0),
+            (false, 0, DECAY_PRESENTS - 1, MAX_NS - STEP_NS),
+            (true, 0, 1, MAX_NS),
+            (false, 0, DECAY_PRESENTS - 1, MAX_NS),
+            (true, MAX_NS + SLIP, 1, MAX_NS),
+            (false, 0, 1, MAX_NS - STEP_NS),
+            (false, 0, (steps - 1) * DECAY_PRESENTS, 0),
+            (false, 0, 10 * DECAY_PRESENTS, 0),
         ];
         let mut m = ApplyMargin::new();
-        for (i, &(missed, n, want)) in replay.iter().enumerate() {
+        for (i, &(missed, slack, n, want)) in replay.iter().enumerate() {
             for _ in 0..n {
-                m.observe(missed);
+                m.observe(missed, slack);
             }
             assert_eq!(m.ns(), want, "run {i}: {n} presents, missed={missed}");
         }

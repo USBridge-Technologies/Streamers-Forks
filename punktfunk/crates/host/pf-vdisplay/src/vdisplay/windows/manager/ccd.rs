@@ -1,8 +1,9 @@
 //! Display-topology seam: the calls the isolate ladder makes into `pf-win-display`.
 //!
-//! [`CcdOps`] is how [`super::isolate_txn`], the exclusive watch's survivor read and its
-//! re-assert reach the OS. [`WinCcd`] is the one production implementor and passes each
-//! call straight on. The trait remains so tests can script what an isolate observed.
+//! [`CcdOps`] is how [`super::isolate_txn`], the exclusive watch's survivor read, its
+//! re-assert and a seat's HDR write reach the OS. [`WinCcd`] is the one production implementor
+//! and passes each call straight on. The trait remains so tests can script what an isolate
+//! observed.
 //!
 //! The manager's other `pf_win_display` calls are direct.
 
@@ -28,6 +29,8 @@ pub(crate) trait CcdOps: Send + Sync {
         baseline_active: &[CcdTargetKey],
         generation: u64,
     ) -> Vec<String>;
+    /// [`pf_win_display::win_display::set_advanced_color`].
+    fn set_advanced_color(&self, key: CcdTargetKey, enable: bool) -> bool;
 }
 
 /// The OS, through `pf-win-display`.
@@ -58,12 +61,18 @@ impl CcdOps for WinCcd {
             generation,
         )
     }
+
+    fn set_advanced_color(&self, key: CcdTargetKey, enable: bool) -> bool {
+        pf_win_display::win_display::set_advanced_color(key, enable)
+    }
 }
 
-/// A [`CcdOps`] that plays a [`Script`] and logs each [`CcdCall`], for tests.
+/// A [`CcdOps`] that plays a [`Script`], logs each [`CcdCall`] and can hold an isolate open,
+/// for tests.
 #[cfg(test)]
 pub(crate) mod fake {
     use std::collections::VecDeque;
+    use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -85,6 +94,10 @@ pub(crate) mod fake {
             baseline_active: Vec<CcdTargetKey>,
             generation: u64,
         },
+        SetAdvancedColor {
+            key: CcdTargetKey,
+            enable: bool,
+        },
     }
 
     /// What a [`FakeCcd`] answers. [`FakeCcd::script`] edits it between calls.
@@ -101,9 +114,22 @@ pub(crate) mod fake {
     struct State {
         script: Script,
         calls: Vec<CcdCall>,
+        /// The next isolate's two channels: one says it started, one lets it return.
+        hold: Option<(Sender<()>, Receiver<()>)>,
     }
 
-    pub(crate) struct FakeCcd(Mutex<State>);
+    /// Clones share one script and one call log, so a test keeps a handle on the fake it
+    /// boxed into a manager.
+    #[derive(Clone)]
+    pub(crate) struct FakeCcd(Arc<Mutex<State>>);
+
+    /// The test's end of a held isolate.
+    pub(crate) struct Hold {
+        /// Fires once the isolate has started.
+        pub(crate) entered: Receiver<()>,
+        /// Lets it return.
+        pub(crate) release: Sender<()>,
+    }
 
     impl FakeCcd {
         /// No isolate scripted, an empty unpublished snapshot, nothing to disable.
@@ -114,7 +140,19 @@ pub(crate) mod fake {
                 disabled: Vec::new(),
             };
             let calls = Vec::new();
-            FakeCcd(Mutex::new(State { script, calls }))
+            FakeCcd(Arc::new(Mutex::new(State {
+                script,
+                calls,
+                hold: None,
+            })))
+        }
+
+        /// The next isolate blocks, outside the fake's lock, until the test releases it.
+        pub(crate) fn hold_next_isolate(&self) -> Hold {
+            let (started, entered) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            self.0.lock().unwrap().hold = Some((started, released));
+            Hold { entered, release }
         }
 
         pub(crate) fn script(&self, edit: impl FnOnce(&mut Script)) {
@@ -142,7 +180,13 @@ pub(crate) mod fake {
             let keep = keep.to_vec();
             let observed = self.took(CcdCall::Isolate { keep, store }, |s| {
                 s.isolates.pop_front().flatten()
-            })?;
+            });
+            let hold = self.0.lock().unwrap().hold.take();
+            if let Some((started, released)) = hold {
+                let _ = started.send(());
+                let _ = released.recv();
+            }
+            let observed = observed?;
             // An empty pre-isolate config stands for the restore snapshot.
             Some(((Vec::new(), Vec::new()), observed))
         }
@@ -163,6 +207,10 @@ pub(crate) mod fake {
                 generation,
             };
             self.took(call, |s| s.disabled.clone())
+        }
+
+        fn set_advanced_color(&self, key: CcdTargetKey, enable: bool) -> bool {
+            self.took(CcdCall::SetAdvancedColor { key, enable }, |_| true)
         }
     }
 }

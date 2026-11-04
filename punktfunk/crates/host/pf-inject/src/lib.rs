@@ -68,6 +68,9 @@ pub trait InputInjector {
 pub enum Backend {
     /// wlroots virtual pointer + keyboard. Headless Sway.
     WlrVirtual,
+    /// The same protocols on a compositor that maps absolute motion over its whole layout and
+    /// ignores the pointer's output (Umbriel): the injector aims in layout space.
+    WlrLayout,
     /// KWin `org_kde_kwin_fake_input`. Direct; no RemoteDesktop portal. Authorized by the
     /// host `.desktop`.
     KwinFakeInput,
@@ -98,7 +101,8 @@ pub enum Backend {
 #[cfg(target_os = "linux")]
 pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
     match backend {
-        Backend::WlrVirtual => Ok(Box::new(wlr::WlrootsInjector::open()?)),
+        Backend::WlrVirtual => Ok(Box::new(wlr::WlrootsInjector::open(false)?)),
+        Backend::WlrLayout => Ok(Box::new(wlr::WlrootsInjector::open(true)?)),
         Backend::KwinFakeInput => Ok(Box::new(kwin_fake_input::KwinFakeInjector::open()?)),
         Backend::Libei => Ok(Box::new(
             libei::LibeiInjector::open_with(libei_ei_source())?,
@@ -157,6 +161,9 @@ impl AbsoluteAnchor {
     }
 }
 
+/// Screens past the first a session's absolute input may land on ([`set_screen_head`]).
+pub const EXTRA_SCREENS: usize = 3;
+
 /// Where absolute input aims, as the host published it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AimState {
@@ -164,17 +171,25 @@ pub(crate) struct AimState {
     pub target: head_pick::StreamTarget,
     /// Capture bring-ups so far, unchanged head included: a new session owes a warp too.
     pub generation: u64,
+    /// The heads of the screens past the first, screen `i + 1` at `i`; no anchor.
+    pub screens: [head_pick::StreamTarget; EXTRA_SCREENS],
+    /// Moves with each of those heads, and owes no warp.
+    pub screens_generation: u64,
 }
+
+const NO_HEAD: head_pick::StreamTarget = head_pick::StreamTarget {
+    name: None,
+    extent: None,
+    anchor: None,
+};
 
 /// One lock, so a reader sees one aim. `RwLock` not env: the injector is host-lifetime behind
 /// a channel, so a session reaches it only through typed process state. See `SESSION_BACKEND`.
 static AIM: std::sync::RwLock<AimState> = std::sync::RwLock::new(AimState {
-    target: head_pick::StreamTarget {
-        name: None,
-        extent: None,
-        anchor: None,
-    },
+    target: NO_HEAD,
     generation: 0,
+    screens: [NO_HEAD; EXTRA_SCREENS],
+    screens_generation: 0,
 });
 
 /// The aim in one read.
@@ -199,6 +214,53 @@ pub fn set_stream_extent(mode: Option<(u16, u16)>) {
     publish_aim(false, |t| t.extent = mode);
 }
 
+/// Host-only, at a further screen's capture bring-up: the head screen `screen` (1 or more)
+/// streams, by output name where the compositor names one, and its mode. No warp: the pointer
+/// stays where the first screen put it.
+pub fn set_screen_head(screen: u8, name: Option<String>, extent: Option<(u16, u16)>) {
+    AIM.write()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_screen(screen, name, extent);
+}
+
+impl AimState {
+    fn set_screen(&mut self, screen: u8, name: Option<String>, extent: Option<(u16, u16)>) {
+        let Some(i) = usize::from(screen)
+            .checked_sub(1)
+            .filter(|&i| i < EXTRA_SCREENS)
+        else {
+            return;
+        };
+        if self.screens[i].name != name {
+            tracing::info!(screen, output = ?name, "absolute-input screen output set");
+        }
+        self.screens[i] = head_pick::StreamTarget {
+            name,
+            extent,
+            anchor: None,
+        };
+        self.screens_generation += 1;
+    }
+
+    fn target_for(&self, screen: u8) -> head_pick::StreamTarget {
+        usize::from(screen)
+            .checked_sub(1)
+            .and_then(|i| self.screens.get(i))
+            .filter(|t| t.name.is_some() || t.extent.is_some())
+            .cloned()
+            .unwrap_or_else(|| self.target.clone())
+    }
+}
+
+/// The head screen `screen` aims at: the first screen's for screen 0 and for one never
+/// published, so input for a screen the host lost still lands on a streamed head.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn stream_target_for(screen: u8) -> head_pick::StreamTarget {
+    AIM.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .target_for(screen)
+}
+
 #[cfg(test)]
 mod aim_tests {
     /// A bring-up's head and its generation land in one write, so one read sees both.
@@ -210,6 +272,25 @@ mod aim_tests {
         assert!(aim.generation > before);
         assert_eq!(aim.target.extent, Some((1234, 567)));
         super::set_stream_extent(None);
+    }
+
+    /// A further screen's head is its own, owes no warp, and an unpublished one is the first's.
+    #[test]
+    fn a_screen_head_is_its_own_and_owes_no_warp() {
+        let mut aim = super::AimState::default();
+        aim.target.name = Some("Virtual-a".into());
+        aim.set_screen(2, Some("Virtual-b".into()), Some((2560, 1440)));
+        assert_eq!((aim.generation, aim.screens_generation), (0, 1), "no warp");
+        let t = aim.target_for(2);
+        assert_eq!(
+            (t.name.as_deref(), t.extent),
+            (Some("Virtual-b"), Some((2560, 1440)))
+        );
+        assert_eq!(aim.target_for(3), aim.target);
+        assert_eq!(aim.target_for(0), aim.target);
+        aim.set_screen(9, Some("ignored".into()), None);
+        aim.set_screen(2, None, None);
+        assert_eq!(aim.target_for(2), aim.target);
     }
 }
 
@@ -233,12 +314,6 @@ pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
     aim().target.anchor
 }
 
-/// The session's output name, the streamed mode and the host-wide anchor, in one read.
-#[cfg(target_os = "linux")]
-pub(crate) fn stream_target() -> head_pick::StreamTarget {
-    aim().target
-}
-
 /// Backend the live session resolved to. Host writes this from `pf_vdisplay::input_backend_id`
 /// on connect and on mid-stream Desktop↔Game switch.
 ///
@@ -259,6 +334,7 @@ fn session_backend() -> Option<Backend> {
 fn backend_from_id(id: &str) -> Option<Backend> {
     Some(match id.trim().to_ascii_lowercase().as_str() {
         "wlr" | "wlroots" | "wlrvirtual" => Backend::WlrVirtual,
+        "wlr-layout" => Backend::WlrLayout,
         "kwin" | "fakeinput" | "fake_input" | "kwin-fake-input" => Backend::KwinFakeInput,
         "libei" | "ei" | "portal" => Backend::Libei,
         "gamescope" | "gamescope-ei" => Backend::GamescopeEi,
@@ -267,7 +343,7 @@ fn backend_from_id(id: &str) -> Option<Backend> {
 }
 
 /// Point input at the backend this session's video resolved to; the two must not diverge.
-/// `id` is `pf_vdisplay::input_backend_id` (`gamescope`/`kwin`/`libei`/`wlr`).
+/// `id` is `pf_vdisplay::input_backend_id` (`gamescope`/`kwin`/`libei`/`wlr`/`wlr-layout`).
 ///
 /// Host-threaded, not `PUNKTFUNK_INPUT_BACKEND`. Call wherever a session compositor is
 /// decided. The operator-pinned `PUNKTFUNK_COMPOSITOR` path deliberately does not, so that
@@ -333,12 +409,17 @@ pub fn default_backend() -> Backend {
         {
             return Backend::WlrVirtual;
         }
+        if c.eq_ignore_ascii_case("umbriel") {
+            return Backend::WlrLayout;
+        }
         // mutter (GNOME) falls through to the desktop check below.
     }
     let desktop = pf_host_config::session::current_desktop().unwrap_or_default();
     let d = desktop.to_ascii_uppercase();
     if d.contains("KDE") {
         Backend::KwinFakeInput
+    } else if d.contains("UMBRIEL") {
+        Backend::WlrLayout
     } else if d.contains("NIRI") {
         // Before GNOME: niri may advertise `niri:GNOME`, and serves no libei.
         Backend::WlrVirtual
@@ -360,18 +441,22 @@ pub fn default_backend() -> Backend {
 }
 
 /// Whether this backend can type committed text ([`InputKind::TextInput`], `HOST_CAP_TEXT_INPUT`).
-/// Windows always (`KEYEVENTF_UNICODE`). Linux only on wlroots (Unicode virtual keyboard);
-/// KWin/libei/gamescope can only press host-layout keycodes. Welcome-time cap; a mid-session
-/// switch away from a capable backend drops text events (input is lossy by design).
+/// Windows always (`KEYEVENTF_UNICODE`). Linux on wlroots (Unicode virtual keyboard) and on KWin
+/// with `keyboard_keysym`; libei and gamescope can only press host-layout keycodes. Welcome-time
+/// cap; a mid-session switch away from a capable backend drops text events (input is lossy).
 #[cfg(target_os = "windows")]
 pub fn text_input_supported() -> bool {
     true
 }
 
-/// Linux types text only through the wlroots virtual-keyboard backend.
+/// Linux types text through the wlroots virtual keyboard and KWin 6.5+ keysyms.
 #[cfg(target_os = "linux")]
 pub fn text_input_supported() -> bool {
-    matches!(default_backend(), Backend::WlrVirtual)
+    match default_backend() {
+        Backend::WlrVirtual | Backend::WlrLayout => true,
+        Backend::KwinFakeInput => kwin_fake_input::keysym_supported(),
+        Backend::Libei | Backend::GamescopeEi => false,
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -384,7 +469,7 @@ pub fn text_input_supported() -> bool {
 /// contacts. Welcome-time so a client can fall back from passthrough.
 #[cfg(target_os = "linux")]
 pub fn touch_supported() -> bool {
-    !matches!(default_backend(), Backend::WlrVirtual)
+    !matches!(default_backend(), Backend::WlrVirtual | Backend::WlrLayout)
 }
 
 /// `PT_TOUCH` synthetic pointer, same 1809 probe as [`pen_supported`], without the pen
@@ -701,6 +786,11 @@ fn libei_ei_source() -> libei::EiSource {
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/channel_proof.rs"]
 pub mod channel_proof;
+/// The desk fence: the console host tags the desk's physical controllers with its session, as
+/// every host tags its virtual pads, so the seats' listings leave them alone.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/desk_fence.rs"]
+pub mod desk_fence;
 /// Wire D-pad bits → the hat octant every HID pad codec reports.
 #[path = "inject/proto/dpad.rs"]
 mod dpad;
@@ -992,7 +1082,7 @@ pub mod pen;
 #[path = "inject/windows/stream_target.rs"]
 pub mod stream_target;
 #[cfg(target_os = "windows")]
-pub use stream_target::set_stream_target;
+pub use stream_target::{set_screen_target, set_stream_target};
 /// Streamed compositor output (by name) that absolute coordinates map into — counterpart
 /// of Windows `stream_target`. Published at capture bring-up; wlroots binds its pointer to
 /// that `wl_output`.
@@ -1094,6 +1184,7 @@ mod backend_select_tests {
             ("kwin", Backend::KwinFakeInput),
             ("libei", Backend::Libei),
             ("wlr", Backend::WlrVirtual),
+            ("wlr-layout", Backend::WlrLayout),
         ] {
             assert_eq!(backend_from_id(id), Some(want), "{id}");
         }

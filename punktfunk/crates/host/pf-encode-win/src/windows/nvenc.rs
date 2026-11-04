@@ -270,8 +270,9 @@ pub struct NvencD3d11Encoder {
     /// ([`Self::use_completion_events`]). Survives a rebuild; the session honours it only when
     /// the GPU advertises async encode and nobody asked for the two-thread mode.
     want_events: bool,
-    /// Capturer `pipeline_depth`. Encode is in-place, so this hard-caps async depth: the capturer
-    /// rotates the ring regardless of encode completion. `None` = unknown, do not pipeline past the env cap.
+    /// What `set_input_ring_depth` promised. Encode is in-place, so this hard-caps async depth:
+    /// the capturer rotates the ring regardless of encode completion. `None` = unknown, do not
+    /// pipeline past the env cap.
     input_ring_depth: Option<usize>,
     async_supported: bool,
     /// D3D11 device this session opened against. Capturer recreates it on a desktop switch; a new
@@ -341,6 +342,7 @@ impl NvencD3d11Encoder {
         // answer the client, and a subsampled input never becomes 4:4:4 later.
         s.chroma_444 = want_444 && full_chroma_input(s.buffer_fmt);
         s.gpu = luid_key(adapter_luid);
+        s.full_range = true;
         Ok(Self {
             s,
             chroma_444_requested: want_444,
@@ -497,10 +499,12 @@ impl NvencD3d11Encoder {
             let s = &self.s;
             tracing::info!(
                 // `split_mode` is the final mode (post-fallback) and `engines` the ceiling it was
-                // chosen from — either alone is ambiguous. `subframe` because AUTO + sub-frame
-                // is a single-engine combination that reads like a split in a log.
+                // chosen from — either alone is ambiguous. `slices` is the count opened, not the
+                // client's ask. `subframe` because AUTO + sub-frame is a single-engine
+                // combination that reads like a split in a log.
                 split_mode = s.split_mode,
                 engines = s.encoder_engines,
+                slices = s.slices,
                 subframe = s.subframe_on,
                 preset = %format_args!("P{}", s.preset),
                 "NVENC D3D11 session: {}x{}@{} {}-bit{} {} Mbps {:?}",
@@ -534,6 +538,12 @@ impl NvencD3d11Encoder {
     /// session opens.
     pub fn use_completion_events(&mut self, on: bool) {
         self.want_events = on;
+    }
+
+    /// Encode and signal studio range instead of full. Call before the session opens; a re-init
+    /// keeps it. NVENC's own conversion of an RGB input writes the range it signals.
+    pub fn set_full_range(&mut self, full: bool) {
+        self.s.full_range = full;
     }
 
     /// Idempotent: a repeat call with the same device, format and size keeps the session.
@@ -631,7 +641,7 @@ impl Encoder for NvencD3d11Encoder {
             captured.height,
         )?;
         // Never reuse an in-flight bitstream; keep depth within the capturer's texture ring.
-        // Encode is in-place: exceeding `pipeline_depth` overwrites a live texture. An
+        // Encode is in-place: exceeding the input ring depth overwrites a live texture. An
         // unknown ring uses 2 — less pipelining, not corruption. At the cap, block on the oldest.
         const UNCONFIGURED_RING_DEPTH: usize = 2;
         let cap = match self.input_ring_depth {

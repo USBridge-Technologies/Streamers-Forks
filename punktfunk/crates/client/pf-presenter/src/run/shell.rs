@@ -1,6 +1,5 @@
 //! The window, presenter, overlay and pads the run loop owns.
 
-use super::stream::ring_facts;
 use super::*;
 
 impl Shell {
@@ -25,29 +24,45 @@ impl Shell {
         // The keyboard grab exists only while shortcut capture is on, and then Alt+Tab
         // belongs to the host. SDL's default minimizes a grabbed fullscreen window on it.
         sdl3::hint::set("SDL_ALLOW_ALT_TAB_WHILE_GRABBED", "0");
-        // Wayland `app_id` (and X11 WM_CLASS) so compositors match io.unom.Punktfunk.desktop.
-        // Without it SDL uses a generic identity and the session window gets the default icon.
-        sdl3::hint::set("SDL_APP_ID", "io.unom.Punktfunk");
+        // Wayland `app_id` and X11 WM_CLASS name the desktop entry a task manager groups and
+        // pins this window under. The console has its own entry, so it carries that one's id.
+        let app_id = if browse {
+            "io.unom.punktfunk.console"
+        } else {
+            "io.unom.punktfunk"
+        };
+        sdl3::hint::set("SDL_APP_ID", app_id);
         // SDL picks XWayland where the compositor lacks `wp_fifo_v1` (KWin before 6.4, Mutter
         // before 48); the native lane and colour management need the Wayland surface. SDL
-        // refuses the hint when the environment names a driver. Gamescope keeps its own.
+        // refuses the hint when the environment names a driver. Gamescope's socket is left to
+        // SDL. Another compositor's inside gamescope, where the session's restart failed, never is.
         #[cfg(target_os = "linux")]
-        if std::env::var_os("WAYLAND_DISPLAY").is_some()
+        if let Some(name) = pf_client_core::gamescope::foreign() {
+            let handed = pf_client_core::gamescope::runtime_path(&name)
+                .is_some_and(|socket| crate::wl_side::hand_sdl_display(&socket));
+            let driver = if handed { "wayland" } else { "x11" };
+            sdl3::hint::set("SDL_VIDEO_DRIVER", driver);
+            tracing::info!(
+                driver,
+                "SDL moved to gamescope's display (WAYLAND_DISPLAY names another compositor)"
+            );
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_some()
             && !pf_client_core::gamescope::under_gamescope()
             && sdl3::hint::set("SDL_VIDEO_DRIVER", "wayland")
         {
             tracing::info!("SDL kept on Wayland (WAYLAND_DISPLAY is set)");
         }
-        // `PUNKTFUNK_DRM_CARD=<n>` → SDL's KMSDRM device index. SDL takes the first card
-        // it can open, often the wrong one on a multi-GPU box. Detecting "already mastered"
-        // needs the ioctl that taking master is, so this stays an explicit operator choice.
-        if let Ok(card) = std::env::var("PUNKTFUNK_DRM_CARD") {
+        let knobs = crate::knobs::read();
+        // `drm_card` → SDL's KMSDRM device index. SDL takes the first card it can open,
+        // often the wrong one on a multi-GPU box. Detecting "already mastered" needs the
+        // ioctl that taking master is, so this stays an explicit operator choice.
+        if let Some(card) = knobs.drm_card.as_deref() {
             if card.chars().all(|c| c.is_ascii_digit()) && !card.is_empty() {
                 tracing::info!(
                     card,
                     "PUNKTFUNK_DRM_CARD: pinning SDL's KMSDRM device index"
                 );
-                sdl3::hint::set("SDL_KMSDRM_DEVICE_INDEX", &card);
+                sdl3::hint::set("SDL_KMSDRM_DEVICE_INDEX", card);
             } else {
                 tracing::warn!(
                     card,
@@ -55,6 +70,7 @@ impl Shell {
                 );
             }
         }
+        let backend = crate::backend::choose(&knobs, browse);
         let sdl = sdl3::init().context("SDL init")?;
         let video = sdl.video().context("SDL video")?;
         let events = sdl.event().context("SDL events")?;
@@ -75,7 +91,8 @@ impl Shell {
             // leaves a Wayland surface at buffer scale 1, so a fractionally scaled output
             // builds the swapchain in points. The flag only widens `size_in_pixels()`;
             // `size()` stays logical (persisted size and SDL mouse coords).
-            b.resizable().vulkan().high_pixel_density();
+            b.resizable().high_pixel_density();
+            backend.flag_window(&mut b);
             if opts.fullscreen {
                 b.fullscreen();
             }
@@ -86,12 +103,9 @@ impl Shell {
         // Exe-embedded icon onto the title bar/taskbar; a no-op for exes that embed none.
         #[cfg(windows)]
         crate::win32::stamp_window_icon(&window);
-        let instance_exts = window
-            .vulkan_instance_extensions()
-            .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
         let mut presenter = Presenter::new(
+            backend,
             &window,
-            &instance_exts,
             crate::vk::PresentPref {
                 vsync: opts.vsync,
                 allow_vrr: opts.allow_vrr,
@@ -100,15 +114,13 @@ impl Shell {
                 // `..Default` keeps this site from breaking when the struct learns another field.
                 ..Default::default()
             },
-        )
-        .context("vulkan presenter")?;
+            &knobs,
+        )?;
         presenter.set_video_fit(opts.video_fit);
         // A valid black frame immediately — the window is honest while the connect runs.
         presenter.present(&window, FrameInput::Redraw, None)?;
 
-        // `PUNKTFUNK_PRESENTER=arrival` forces the latency drain without a rebuild.
-        let arrival_override =
-            std::env::var("PUNKTFUNK_PRESENTER").ok().as_deref() == Some("arrival");
+        let arrival_override = knobs.presenter_arrival;
         let present_priority = if arrival_override {
             tracing::info!("PUNKTFUNK_PRESENTER=arrival — presentation pacing disabled");
             PresentPriority::Latency
@@ -129,15 +141,17 @@ impl Shell {
             emit(SessionLine::Ready);
         }
 
-        let osd_scale_pref = std::env::var("PUNKTFUNK_OSD_SCALE")
-            .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(1.0);
+        let osd_scale_pref = knobs.osd_scale.unwrap_or(1.0);
 
         let mut overlay = opts.overlay.take();
         if let Some(o) = overlay.as_mut() {
-            if let Err(e) = o.init(&presenter.shared_device()) {
+            let init = match presenter.shared_device() {
+                Some(shared) => o.init(&shared),
+                None => Err(anyhow::anyhow!(
+                    "console overlay needs the Vulkan presenter; stats stay on stdout"
+                )),
+            };
+            if let Err(e) = init {
                 if browse {
                     return Err(e).context("console UI init (required for --browse)");
                 }
@@ -203,6 +217,8 @@ impl Shell {
             overlay,
             osd_scale_pref,
             pacing_active: !arrival_override,
+            knobs,
+            backend,
             present_priority,
             presenter,
             scroll_routing,
@@ -238,7 +254,7 @@ impl Shell {
     /// Resize the window to `mode` within the display's usable area, before the stream
     /// starts. Match-window and fullscreen keep the size they own.
     pub(super) fn size_to_stream(&mut self, mode: Mode) {
-        if self.fullscreen || self.opts.match_window.is_some() {
+        if self.fullscreen || self.opts.match_window {
             return;
         }
         let Ok(area) = self
@@ -303,9 +319,9 @@ fn stream_window_rect(
 }
 
 impl Shell {
-    /// This pass's overlay: expire the access toast, render the console over the frame
-    /// context, and tell the damage tracker what changed. Browse needs the console, so a
-    /// frame error is fatal there.
+    /// This pass's overlay: expire the access toast, settle an End game, hold or release the
+    /// screen saver, gather the console's facts once and render its frame, then tell the
+    /// damage tracker what changed. Browse needs the console, so a frame error is fatal there.
     pub(super) fn overlay_tick(&mut self, stream: &mut Option<StreamState>) -> Result<()> {
         if let Some(st) = stream.as_mut() {
             if st
@@ -333,147 +349,23 @@ impl Shell {
                 }
             }
         }
-
-        if let Some(o) = self.overlay.as_mut() {
-            let (pw, ph) = self.window.size_in_pixels();
-            let (stats, hint) = match &stream {
-                Some(st) if st.connector.is_some() => {
-                    // No "click to capture" over a session with nothing to capture for, or
-                    // while another window has focus: the hint returns with the focus.
-                    let hint = match &st.capture {
-                        Some(cap) if !cap.captured() && cap.can_capture() && !self.focus_lost => {
-                            Some(if self.gamepad.active().is_some() {
-                                HINT_WITH_PAD
-                            } else {
-                                HINT_KEYBOARD
-                            })
+        self.screen_saver_tick(stream.as_ref());
+        if self.overlay.is_some() {
+            let facts = self.overlay_facts(stream.as_ref());
+            if let Some(o) = self.overlay.as_mut() {
+                match o.frame(&facts.ctx()) {
+                    Ok(f) => self.overlay_frame = f,
+                    Err(e) => {
+                        if self.browse {
+                            return Err(e).context("console UI frame (required for --browse)");
                         }
-                        _ => None,
-                    };
-                    (
-                        (self.stats_verbosity != StatsVerbosity::Off && !st.osd.is_empty())
-                            .then_some(st.osd.as_slice()),
-                        hint,
-                    )
-                }
-                _ => (None, None),
-            };
-            // Access chip: a standing pill in the stats overlay family. A pill that never
-            // goes away is chrome, so it rides the stats tier. `None` for a full-control
-            // permanent session — what a host that never sent access looks like.
-            let access_chip = match &stream {
-                Some(st)
-                    if st.connector.is_some() && self.stats_verbosity != StatsVerbosity::Off =>
-                {
-                    st.access.chip_text(Instant::now())
-                }
-                _ => None,
-            };
-            let session_notice = stream
-                .as_ref()
-                .filter(|st| st.connector.is_some())
-                .and_then(|st| st.session_notice.as_ref().map(|(n, _)| n.as_str()));
-            let pad = self.gamepad.active();
-            let pads = self.gamepad.pads();
-            let resizing = stream
-                .as_ref()
-                .is_some_and(|st| st.connector.is_some() && st.resize_overlay.active());
-            // Read live from the session's control rather than mirrored into StreamState:
-            // the pump knows whether an uplink exists, and a mirrored copy would go stale
-            // at session end.
-            let mic_muted = stream.as_ref().is_some_and(|st| st.handle.mic.muted());
-            // A switch inside a stream starts the notice's clock. A stream ending muted is
-            // not the player unmuting, so that edge clears it instead.
-            if mic_muted != self.mic_muted_seen {
-                self.mic_muted_seen = mic_muted;
-                self.mic_muted_at = stream.is_some().then(Instant::now);
-            }
-            let mic_notice = self
-                .mic_muted_at
-                .and_then(|at| punktfunk_core::client::mic_mute_notice(mic_muted, at.elapsed()));
-            // The badge clears itself once a local mute has been read; the mask's own clock
-            // lives here because only the frame loop knows when it last moved.
-            let audio_mute = stream
-                .as_ref()
-                .and_then(|st| st.connector.as_ref())
-                .and_then(|c| {
-                    let mask = c.audio_mute();
-                    if mask != self.audio_mute_seen {
-                        self.audio_mute_seen = mask;
-                        self.audio_mute_at = Instant::now();
+                        tracing::warn!(error = %format!("{e:#}"),
+                            "overlay frame failed — disabling the console UI");
+                        // The overlay's drop frees images the last present may still sample.
+                        self.presenter.wait_idle();
+                        self.overlay = None;
+                        self.overlay_frame = None;
                     }
-                    punktfunk_core::client::audio_mute_notice(mask, self.audio_mute_at.elapsed())
-                });
-            // SDL holds the screen saver off for as long as the window lives. A stream whose
-            // player turned "Keep screen awake" off gives it back once their input goes quiet,
-            // so the desktop's own saver runs over a game left alone. No stream holds as before.
-            let hold = stream
-                .as_ref()
-                .and_then(|st| Some((st, st.connector.as_ref()?)))
-                .is_none_or(|(st, c)| {
-                    punktfunk_core::client::holds_screen_awake(st.params.keep_awake, c.input_idle())
-                });
-            if hold != self.screen_held {
-                self.screen_held = hold;
-                let set = if hold {
-                    self.sdl_video.disable_screen_saver()
-                } else {
-                    self.sdl_video.enable_screen_saver()
-                };
-                if let Err(e) = set {
-                    tracing::debug!(error = %e, hold, "screen saver hold not changed");
-                }
-            }
-            let ring_facts = stream
-                .as_ref()
-                .filter(|st| st.connector.is_some())
-                .map(|st| {
-                    ring_facts(
-                        st,
-                        &self.opts,
-                        self.stats_verbosity,
-                        mic_muted,
-                        self.ring_opener,
-                        self.gamepad.kind_override(),
-                    )
-                });
-            let ctx = FrameCtx {
-                width: pw,
-                height: ph,
-                ten_bit: self.presenter.ten_bit(),
-                // Re-read per frame: dragging to a second monitor with a different scale
-                // updates this.
-                scale: overlay_scale(self.window.display_scale(), self.osd_scale_pref),
-                stats,
-                stats_corner: stream
-                    .as_ref()
-                    .map_or(punktfunk_core::hud::HudCorner::TopLeft, |st| {
-                        st.params.stats_corner
-                    }),
-                stats_scale: stream.as_ref().map_or(1.0, |st| st.params.stats_scale),
-                exit_hint: stream.as_ref().is_some_and(|st| st.params.exit_hint),
-                hint,
-                access: access_chip.as_deref(),
-                notice: session_notice,
-                mic_notice,
-                audio_mute,
-                resizing,
-                pad: pad.as_ref().map(|p| p.name.as_str()),
-                pad_pref: pad.as_ref().map(|p| p.pref),
-                pads: &pads,
-                ring: ring_facts.as_ref(),
-                native: self.native,
-            };
-            match o.frame(&ctx) {
-                Ok(f) => self.overlay_frame = f,
-                Err(e) => {
-                    if self.browse {
-                        return Err(e).context("console UI frame (required for --browse)");
-                    }
-                    tracing::warn!(error = %format!("{e:#}"),
-                        "overlay frame failed — disabling the console UI");
-                    self.overlay = None;
-                    self.overlay_frame = None;
                 }
             }
         }
@@ -483,6 +375,28 @@ impl Shell {
         self.presenter
             .sync_native_overlay(self.overlay_frame.as_ref(), self.window.size());
         Ok(())
+    }
+
+    /// SDL holds the screen saver off while the window lives. A stream whose player turned
+    /// "Keep screen awake" off gives it back once their input goes quiet, so the desktop's
+    /// own saver runs over a game left alone. No stream holds.
+    fn screen_saver_tick(&mut self, stream: Option<&StreamState>) {
+        let hold = stream
+            .and_then(|st| Some((st, st.connector.as_ref()?)))
+            .is_none_or(|(st, c)| {
+                punktfunk_core::client::holds_screen_awake(st.params.keep_awake, c.input_idle())
+            });
+        if hold != self.screen_held {
+            self.screen_held = hold;
+            let set = if hold {
+                self.sdl_video.disable_screen_saver()
+            } else {
+                self.sdl_video.enable_screen_saver()
+            };
+            if let Err(e) = set {
+                tracing::debug!(error = %e, hold, "screen saver hold not changed");
+            }
+        }
     }
 }
 
@@ -531,8 +445,9 @@ pub(super) fn native_mode_of(window: &sdl3::video::Window) -> Option<Mode> {
 }
 
 /// Apply capture to the window: pointer lock (relative mouse + hidden cursor) and a
-/// keyboard grab so system chords reach the host while captured. SDL implements the
-/// grab per platform (low-level hook / shortcuts-inhibit / XGrabKeyboard).
+/// keyboard grab so system chords, Alt+F4 included, reach the host while captured. SDL
+/// grabs per platform (low-level hook / shortcuts-inhibit / XGrabKeyboard); on Windows it
+/// also closes the window on Alt+F4 under the grab unless told not to.
 ///
 /// `inhibit` is [`Settings::inhibit_shortcuts`] — off leaves system chords with the
 /// local shell. It only ever *removes* a grab: releasing input always hands chords back.
@@ -558,7 +473,8 @@ pub(super) fn apply_capture(
     // The local cursor hides only while the host's cursor stands in for it — without
     // POINTER no send lands, so hiding it would leave a keyboard-only session with no cursor.
     mouse.show_cursor(!(on && pointer));
-    let grab = on && inhibit && grants & GRANT_KEYBOARD != 0;
+    let grab = crate::route::keyboard_grab(on, inhibit, grants & GRANT_KEYBOARD != 0);
+    sdl3::hint::set("SDL_WINDOWS_CLOSE_ON_ALT_F4", if grab { "0" } else { "1" });
     if !window.set_keyboard_grab(grab) && grab {
         // The one refusal SDL reports is a missing mechanism. Said once per process: the
         // answer never changes mid-session. Under gamescope that is expected (it has no
@@ -579,7 +495,7 @@ pub(super) fn apply_capture(
     }
 }
 
-/// Overlay chrome UI scale: SDL's window display scale times `PUNKTFUNK_OSD_SCALE`.
+/// Overlay chrome UI scale: SDL's window display scale times `knobs.osd_scale`.
 ///
 /// `SDL_GetWindowDisplayScale` returns `0.0` when it cannot resolve the display; a 0
 /// multiplier would collapse the OSD to an invisible panel. The 4× ceiling keeps a
@@ -647,7 +563,7 @@ mod tests {
         assert_eq!(overlay_scale(1.0, 1.0), 1.0);
         assert_eq!(overlay_scale(1.5, 1.0), 1.5);
         assert_eq!(overlay_scale(2.0, 1.0), 2.0);
-        // PUNKTFUNK_OSD_SCALE multiplies the display's own scale, it does not replace it.
+        // `knobs.osd_scale` multiplies the display's own scale, it does not replace it.
         assert_eq!(overlay_scale(2.0, 1.25), 2.5);
         // SDL reports 0.0 when it cannot resolve the window's display — must not collapse
         // the panel to nothing.

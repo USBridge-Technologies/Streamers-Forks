@@ -49,12 +49,13 @@ rows! {
     REFRESH: "refresh_hz", "Refresh rate", "display", false;
     BITRATE: "bitrate_kbps", "Bitrate", "display", false;
     VIDEO_FIT: "video_fit", "Picture fit", "display", false;
+    SCREENS: "screens", "Screens", "display", false;
     HDR: "hdr_enabled", "10-bit HDR", "display", false;
     PRESENT: "present_priority", "Prioritize", "display", false;
     SMOOTH_BUFFER: "smooth_buffer", "Smoothness buffer", "display", true;
     RENDER_SCALE: "render_scale", "Render scale", "display", true;
-    CODEC: "codec", "Video codec", "display", true;
-    PYROWAVE_QUALITY: "pyrowave_bpp", "PyroWave quality", "display", true;
+    CODEC: "codec", "Video codec", "display", false;
+    PYROWAVE_QUALITY: "pyrowave_bpp", "PyroWave quality", "display", false;
     CHROMA: "enable_444", "Full chroma (4:4:4)", "display", true;
     TEN_BIT_SDR: "ten_bit_sdr", "10-bit SDR", "display", true;
     VSYNC: "vsync", "V-Sync", "display", true;
@@ -118,6 +119,8 @@ mod tests {
         ("gyro_on_phone", "a phone's own hardware"),
         ("sc2_capture", "Apple only"),
         ("ds_capture", "Android and webOS only"),
+        ("spatial_audio", "a Vision Pro's room"),
+        ("screen", "a Vision Pro's room"),
     ];
 
     /// Rows with no catalog entry: this device's own pickers.

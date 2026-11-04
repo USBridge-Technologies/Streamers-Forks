@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -25,21 +26,28 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import coil3.ImageLoader
+import coil3.compose.AsyncImage
 import io.unom.punktfunk.kit.ListedProfile
 import io.unom.punktfunk.kit.ProfilePick
 import io.unom.punktfunk.kit.SeatGate
 import io.unom.punktfunk.kit.initials
 import io.unom.punktfunk.kit.library.MgmtReply
+import io.unom.punktfunk.kit.library.mgmtBase
 import io.unom.punktfunk.kit.library.mgmtCall
 import io.unom.punktfunk.kit.pickerDecision
+import io.unom.punktfunk.kit.pictureUrl
 import io.unom.punktfunk.kit.seatGate
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
@@ -70,8 +78,8 @@ object HostProfiles {
     private const val TAG = "HostProfiles"
 
     /** A host without the route has no profiles; a refusal or no answer is [ProfilesAnswer.Failed]. */
-    fun fetch(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String): ProfilesAnswer {
-        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, PROFILES_WAIT_MS) { base ->
+    fun fetch(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String, streamPort: Int = 0): ProfilesAnswer {
+        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, PROFILES_WAIT_MS, streamPort) { base ->
             Request.Builder().url("$base/api/v1/profiles/enumerate").get().build()
         }
         return when {
@@ -83,8 +91,8 @@ object HostProfiles {
     }
 
     /** Starts a stopped seat. `enumerate` says whether it came up, so a failure is only logged. */
-    fun wake(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String, id: String) {
-        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, PROFILES_WAIT_MS) { base ->
+    fun wake(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String, id: String, streamPort: Int = 0) {
+        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, PROFILES_WAIT_MS, streamPort) { base ->
             Request.Builder().url("$base/api/v1/profiles/$id/wake")
                 .post(ByteArray(0).toRequestBody(null, 0, 0)).build()
         }
@@ -122,7 +130,7 @@ class ProfileWait(val title: String) {
 /** Whether [host] still lists profile [id], by a fresh answer. */
 suspend fun stillListed(identity: ClientIdentity, host: KnownHost, id: String): Boolean =
     withContext(Dispatchers.IO) {
-        HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex)
+        HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex, host.port)
     }.let { it is ProfilesAnswer.Listed && it.rows.any { r -> r.id == id } }
 
 /** The one redial a seat host's `profile-unknown` earns, for every touch connect. */
@@ -166,7 +174,7 @@ suspend fun chooseProfile(
     if (host == null || !host.paired || host.fpHex.isEmpty()) return ProfileChoice.Dial(link)
     val saved = store.byId(host.id)?.asProfile ?: host.asProfile
     val answer = withContext(Dispatchers.IO) {
-        HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex)
+        HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex, host.port)
     }
     val listed = when (answer) {
         is ProfilesAnswer.Listed -> answer.rows.takeIf { it.isNotEmpty() }
@@ -206,13 +214,13 @@ private suspend fun gateSeat(
                 SeatGate.Dial -> return ProfileChoice.Dial(id)
                 is SeatGate.Refuse -> return ProfileChoice.Refused(g.line)
                 SeatGate.Wake -> withContext(Dispatchers.IO) {
-                    HostProfiles.wake(identity, host.address, host.effectiveMgmtPort, host.fpHex, row.id)
+                    HostProfiles.wake(identity, host.address, host.effectiveMgmtPort, host.fpHex, row.id, host.port)
                 }
                 is SeatGate.Wait -> w.detail = g.detail
             }
             if (withTimeoutOrNull(SEAT_POLL_MS) { w.cancelled.await() } != null) return ProfileChoice.Cancelled
             val answer = withContext(Dispatchers.IO) {
-                HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex)
+                HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex, host.port)
             }
             if (w.cancelled.isCompleted) return ProfileChoice.Cancelled
             val rows = (answer as? ProfilesAnswer.Listed)?.rows ?: continue
@@ -249,9 +257,35 @@ private fun accentOf(accent: String?): Color =
     accent?.let { runCatching { Color(android.graphics.Color.parseColor(it)) }.getOrNull() }
         ?: MaterialTheme.colorScheme.primary
 
-/** A circle with a name's initials: the profile's face, and the small mark on a host card. */
+/** Where a host's profile pictures come from. */
+class ProfileArt(private val base: String, val loader: ImageLoader) {
+    fun url(path: String?): String? = pictureUrl(base, path)
+}
+
+/** [host]'s [ProfileArt]; `null` until the identity is ready, and without one. */
 @Composable
-internal fun ProfileFace(name: String, size: Int, accent: String? = null, ringed: Boolean = false) {
+internal fun rememberProfileArt(host: KnownHost): ProfileArt? {
+    val context = LocalContext.current
+    return produceState<ProfileArt?>(null, host.id, host.effectiveMgmtPort) {
+        value = prepareLoader(context, host)?.let { (_, loader) ->
+            ProfileArt(mgmtBase(host.address, host.effectiveMgmtPort), loader)
+        }
+    }.value
+}
+
+/**
+ * A circle with a name's initials and [picture] over them once it loads: the profile's face, and
+ * the small mark on a host card.
+ */
+@Composable
+internal fun ProfileFace(
+    name: String,
+    size: Int,
+    accent: String? = null,
+    ringed: Boolean = false,
+    picture: String? = null,
+    art: ProfileArt? = null,
+) {
     val color = accentOf(accent)
     Box(
         Modifier
@@ -269,6 +303,16 @@ internal fun ProfileFace(name: String, size: Int, accent: String? = null, ringed
             color = Color.White,
             style = if (size >= 48) MaterialTheme.typography.titleLarge else MaterialTheme.typography.labelSmall,
         )
+        val url = art?.url(picture)
+        if (url != null) {
+            AsyncImage(
+                model = url,
+                imageLoader = art.loader,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
     }
 }
 
@@ -282,6 +326,7 @@ internal fun ProfilePickerDialog(
     answer: ProfilesAnswer?,
     saved: ProfilePick?,
     gone: String?,
+    art: ProfileArt?,
     onPick: (ProfilePick) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -320,7 +365,10 @@ internal fun ProfilePickerDialog(
                                             .padding(4.dp),
                                         horizontalAlignment = Alignment.CenterHorizontally,
                                     ) {
-                                        ProfileFace(p.displayName, 72, p.accent, ringed = p.id == saved?.id)
+                                        ProfileFace(
+                                            p.displayName, 72, p.accent, ringed = p.id == saved?.id,
+                                            picture = p.avatar, art = art,
+                                        )
                                         Spacer(Modifier.height(6.dp))
                                         Text(
                                             p.displayName,

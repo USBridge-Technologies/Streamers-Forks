@@ -43,6 +43,17 @@ impl HostTarget {
     pub fn pin(&self) -> Option<&str> {
         self.fp_hex.as_deref().filter(|f| !f.is_empty())
     }
+
+    /// This host's management API as `identity`.
+    pub fn api(&self, identity: &(String, String)) -> crate::library::HostApi {
+        crate::library::HostApi::new(
+            &self.addr,
+            self.mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT),
+            self.port,
+            identity,
+            self.pin().and_then(crate::trust::parse_hex32),
+        )
+    }
 }
 
 /// A saved card is never a typed address: an unpinned record maps to `Some("")`, so
@@ -442,6 +453,8 @@ pub struct UnknownHost {
     pub fp: Option<String>,
     pub launch: Option<String>,
     pub preset: Option<String>,
+    /// The link's `as=`, as typed. It rides the pairing detour into the connect.
+    pub profile: Option<String>,
 }
 
 /// Why a link cannot become a plan. Each is a notice, never a degraded connect
@@ -534,6 +547,7 @@ pub fn plan_from_link(
                     fp: link.fp.clone(),
                     launch: link.launch.clone(),
                     preset: link.preset.clone(),
+                    profile: link.as_profile.clone(),
                 })));
             }
             if plan.host.name.is_empty() {
@@ -563,6 +577,7 @@ pub fn plan_from_link(
             fp,
             launch: link.launch.clone(),
             preset: link.preset.clone(),
+            profile: link.as_profile.clone(),
         }))),
         HostResolution::Ambiguous => Err(PlanError::AmbiguousHost(link.host_ref.clone())),
         HostResolution::Unresolvable => Err(PlanError::UnresolvableHost(link.host_ref.clone())),
@@ -867,6 +882,8 @@ impl ResolvedSpec {
 pub enum SessionEvent {
     /// First frame presented — the stream is up.
     Ready,
+    /// `{"awaiting_approval":true}`: the host parked the dial for its operator.
+    AwaitingApproval,
     /// One `stats-json:` window, once a second.
     Stats(Box<punktfunk_core::hud::StatsSnapshot>),
     Error(SessionError),
@@ -905,6 +922,9 @@ pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
     if v.get("ready").and_then(|r| r.as_bool()) == Some(true) {
         return Some(SessionEvent::Ready);
     }
+    if v.get("awaiting_approval").and_then(|r| r.as_bool()) == Some(true) {
+        return Some(SessionEvent::AwaitingApproval);
+    }
     if let Some(msg) = v.get("error").and_then(|m| m.as_str()) {
         return Some(SessionEvent::Error(SessionError {
             msg: msg.to_string(),
@@ -939,6 +959,7 @@ pub mod exit {
 /// One line the session writes on stdout; [`parse_session_line`] reads each back.
 pub enum SessionLine<'a> {
     Ready,
+    AwaitingApproval,
     /// `trust_rejected: None` leaves the field out, which readers take as `false`.
     Error {
         msg: &'a str,
@@ -962,6 +983,7 @@ impl SessionLine<'_> {
         use serde_json::json;
         match self {
             SessionLine::Ready => json!({ "ready": true }).to_string(),
+            SessionLine::AwaitingApproval => json!({ "awaiting_approval": true }).to_string(),
             SessionLine::Error {
                 msg,
                 trust_rejected,
@@ -1059,6 +1081,16 @@ pub fn session_binary() -> std::path::PathBuf {
     SESSION_BIN.into()
 }
 
+/// The session binary as a command. Inside gamescope it carries gamescope's socket name as
+/// `WAYLAND_DISPLAY` ([`crate::gamescope::foreign`]), which spares the session its restart.
+pub fn session_process() -> Command {
+    let mut cmd = Command::new(session_binary());
+    if let Some(name) = crate::gamescope::foreign() {
+        cmd.env("WAYLAND_DISPLAY", name);
+    }
+    cmd
+}
+
 #[cfg(windows)]
 const SESSION_BIN: &str = "punktfunk-session.exe";
 #[cfg(not(windows))]
@@ -1122,7 +1154,7 @@ impl CancelHandle {
 /// child reads no stores and cannot disagree about a file either of us might write. A failed
 /// write is not fatal — the child's compat path resolves the same values through the same helper.
 pub fn session_command(plan: &ConnectPlan) -> (Command, Option<std::path::PathBuf>) {
-    let mut cmd = Command::new(session_binary());
+    let mut cmd = session_process();
     let mut args = plan.session_args();
     let spec_path = match plan.spec(plan.clipboard).write_temp() {
         Ok(path) => {
@@ -1147,7 +1179,7 @@ pub const CONSOLE_NOT_STARTED: &str = "The console didn't start. Check the clien
 /// and its exit as it reads a stream's. `until_no_pads` hands the desk back once the last
 /// controller is gone.
 pub fn browse_command(fullscreen: bool, until_no_pads: bool) -> Command {
-    let mut cmd = Command::new(session_binary());
+    let mut cmd = session_process();
     cmd.args(["--browse", "--json-status"]);
     if fullscreen {
         cmd.arg("--fullscreen");
@@ -1262,7 +1294,7 @@ pub fn spawn_child(
 /// returns on success. Windows has no `exec`, so this runs the child to
 /// completion and exits with its code.
 pub fn exec_session(plan: &ConnectPlan) -> std::io::Error {
-    let mut cmd = Command::new(session_binary());
+    let mut cmd = session_process();
     cmd.args(plan.session_args());
     #[cfg(unix)]
     {
@@ -1677,6 +1709,7 @@ mod tests {
                     fp: Some(fp.clone()),
                     launch: None,
                     preset: None,
+                    profile: None,
                 }
             ),
             other => panic!("expected a confirmation, got {other:?}"),
@@ -1693,6 +1726,33 @@ mod tests {
             plan("punktfunk://wake/Desk").unwrap(),
             PlanOutcome::Unsupported(Route::Wake)
         ));
+    }
+
+    /// A link's `as=` survives the PIN detour: the shell resumes the connect from
+    /// `ConfirmUnknown`, and a profile dropped there plays as the wrong person.
+    #[test]
+    fn confirm_unknown_carries_the_links_profile() {
+        let known = KnownHosts {
+            hosts: vec![host(
+                "Couch",
+                "192.168.1.60",
+                "22222222-3333-4444-8555-666666666666",
+                "",
+            )],
+        };
+        let (catalog, base) = (PresetsFile::default(), Settings::default());
+        for url in [
+            "punktfunk://connect/10.0.0.9:7000?as=Kid",
+            "punktfunk://connect/192.168.1.60?as=Kid",
+        ] {
+            let link = deeplink::parse(url).unwrap();
+            match plan_from_link(&link, &known, &catalog, &base).unwrap() {
+                PlanOutcome::ConfirmUnknown(u) => {
+                    assert_eq!(u.profile.as_deref(), Some("Kid"), "{url}")
+                }
+                other => panic!("{url}: expected a confirmation, got {other:?}"),
+            }
+        }
     }
 
     /// Spec round-trips. A field lost here is a setting the stream silently doesn't get.
@@ -1925,6 +1985,10 @@ mod tests {
         let parse = |l: SessionLine| parse_session_line(&l.render());
         assert_eq!(SessionLine::Ready.render(), r#"{"ready":true}"#);
         assert_eq!(parse(SessionLine::Ready), Some(SessionEvent::Ready));
+        assert_eq!(
+            parse(SessionLine::AwaitingApproval),
+            Some(SessionEvent::AwaitingApproval)
+        );
         let pin = SessionLine::Error {
             msg: "pin \"x\"\n\tno",
             trust_rejected: Some(true),
@@ -1990,8 +2054,9 @@ mod tests {
         }
     }
 
-    /// No GPU and no store. Host, launch, clipboard, timeout, bitrate, and codec
-    /// come from the plan. Caps are the wire bits, not whatever the helper returns.
+    /// No GPU and no store. Host, launch, clipboard, timeout, bitrate, codec, the ring and
+    /// the window's settings come from the plan. Caps are the wire bits, not whatever the
+    /// helper returns.
     #[test]
     fn session_params_carry_the_plan_without_a_gpu() {
         let h = host(
@@ -2011,6 +2076,10 @@ mod tests {
                 pyrowave_bpp: 1.2,
                 codec: "av1".into(),
                 enable_444: true,
+                overlay_actions: r#"{"v":2,"ring":["stats"]}"#.into(),
+                vsync: false,
+                invert_scroll: true,
+                fullscreen_on_stream: true,
                 ..Default::default()
             },
             wake: false,
@@ -2045,6 +2114,12 @@ mod tests {
         );
         assert_eq!(params.bitrate_kbps, plan.settings.bitrate_kbps);
         assert_ne!(plan.settings.bitrate_kbps, Settings::default().bitrate_kbps);
+        assert_eq!(params.overlay_actions, plan.settings.overlay_actions);
+        assert!(!params.vsync && params.invert_scroll && params.fullscreen);
+        assert_eq!(
+            params.render_scale_max_dim, 8192,
+            "the av1 ceiling, not H.264's"
+        );
         assert_eq!(params.pyrowave_bpp_x100, 120);
         assert_eq!(params.preferred_codec, punktfunk_core::quic::CODEC_AV1);
         assert_ne!(plan.settings.codec, Settings::default().codec);
@@ -2069,18 +2144,20 @@ mod tests {
         assert_eq!(params.gamepad, GamepadPref::Xbox360);
         assert_eq!(params.stats_verbosity, StatsVerbosity::Detailed);
         assert!(Arc::ptr_eq(&params.force_software, &force_software));
-        // A setup refusal reads as a waking host until the settle window shuts.
-        assert!(params.auto_wake && params.settle_until.is_none() && params.waking());
+        // A setup refusal before any frame reads as a waking host until the window shuts.
+        let setup = Some(punktfunk_core::reject::RejectReason::SetupFailed);
+        assert!(params.auto_wake && params.settle_until.is_none() && params.not_ready(setup, 0));
+        assert!(!params.not_ready(setup, 1), "it streamed");
         let mut settling = params.clone();
         settling.settle_until = Some(std::time::Instant::now() + Duration::from_secs(5));
-        assert!(settling.waking());
+        assert!(settling.not_ready(setup, 0));
         settling.settle_until = Some(std::time::Instant::now());
-        assert!(!settling.waking(), "the window shut");
+        assert!(!settling.not_ready(setup, 0), "the window shut");
         let mut no_wake = plan.clone();
         no_wake.settings.auto_wake = false;
         assert!(!no_wake
             .session_params([9; 32], probes(false, false))
-            .waking());
+            .not_ready(setup, 0));
 
         let hdr = plan.session_params([9; 32], probes(true, false));
         assert_eq!(

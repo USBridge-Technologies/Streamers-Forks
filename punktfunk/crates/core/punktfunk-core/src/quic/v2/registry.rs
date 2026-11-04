@@ -63,6 +63,10 @@ pub const MSG_SET_BITRATE: u64 = 0x24;
 pub const MSG_BITRATE_CHANGED: u64 = 0x25;
 /// `host → client`: the host rebuilt its pipeline and nothing flowed for a while.
 pub const MSG_PIPELINE_GAP: u64 = 0x26;
+/// `host → client`: the screens the host built and the stream each rides (`ScreenLayout`).
+pub const MSG_SCREEN_LAYOUT: u64 = 0x28;
+/// `client → host`: the screens the client shows now (`Screens`). Under [`FEATURE_SCREENS`].
+pub const MSG_SCREENS: u64 = 0x29;
 /// `client → host`: a bandwidth probe, smooth or shaped.
 pub const MSG_PROBE_REQUEST: u64 = 0x2B;
 /// `host → client`: the probe's counts.
@@ -132,6 +136,8 @@ pub const FRAMES: &[(&str, u64, usize)] = &[
     ("MSG_SET_BITRATE", MSG_SET_BITRATE, 256),
     ("MSG_BITRATE_CHANGED", MSG_BITRATE_CHANGED, 256),
     ("MSG_PIPELINE_GAP", MSG_PIPELINE_GAP, 256),
+    ("MSG_SCREEN_LAYOUT", MSG_SCREEN_LAYOUT, 1024),
+    ("MSG_SCREENS", MSG_SCREENS, 1024),
     ("MSG_PROBE_REQUEST", MSG_PROBE_REQUEST, 256),
     ("MSG_PROBE_RESULT", MSG_PROBE_RESULT, 256),
     ("MSG_PHASE_REPORT", MSG_PHASE_REPORT, 256),
@@ -224,6 +230,33 @@ pub const FEATURE_PAD_WRITES: u32 = 33;
 /// Both ends: the client reads `ServerHello`'s profile echo and follows a `Redirect`, and the
 /// host resolves `ClientHello`'s profile. A host redirects only a client that sets it.
 pub const FEATURE_PROFILES: u32 = 34;
+/// Both ends: a sealed media packet leaves its whole 30-byte header in the clear, bound as
+/// associated data, so the receiver opens each shard straight into its frame. Without it only
+/// the tag and packet number are clear.
+pub const FEATURE_CLEAR_PLACEMENT: u32 = 35;
+/// Both ends, beside [`FEATURE_STREAM_CONFIG`]: an epoch's `StreamConfig` may change codec, bit
+/// depth, colour or chroma, and the client rebuilds its decoder at that epoch's first frame. The
+/// client sets it only when its embedder said it rebuilds; a `Reconfigure` may then ask for
+/// another codec.
+pub const FEATURE_FORMAT_EPOCH: u32 = 36;
+/// Both ends: an `AudioConfig` may change codec, rate or channels from its `first_seq` on, and
+/// the client reopens its player there. Set only when the embedder said it reopens.
+pub const FEATURE_AUDIO_EPOCH: u32 = 37;
+/// Both ends: the client shows more than one screen. Its `ClientHello` lists them, the host
+/// streams each past the first on a stream id of its own and says so in a `ScreenLayout`.
+pub const FEATURE_SCREENS: u32 = 38;
+/// Both ends: a finger or continuous scroll may carry
+/// [`SCROLL_FLAG_AXIS_UNITS`](crate::input::scroll::SCROLL_FLAG_AXIS_UNITS), and a host that
+/// injects wheel clicks counts it at Qt's 10 units a click instead of 60 DIP.
+pub const FEATURE_SCROLL_AXIS_UNITS: u32 = 39;
+/// Both ends: the client's display shows full-range SDR as studio range (Qualcomm's display
+/// HAL), so the host encodes SDR at studio range. HDR follows [`FEATURE_STUDIO_RANGE_HDR`]. The
+/// Welcome's colour says which range the session got; PyroWave stays full.
+pub const FEATURE_STUDIO_RANGE: u32 = 40;
+/// Both ends: the client's display shows full-range HDR10 as studio range, so the host encodes
+/// HDR at studio range. The Welcome's colour says which range the session got; PyroWave stays
+/// full.
+pub const FEATURE_STUDIO_RANGE_HDR: u32 = 41;
 
 #[cfg(test)]
 mod tests {
@@ -258,6 +291,13 @@ mod tests {
         ("FEATURE_STREAM_CONFIG", FEATURE_STREAM_CONFIG),
         ("FEATURE_PAD_WRITES", FEATURE_PAD_WRITES),
         ("FEATURE_PROFILES", FEATURE_PROFILES),
+        ("FEATURE_CLEAR_PLACEMENT", FEATURE_CLEAR_PLACEMENT),
+        ("FEATURE_FORMAT_EPOCH", FEATURE_FORMAT_EPOCH),
+        ("FEATURE_AUDIO_EPOCH", FEATURE_AUDIO_EPOCH),
+        ("FEATURE_SCREENS", FEATURE_SCREENS),
+        ("FEATURE_SCROLL_AXIS_UNITS", FEATURE_SCROLL_AXIS_UNITS),
+        ("FEATURE_STUDIO_RANGE", FEATURE_STUDIO_RANGE),
+        ("FEATURE_STUDIO_RANGE_HDR", FEATURE_STUDIO_RANGE_HDR),
     ];
 
     /// Every close and stop code either wire uses: v1's live on, and v2 adds its own.
@@ -268,6 +308,10 @@ mod tests {
         ),
         ("QUIT_CLOSE_CODE", crate::quic::QUIT_CLOSE_CODE),
         ("APP_EXITED_CLOSE_CODE", crate::quic::APP_EXITED_CLOSE_CODE),
+        (
+            "PATH_SHRANK_CLOSE_CODE",
+            crate::quic::PATH_SHRANK_CLOSE_CODE,
+        ),
         (
             "PAIR_NOT_ARMED_CLOSE_CODE",
             crate::reject::PAIR_NOT_ARMED_CLOSE_CODE,

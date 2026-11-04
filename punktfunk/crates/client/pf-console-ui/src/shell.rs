@@ -198,8 +198,12 @@ pub struct ConsoleOptions {
     /// The device's own keyboard types into an open field: Steam's on a Steam Deck, tvOS's
     /// on an Apple TV. This shell never raises its keyboard tray.
     pub system_keyboard: bool,
-    /// A TV (Apple TV, Android TV): rows for a clipboard or a phone's sensors do nothing.
+    /// A TV (Apple TV, Android TV): rows for a phone's sensors do nothing, nor do a clipboard's,
+    /// bar Android TV's shared clipboard.
     pub tv: bool,
+    /// A headset whose windows stand in a room (Apple Vision Pro): its audio can be placed
+    /// there and its picture shown on more than a flat window.
+    pub spatial: bool,
     /// Host has another UI when the console is off (phone/tablet touch shell).
     /// False on desktop and Android TV — offering "off" would strand the user.
     pub fallback_ui: bool,
@@ -224,7 +228,7 @@ pub struct ConsoleOptions {
     /// TV: only a panel of an unusual shape (a phone) changes what the row offers.
     pub screen: Option<DeviceScreen>,
     /// The host answers [`ConsoleCmd::FetchProfiles`], so a connect checks the box's profiles
-    /// first. False connects with the card's remembered pick, unchecked.
+    /// first. False connects with the card's remembered pick, unchecked, and offers no pick.
     pub profiles: bool,
 }
 
@@ -242,6 +246,7 @@ impl ConsoleOptions {
             version: None,
             system_keyboard,
             tv: false,
+            spatial: false,
             fallback_ui: false,
             // The desktop probe reads the session's Vulkan device, which the console does
             // not own yet. A GPU that runs this shell is a Vulkan 1.3 one, so it is yes.
@@ -438,10 +443,10 @@ impl Shell {
                 native_mode: None,
                 system_keyboard: opts.system_keyboard,
                 tv: opts.tv,
+                spatial: opts.spatial,
                 fallback_ui: opts.fallback_ui,
                 pyrowave_ok: opts.pyrowave_ok,
                 av1_ok: opts.av1_ok,
-                profiles: opts.profiles,
                 name: opts.device_name,
                 version: opts.version.unwrap_or_else(|| crate::VERSION.into()),
             },
@@ -452,7 +457,7 @@ impl Shell {
             in_stream: false,
             connect: Connect::Idle,
             reask: Reask::None,
-            profiles: Default::default(),
+            profiles: crate::screens::profiles::ProfileBook::new(opts.profiles),
             last_connect_title: None,
             wake: None,
             speed: None,
@@ -536,6 +541,7 @@ impl Shell {
         use pf_client_core::console::SessionPhase;
         match phase {
             SessionPhase::Connecting => {}
+            SessionPhase::AwaitingApproval => self.session_awaiting_approval(),
             SessionPhase::Streaming => self.session_streaming(),
             SessionPhase::Failed(msg) => self.session_failed(msg),
             SessionPhase::Ended(reason) => self.session_ended(reason),
@@ -666,6 +672,7 @@ impl Shell {
         self.tick_asking();
         self.tick_seat_wait();
         self.collect_profiles();
+        self.collect_pictures();
         self.home_shelf();
         self.tick_launch();
         self.tick_downloads();
@@ -725,6 +732,7 @@ impl Shell {
             if let Some(state) = self.console.take_pad_test() {
                 test.set_state(state, t);
             }
+            test.tick(t);
             if test.done {
                 self.apply_nav(Nav::Pop);
             }

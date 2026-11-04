@@ -13,7 +13,7 @@ import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot"
 import type { ScannerInfo } from "@/api/gen/model/scannerInfo";
 import { useGetPluginCatalog } from "@/api/gen/store/store";
 import { usePlugins } from "@/api/plugins";
-import { useSeat } from "@/api/seat";
+import { usePluginsReachable } from "@/api/seat";
 import { useInstallPlugin } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
 import { ROW_GAP, Stagger } from "@/components/stagger";
@@ -39,7 +39,7 @@ export const SourcesSection: FC<{
 	/** The provider currently filtered to in the grid, or null for "everything". */
 	activeFilter: string | null;
 	onFilter: (provider: string | null) => void;
-	/** Art & metadata: the box's, absent on a seat. */
+	/** Art & metadata: absent on a seat whose plugins the console can't reach. */
 	metadata?: ReactNode;
 }> = ({ activeFilter, onFilter, metadata }) => {
 	const qc = useQueryClient();
@@ -135,6 +135,12 @@ export const SourcesSection: FC<{
 	// cannot decide whether its liveness badge is honest: a library plugin that registers without
 	// `category` is live, and filtering on it here badges a running plugin "Stopped".
 	const running = new Set((plugins.data ?? []).map((p) => p.id));
+	// The host probed for these launchers and found none: their sources list nothing, and say so.
+	const absent = new Set(
+		(catalog.data?.plugins ?? [])
+			.filter((p) => p.detected === false)
+			.map((p) => p.id),
+	);
 
 	// The bridge-release nudge (design D9): a built-in scanner still doing the work, with its
 	// replacement plugin sitting uninstalled in the catalog. One click per scanner, and NEVER a
@@ -170,6 +176,7 @@ export const SourcesSection: FC<{
 						sources={sources}
 						available={available}
 						running={running}
+						absent={absent}
 						busyId={toggle.isPending ? (toggle.variables?.id ?? null) : null}
 						installBusy={catalog.data?.busy === true || install.isPending}
 						activeFilter={activeFilter}
@@ -248,6 +255,8 @@ export const SourcesCard: FC<{
 	available: CatalogEntry[];
 	/** Ids of every plugin whose lease is currently live, whatever its category. */
 	running: Set<string>;
+	/** Ids of the sources whose launcher the host looked for and didn't find. */
+	absent?: Set<string>;
 	/** Source id whose toggle is in flight, or null — only that row disables. */
 	busyId: string | null;
 	installBusy: boolean;
@@ -269,6 +278,7 @@ export const SourcesCard: FC<{
 	sources,
 	available,
 	running,
+	absent = new Set(),
 	busyId,
 	installBusy,
 	activeFilter,
@@ -293,6 +303,7 @@ export const SourcesCard: FC<{
 						key={source.id}
 						source={source}
 						running={running.has(source.provider ?? source.id)}
+						absent={absent.has(source.provider ?? source.id)}
 						access={access.find(
 							(row) => row.plugin === (source.provider ?? source.id),
 						)}
@@ -335,6 +346,8 @@ const SourceRow: FC<{
 	source: ScannerInfo;
 	/** The plugin backing this source is currently registered (its lease is live). */
 	running: boolean;
+	/** The host found no launcher for this source. */
+	absent: boolean;
 	access?: PluginAccessSnapshot;
 	accessBusy: boolean;
 	accessInitiallyOpen: boolean;
@@ -352,6 +365,7 @@ const SourceRow: FC<{
 }> = ({
 	source,
 	running,
+	absent,
 	access,
 	accessBusy,
 	accessInitiallyOpen,
@@ -364,13 +378,15 @@ const SourceRow: FC<{
 	onPurge,
 }) => {
 	const isPlugin = source.origin === "plugin";
-	const seat = useSeat();
+	const reachable = usePluginsReachable();
 	const [accessOpen, setAccessOpen] = useState(accessInitiallyOpen);
 	const meta = [
 		isPlugin &&
 			(running ? m.library_source_running() : m.library_source_stopped()),
-		source.entries != null &&
-			m.library_provider_count({ count: source.entries }),
+		absent && !source.entries
+			? m.library_source_absent({ title: source.label })
+			: source.entries != null &&
+				m.library_provider_count({ count: source.entries }),
 	]
 		.filter(Boolean)
 		.join(" · ");
@@ -396,8 +412,8 @@ const SourceRow: FC<{
 									: m.library_provider_filter(),
 								onSelect: onFilter,
 							},
-							// The form is the box's plugin; a seat has none to open.
-							!seat && {
+							// The form is a plugin the console reaches; another seat's is not.
+							reachable && {
 								label: m.library_source_settings(),
 								icon: <Settings2 />,
 								iconOnly: true,

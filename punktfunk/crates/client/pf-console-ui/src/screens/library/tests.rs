@@ -324,7 +324,7 @@ fn pulling_the_games_past_their_top_brings_the_hosts_row_back() {
     home.pointer(hover(640.0, 500.0), &mut ctx, &mut fx);
     assert!(home.shelf().is_none(), "a cursor resting on the games");
     frames(&mut home, &mut ctx, 60);
-    home.pointer(hover(640.0, 60.0), &mut ctx, &mut fx);
+    home.pointer(hover(200.0, 60.0), &mut ctx, &mut fx);
     home.pointer(hover(640.0, 500.0), &mut ctx, &mut fx);
     assert!(home.shelf().is_some(), "back onto the games from the row");
 }
@@ -1448,6 +1448,7 @@ fn many_hosts_wait_behind_one_host_pill() {
         id: "kid".into(),
         display_name: "Kid".into(),
         remember: true,
+        ..Default::default()
     });
     let fonts = crate::theme::build_fonts().unwrap();
     let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();

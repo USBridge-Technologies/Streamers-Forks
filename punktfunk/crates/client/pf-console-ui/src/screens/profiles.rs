@@ -14,12 +14,15 @@ use crate::el::{Axis, El, Id, Tree};
 use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow, ProfilesAnswer};
 use crate::pointer::{Pointer, PointerKind};
+use crate::screens::library::art::ArtDecoder;
 use crate::screens::{ConnectIntent, Ctx, Outbox, ProfileAsk, Screen, ScreenView, Seated};
 use crate::theme::{fill, Fonts, Frame, PanelStroke, W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::profiles::{initials, ListedProfile, ProfilePick};
-use skia_safe::{Canvas, Color4f, RRect, Rect};
-use std::collections::BTreeMap;
+use skia_safe::{Canvas, Color4f, Image, Matrix, RRect, Rect, TileMode};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 const GRID: &str = "profile-grid";
 /// A circle's diameter and a cell's width, design units.
@@ -67,6 +70,11 @@ pub(crate) struct ProfileBook {
     asked: Vec<String>,
     /// The id this run last played as on each host: it leads the next picker there.
     last: BTreeMap<String, String>,
+    /// Picture URLs asked since a host last listed its profiles. That list is what retries.
+    pictures: BTreeSet<String>,
+    /// The shell never asks ([`crate::shell::ConsoleOptions::profiles`]): nothing is listed
+    /// and who plays is never a choice.
+    silent: bool,
 }
 
 /// The book of a test context that has learned nothing.
@@ -75,16 +83,61 @@ pub(crate) static NO_PROFILES: ProfileBook = ProfileBook {
     listed: BTreeMap::new(),
     asked: Vec::new(),
     last: BTreeMap::new(),
+    pictures: BTreeSet::new(),
+    silent: false,
 };
 
+/// Decoded at this scale whatever the window: up to 600 across, twice a face on a 4K screen.
+const PICTURE_K: f64 = 2.0;
+
+thread_local! {
+    /// Pictures on the drawing thread, by URL. Every screen that draws a face reads this one.
+    static PICTURES: RefCell<Pictures> = RefCell::new(Pictures::default());
+}
+
+#[derive(Default)]
+struct Pictures {
+    /// `None`: the bytes wouldn't decode, so the initials stay and nothing asks again.
+    decoded: HashMap<String, Option<Image>>,
+    decoder: ArtDecoder,
+}
+
+/// Decode a picture that arrived, off the thread that draws.
+pub(crate) fn offer_picture(url: String, bytes: Arc<[u8]>) {
+    PICTURES.with_borrow_mut(|p| p.decoder.want(url, bytes, PICTURE_K));
+}
+
+/// Pictures the decoder has finished since the last frame.
+pub(crate) fn adopt_pictures() {
+    PICTURES.with_borrow_mut(|p| p.decoded.extend(p.decoder.finished()));
+}
+
+fn picture_known(url: &str) -> bool {
+    PICTURES.with_borrow(|p| p.decoded.contains_key(url))
+}
+
 impl ProfileBook {
+    pub(crate) fn new(asks: bool) -> ProfileBook {
+        ProfileBook {
+            silent: !asks,
+            ..ProfileBook::default()
+        }
+    }
+
+    /// The shell asks hosts for their profiles.
+    pub(crate) fn asks(&self) -> bool {
+        !self.silent
+    }
+
     pub(crate) fn listed(&self, fp: &str) -> Option<&[ListedProfile]> {
         self.listed.get(fp).map(Vec::as_slice)
     }
 
-    /// Who plays on `h` is a choice: it listed two profiles or more, or one is remembered.
+    /// Who plays on `h` is a choice: the shell asks, and `h` listed two profiles or more or
+    /// remembers one.
     pub(crate) fn choice(&self, h: &HostRow) -> bool {
-        h.paired
+        !self.silent
+            && h.paired
             && (h.remembered().is_some() || self.listed(&h.fp_hex).is_some_and(|l| l.len() > 1))
     }
 
@@ -92,7 +145,10 @@ impl ProfileBook {
     pub(crate) fn learn(&mut self, fp: &str, answer: &ProfilesAnswer) {
         self.asked.retain(|f| f != fp);
         match answer {
-            ProfilesAnswer::Listed(l) => drop(self.listed.insert(fp.into(), l.clone())),
+            ProfilesAnswer::Listed(l) => {
+                self.listed.insert(fp.into(), l.clone());
+                self.pictures.clear();
+            }
             ProfilesAnswer::NoProfiles => drop(self.listed.insert(fp.into(), Vec::new())),
             ProfilesAnswer::Failed(_) => {}
         }
@@ -109,6 +165,18 @@ impl ProfileBook {
 
     pub(crate) fn asked(&self) -> &[String] {
         &self.asked
+    }
+
+    /// The pictures `h` shows that nothing has asked for: its saved pick's and its rows'. Noted
+    /// as asked, so the caller sends each once.
+    pub(crate) fn pictures_to_ask(&mut self, h: &HostRow) -> Vec<String> {
+        let saved = h.profile.iter().filter_map(|p| p.avatar.as_ref());
+        let rows = self.listed.get(&h.fp_hex).into_iter().flatten();
+        saved
+            .chain(rows.filter_map(|p| p.avatar.as_ref()))
+            .filter(|url| !picture_known(url) && self.pictures.insert((*url).clone()))
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn note_pick(&mut self, fp: &str, id: &str) {
@@ -130,6 +198,8 @@ impl ProfileBook {
 /// What the host has said so far.
 enum State {
     Waiting,
+    /// The shell never asks: no circles, no line.
+    Unasked,
     Listed(Vec<ListedProfile>),
     NoProfiles,
     Failed(String),
@@ -255,11 +325,12 @@ impl ProfilesScreen {
         Screen::Profiles(self)
     }
 
-    /// The book's list, else wait for one.
+    /// The book's list, else wait for one where the shell asks.
     fn fill(&mut self, book: &ProfileBook) {
         match book.listed(&self.fp_hex) {
             Some([]) => self.state = State::NoProfiles,
             Some(l) => self.set_listed(l.to_vec()),
+            None if book.silent => self.state = State::Unasked,
             None => self.state = State::Waiting,
         }
     }
@@ -459,6 +530,7 @@ impl ProfilesScreen {
         let name = &self.ask.name;
         match &self.state {
             State::Waiting => Some("Loading profiles\u{2026}".into()),
+            State::Unasked => None,
             State::NoProfiles => Some(format!("{name} has no profiles.")),
             State::Failed(why) => Some(format!("Couldn't load the profiles \u{2014} {why}")),
             State::Listed(l) if self.faces().is_empty() => l
@@ -706,6 +778,7 @@ impl ScreenView for ProfilesScreen {
                                             fonts,
                                             &p.display_name,
                                             p.accent.as_deref(),
+                                            p.avatar.as_deref(),
                                             cx,
                                             cy,
                                             r,
@@ -897,7 +970,30 @@ fn accent_of(ui: &Frame, hex: Option<&str>) -> Color4f {
     }
 }
 
-/// A profile's face: its initials on its accent, in a circle of radius `r` at `cx, cy`.
+/// The picture at `url` filling a circle, cropped about its centre. `false` while there is none.
+fn draw_picture(canvas: &Canvas, url: &str, cx: f32, cy: f32, r: f32) -> bool {
+    PICTURES.with_borrow(|p| {
+        let Some(Some(img)) = p.decoded.get(url) else {
+            return false;
+        };
+        let (iw, ih) = (img.width() as f32, img.height() as f32);
+        let scale = 2.0 * r / iw.min(ih);
+        let mut local = Matrix::scale((scale, scale));
+        local.post_translate((cx - iw * scale / 2.0, cy - ih * scale / 2.0));
+        let tile = (TileMode::Clamp, TileMode::Clamp);
+        let Some(shader) = img.to_shader(tile, crate::theme::art_sampling(), Some(&local)) else {
+            return false;
+        };
+        let mut paint = crate::theme::shaded();
+        paint.set_anti_alias(true);
+        paint.set_shader(shader);
+        canvas.draw_circle((cx, cy), r, &paint);
+        true
+    })
+}
+
+/// A profile's face in a circle of radius `r` at `cx, cy`: its picture, else its initials on
+/// its accent.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_face(
     canvas: &Canvas,
@@ -905,10 +1001,14 @@ pub(crate) fn draw_face(
     fonts: &Fonts,
     name: &str,
     accent: Option<&str>,
+    picture: Option<&str>,
     cx: f32,
     cy: f32,
     r: f64,
 ) {
+    if picture.is_some_and(|url| draw_picture(canvas, url, cx, cy, r as f32)) {
+        return;
+    }
     let bg = accent_of(ui, accent);
     canvas.draw_circle((cx, cy), r as f32, &fill(bg));
     let luma = crate::theme::luma((f64::from(bg.r), f64::from(bg.g), f64::from(bg.b)));
@@ -947,7 +1047,17 @@ pub(crate) fn draw_pick(
     r: f64,
 ) {
     match pick {
-        Some(p) => draw_face(canvas, ui, fonts, &p.display_name, None, cx, cy, r),
+        Some(p) => draw_face(
+            canvas,
+            ui,
+            fonts,
+            &p.display_name,
+            None,
+            p.avatar.as_deref(),
+            cx,
+            cy,
+            r,
+        ),
         None => draw_ask(canvas, ui, fonts, cx, cy, r),
     }
 }

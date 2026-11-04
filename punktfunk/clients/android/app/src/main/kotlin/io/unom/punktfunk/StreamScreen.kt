@@ -8,10 +8,14 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.os.Build
 import android.text.InputType
 import android.util.Log
 import android.view.KeyEvent
+import android.view.PointerIcon
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -95,6 +99,8 @@ fun StreamScreen(
     session: ActiveSession,
     /** The hinge across the window ([rememberFoldHinge]), or null. */
     hinge: IntRect?,
+    /** The session ended as a woken host not yet ready: dial it again; true when that is on its way. */
+    wakeRedial: () -> Boolean = { false },
     onSessionEnded: (SessionEndReason) -> Unit,
 ) {
     val handle = session.handle
@@ -227,6 +233,18 @@ fun StreamScreen(
     LaunchedEffect(handle) {
         NativeBridge.nativeSetInvertScroll(handle, ui.invertScroll)
     }
+    // A roam: the default network or its addresses changed. The socket already follows it; the
+    // nudge tells the host now instead of at the next datagram.
+    DisposableEffect(handle) {
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val watch = object : ConnectivityManager.NetworkCallback() {
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                NativeBridge.nativePathChanged(handle)
+            }
+        }
+        runCatching { cm?.registerDefaultNetworkCallback(watch) }
+        onDispose { runCatching { cm?.unregisterNetworkCallback(watch) } }
+    }
     // The companion panel (design/android-dual-screen.md): a second screen below the picture —
     // the lower half of a hinge with room for it, else a small second display — carries pages the
     // player flips between. Only while streaming; showing the pad brings its page forward.
@@ -291,7 +309,7 @@ fun StreamScreen(
     var statsView by remember { mutableStateOf(CompanionMemory.statsView(context)) }
 
     // Host-gone watchdog and the live access level.
-    SessionWatchEffect(handle, initialAccess, ui, peripherals, onSessionEnded)
+    SessionWatchEffect(handle, initialAccess, ui, peripherals, wakeRedial, onSessionEnded)
 
     // Everything this stream does to the window — wake/Wi-Fi locks, the refresh pin, ALLM, the
     // cutout and soft-keyboard modes — and the prior values it puts back.
@@ -459,7 +477,7 @@ fun StreamScreen(
             hostRecord?.let { kh ->
                 scope.launch(Dispatchers.IO) {
                     (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
-                        HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label)
+                        HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label, kh.port)
                     }
                 }
             }
@@ -491,7 +509,7 @@ fun StreamScreen(
                 scope.launch {
                     val outcome = withContext(Dispatchers.IO) {
                         (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
-                            LibraryClient.endGame(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, appId)
+                            LibraryClient.endGame(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, appId, kh.port)
                         } ?: GameEnd.Failed("this device has no identity yet")
                     }
                     // Gone either way: leave as End stream does. A refusal keeps the stream.
@@ -547,7 +565,7 @@ fun StreamScreen(
             keys = KeySink { vk, down -> NativeBridge.nativeSendKey(handle, vk, down, 0) },
             trackpad = {
                 streamTouchInput(
-                    NativeTouchSink(handle), null, ::videoFrame, trackpad = true,
+                    NativeTouchSink(handle, peripherals::handBack), null, ::videoFrame, trackpad = true,
                     onCycleStats = { ui.statsVerbosity = ui.statsVerbosity.next() },
                     onKeyboard = showKeyboard,
                     onDial = {},
@@ -747,7 +765,11 @@ fun StreamScreen(
                             touchMode == TouchMode.TOUCH ->
                                 streamTouchPassthrough(NativeTouchSink(handle), stylus, frame)
                             else -> streamTouchInput(
-                                if (touchMode == TouchMode.OFF) DroppedTouchSink else NativeTouchSink(handle),
+                                if (touchMode == TouchMode.OFF) {
+                                    DroppedTouchSink
+                                } else {
+                                    NativeTouchSink(handle, peripherals::handBack)
+                                },
                                 stylus,
                                 frame,
                                 trackpad = touchMode != TouchMode.POINTER,
@@ -804,6 +826,12 @@ fun StreamScreen(
             }
         }
     Box(Modifier.fillMaxSize().background(Color.Black).onSizeChanged { rootSize = it }) {
+        StreamPointer(
+            hidden = !ring.committed,
+            host = ui.hostPointer,
+            scale = videoFrame().at(containerSize).placement.let { minOf(it.scaleX, it.scaleY).toFloat() },
+            Modifier.fillMaxSize(),
+        )
         // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe up in
         // the mouse modes) AND the pointer-capture grab target. It never draws or takes touches,
         // and it stays in the activity's window wherever the picture is: that window keeps focus.
@@ -1071,6 +1099,27 @@ internal fun StreamStartBanner(text: String, alpha: Float, modifier: Modifier = 
             .padding(horizontal = 14.dp, vertical = 8.dp),
         color = Color.White,
         fontSize = 15.sp,
+    )
+}
+
+/**
+ * The mouse pointer over the stream: the host's shape while the client draws it ([host], at
+ * [scale] view pixels per frame pixel), else hidden so the host's cursor in the picture is the
+ * only one — or the system's while [hidden] is false (the ring).
+ *
+ * Android takes the icon of the deepest view under the mouse that has one. Compose's own view
+ * keeps the icon a hovered text field left, which beats one on the window, and Compose rewrites
+ * it at will. This empty view covers the whole stream from deeper than both.
+ */
+@Composable
+internal fun StreamPointer(hidden: Boolean, host: HostShape?, scale: Float, modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier,
+        factory = { View(it) },
+        update = { v ->
+            v.pointerIcon =
+                if (hidden) host?.icon(scale) ?: PointerIcon.getSystemIcon(v.context, PointerIcon.TYPE_NULL) else null
+        },
     )
 }
 

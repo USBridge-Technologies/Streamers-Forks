@@ -180,6 +180,9 @@ pub(super) fn run_service() -> Result<()> {
     // Own thread: `Get-NetConnectionProfile` is slow and must not delay the host.
     std::thread::spawn(warn_if_public_network);
     let result = supervise(stop, session);
+    // The job took the console host with it, so its desk fence comes off here: a pad that stays
+    // up through a service stop must not keep hiding from the next console session.
+    pf_inject::desk_fence::clear();
 
     // Report the truth: `running` carries Win32(0), so a failed `supervise` used to stop as
     // cleanly as an operator-requested stop, and the SCM log — and any failure action keyed on
@@ -248,7 +251,7 @@ pub(super) fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         }
 
         // The box's own host only: seat hosts start under `SeatsSlot`, never through here.
-        sync_browser_rule(Some(&exe));
+        sync_plane_rules(Some(&exe));
         let job_h = HANDLE(job.as_raw_handle());
         // SAFETY: `spawn_host` is unsafe only for its Win32 FFI. `session` is a valid console
         // session id (checked != 0xFFFFFFFF above), `cmdline`/`workdir` are live borrows, and
@@ -443,7 +446,7 @@ pub(super) unsafe fn spawn_host(
     // SAFETY: `env_block` is either still null (the call above failed) or the double-null-terminated
     // UTF-16 block `CreateEnvironmentBlock` just wrote — exactly the two states the helper accepts.
     let mut merged =
-        unsafe { crate::interactive::merged_env_block(env_block as *const u16, false) };
+        unsafe { crate::interactive::merged_env_block(env_block as *const u16, false, &[]) };
     // Tells the host a restart request is answered (`crate::power::RESTART_EXIT_CODE`). The block
     // ends in its terminating NUL; the entry goes before it.
     merged.pop();

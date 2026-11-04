@@ -32,18 +32,20 @@ use std::time::{Duration, Instant};
 mod control;
 pub(crate) mod frame_channel;
 pub mod health;
+pub mod mgmt;
 mod pad_mouse;
 mod pad_touch;
 mod pairing;
 mod planes;
 mod probe;
 mod pump;
-mod recovery;
+pub(crate) mod recovery;
 mod resume;
 /// cbindgen:ignore
 pub mod sc1_ble;
 /// cbindgen:ignore
 pub mod sc2;
+mod screens;
 use crate::rumble;
 mod worker;
 
@@ -206,19 +208,34 @@ impl PunktfunkEndReason {
     pub fn is_normal(self) -> bool {
         !matches!(self, Self::HostError | Self::Lost)
     }
+
+    /// How long to wait before redial `attempt` (0-based) of a session that ended this way;
+    /// `None` once the schedule is spent, and for every ending but [`Self::Lost`]: a host
+    /// that closed the session meant it. Every shell redials on this one schedule.
+    pub fn redial_delay(self, attempt: u32) -> Option<Duration> {
+        const SCHEDULE_S: [u64; 5] = [0, 1, 2, 4, 8];
+        if self != Self::Lost {
+            return None;
+        }
+        SCHEDULE_S
+            .get(attempt as usize)
+            .map(|&s| Duration::from_secs(s))
+    }
 }
 
 #[cfg(feature = "quic")]
 impl From<&quinn::ConnectionError> for PunktfunkEndReason {
-    /// Map a QUIC close. Host app codes: `APP_EXITED` → GameExited, `0` → HostEnded.
-    /// Any other application code is unnamed and treated as `HostError` (visible) rather
-    /// than a clean host end. Transport-level failures are `Lost`.
+    /// Map a QUIC close. Host app codes: `APP_EXITED` → GameExited, `PATH_SHRANK` → Lost
+    /// (a redial heals it), `0` → HostEnded. Any other application code is unnamed and
+    /// treated as `HostError` (visible) rather than a clean host end. Transport-level
+    /// failures are `Lost`.
     fn from(e: &quinn::ConnectionError) -> Self {
         match e {
             quinn::ConnectionError::LocallyClosed => Self::Local,
             quinn::ConnectionError::ApplicationClosed(ac) => {
                 match u32::try_from(u64::from(ac.error_code)) {
                     Ok(crate::quic::APP_EXITED_CLOSE_CODE) => Self::GameExited,
+                    Ok(crate::quic::PATH_SHRANK_CLOSE_CODE) => Self::Lost,
                     Ok(0) => Self::HostEnded,
                     _ => Self::HostError,
                 }
@@ -281,6 +298,8 @@ pub struct NativeClient {
     /// ABR armed (Automatic). Skip per-frame decode measurement when false
     /// ([`wants_decode_latency`](Self::wants_decode_latency)).
     wants_decode: bool,
+    /// Hello asked for 4:4:4, so the overlay can name a refusal.
+    asked_444: bool,
     worker: Option<std::thread::JoinHandle<()>>,
     /// SHA-256 of the cert the host presented. A TOFU caller (`pin = None`) persists this.
     pub host_fingerprint: [u8; 32],
@@ -302,20 +321,25 @@ pub struct NativeClient {
     /// clock. `0` = old host or synced clocks. Ongoing math should read
     /// [`clock_offset_now_ns`](Self::clock_offset_now_ns).
     pub clock_offset_ns: i64,
-    /// Encode bit depth: `8`, or `10` for Main10/HDR. `8` for an older host.
+    /// Encode bit depth at connect: `8`, or `10` for Main10/HDR. `8` for an older host.
+    /// [`video_format`](Self::video_format) follows it mid-session.
     pub bit_depth: u8,
-    /// Host colour signalling for decoder/presenter. [`ColorInfo::SDR_BT709`] for an older
-    /// host. HDR mastering arrives via [`NativeClient::next_hdr_meta`].
+    /// Host colour signalling at connect. [`ColorInfo::SDR_BT709`] for an older host. HDR
+    /// mastering arrives via [`NativeClient::next_hdr_meta`]; [`video_format`](Self::video_format)
+    /// follows the colour mid-session.
     pub color: ColorInfo,
-    /// HEVC `chroma_format_idc` ([`quic::CHROMA_IDC_420`] or [`quic::CHROMA_IDC_444`]). SPS
-    /// is authoritative; this pre-sizes the decoder. `420` for an older host.
+    /// HEVC `chroma_format_idc` at connect ([`quic::CHROMA_IDC_420`] or
+    /// [`quic::CHROMA_IDC_444`]). SPS is authoritative; this pre-sizes the decoder. `420` for an
+    /// older host. [`video_format`](Self::video_format) follows it mid-session.
     pub chroma_format: u8,
     /// Host-resolved channels: `2` / `6` / `8`. Build the Opus decoder from this via
     /// [`crate::audio::layout_for`], never from the request. Omitted → `2`.
     pub audio_channels: u8,
     /// Selects the decoder: [`quic::AUDIO_CODEC_OPUS`] (`0xC9`) or [`quic::AUDIO_CODEC_PCM`]
     /// (`0xD3`). A 48 kHz/16-bit lossless session and a 48 kHz Opus session agree on every
-    /// other resolved value. Fixed for the session — the output device is open at one format.
+    /// other resolved value. [`quic::AUDIO_CODEC_AC3`] / [`quic::AUDIO_CODEC_EAC3`] (`0xD4`,
+    /// only on a [`ConnectParams::audio_bitstreams`] ask) go to a passthrough sink undecoded.
+    /// Fixed for the session — the output device is open at one format.
     pub audio_codec: u8,
     /// Host-resolved sample rate. `48_000` for Opus and older hosts; a hi-res session may
     /// land lower than asked. Open the output device from THIS, never from the request.
@@ -334,15 +358,23 @@ pub struct NativeClient {
     /// from the request, and refuse audio on `None` rather than pair channels wrongly. `0` for
     /// an older host.
     pub audio_layout: u8,
-    /// Host-resolved video codec. Build the decoder from THIS; do not assume HEVC.
+    /// Host-resolved video codec at connect. Build the decoder from THIS; do not assume HEVC.
+    /// Under [`ConnectParams::rebuilds_decoder`] it can move: [`video_format`](Self::video_format).
     pub codec: u8,
 }
 
 impl NativeClient {
-    /// Payload kbps of the lossless plane: `rate × depth × channels` (CBR, exact). `None` for
+    /// Payload kbps of a constant-rate plane: lossless is `rate × depth × channels` (exact),
+    /// bitstream its fixed [`bitrate_kbps`](crate::audio::bitstream::bitrate_kbps). `None` for
     /// Opus (VBR, host-chosen via [`crate::audio::plan_audio_budget`]) — a short window would
     /// read as jitter. Header and QUIC framing are omitted, as with every other quoted bitrate.
     pub fn audio_kbps(&self) -> Option<u32> {
+        if crate::audio::bitstream::is_bitstream(self.audio_codec) {
+            return Some(crate::audio::bitstream::bitrate_kbps(
+                self.audio_codec,
+                self.audio_channels,
+            ));
+        }
         (self.audio_codec == crate::quic::AUDIO_CODEC_PCM).then(|| {
             crate::audio::pcm::bitrate_kbps(
                 self.audio_sample_rate_hz,
@@ -451,6 +483,7 @@ fn send_recovery(shared: &ClientShared, ask: RecoveryAsk) {
             let _ = send_rfi(shared, first, last);
         }
         RecoveryAsk::Keyframe => shared.ask_keyframe(),
+        RecoveryAsk::StarvedKeyframe => shared.ask_starved_keyframe(),
         RecoveryAsk::None => {}
     }
 }
@@ -540,6 +573,9 @@ pub struct ConnectParams {
     /// PyroWave quality in hundredths of a bit per pixel
     /// ([`crate::quic::EXT_TAG_PYROWAVE_QUALITY`]); `0` leaves the host's own.
     pub pyrowave_bpp_x100: u16,
+    /// H.264/HEVC slices per picture the decoder wants; `0` leaves the host's. The host reads
+    /// it only under [`crate::quic::VIDEO_CAP_MULTI_SLICE`].
+    pub slices: u8,
     /// [`crate::quic::VIDEO_CAP_10BIT`] / [`crate::quic::VIDEO_CAP_HDR`]; the host upgrades only
     /// on a set bit. `0` = 8-bit BT.709.
     pub video_caps: u8,
@@ -554,6 +590,9 @@ pub struct ConnectParams {
     pub audio_layout: crate::audio::AudioLayout,
     /// How this client fills its view ([`crate::quic::Hello::video_fit`]).
     pub video_fit: crate::video_fit::VideoFit,
+    /// The sinks this embedder plays through unchanged
+    /// ([`crate::quic::Hello::audio_bitstreams`]); `0` asks for none.
+    pub audio_bitstreams: u8,
     /// Decode bitfield (H264 / HEVC / AV1 / PyroWave); `0` = HEVC only.
     pub video_codecs: u8,
     /// One codec bit to prefer; `0` = host's choice. The host answers in [`NativeClient::codec`].
@@ -565,6 +604,14 @@ pub struct ConnectParams {
     pub client_caps: u8,
     /// AU prefixes as [`Frame`]s with `part = Some`. Only for a decoder that takes parts.
     pub frame_parts: bool,
+    /// This embedder rebuilds its decoder on a frame whose [`Frame::new_format`] is `Some`.
+    /// Only then may the host change codec, depth, colour or chroma mid-stream
+    /// ([`crate::quic::v2::registry::FEATURE_FORMAT_EPOCH`]).
+    pub rebuilds_decoder: bool,
+    /// This embedder reopens its audio decoder and player on a packet whose
+    /// [`AudioPacket::new_format`] is `Some`. Only then may the host change the audio format
+    /// mid-stream ([`crate::quic::v2::registry::FEATURE_AUDIO_EPOCH`]).
+    pub reopens_audio: bool,
     /// Store-qualified library id to launch (`steam:570`).
     pub launch: Option<String>,
     /// [`crate::quic::Hello::name`], usually [`device_name`]. `None` knocks as "device abcd1234".
@@ -578,17 +625,38 @@ pub struct ConnectParams {
     /// unchanged. `None` names none.
     pub preset: Option<crate::quic::SessionPreset>,
     /// A diagnostic session ([`crate::quic::EXT_DELIVERY_PROBE_ONLY`]): the host serves probes
-    /// from the punched data plane and never builds a pipeline.
+    /// from the bound data plane and never builds a pipeline.
     pub probe_only: bool,
     /// The profile to play as: a host profile id. `None` lets the host choose
     /// ([`NativeClient::profile`] says which it did).
     pub profile: Option<String>,
+    /// Every screen this embedder shows, screen 0 first with `mode`'s size; empty for one.
+    /// Screens past the first arrive on [`NativeClient::next_screen_frame`].
+    pub screens: Vec<crate::quic::v2::msg::Screen>,
+    /// This embedder can show more than one picture, so screens are offered even with `screens`
+    /// empty and [`NativeClient::request_screens`] can ask for them later.
+    pub shows_screens: bool,
+    /// This embedder's display shows full-range BT.709 video as studio range, so the host is
+    /// asked for studio SDR ([`crate::quic::v2::registry::FEATURE_STUDIO_RANGE`]). Build the
+    /// decoder from [`NativeClient::video_format`]'s colour, which says what the host sent.
+    pub studio_range: bool,
+    /// [`Self::studio_range`] for HDR10: this display shows full-range HDR as studio range
+    /// ([`crate::quic::v2::registry::FEATURE_STUDIO_RANGE_HDR`]).
+    pub studio_range_hdr: bool,
     /// Handshake budget. The dial re-dials inside it, so a waking host is not a failure.
     pub timeout: Duration,
     /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
     /// `shutdown` onto it; that races the end reason. `None` = uncancelable.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Called once, on the connecting thread, when the host answers that its operator is
+    /// deciding about this device. From then the dial waits for the host's verdict, up to
+    /// [`APPROVAL_WAIT`], not `timeout`; `cancel` still ends it. `None`: `timeout` stands.
+    pub on_pending: Option<Arc<dyn Fn() + Send + Sync>>,
 }
+
+/// Longest a dial waits on an operator once the host said it is asking. The host answers
+/// sooner: approval, a refusal, or its own timeout.
+pub const APPROVAL_WAIT: Duration = Duration::from_secs(10 * 60);
 
 impl ConnectParams {
     /// A plain dial to `host:port` at (up to) `mode`, giving up after `timeout`.
@@ -601,17 +669,21 @@ impl ConnectParams {
             gamepad: GamepadPref::Auto,
             bitrate_kbps: 0,
             pyrowave_bpp_x100: 0,
+            slices: 0,
             video_caps: 0,
             audio_channels: 2,
             audio_rate_hz: 0,
             audio_bits: 0,
             audio_layout: crate::audio::AudioLayout::Legacy,
             video_fit: crate::video_fit::VideoFit::Fit,
+            audio_bitstreams: 0,
             video_codecs: 0,
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
             frame_parts: false,
+            rebuilds_decoder: false,
+            reopens_audio: false,
             launch: None,
             name: None,
             pin: None,
@@ -619,8 +691,13 @@ impl ConnectParams {
             preset: None,
             probe_only: false,
             profile: None,
+            screens: Vec::new(),
+            shows_screens: false,
+            studio_range: false,
+            studio_range_hdr: false,
             timeout,
             cancel: None,
+            on_pending: None,
         }
     }
 }
@@ -649,8 +726,11 @@ impl NativeClient {
             .store(params.probe_only, Ordering::Relaxed);
 
         let cancel = params.cancel.take();
+        let on_pending = params.on_pending.take();
         let (timeout, bitrate_kbps, requested_gamepad) =
             (params.timeout, params.bitrate_kbps, params.gamepad);
+        let (preferred_codec, offered_codecs) = (params.preferred_codec, params.video_codecs);
+        let asked_444 = params.video_caps & crate::quic::VIDEO_CAP_444 != 0;
         // RED is core-decided; HIRES is not. See `advertised_client_caps`.
         params.client_caps =
             advertised_client_caps(params.client_caps, params.audio_rate_hz, params.audio_bits);
@@ -691,12 +771,20 @@ impl NativeClient {
 
         // Poll so `cancel` can abort; a parked request-access handshake has nothing to wake on.
         const READY_POLL: Duration = Duration::from_millis(50);
-        let deadline = std::time::Instant::now() + timeout;
+        let mut deadline = std::time::Instant::now() + timeout;
+        let mut told_pending = false;
         let negotiated = loop {
+            if !told_pending && shared.pending.load(Ordering::Relaxed) {
+                told_pending = true;
+                if let Some(hook) = &on_pending {
+                    hook();
+                    deadline = deadline.max(std::time::Instant::now() + APPROVAL_WAIT);
+                }
+            }
             match ready_rx.recv_timeout(READY_POLL) {
                 Ok(Ok(t)) => break t,
                 Ok(Err(e)) => {
-                    // Stops what the handshake already started, such as the data punch.
+                    // Stops what the handshake already started.
                     shared.shutdown.store(true, Ordering::SeqCst);
                     return Err(e);
                 }
@@ -750,7 +838,14 @@ impl NativeClient {
             hud,
             // Match the pump: Automatic AND host echoed a rate. Dropping the last term
             // over-advertises against an old host that reports no rate.
-            wants_decode: bitrate_kbps == 0 && welcome.bitrate_kbps > 0,
+            wants_decode: crate::quic::session_bitrate_kbps(
+                bitrate_kbps,
+                preferred_codec,
+                offered_codecs,
+                welcome.codec,
+            ) == 0
+                && welcome.bitrate_kbps > 0,
+            asked_444,
             host_fingerprint: negotiated.host_fingerprint,
             resolved_compositor: welcome.compositor,
             resolved_gamepad: welcome.gamepad,
@@ -828,6 +923,41 @@ impl NativeClient {
             .map_err(|_| PunktfunkError::Closed)
     }
 
+    /// The format the newest frame from [`next_frame`](Self::next_frame) decodes as: the
+    /// Welcome's until a frame's [`Frame::new_format`] moves it.
+    pub fn video_format(&self) -> crate::quic::VideoFormat {
+        *self.shared.video_format.lock().unwrap()
+    }
+
+    /// The decoder can't take these `CODEC_*` bits: ask the host to stream on in another codec,
+    /// from a new epoch, without a reconnect. The answer is a frame whose [`Frame::new_format`]
+    /// names the new codec, or a [`codec_refused`](Self::codec_refused).
+    /// [`PunktfunkError::Unsupported`] when the session has no format epochs.
+    pub fn request_codec_change(&self, exclude: u8) -> Result<()> {
+        if !self.shared.anchor.lock().unwrap().formats {
+            return Err(PunktfunkError::Unsupported("format epochs"));
+        }
+        self.ctrl_tx
+            .try_send(CtrlRequest::Codec(exclude))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// The desktop audio format the newest packet from [`next_audio`](Self::next_audio) is in:
+    /// the Welcome's until a packet's [`AudioPacket::new_format`] moves it.
+    pub fn audio_format(&self) -> crate::audio::plane::PlaneFormat {
+        self.shared
+            .audio_out
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| crate::audio::plane::PlaneFormat::of(self))
+    }
+
+    /// `CODEC_*` bits of the codec ask the host refused, `0` while none was. The stream is
+    /// unchanged: reconnect without those codecs.
+    pub fn codec_refused(&self) -> u8 {
+        self.shared.codec_refused.load(Ordering::Relaxed)
+    }
+
     /// Who draws the pointer: `true` = client (host forwards shape/state, excludes it from
     /// video), `false` = host composites. Latest-wins; no-op without
     /// [`HOST_CAP_CURSOR`](crate::quic::HOST_CAP_CURSOR).
@@ -845,6 +975,17 @@ impl NativeClient {
     pub fn request_keyframe(&self) -> Result<()> {
         self.recovery_step(RecoveryEvent::NeedKeyframe, false);
         Ok(())
+    }
+
+    /// The device's network path changed: an interface came up, went down or took over the
+    /// default route. Re-picks the socket's source address and sends the host a copy of the
+    /// last feedback, so it follows a roam within a round trip instead of a keep-alive.
+    pub fn path_changed(&self) {
+        if let Some(reconnect) = self.shared.reconnect.get() {
+            reconnect();
+        }
+        let fb = self.shared.feedback.lock().unwrap().again();
+        self.shared.send_feedback(&fb);
     }
 
     /// Recover `[first_frame, last_frame]` by RFI instead of a full IDR. Capable hosts emit a
@@ -922,6 +1063,13 @@ impl NativeClient {
     /// A loss the index gap cannot see (a parked AU overflowed, a wedge): arm and ask.
     pub fn recovery_lost(&self) {
         self.recovery_step(RecoveryEvent::Lost, true);
+    }
+
+    /// The decoder owes output and nothing was lost: arm and ask as
+    /// [`recovery_lost`](Self::recovery_lost) does. This ask and the freeze's re-asks after
+    /// it are counted apart from recovery's: a lower rate cannot feed a starved decoder.
+    pub fn recovery_starved(&self) {
+        self.recovery_step(RecoveryEvent::Starved, true);
     }
 
     /// The decoder raised an error it recovers from: its next pictures may be concealment.
@@ -1030,6 +1178,18 @@ impl NativeClient {
         self.shared.end_reject_said.get().map(String::as_str)
     }
 
+    /// [`crate::reject::wake_redial_delay`] for how this session ended: its typed close, and
+    /// whether a frame reached the embedder first. Ask once
+    /// [`is_session_ended`](Self::is_session_ended).
+    pub fn wake_redial_delay(
+        &self,
+        auto_wake: bool,
+        since_first: Option<Duration>,
+    ) -> Option<Duration> {
+        let streamed = self.shared.streamed.load(Ordering::Relaxed);
+        crate::reject::wake_redial_delay(auto_wake, self.end_reject(), streamed, since_first)
+    }
+
     /// Fold the calling thread into [`hot_thread_ids`](Self::hot_thread_ids) (decode/audio
     /// with the pump). Idempotent; no-op without `gettid`.
     pub fn register_hot_thread(&self) {
@@ -1124,8 +1284,8 @@ impl NativeClient {
     }
 
     /// Close the overlay window with everything the connector knows filled in: mode, codec,
-    /// colour, audio format, counters, the link line and the weak-network warning. The caller
-    /// adds the decoder, display HDR and its own extras.
+    /// colour, chroma asked and granted, audio format, counters, the link line and the
+    /// weak-network warning. The caller adds the decoder, display HDR and its own extras.
     pub fn hud_snapshot(&self) -> crate::hud::StatsSnapshot {
         // Whole AUs the all-intra drain dropped before the decoder: it fell behind.
         let behind = self.shared.frames.take_skipped();
@@ -1136,20 +1296,20 @@ impl NativeClient {
         let mut s = self.hud.drain(&self.hud_counters());
         let m = self.mode();
         (s.width, s.height, s.refresh_hz) = (m.width, m.height, m.refresh_hz);
-        s.codec = crate::hud::codec_label(self.codec).into();
-        s.bit_depth = self.bit_depth;
-        if matches!(
-            self.color.transfer,
-            crate::quic::ColorInfo::TRC_PQ | crate::quic::ColorInfo::TRC_HLG
-        ) {
+        let f = self.video_format();
+        s.codec = crate::hud::codec_label(f.codec).into();
+        s.bit_depth = f.bit_depth;
+        if f.color.is_hdr() {
             s.hdr = crate::hud::Hdr::Hdr;
         }
-        s.chroma_444 = self.chroma_format == crate::quic::CHROMA_IDC_444;
+        s.chroma_444 = f.chroma_format == crate::quic::CHROMA_IDC_444;
+        s.asked_444 = self.asked_444;
         s.auto_rate = self.wants_decode;
-        s.audio_lossless = self.audio_codec == crate::quic::AUDIO_CODEC_PCM;
-        s.audio_rate_hz = self.audio_sample_rate_hz;
-        s.audio_bits = self.audio_bits;
-        s.audio_channels = self.audio_channels;
+        let a = self.audio_format();
+        s.audio_lossless = a.is_pcm();
+        s.audio_rate_hz = a.rate_hz;
+        s.audio_bits = a.bits;
+        s.audio_channels = a.channels;
         s.extras.push(crate::hud::Extra {
             role: crate::hud::Role::Muted,
             ..crate::hud::Extra::detail(self.link_line())
@@ -1199,6 +1359,12 @@ impl NativeClient {
         let mut acc = self.shared.decode_lat.lock().unwrap();
         acc.sum_us += us as u64;
         acc.count += 1;
+    }
+
+    /// Assemble video AUs in `memory` from the next frame on: a decoder that reads the AU where
+    /// it lies lends its own ([`crate::au`]). Frames already assembled keep their memory.
+    pub fn set_au_memory(&self, memory: Arc<dyn crate::au::AuMemory>) {
+        *self.shared.au_memory.lock().unwrap() = Some(memory);
     }
 
     /// Whether [`report_decode_us`](Self::report_decode_us) is used (Automatic). Constant for
@@ -1376,7 +1542,11 @@ impl NativeClient {
     /// One thread per plane; `&self` is for sharing across planes, not two consumers of one.
     pub fn next_frame(&self, timeout: Duration) -> Result<Frame> {
         match self.shared.frames.pop(timeout) {
-            FramePop::Frame(f) => {
+            FramePop::Frame(mut f) => {
+                if !self.shared.streamed.load(Ordering::Relaxed) {
+                    self.shared.streamed.store(true, Ordering::Relaxed);
+                }
+                pump::anchor::mark(&self.shared, &mut f);
                 let completes_au = f.part.as_ref().is_none_or(|p| p.last);
                 self.hud
                     .note_received(f.pts_ns, f.received_ns, f.data.len(), completes_au);
@@ -1389,9 +1559,75 @@ impl NativeClient {
         }
     }
 
+    /// Return the consumer from [`Self::next_frame`] with `NoFrame` now, or at its next
+    /// call: a hardware decode it submitted is complete. Any thread may call this.
+    pub fn kick_frame_wait(&self) {
+        self.shared.frames.kick();
+    }
+
+    /// The screens the host built, screen 0 included, and a generation that moves with each
+    /// change; generation 0 before the host said. A screen it could not build is absent.
+    pub fn screen_layout(&self) -> (u32, Vec<crate::quic::v2::msg::Screen>) {
+        self.shared.screens.layout()
+    }
+
+    /// The host took screens: [`Self::request_screens`] reaches it. Without, the session shows
+    /// one picture whatever is asked.
+    pub fn screens_on(&self) -> bool {
+        self.shared.screens.is_on()
+    }
+
+    /// Next whole AU of screen `screen` (1 or more), the first of each format with
+    /// [`Frame::new_format`] set. `NoFrame` on timeout, also before the host opened that
+    /// screen; `Closed` once the session ended or the host dropped the screen.
+    pub fn next_screen_frame(&self, screen: u8, timeout: Duration) -> Result<Frame> {
+        let lane = (screen > 0)
+            .then(|| {
+                self.shared
+                    .screens
+                    .lane(crate::packet::screen_stream(screen))
+            })
+            .flatten();
+        let Some(lane) = lane else {
+            if self.shared.shutdown.load(Ordering::SeqCst) {
+                return Err(PunktfunkError::Closed);
+            }
+            std::thread::sleep(timeout.min(Duration::from_millis(20)));
+            return Err(PunktfunkError::NoFrame);
+        };
+        match lane.frames.pop(timeout) {
+            FramePop::Frame(f) => Ok(f),
+            FramePop::Timeout => Err(PunktfunkError::NoFrame),
+            FramePop::Closed => Err(PunktfunkError::Closed),
+        }
+    }
+
+    /// Screen `screen`'s decoder cannot go on, or is new: its frames wait for a keyframe, which
+    /// the pump asks the host for, and that frame names its format.
+    pub fn request_screen_keyframe(&self, screen: u8) {
+        if screen > 0 {
+            self.shared
+                .screens
+                .want_key(crate::packet::screen_stream(screen));
+        }
+    }
+
+    /// Show these screens from now on, screen 0 first: the host adds, drops and resizes the
+    /// others and answers with a new [`Self::screen_layout`]. Screen 0's size still moves by
+    /// [`Self::request_mode`]. A host or dial without screens ignores it.
+    pub fn request_screens(&self, screens: Vec<crate::quic::v2::msg::Screen>) -> Result<()> {
+        self.ctrl_tx
+            .try_send(CtrlRequest::Screens(screens))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
     /// Next audio packet. Drain on a dedicated thread — packets arrive every 5 ms.
     pub fn next_audio(&self, timeout: Duration) -> Result<AudioPacket> {
-        pull(&self.planes.audio, timeout)
+        let pkt = pull(&self.planes.audio, timeout)?;
+        if let Some(format) = pkt.new_format {
+            *self.shared.audio_out.lock().unwrap() = Some(format);
+        }
+        Ok(pkt)
     }
 
     /// Mute this client's own speakers. Nothing leaves for the host: it keeps encoding, and a
@@ -1458,6 +1694,13 @@ impl NativeClient {
             Ok(None) => Err(PunktfunkError::NoFrame),
             Err(rumble::Closed) => Err(PunktfunkError::Closed),
         }
+    }
+
+    /// Run `wake` on the demux thread as each rumble update lands, for a poller that blocks
+    /// on something other than [`Self::next_rumble_command`] and then drains it with a zero
+    /// timeout. A scheduled follow-up (a ramp step, a backstop) still waits for that poll.
+    pub fn set_rumble_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.planes.rumble_sched.set_wake(wake);
     }
 
     /// Actuator quirks for wire pad `pad` (at attach). Default = well-behaved; only decaying
@@ -1913,6 +2156,58 @@ fn expires_in_secs(deadline_unix: Option<u64>, now_unix: u64) -> u32 {
             .unwrap_or(u32::MAX)
             .max(1)
     })
+}
+
+#[cfg(all(test, feature = "quic"))]
+mod end_reason_tests {
+    use super::PunktfunkEndReason;
+
+    fn closed_with(code: u32) -> PunktfunkEndReason {
+        let e = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(code),
+            reason: Default::default(),
+        });
+        PunktfunkEndReason::from(&e)
+    }
+
+    /// A path too small for the stream redials like a dropped connection.
+    #[test]
+    fn a_shrunk_path_reads_as_lost() {
+        assert_eq!(
+            closed_with(crate::quic::PATH_SHRANK_CLOSE_CODE),
+            PunktfunkEndReason::Lost
+        );
+        assert_eq!(
+            closed_with(crate::quic::APP_EXITED_CLOSE_CODE),
+            PunktfunkEndReason::GameExited
+        );
+        assert_eq!(closed_with(0x6B), PunktfunkEndReason::HostError);
+    }
+}
+
+#[cfg(test)]
+mod redial_tests {
+    use super::PunktfunkEndReason;
+
+    /// Only a lost connection redials, five times, with the waits growing.
+    #[test]
+    fn only_a_lost_session_redials() {
+        let lost = PunktfunkEndReason::Lost;
+        let waits: Vec<u64> = (0..)
+            .map_while(|a| lost.redial_delay(a))
+            .map(|d| d.as_secs())
+            .collect();
+        assert_eq!(waits, [0, 1, 2, 4, 8]);
+        for other in [
+            PunktfunkEndReason::None,
+            PunktfunkEndReason::Local,
+            PunktfunkEndReason::GameExited,
+            PunktfunkEndReason::HostEnded,
+            PunktfunkEndReason::HostError,
+        ] {
+            assert_eq!(other.redial_delay(0), None);
+        }
+    }
 }
 
 #[cfg(test)]

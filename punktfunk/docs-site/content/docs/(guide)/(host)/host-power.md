@@ -24,12 +24,19 @@ removes its virtual displays too, so a wake starts clean. A display kept until r
 a gamescope game survives the sleep. If a wake then shows a black screen, click **Release** in
 **Displays**.
 
+## While someone streams
+
+A live stream keeps the machine from sleeping on its own timer. On a box with seats that covers
+every seat, and the screen at the desk can still go dark. **Sleep host** still works: it ends
+those streams first.
+
 ## Why an action can be refused
 
 The host refuses with the reason:
 
 - **Another device is streaming.** A guest can't pull the host out from under someone else's
-  session. Your own session never blocks you, and the console is never blocked.
+  session. Your own session never blocks you, and the console is never blocked. On a box with
+  seats, a seat that doesn't answer counts as streaming.
 - **The system said no.** A Linux host respects other programs' sleep inhibitors and refuses while
   another user is logged in locally. A machine that can't sleep lists **Sleep host** as
   unavailable, with the reason.

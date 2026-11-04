@@ -7,7 +7,9 @@
 
 use super::{err, run};
 use crate::backend::BackendError;
-use crate::model::{Seat, SeatId};
+use crate::model::{
+    ordinary_uid, valid_owner_account, Ledger, Seat, SeatId, MAX_OWNER_ACCOUNT_LEN, MAX_SEATS,
+};
 use std::path::{Path, PathBuf};
 
 /// `=`, not `:`: the colon separates passwd fields and `useradd` refuses it in a comment.
@@ -59,16 +61,6 @@ pub(super) fn parse_passwd(line: &str) -> Option<Passwd> {
 /// Whether `passwd` is the account this ledger created for `id`.
 pub(super) fn owned_by(passwd: &Passwd, id: &SeatId) -> bool {
     passwd.gecos == marker(id)
-}
-
-/// A name `useradd` accepts everywhere: lowercase, starting with a letter or `_`. The ledger's own
-/// rule is wider (uppercase, dots), which Debian's `useradd` refuses.
-pub(super) fn valid_unix_name(account: &str) -> bool {
-    let mut bytes = account.bytes();
-    bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
-        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
 }
 
 /// The passwd row for `name`, `None` when no such user exists. `getent` answers through NSS, so a
@@ -150,8 +142,9 @@ fn getent(database: &str, key: &str) -> Result<Option<String>, BackendError> {
     }
 }
 
+/// Refuses an owner name outside [`valid_owner_account`] before any lookup runs.
 pub(super) fn check_name(account: &str) -> Result<(), BackendError> {
-    if valid_unix_name(account) {
+    if valid_owner_account(account) {
         return Ok(());
     }
     Err(err(
@@ -160,14 +153,26 @@ pub(super) fn check_name(account: &str) -> Result<(), BackendError> {
     ))
 }
 
+/// The names the door and the CLI give a seat's user: `pf-seat-1` up to the last seat. Whoever
+/// reaches the socket creates a system user, so the name is not theirs to choose.
+pub(super) fn check_seat_name(account: &str) -> Result<(), BackendError> {
+    if (1..=MAX_SEATS).any(|n| account == format!("pf-seat-{n}")) {
+        return Ok(());
+    }
+    Err(err(
+        "account_invalid",
+        format!("account '{account}' isn't a seat account, pf-seat-1 to pf-seat-{MAX_SEATS}"),
+    ))
+}
+
 /// The seat's user, created on first use. An existing user is accepted only with the seat's
-/// marker. The second value is whether this call created it.
-pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<(Passwd, bool), BackendError> {
+/// marker.
+pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<Passwd, BackendError> {
     if let Some(existing) = lookup(&seat.account)? {
         return if owned_by(&existing, &seat.id) {
-            Ok((existing, false))
+            Ok(existing)
         } else {
-            Err(not_owned(seat))
+            Err(not_owned(&seat.account, &seat.id))
         };
     }
     let mut groups = Vec::new();
@@ -180,7 +185,7 @@ pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<(Passwd, bool), Backen
     let seat_dir = super::shared::seat_dir(state, &seat.id);
     super::shared::make_dir(&seat_dir, 0o711)
         .map_err(|e| err("seat_dirs", format!("create {}: {e}", seat_dir.display())))?;
-    let home = seat_dir.join("home");
+    let home = seat_home(state, &seat.id);
     let comment = marker(&seat.id);
     let groups = groups.join(",");
     let home_arg = home.to_string_lossy();
@@ -199,9 +204,58 @@ pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<(Passwd, bool), Backen
             &seat.account,
         ],
     )?;
-    let created = lookup(&seat.account)?
-        .ok_or_else(|| err("useradd_failed", "useradd left no passwd entry"))?;
-    Ok((created, true))
+    lookup(&seat.account)?.ok_or_else(|| err("useradd_failed", "useradd left no passwd entry"))
+}
+
+/// The home `useradd` is given for `id`'s user.
+fn seat_home(state: &Path, id: &SeatId) -> PathBuf {
+    super::shared::seat_dir(state, id).join("home")
+}
+
+/// The seat id in `passwd`'s marker, whichever seat that is.
+fn marked_id(passwd: &Passwd) -> Option<SeatId> {
+    SeatId::parse(passwd.gecos.strip_prefix(MARKER_PREFIX)?).ok()
+}
+
+/// The seat accounts in `users` that no row of `ledger` names, with their seat ids. A user can
+/// write a marker into their own comment, so only an account in the home `useradd` gave that seat
+/// counts: a person's account never lives there.
+pub(super) fn orphans<'a>(
+    users: &'a [Passwd],
+    ledger: &Ledger,
+    state: &Path,
+) -> Vec<(&'a Passwd, SeatId)> {
+    users
+        .iter()
+        .filter_map(|user| Some((user, marked_id(user)?)))
+        .filter(|(user, id)| ledger.seat(id).is_none() && user.home == seat_home(state, id))
+        .collect()
+}
+
+/// Closes a seat's home to every user but its own. `useradd` makes it as open as `login.defs`
+/// says, `0755` on Debian, and the seat directory above it is `0711` for every seat user. An
+/// absent home is left as it is; a link is refused.
+pub(super) fn close_home(home: &Path) -> Result<(), BackendError> {
+    let io = |e: std::io::Error| {
+        err(
+            "seat_dirs",
+            format!("close the home {}: {e}", home.display()),
+        )
+    };
+    let (Some(parent), Some(name)) = (home.parent(), home.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(());
+    };
+    let above = match super::safe_open::dir(parent) {
+        Ok(above) => above,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io(e)),
+    };
+    let Some(dir) = super::safe_open::dir_at(&above, name).map_err(io)? else {
+        return Ok(());
+    };
+    let closed = rustix::fs::fchmod(&dir, rustix::fs::Mode::from_raw_mode(0o700 as _));
+    closed.map_err(|e| io(e.into()))
 }
 
 /// Whether `passwd` carries a seat's marker, for any seat.
@@ -209,9 +263,9 @@ pub(super) fn is_seat(passwd: &Passwd) -> bool {
     passwd.gecos.starts_with(MARKER_PREFIX)
 }
 
-/// Whether `passwd` is a person's own account: in the ordinary uid range and not a seat's.
+/// Whether `passwd` is a person's own account: an [`ordinary_uid`] and not a seat's.
 pub(super) fn is_ordinary(passwd: &Passwd) -> bool {
-    (1000..60000).contains(&passwd.uid) && !is_seat(passwd)
+    ordinary_uid(passwd.uid) && !is_seat(passwd)
 }
 
 /// The owner's account for `account`: a Unix name, an existing user and an ordinary one. Never
@@ -231,17 +285,99 @@ pub(super) fn require_owner(account: &str) -> Result<Passwd, BackendError> {
     }
 }
 
+/// The group whose members may switch the door for their own account.
+const UPDATE_GROUP: &str = "punktfunk-update";
+
+/// An account `door-helper` may switch the door for.
+pub(super) enum Switchable {
+    Account(Passwd),
+    /// Switching off for a recorded owner whose account no longer exists.
+    Gone,
+}
+
+/// Whether `door-helper` may switch the door for `account`: [`require_owner`]'s person, and a
+/// member of [`UPDATE_GROUP`] to switch on. Switching off, a missing account is [`Switchable::Gone`]
+/// only where every passwd source sits on the box: a directory service that isn't answering
+/// misses too, and nothing is switched off on a guess.
+pub(super) fn switchable(account: &str, on: bool) -> Result<Switchable, BackendError> {
+    check_name(account)?;
+    if !on && lookup(account)?.is_none() {
+        let nsswitch = std::fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
+        if passwd_sources_local(&nsswitch) {
+            return Ok(Switchable::Gone);
+        }
+        return Err(err(
+            "account_unknown",
+            format!(
+                "can't tell if '{account}' is gone: its accounts may come from a directory service"
+            ),
+        ));
+    }
+    let passwd = require_owner(account)?;
+    if on
+        && !run("id_failed", "id", &["-nG", account])?
+            .split_whitespace()
+            .any(|g| g == UPDATE_GROUP)
+    {
+        return Err(err(
+            "not_in_update_group",
+            format!("'{account}' is not in the {UPDATE_GROUP} group"),
+        ));
+    }
+    Ok(Switchable::Account(passwd))
+}
+
+/// Whether `nsswitch.conf` reads passwd from the box alone: files and the sources that keep their
+/// rows beside them, with any `[STATUS=action]` between.
+fn passwd_sources_local(nsswitch: &str) -> bool {
+    let mut seen = false;
+    for line in nsswitch.lines() {
+        let mut words = line.split('#').next().unwrap_or("").split_whitespace();
+        if words.next() != Some("passwd:") {
+            continue;
+        }
+        seen = true;
+        for word in words {
+            let local = matches!(
+                word,
+                "files" | "compat" | "systemd" | "altfiles" | "extrausers" | "mymachines"
+            );
+            let action = word
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_start_matches('!')
+                .split_once('=')
+                .is_some_and(|(status, act)| {
+                    [status, act]
+                        .iter()
+                        .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphabetic()))
+                });
+            if !local && !action {
+                return false;
+            }
+        }
+    }
+    seen
+}
+
 /// Where `door-helper` writes the box owner's account, under the state directory.
 const OWNER_FILE: &str = "owner";
 
-/// Refuses `account` as the owner's row unless it is the one `door-helper` recorded in `state`,
-/// a directory only root writes. The door asks for the row, so it can't name another account.
-pub(super) fn require_recorded(state: &Path, account: &str) -> Result<(), BackendError> {
-    let recorded = super::safe_open::read(&state.join(OWNER_FILE), 64)
+/// The account `door-helper` recorded in `state`, a directory only root writes.
+pub(super) fn recorded_owner(state: &Path) -> Option<String> {
+    // The name and `door-helper`'s newline.
+    let cap = MAX_OWNER_ACCOUNT_LEN as u64 + 1;
+    super::safe_open::read(&state.join(OWNER_FILE), cap)
         .ok()
         .flatten()
-        .map(|(bytes, _)| String::from_utf8_lossy(&bytes).trim().to_owned());
-    if recorded.as_deref() == Some(account) {
+        .map(|(bytes, _)| String::from_utf8_lossy(&bytes).trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// Refuses `account` as the owner's row unless it is the one `door-helper` recorded in `state`.
+/// The door asks for the row, so it can't name another account.
+pub(super) fn require_recorded(state: &Path, account: &str) -> Result<(), BackendError> {
+    if recorded_owner(state).as_deref() == Some(account) {
         return Ok(());
     }
     Err(err(
@@ -254,7 +390,7 @@ pub(super) fn require_recorded(state: &Path, account: &str) -> Result<(), Backen
 pub(super) fn require(seat: &Seat) -> Result<Passwd, BackendError> {
     match lookup(&seat.account)? {
         Some(found) if owned_by(&found, &seat.id) => Ok(found),
-        Some(_) => Err(not_owned(seat)),
+        Some(_) => Err(not_owned(&seat.account, &seat.id)),
         None => Err(err(
             "account_missing",
             format!("account '{}' doesn't exist", seat.account),
@@ -262,20 +398,29 @@ pub(super) fn require(seat: &Seat) -> Result<Passwd, BackendError> {
     }
 }
 
-/// Deletes the seat's user and home. A user without the marker is refused; one that is already
-/// gone is not an error.
-pub(super) fn delete(seat: &Seat) -> Result<(), BackendError> {
-    let Some(found) = lookup(&seat.account)? else {
+/// Refuses a user named `account` that isn't `id`'s, before anything is done to it. An absent
+/// user is fine.
+pub(super) fn refuse_foreign(account: &str, id: &SeatId) -> Result<(), BackendError> {
+    match lookup(account)? {
+        Some(found) if !owned_by(&found, id) => Err(not_owned(account, id)),
+        _ => Ok(()),
+    }
+}
+
+/// Deletes the user `account` and its home when it carries `id`'s marker. A user without the
+/// marker is refused; one that is already gone is not an error.
+pub(super) fn delete(account: &str, id: &SeatId) -> Result<(), BackendError> {
+    let Some(found) = lookup(account)? else {
         return Ok(());
     };
-    if !owned_by(&found, &seat.id) {
-        return Err(not_owned(seat));
+    if !owned_by(&found, id) {
+        return Err(not_owned(account, id));
     }
-    quiesce(&seat.account)?;
-    let removed = run("userdel_failed", "userdel", &["-r", &seat.account]);
+    quiesce(account)?;
+    let removed = run("userdel_failed", "userdel", &["-r", account]);
     // userdel exits 12 when it can't remove the home. The user is gone and the seat directory
     // is removed by path afterwards, so only a user that is still there is a failure.
-    match (removed, lookup(&seat.account)?) {
+    match (removed, lookup(account)?) {
         (Err(error), Some(_)) => Err(error),
         _ => Ok(()),
     }
@@ -305,13 +450,10 @@ pub(super) fn quiesce(account: &str) -> Result<(), BackendError> {
     ))
 }
 
-fn not_owned(seat: &Seat) -> BackendError {
+fn not_owned(account: &str, id: &SeatId) -> BackendError {
     err(
         "account_not_owned",
-        format!(
-            "account '{}' exists without the marker for seat {}",
-            seat.account, seat.id
-        ),
+        format!("account '{account}' exists without the marker for seat {id}"),
     )
 }
 
@@ -367,17 +509,114 @@ mod tests {
         assert!(!owned(""));
     }
 
-    /// The owner is a person: uid 1000 up and below the nobody range, never a seat's marked
-    /// account, and never a system user such as `punktfunk`.
+    /// A home `useradd` left at the distro's mode closes to its user; a link in its place is
+    /// refused, and the directory it points at keeps its mode.
+    #[test]
+    fn a_seat_home_closes_to_its_user_and_never_through_a_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let seat = tempfile::tempdir().unwrap();
+        let home = seat.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        close_home(&home).unwrap();
+        assert_eq!(mode(&home), 0o700);
+
+        close_home(&seat.path().join("absent")).unwrap();
+        close_home(&seat.path().join("no-seat-dir/home")).unwrap();
+
+        let target = seat.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let linked = seat.path().join("linked");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        assert!(close_home(&linked).is_err());
+        assert_eq!(mode(&target), 0o755);
+    }
+
+    /// A seat's marker names its id, whichever seat that is; anything else names none.
+    #[test]
+    fn a_marker_names_the_seat_whose_account_it_is() {
+        let row = |gecos: &str| {
+            parse_passwd(&format!("u:x:975:972:{gecos}:/var/lib/h:/bin/bash")).unwrap()
+        };
+        assert_eq!(marked_id(&row(&marker(&id()))), Some(id()));
+        for gecos in [
+            "",
+            "Ada Lovelace",
+            "punktfunk-seat=",
+            "punktfunk-seat=0123456789abcdef",
+            "punktfunk-seat=0123456789ABCDEF0123456789ABCDEF",
+        ] {
+            assert_eq!(marked_id(&row(gecos)), None, "{gecos:?}");
+        }
+    }
+
+    /// An orphan is a seat account in its own seat home that no ledger row names. A marker in a
+    /// person's comment, or in an account elsewhere, is not one.
+    #[test]
+    fn only_a_seat_account_in_its_seat_home_is_an_orphan() {
+        use crate::model::CreateSeat;
+        let state = Path::new("/var/lib/punktfunk-seats");
+        let mut ledger = Ledger::new();
+        let kept = ledger
+            .allocate(CreateSeat {
+                name: "Kept".into(),
+                account: "pf-seat-1".into(),
+                autostart: false,
+            })
+            .unwrap();
+        let (orphan, forged) = (SeatId::random(), SeatId::random());
+        let row = |name: &str, id: &SeatId, home: &Path| {
+            let gecos = marker(id);
+            parse_passwd(&format!(
+                "{name}:x:975:972:{gecos}:{}:/bin/bash",
+                home.display()
+            ))
+            .unwrap()
+        };
+        let users = [
+            row("pf-seat-1", &kept.id, &seat_home(state, &kept.id)),
+            row("pf-seat-2", &orphan, &seat_home(state, &orphan)),
+            row("alice", &forged, Path::new("/home/alice")),
+            row("pf-seat-3", &forged, &seat_home(state, &orphan)),
+            parse_passwd("bob:x:1001:1001:Bob:/home/bob:/bin/bash").unwrap(),
+        ];
+        let found: Vec<_> = orphans(&users, &ledger, state)
+            .into_iter()
+            .map(|(user, id)| (user.name.as_str(), id))
+            .collect();
+        assert_eq!(found, [("pf-seat-2", orphan)]);
+    }
+
+    /// A user that isn't the seat's is refused before its sessions are touched; an absent one is
+    /// not. `getent` answers for the machine's own users, so only Linux runs it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_foreign_user_is_refused_and_an_absent_one_is_not() {
+        assert_eq!(
+            refuse_foreign("root", &id()).unwrap_err().code,
+            "account_not_owned"
+        );
+        assert!(refuse_foreign("pf-seat-no-such-user", &id()).is_ok());
+    }
+
+    /// The owner is a person: a local or a directory service's uid, never a seat's marked
+    /// account, and never a system, homed or dynamic user.
     #[test]
     fn only_an_ordinary_account_can_be_the_owner() {
         let row = |uid: u32, gecos: &str| {
             parse_passwd(&format!("u:x:{uid}:{uid}:{gecos}:/home/u:/bin/bash")).unwrap()
         };
         assert!(is_ordinary(&row(1000, "Enrico")));
-        assert!(is_ordinary(&row(59999, "")));
+        assert!(is_ordinary(&row(60000, "")));
+        assert!(is_ordinary(&row(65536, "")));
+        assert!(is_ordinary(&row(1_950_400_009, "")), "FreeIPA");
         assert!(!is_ordinary(&row(999, "")), "a system user");
-        assert!(!is_ordinary(&row(60000, "")), "nobody and the above");
+        assert!(!is_ordinary(&row(60001, "")), "homed");
+        assert!(!is_ordinary(&row(65534, "")), "nobody");
+        assert!(!is_ordinary(&row(1 << 31, "")));
+        assert!(!is_ordinary(&row(u32::MAX, "")));
         assert!(!is_ordinary(&row(0, "root")));
         assert!(!is_ordinary(&row(1001, &marker(&id()))), "a seat's account");
     }
@@ -392,6 +631,32 @@ mod tests {
         assert!(!refused("alice"));
         assert!(refused("bob"));
         assert!(refused(""));
+        let longest = format!("{}@corp.example.com", "j".repeat(64 - 17));
+        assert_eq!(longest.len(), MAX_OWNER_ACCOUNT_LEN);
+        std::fs::write(state.path().join(OWNER_FILE), format!("{longest}\n")).unwrap();
+        assert!(!refused(&longest), "the longest name the seats accept");
+    }
+
+    /// A miss means gone only where no passwd source could have been silent.
+    #[test]
+    fn only_local_passwd_sources_let_a_miss_mean_gone() {
+        for local in [
+            "passwd: files systemd\n",
+            "passwd:   files altfiles [!UNAVAIL=return] systemd # comment sss\n",
+            "group: sss\npasswd: compat\n",
+        ] {
+            assert!(passwd_sources_local(local), "{local:?}");
+        }
+        for remote in [
+            "",
+            "group: files\n",
+            "passwd: files sss\n",
+            "passwd: files ldap [NOTFOUND=return]\n",
+            "passwd: files\npasswd: winbind\n",
+            "passwd: files [=]\n",
+        ] {
+            assert!(!passwd_sources_local(remote), "{remote:?}");
+        }
     }
 
     /// An owner name `getent` could read as an option is refused before anything runs.
@@ -400,15 +665,29 @@ mod tests {
         assert_eq!(require_owner("-s").unwrap_err().code, "account_invalid");
     }
 
+    /// Creating a seat takes the names the door and the CLI send and no other, even a valid one.
     #[test]
-    fn the_account_name_must_be_one_every_useradd_takes() {
-        for good in ["pf-seat-1", "_svc", "a", "pf_seat1"] {
-            assert!(valid_unix_name(good), "{good}");
+    fn a_seat_account_is_named_pf_seat_and_its_number() {
+        for good in ["pf-seat-1", "pf-seat-2", "pf-seat-3", "pf-seat-4"] {
+            assert!(check_seat_name(good).is_ok(), "{good}");
         }
         for bad in [
-            "", "Pf-seat", "1seat", "-seat", "pf.seat", "pf seat", "pf-séat",
+            "pf-seat-0",
+            "pf-seat-5",
+            "pf-seat-01",
+            "pf-seat-+1",
+            "pf-seat-",
+            "pf-seat",
+            "pf_seat1",
+            "www-data",
+            "_svc",
+            "xpf-seat-1",
         ] {
-            assert!(!valid_unix_name(bad), "{bad:?}");
+            assert_eq!(
+                check_seat_name(bad).unwrap_err().code,
+                "account_invalid",
+                "{bad}"
+            );
         }
     }
 }

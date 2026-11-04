@@ -37,6 +37,7 @@ struct SettingsView: View {
     // link). 1.0 = Native (the prior behaviour).
     @AppStorage(DefaultsKey.renderScale) var renderScale = SettingDefault.renderScale
     @AppStorage(DefaultsKey.videoFit) var videoFit = SettingDefault.videoFit
+    @AppStorage(DefaultsKey.screens) var screens = SettingDefault.screens
     @AppStorage(DefaultsKey.compositor) var compositor = SettingDefault.compositor
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = SettingDefault.gamepadType
     @AppStorage(DefaultsKey.gamepadForwarding) var gamepadForwarding =
@@ -76,6 +77,8 @@ struct SettingsView: View {
     // the legacy-hudEnabled migration (same pattern as ContentView/StreamCommands).
     @AppStorage(DefaultsKey.statsVerbosity) var statsVerbosityRaw = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) var hudPlacement = SettingDefault.hudPlacement
+    @AppStorage(DefaultsKey.spatialAudio) var spatialAudio = SettingDefault.spatialAudio
+    @AppStorage(DefaultsKey.screen) var screen = SettingDefault.screen
     @AppStorage(DefaultsKey.advancedStats) var advancedStats = SettingDefault.advancedStats
     @AppStorage(DefaultsKey.statsScalePct) var statsScalePct = SettingDefault.statsScalePct
     @AppStorage(DefaultsKey.exitHint) var exitHint = SettingDefault.exitHint

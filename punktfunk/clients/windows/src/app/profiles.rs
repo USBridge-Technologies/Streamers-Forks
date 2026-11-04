@@ -2,15 +2,18 @@
 //! before a connect and from a host card's "Switch profile…". The rule is
 //! `pf_client_core::profiles::picker_decision`; this file runs the fetch and draws the sheet.
 //!
-//! The sheet is an in-tree overlay like the host editor: a ContentDialog takes text only, and
-//! the picker needs circles. It lives at root, so a worker thread can raise it over any screen.
-//! A profile whose seat is starting gets a second sheet of the same frame, [`SeatWait`].
+//! The sheet is a [`sheet`] overlay like the host editor, at root, so a worker thread can raise
+//! it over any screen. A profile whose seat is starting gets a second sheet of the same frame,
+//! [`SeatWait`].
 
 use super::style::*;
-use super::{AppCtx, Screen, Target};
+use super::{AppCtx, AsyncSetState, Screen, Target};
 use crate::trust::KnownHosts;
+use pf_client_core::library::HostApi;
 use pf_client_core::orchestrate::HostTarget;
 use pf_client_core::profiles::{self, Decision, ListedProfile, ProfilePick, SeatGate};
+use pf_fluent::Palette;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,7 +21,76 @@ use windows_reactor::*;
 
 /// How long a connect waits for the host's list before it dials as it would have.
 const FETCH_CUTOFF: Duration = Duration::from_secs(3);
+/// How long a picker waits for its pictures. One that lands later is there next time.
+const PICTURES_CUTOFF: Duration = Duration::from_secs(1);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Profile pictures read this run, by URL.
+#[derive(Default)]
+pub(crate) struct Pictures {
+    held: HashMap<String, EncodedImage>,
+    /// Asked for by a host card. One that failed waits for a picker or the next launch.
+    asked: HashSet<String>,
+}
+
+/// Reads the picture at `url` into [`Pictures`] and says how many are held then. Blocks.
+fn read_picture(ctx: &AppCtx, api: &HostApi, url: &str) -> Option<u64> {
+    let bytes = profiles::fetch_avatar(api, url)?;
+    let mut pictures = ctx.shared.pictures.lock().unwrap();
+    pictures
+        .held
+        .insert(url.to_string(), EncodedImage::new(bytes));
+    Some(pictures.held.len() as u64)
+}
+
+/// The picture of `k`'s saved pick, when this run holds it. The first ask reads it off the UI
+/// thread, then runs `redraw` with a count that grows with each picture held.
+pub(crate) fn card_picture(
+    ctx: &Arc<AppCtx>,
+    k: &pf_client_core::trust::KnownHost,
+    redraw: impl FnOnce(u64) + Send + 'static,
+) -> Option<EncodedImage> {
+    let url = k.profile.as_ref()?.avatar.clone()?;
+    let mut pictures = ctx.shared.pictures.lock().unwrap();
+    if let Some(held) = pictures.held.get(&url) {
+        return Some(held.clone());
+    }
+    if pictures.asked.insert(url.clone()) {
+        let (worker, api) = (ctx.clone(), HostTarget::from(k).api(&ctx.identity));
+        let _ = std::thread::Builder::new()
+            .name("pf-picture".into())
+            .spawn(move || {
+                if let Some(held) = read_picture(&worker, &api, &url) {
+                    redraw(held);
+                }
+            });
+    }
+    None
+}
+
+/// The pictures `listed` names, as far as [`PICTURES_CUTOFF`] allows. Blocks.
+fn picker_pictures(
+    ctx: &Arc<AppCtx>,
+    target: &Target,
+    listed: Option<&[ListedProfile]>,
+) -> HashMap<String, EncodedImage> {
+    let rows = listed.into_iter().flatten();
+    let urls: Vec<String> = rows.filter_map(|p| p.avatar.clone()).collect();
+    let (read, finished) = std::sync::mpsc::channel();
+    let (worker, api, wanted) = (ctx.clone(), target.host.api(&ctx.identity), urls.clone());
+    let _ = std::thread::Builder::new()
+        .name("pf-pictures".into())
+        .spawn(move || {
+            for url in &wanted {
+                read_picture(&worker, &api, url);
+            }
+            let _ = read.send(());
+        });
+    let _ = finished.recv_timeout(PICTURES_CUTOFF);
+    let pictures = ctx.shared.pictures.lock().unwrap();
+    let held = |url: String| Some((url.clone(), pictures.held.get(&url)?.clone()));
+    urls.into_iter().filter_map(held).collect()
+}
 
 /// What a pick does: saves it, then connects (or just closes, for "Switch profile…").
 type OnPick = Arc<Mutex<Option<Box<dyn FnOnce(ProfilePick) + Send>>>>;
@@ -30,6 +102,7 @@ pub(crate) struct PickerAsk {
     host: String,
     /// `None`: the list didn't load.
     listed: Option<Arc<Vec<ListedProfile>>>,
+    pictures: Arc<HashMap<String, EncodedImage>>,
     saved: Option<ProfilePick>,
     gone: Option<String>,
     on_pick: OnPick,
@@ -44,7 +117,9 @@ impl PartialEq for PickerAsk {
 }
 
 impl PickerAsk {
+    /// Reads the rows' pictures first, so a worker thread calls this. Blocks.
     fn new(
+        ctx: &Arc<AppCtx>,
         target: &Target,
         listed: Option<Vec<ListedProfile>>,
         saved: Option<ProfilePick>,
@@ -55,11 +130,19 @@ impl PickerAsk {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             host: target.host.name.clone(),
+            pictures: Arc::new(picker_pictures(ctx, target, listed.as_deref())),
             listed: listed.map(Arc::new),
             saved,
             gone,
             on_pick: Arc::new(Mutex::new(Some(Box::new(on_pick)))),
             cancel_to,
+        }
+    }
+
+    /// Close without a pick: a connect waiting on it returns to the host list.
+    pub(crate) fn abandon(&self) {
+        if let Some(back) = &self.cancel_to {
+            back.call(Screen::Hosts);
         }
     }
 }
@@ -80,6 +163,14 @@ impl PartialEq for SeatWait {
         self.title == other.title
             && self.detail == other.detail
             && Arc::ptr_eq(&self.cancel, &other.cancel)
+    }
+}
+
+impl SeatWait {
+    /// Give up the wait: the poll stops, nothing dials, and the shell returns to the host list.
+    pub(crate) fn abandon(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        self.back.call(Screen::Hosts);
     }
 }
 
@@ -107,7 +198,8 @@ fn fetch(
         .host
         .mgmt_port
         .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-    profiles::fetch_within(&target.host.addr, mgmt, &ctx.identity, pin, FETCH_CUTOFF)
+    let (addr, port) = (&target.host.addr, target.host.port);
+    profiles::fetch_within(addr, mgmt, port, &ctx.identity, pin, FETCH_CUTOFF)
 }
 
 fn open(ctx: &AppCtx, ask: PickerAsk) {
@@ -211,6 +303,7 @@ pub(crate) fn seat_then(
             profiles::watch_seat(
                 &target.host.addr,
                 mgmt,
+                target.host.port,
                 &ctx.identity,
                 pin,
                 &row,
@@ -277,7 +370,8 @@ pub(crate) fn then_connect(
                 let row = row_of(rows.as_deref(), Some(&p.id));
                 seat_then(&ctx2, t, pin, &ss, &st, row, move || go(Some(p.id)));
             };
-            let ask = PickerAsk::new(&target, listed, saved, d.gone, on_pick, Some(set_screen));
+            let cancel_to = Some(set_screen);
+            let ask = PickerAsk::new(&ctx, &target, listed, saved, d.gone, on_pick, cancel_to);
             open(&ctx, ask);
         });
 }
@@ -304,7 +398,7 @@ pub(crate) fn switch(
             };
             open(
                 &ctx,
-                PickerAsk::new(&target, listed, saved, None, on_pick, None),
+                PickerAsk::new(&ctx, &target, listed, saved, None, on_pick, None),
             );
         });
 }
@@ -326,30 +420,36 @@ fn chooser(
 
 /// One profile: its circle (tap), its name as the focusable button (keyboard, pad), and the
 /// seat's note. The saved pick is ringed.
-fn profile_card(p: &ListedProfile, saved: bool, go: impl Fn() + Clone + 'static) -> Element {
+fn profile_card(
+    pal: &Palette,
+    p: &ListedProfile,
+    picture: Option<EncodedImage>,
+    saved: bool,
+    go: impl Fn() + Clone + 'static,
+) -> View {
     let fill = p.accent.as_deref().and_then(super::settings::hex_color);
-    let mut ring = border(monogram(&profiles::initials(&p.display_name), 60.0, fill))
+    let mut ring = Border::new()
+        .content(profile_face(pal, &p.display_name, picture, 60.0, fill))
         .border_thickness(uniform(3.0))
         .corner_radius(33.0)
-        .horizontal_alignment(HorizontalAlignment::Center)
-        .on_tapped(go.clone());
+        .horizontal_alignment(HorizontalAlignment::Center);
     if saved {
-        ring = ring.border_brush(ThemeRef::Accent);
+        ring = ring.border_brush(ThemeBrush::Accent);
     }
-    let mut parts: Vec<Element> = vec![
-        ring.into(),
-        button(p.display_name.clone())
-            .subtle()
-            .on_click(go)
+    let click = go.clone();
+    let mut parts: Vec<View> = vec![
+        on_tap(ring, go).into(),
+        button(p.display_name.as_str())
+            .style(ButtonStyle::Subtle)
+            .on_click(click)
             .horizontal_alignment(HorizontalAlignment::Center)
             .into(),
     ];
     if let Some(note) = p.note() {
         parts.push(
-            text_block(note)
+            muted(pal, note)
                 .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText)
-                .wrap()
+                .text_wrapping(TextWrapping::Wrap)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .into(),
         );
@@ -357,115 +457,80 @@ fn profile_card(p: &ListedProfile, saved: bool, go: impl Fn() + Clone + 'static)
     vstack(parts).spacing(6.0).into()
 }
 
-fn quiet(text: String) -> Element {
-    text_block(text)
+fn quiet(pal: &Palette, line: String) -> View {
+    muted(pal, line)
         .font_size(13.0)
-        .wrap()
-        .foreground(ThemeRef::SecondaryText)
+        .text_wrapping(TextWrapping::Wrap)
         .into()
 }
 
-/// A sheet over the screen: `body` in a dialog surface on a scrim. `cancel` runs on Escape and
-/// on a tap outside the surface.
-fn sheet(body: Vec<Element>, cancel: impl Fn() + Clone + 'static) -> Element {
-    // A tap inside the card bubbles to the scrim; the flag makes the scrim swallow it.
-    let inside_tap = std::rc::Rc::new(std::cell::Cell::new(false));
-    let modal = dialog_surface(scroll_view(vstack(body).spacing(14.0)))
-        .on_tapped({
-            let inside_tap = inside_tap.clone();
-            move || inside_tap.set(true)
-        })
-        .max_width(640.0)
-        .horizontal_alignment(HorizontalAlignment::Center)
-        .vertical_alignment(VerticalAlignment::Center)
-        .margin(uniform(24.0));
-    let scrim_cancel = cancel.clone();
-    Element::from(
-        border(modal)
-            .background(Color {
-                a: 140,
-                r: 0,
-                g: 0,
-                b: 0,
-            })
-            .on_tapped(move || {
-                if inside_tap.replace(false) {
-                    return;
-                }
-                scrim_cancel();
-            }),
-    )
-    .keyboard_accelerator(KeyboardAccelerator::new(
-        VirtualKey::Escape,
-        VirtualKeyModifiers::None,
-        cancel,
-    ))
-}
-
-/// The seat wait overlay, in its own stable root slot: the line, the host's detail and Cancel.
+/// The seat wait overlay, in its own root slot: the line, the host's detail and Cancel.
 pub(crate) fn seat_slot(
+    pal: &Palette,
     wait: &Option<SeatWait>,
     set_seat: &AsyncSetState<Option<SeatWait>>,
-) -> Element {
+) -> View {
     let Some(w) = wait else {
-        return border(vstack(Vec::<Element>::new())).into();
+        return Border::new().into();
     };
-    let mut body: Vec<Element> = vec![
-        ProgressRing::indeterminate()
+    let mut body: Vec<View> = vec![
+        ProgressRing::new()
+            .is_indeterminate(true)
             .width(32.0)
             .height(32.0)
             .horizontal_alignment(HorizontalAlignment::Left)
             .into(),
-        text_block(w.title.clone())
+        text(&w.title)
             .font_size(20.0)
-            .bold()
-            .wrap()
+            .font_weight(FontWeight::BOLD)
+            .text_wrapping(TextWrapping::Wrap)
             .into(),
     ];
     if let Some(detail) = &w.detail {
-        body.push(quiet(detail.clone()));
+        body.push(quiet(pal, detail.clone()));
     }
     let cancel = {
-        let (set, flag, back) = (set_seat.clone(), w.cancel.clone(), w.back.clone());
+        let (set, w) = (set_seat.clone(), w.clone());
         move || {
-            flag.store(true, Ordering::SeqCst);
             set.call(None);
-            back.call(Screen::Hosts);
+            w.abandon();
         }
     };
+    let click = cancel.clone();
     body.push(
         button("Cancel")
-            .on_click(cancel.clone())
+            .on_click(click)
             .horizontal_alignment(HorizontalAlignment::Right)
             .into(),
     );
-    sheet(body, cancel)
+    sheet(pal, vstack(body).spacing(14.0), 640.0, 1.0, cancel)
 }
 
-/// The picker overlay, in a stable root slot: a same-kind empty border while closed.
+/// The picker overlay, in its own root slot.
 pub(crate) fn picker_slot(
+    pal: &Palette,
     ask: &Option<PickerAsk>,
     set_picker: &AsyncSetState<Option<PickerAsk>>,
-) -> Element {
+) -> View {
     let Some(a) = ask else {
-        return border(vstack(Vec::<Element>::new())).into();
+        return Border::new().into();
     };
-    let mut body: Vec<Element> = vec![text_block(format!("Who\u{2019}s playing on {}?", a.host))
+    let mut body: Vec<View> = vec![text(format!("Who\u{2019}s playing on {}?", a.host))
         .font_size(20.0)
-        .bold()
-        .wrap()
+        .font_weight(FontWeight::BOLD)
+        .text_wrapping(TextWrapping::Wrap)
         .into()];
     if let Some(gone) = &a.gone {
-        body.push(quiet(format!("{gone} is gone from this host.")));
+        body.push(quiet(pal, format!("{gone} is gone from this host.")));
     }
     let mut close_label = "Cancel";
     match a.listed.as_deref() {
         None => {
-            body.push(quiet("Couldn\u{2019}t load the profiles.".into()));
+            body.push(quiet(pal, "Couldn\u{2019}t load the profiles.".into()));
             close_label = "Close";
         }
         Some(l) if l.is_empty() => {
-            body.push(quiet("No profiles on this host.".into()));
+            body.push(quiet(pal, "No profiles on this host.".into()));
             close_label = "Close";
         }
         Some(l) => {
@@ -473,30 +538,30 @@ pub(crate) fn picker_slot(
             let is_saved = |p: &ListedProfile| a.saved.as_ref().is_some_and(|s| s.id == p.id);
             let mut rows: Vec<&ListedProfile> = l.iter().collect();
             rows.sort_by_key(|p| !is_saved(p));
-            let cards: Vec<Element> = rows
+            let cards: Vec<View> = rows
                 .iter()
                 .map(|p| {
                     let go = chooser(set_picker, &a.on_pick, p.pick());
-                    profile_card(p, is_saved(p), go)
+                    let picture = p.avatar.as_ref().and_then(|u| a.pictures.get(u));
+                    profile_card(pal, p, picture.cloned(), is_saved(p), go)
                 })
                 .collect();
             body.push(tile_grid(cards, l.len().clamp(1, 4), 12.0));
         }
     }
     let cancel = {
-        let (set, back) = (set_picker.clone(), a.cancel_to.clone());
+        let (set, a) = (set_picker.clone(), a.clone());
         move || {
             set.call(None);
-            if let Some(back) = &back {
-                back.call(Screen::Hosts);
-            }
+            a.abandon();
         }
     };
+    let click = cancel.clone();
     body.push(
         button(close_label)
-            .on_click(cancel.clone())
+            .on_click(click)
             .horizontal_alignment(HorizontalAlignment::Right)
             .into(),
     );
-    sheet(body, cancel)
+    sheet(pal, vstack(body).spacing(14.0), 640.0, 1.0, cancel)
 }

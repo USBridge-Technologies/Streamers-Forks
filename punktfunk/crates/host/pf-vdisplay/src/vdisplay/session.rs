@@ -37,43 +37,61 @@ static LAST_INSTANCE: std::sync::Mutex<Option<(ActiveKind, Option<u32>)>> =
     std::sync::Mutex::new(None);
 
 /// If the live compositor instance changed — different [`ActiveKind`], or same kind new PID —
-/// bump [`SESSION_EPOCH`] and drop the previous backend's kept displays.
-/// Idempotent per instance. Call from every site that detects the session.
+/// bump [`SESSION_EPOCH`] and drop the previous backend's kept displays. A new desktop also
+/// takes back the desk changes a dead host left. Idempotent per instance. Call from every site
+/// that detects the session.
 pub fn observe_session_instance(active: &ActiveSession) {
     let cur = (active.kind, active.compositor_pid);
-    // Decide under the lock, act outside it. The action takes the registry lock and shells out
-    // to `systemctl` on a 10 s budget; holding LAST_INSTANCE across that blocks every detector.
-    // Advance the baseline inside the lock so a concurrent observer cannot run the action twice.
-    let changed = {
-        let mut last = LAST_INSTANCE.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = *last;
-        // `None` is not an observation ([`classify_instance_change`]). Recording it as the
-        // baseline would make the next real desktop look like `None → Desktop` and bump the
-        // epoch under live pooled displays. Leave the last real instance; a miss is inert.
-        if cur.0 != ActiveKind::None {
-            *last = Some(cur);
-        }
-        prev
+    let Some((from, invalidate, scrub, epoch)) =
+        advance_instance(&LAST_INSTANCE, cur, bump_session_epoch)
+    else {
+        return;
     };
-    if let Some(prev) = changed {
-        if let InstanceChange::NewInstance { invalidate } = classify_instance_change(prev, cur) {
-            if let Some(old_kind) = invalidate {
-                if let Some(old) = compositor_for_kind(old_kind) {
-                    registry::invalidate_backend(old.id());
-                }
-                // Dead desktop WAYLAND_DISPLAY may still sit in systemd --user. Scrub now or
-                // the next `gamescope-session.target` starts nested on the dead socket.
-                scrub_desktop_manager_env();
-            }
-            let epoch = bump_session_epoch();
-            tracing::info!(
-                from = ?prev.0,
-                to = ?cur.0,
-                epoch,
-                "desktop compositor instance changed — session epoch bumped"
-            );
-            // A compositor that just came up can run the undos a dead host left for it.
-            crate::routing::reclaim_topology_journal();
+    if let Some(old_kind) = invalidate {
+        if let Some(old) = compositor_for_kind(old_kind) {
+            registry::invalidate_backend(old.id());
+        }
+    }
+    // Dead desktop WAYLAND_DISPLAY may still sit in systemd --user. Scrub now or
+    // the next `gamescope-session.target` starts nested on the dead socket.
+    if scrub {
+        scrub_desktop_manager_env();
+    }
+    tracing::info!(
+        from = ?from,
+        to = ?cur.0,
+        epoch,
+        "desktop compositor instance changed — session epoch bumped"
+    );
+    // A desktop that just came up can run the desk undos a dead host left for it. Game Mode
+    // runs none, and this is the stream thread mid-rebuild.
+    if is_desktop_kind(cur.0) {
+        crate::routing::reclaim_topology_journal();
+    }
+}
+
+/// The decision half of [`observe_session_instance`], under `last`'s lock: advance the baseline
+/// to `cur` and, on a new instance, `bump` the epoch, so a second observer of the same change
+/// returns already seeing the new epoch. `Some((from, invalidate, scrub, epoch))` names the work
+/// left; it runs unlocked, since it takes the registry lock and shells out on a 10 s budget.
+fn advance_instance(
+    last: &std::sync::Mutex<Option<(ActiveKind, Option<u32>)>>,
+    cur: (ActiveKind, Option<u32>),
+    bump: impl FnOnce() -> u64,
+) -> Option<(ActiveKind, Option<ActiveKind>, bool, u64)> {
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = *last;
+    // `None` is not an observation ([`classify_instance_change`]). Recording it as the
+    // baseline would make the next real desktop look like `None → Desktop` and bump the
+    // epoch under live pooled displays. Leave the last real instance; a miss is inert.
+    if cur.0 != ActiveKind::None {
+        *last = Some(cur);
+    }
+    let prev = prev?;
+    match classify_instance_change(prev, cur) {
+        InstanceChange::Nothing => None,
+        InstanceChange::NewInstance { invalidate, scrub } => {
+            Some((prev.0, invalidate, scrub, bump()))
         }
     }
 }
@@ -84,8 +102,11 @@ enum InstanceChange {
     Nothing,
     /// Bump the epoch. `invalidate` is the outgoing desktop whose kept nodes died with it;
     /// `None` when the outgoing session was gamescope / nothing (no pooled displays).
+    /// `scrub`: drop the dead desktop's socket vars from systemd `--user`, which only a
+    /// non-desktop successor wants — a new desktop has just imported its own.
     NewInstance {
         invalidate: Option<ActiveKind>,
+        scrub: bool,
     },
 }
 
@@ -109,14 +130,16 @@ fn classify_instance_change(
     {
         return InstanceChange::Nothing;
     }
+    let invalidate = is_desktop_kind(prev.0).then_some(prev.0);
     InstanceChange::NewInstance {
-        invalidate: is_desktop_kind(prev.0).then_some(prev.0),
+        invalidate,
+        scrub: invalidate.is_some() && !is_desktop_kind(cur.0),
     }
 }
 
 /// Drop the dead desktop's socket vars from systemd `--user` so a later `gamescope-session.target`
 /// does not inherit them and nest against the dead socket. Best-effort; D-Bus activation has no
-/// unset. A desktop restart re-imports via [`settle_desktop_portal`].
+/// unset. Never after a desktop restart: the new desktop has imported its own values.
 #[cfg(target_os = "linux")]
 fn scrub_desktop_manager_env() {
     let _ = crate::proc::status_within(
@@ -142,6 +165,7 @@ pub(crate) fn is_desktop_kind(kind: ActiveKind) -> bool {
             | ActiveKind::DesktopWlroots
             | ActiveKind::DesktopHyprland
             | ActiveKind::DesktopNiri
+            | ActiveKind::DesktopUmbriel
     )
 }
 
@@ -158,6 +182,8 @@ pub enum ActiveKind {
     DesktopHyprland,
     /// niri or its biri fork: JSON IPC on `$NIRI_SOCKET`, wlr virtual input.
     DesktopNiri,
+    /// Umbriel: JSON IPC on `$UMBRIEL_SOCKET`, wlr virtual input.
+    DesktopUmbriel,
     None,
 }
 
@@ -196,6 +222,7 @@ pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
         ActiveKind::DesktopWlroots => Some(Compositor::Wlroots),
         ActiveKind::DesktopHyprland => Some(Compositor::Hyprland),
         ActiveKind::DesktopNiri => Some(Compositor::Niri),
+        ActiveKind::DesktopUmbriel => Some(Compositor::Umbriel),
         ActiveKind::None => None,
     }
 }
@@ -214,6 +241,7 @@ struct EnvProbe {
     hyprland_signature: Option<String>,
     swaysock: Option<String>,
     niri_socket: Option<String>,
+    umbriel_socket: Option<String>,
 }
 
 impl EnvProbe {
@@ -230,6 +258,7 @@ impl EnvProbe {
             hyprland_signature: v("HYPRLAND_INSTANCE_SIGNATURE"),
             swaysock: v("SWAYSOCK"),
             niri_socket: v("NIRI_SOCKET"),
+            umbriel_socket: v("UMBRIEL_SOCKET"),
         })
     }
 }
@@ -278,6 +307,7 @@ pub fn detect_active_session() -> ActiveSession {
     let mut winning_pid: Option<u32> = None;
     // scroll shares sway's backend but not its desktop name, which portal routing reads.
     let mut winning_scroll = false;
+    let mut umbriels = Vec::new();
     for (pid, pid_path) in crate::proc::own_pids() {
         let Some(comm) = crate::proc::match_name(&pid_path) else {
             continue;
@@ -292,6 +322,10 @@ pub fn detect_active_session() -> ActiveSession {
             "sway" | "river" | "scroll" => (ActiveKind::DesktopWlroots, 4),
             // biri is the niri fork with virtual outputs; `biri-altinstall` keeps its own name.
             "niri" | "biri" => (ActiveKind::DesktopNiri, 4),
+            "umbriel" => {
+                umbriels.push(pid);
+                (ActiveKind::DesktopUmbriel, 4)
+            }
             _ => continue,
         };
         // Lowest pid among same-priority hits, so `/proc` order cannot flap `winning_pid`
@@ -308,7 +342,8 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopKde
         | ActiveKind::DesktopWlroots
         | ActiveKind::DesktopHyprland
-        | ActiveKind::DesktopNiri => find_wayland_socket(&env, &xdg_runtime_dir, uid),
+        | ActiveKind::DesktopNiri
+        | ActiveKind::DesktopUmbriel => find_wayland_socket(&env, &xdg_runtime_dir, uid),
         _ => None,
     };
     let xdg_current_desktop = match kind {
@@ -319,6 +354,7 @@ pub fn detect_active_session() -> ActiveSession {
         // Real desktop name so portal routing (`[Hyprland]`) and xdph's own checks fire.
         ActiveKind::DesktopHyprland => Some("Hyprland".to_string()),
         ActiveKind::DesktopNiri => Some("niri".to_string()),
+        ActiveKind::DesktopUmbriel => Some("umbriel".to_string()),
         ActiveKind::Gaming => Some("gamescope".to_string()),
         ActiveKind::None => None,
     };
@@ -334,9 +370,26 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopNiri => find_niri_socket(&env, &xdg_runtime_dir, uid, winning_pid),
         _ => None,
     };
-    // A `niri msg` child shares the compositor's name; the socket names the compositor itself.
-    if let Some(pid) = niri_socket.as_deref().and_then(niri_socket_pid) {
+    // A `niri msg` child shares the compositor's name; the socket names the compositor itself,
+    // and counts only while that compositor runs.
+    if let Some(pid) = niri_socket
+        .as_deref()
+        .and_then(ipc_socket_pid)
+        .filter(|&pid| crate::proc::pid_alive(pid))
+    {
         winning_pid = Some(pid);
+    }
+    // A `umbriel msg` child shares the compositor's name too; the socket's holder is the
+    // compositor. Its socket is found per call ([`umbriel_socket`]), not stored.
+    if kind == ActiveKind::DesktopUmbriel {
+        winning_pid = find_umbriel_socket(&env, &xdg_runtime_dir, uid, wayland_display.as_deref())
+            .and_then(|s| listener_pid(&s, &umbriels))
+            .or_else(|| {
+                umbriels
+                    .iter()
+                    .copied()
+                    .min_by_key(|&p| crate::proc::start_ticks(p))
+            });
     }
     ActiveSession {
         kind,
@@ -353,13 +406,14 @@ pub fn detect_active_session() -> ActiveSession {
     }
 }
 
-/// Live Hyprland instance signature for this uid. Trust a valid inherited value; else the newest
-/// owned instance dir under `$XDG_RUNTIME_DIR/hypr/` that still has `.socket.sock`.
+/// Live Hyprland instance signature for this uid: the inherited one while its `.socket.sock`
+/// answers ([`inherited_live`]), else the newest owned instance dir under
+/// `$XDG_RUNTIME_DIR/hypr/` that still has `.socket.sock`.
 #[cfg(target_os = "linux")]
 fn find_hypr_signature(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
     let hypr = std::path::Path::new(runtime).join("hypr");
     if let Some(sig) = &env.hyprland_signature {
-        if hypr.join(sig).join(".socket.sock").exists() {
+        if inherited_live(&hypr.join(sig).join(".socket.sock")) {
             return Some(sig.clone());
         }
     }
@@ -393,23 +447,45 @@ fn newest_owned(
 #[cfg(target_os = "linux")]
 const SWAY_IPC_STEMS: [&str; 2] = ["sway-ipc", "scroll-ipc"];
 
-/// Live sway-protocol IPC socket for this uid. Inherited path if it still exists; else
-/// `<stem>.<uid>.<pid>.sock` for the detected compositor PID (identity, not a guess); else newest
-/// owned `<stem>.<uid>.*.sock` (re-exec / wrapper). `None` on river: no sway IPC, and the wlroots
-/// backend talks through `swaymsg`.
+/// The compositor pid a sway, scroll or niri IPC socket name ends in; `None` for any other name.
+#[cfg(target_os = "linux")]
+fn ipc_socket_pid(path: &str) -> Option<u32> {
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    let known = is_niri_socket_name(name)
+        || SWAY_IPC_STEMS
+            .iter()
+            .any(|stem| name.starts_with(&format!("{stem}.")));
+    let stem = name.strip_suffix(".sock").filter(|_| known)?;
+    stem.rsplit('.').next()?.parse().ok()
+}
+
+/// Whether an inherited IPC socket still has its compositor: the pid its name ends in runs, or,
+/// for a name without one, a connect succeeds. A crashed compositor leaves the file behind.
+#[cfg(target_os = "linux")]
+fn inherited_live(path: &std::path::Path) -> bool {
+    match path.to_str().and_then(ipc_socket_pid) {
+        Some(pid) => path.exists() && crate::proc::pid_alive(pid),
+        None => connect_within(path).is_ok(),
+    }
+}
+
+/// Live sway-protocol IPC socket for this uid: `<stem>.<uid>.<pid>.sock` for the detected
+/// compositor PID (identity, not a guess); else the inherited path while its compositor runs
+/// ([`inherited_live`]); else newest owned `<stem>.<uid>.*.sock` (re-exec / wrapper). `None` on
+/// river: no sway IPC, and the wlroots backend talks through `swaymsg`.
 #[cfg(target_os = "linux")]
 fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
-    if let Some(s) = &env.swaysock {
-        if std::path::Path::new(s).exists() {
-            return Some(s.clone());
-        }
-    }
     if let Some(pid) = pid {
         for stem in SWAY_IPC_STEMS {
             let exact = std::path::Path::new(runtime).join(format!("{stem}.{uid}.{pid}.sock"));
             if exact.exists() {
                 return Some(exact.to_string_lossy().into_owned());
             }
+        }
+    }
+    if let Some(s) = &env.swaysock {
+        if inherited_live(std::path::Path::new(s)) {
+            return Some(s.clone());
         }
     }
     let prefixes = SWAY_IPC_STEMS.map(|stem| format!("{stem}.{uid}."));
@@ -425,39 +501,29 @@ fn is_niri_socket_name(name: &str) -> bool {
     name.starts_with("niri.") && name.ends_with(".sock")
 }
 
-/// Compositor pid from a niri socket path, `None` for any other name.
-#[cfg(target_os = "linux")]
-fn niri_socket_pid(path: &str) -> Option<u32> {
-    let name = std::path::Path::new(path).file_name()?.to_str()?;
-    if !is_niri_socket_name(name) {
-        return None;
-    }
-    name.trim_end_matches(".sock")
-        .rsplit('.')
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// Live niri IPC socket for this uid: the inherited `NIRI_SOCKET` if it still exists, else
-/// the one `pid` opened, else the newest owned `niri.*.sock`.
+/// Live niri IPC socket for this uid: the one `pid` opened, else the inherited `NIRI_SOCKET`
+/// while its compositor runs ([`inherited_live`]), else the newest owned `niri.*.sock`.
 #[cfg(target_os = "linux")]
 fn find_niri_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
-    if let Some(s) = &env.niri_socket {
-        if std::path::Path::new(s).exists() {
-            return Some(s.clone());
-        }
-    }
     let dir = std::path::Path::new(runtime);
     if let Some(pid) = pid {
         let suffix = format!(".{pid}.sock");
-        let exact = std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            (is_niri_socket_name(&name) && name.ends_with(&suffix))
-                .then(|| e.path().to_string_lossy().into_owned())
-        });
+        let exact = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (is_niri_socket_name(&name) && name.ends_with(&suffix))
+                    .then(|| e.path().to_string_lossy().into_owned())
+            });
         if exact.is_some() {
             return exact;
+        }
+    }
+    if let Some(s) = &env.niri_socket {
+        if inherited_live(std::path::Path::new(s)) {
+            return Some(s.clone());
         }
     }
     newest_owned(dir, uid, |name, _, path| {
@@ -471,6 +537,74 @@ pub(crate) fn niri_socket() -> Option<String> {
     let probe = EnvProbe::sample();
     let runtime = default_runtime_dir(&probe);
     find_niri_socket(&probe, &runtime, crate::proc::current_uid(), None)
+}
+
+/// Live Umbriel IPC socket for this uid: the inherited `UMBRIEL_SOCKET` while it exists, else
+/// `umbriel-<wayland>.sock` beside the Wayland socket, else the newest owned `umbriel-*.sock`.
+#[cfg(target_os = "linux")]
+fn find_umbriel_socket(
+    env: &EnvProbe,
+    runtime: &str,
+    uid: u32,
+    wayland: Option<&str>,
+) -> Option<String> {
+    if let Some(s) = env
+        .umbriel_socket
+        .as_ref()
+        .filter(|s| std::path::Path::new(s).exists())
+    {
+        return Some(s.clone());
+    }
+    let dir = std::path::Path::new(runtime);
+    if let Some(w) = wayland {
+        let exact = dir.join(format!("umbriel-{w}.sock"));
+        if exact.exists() {
+            return Some(exact.to_string_lossy().into_owned());
+        }
+    }
+    newest_owned(dir, uid, |name, _, path| {
+        (name.starts_with("umbriel-") && name.ends_with(".sock"))
+            .then(|| path.to_string_lossy().into_owned())
+    })
+}
+
+/// `UMBRIEL_SOCKET` for the Umbriel backend, resolved per call like [`niri_socket`].
+#[cfg(target_os = "linux")]
+pub(crate) fn umbriel_socket() -> Option<String> {
+    let probe = EnvProbe::sample();
+    let runtime = default_runtime_dir(&probe);
+    let wayland = probe.wayland_display.clone();
+    find_umbriel_socket(
+        &probe,
+        &runtime,
+        crate::proc::current_uid(),
+        wayland.as_deref(),
+    )
+}
+
+/// The inode of the socket listening at `path`, from `/proc/net/unix` text. Accepted
+/// connections list the same path; only the listener carries `__SO_ACCEPTCON` (0x10000).
+#[cfg(target_os = "linux")]
+fn listening_inode(net_unix: &str, path: &str) -> Option<u64> {
+    net_unix.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let flags = u32::from_str_radix(f.get(3)?, 16).ok()?;
+        (f.get(7) == Some(&path) && flags & 0x1_0000 != 0).then(|| f.get(6)?.parse().ok())?
+    })
+}
+
+/// Which of `pids` holds the socket listening at `path`: the compositor, never a CLI child.
+#[cfg(target_os = "linux")]
+fn listener_pid(path: &str, pids: &[u32]) -> Option<u32> {
+    let net = std::fs::read_to_string("/proc/net/unix").ok()?;
+    let want = format!("socket:[{}]", listening_inode(&net, path)?);
+    pids.iter().copied().find(|pid| {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == want.as_str()))
+    })
 }
 
 /// `HYPRLAND_INSTANCE_SIGNATURE` for a `hyprctl` child, resolved at spawn.
@@ -591,16 +725,37 @@ pub fn apply_session_env(active: &ActiveSession) {
 #[cfg(not(target_os = "linux"))]
 pub fn apply_session_env(_active: &ActiveSession) {}
 
-/// A connection to the live compositor: the stored session's socket, or the environment's
-/// while nothing is stored (a host started inside its desktop, before the first connect).
+/// A connection to the live compositor: the stored session's socket within
+/// [`CONNECT_BUDGET`], or the environment's while nothing is stored (a host started inside its
+/// desktop, before the first connect).
 #[cfg(target_os = "linux")]
 pub(crate) fn wayland_connect() -> Result<wayland_client::Connection, wayland_client::ConnectError>
 {
     use wayland_client::{ConnectError, Connection};
-    match pf_host_config::session::wayland_stream() {
-        Some(stream) => Connection::from_socket(stream.map_err(|_| ConnectError::NoCompositor)?),
-        None => Connection::connect_to_env(),
-    }
+    let Some(session) = pf_host_config::session::get() else {
+        return Connection::connect_to_env();
+    };
+    let path = session.wayland_socket().ok_or(ConnectError::NoCompositor)?;
+    let stream = connect_within(&path).map_err(|_| ConnectError::NoCompositor)?;
+    Connection::from_socket(stream)
+}
+
+/// One connect's ceiling. A compositor that stops accepting fills its listen backlog, and a
+/// plain `connect` then waits for it without end; a live one drains the backlog within frames.
+#[cfg(target_os = "linux")]
+const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Connect to the Unix socket at `path` within [`CONNECT_BUDGET`]. Linux bounds a Unix
+/// connect's wait for backlog room by `SO_SNDTIMEO`; a nonblocking one answers `EAGAIN`, with
+/// no pending connect to poll. The timeout is cleared before the stream is handed on.
+#[cfg(target_os = "linux")]
+fn connect_within(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.set_write_timeout(Some(CONNECT_BUDGET))?;
+    socket.connect(&SockAddr::unix(path)?)?;
+    socket.set_write_timeout(None)?;
+    Ok(socket.into())
 }
 
 /// Operator session-recovery hook (`PUNKTFUNK_RECOVER_SESSION_CMD`) when a client connects with
@@ -735,8 +890,10 @@ mod instance_change_tests {
                 (ActiveKind::DesktopGnome, Some(2))
             ),
             InstanceChange::NewInstance {
-                invalidate: Some(ActiveKind::DesktopKde)
-            }
+                invalidate: Some(ActiveKind::DesktopKde),
+                scrub: false,
+            },
+            "the new desktop imported its own socket vars; scrubbing takes them away"
         );
         assert_eq!(
             classify_instance_change(
@@ -744,7 +901,8 @@ mod instance_change_tests {
                 (ActiveKind::Gaming, Some(2))
             ),
             InstanceChange::NewInstance {
-                invalidate: Some(ActiveKind::DesktopKde)
+                invalidate: Some(ActiveKind::DesktopKde),
+                scrub: true,
             }
         );
         assert_eq!(
@@ -752,7 +910,38 @@ mod instance_change_tests {
                 (ActiveKind::Gaming, Some(1)),
                 (ActiveKind::DesktopKde, Some(2))
             ),
-            InstanceChange::NewInstance { invalidate: None }
+            InstanceChange::NewInstance {
+                invalidate: None,
+                scrub: false,
+            }
+        );
+    }
+
+    /// Two observers of one change: the decision alone bumps the epoch, so the second returns
+    /// seeing it before the first has invalidated or scrubbed anything.
+    #[test]
+    fn a_second_observer_of_a_change_sees_the_new_epoch_at_once() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let last = std::sync::Mutex::new(None);
+        let epoch = AtomicU64::new(7);
+        let bump = || epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let first = (ActiveKind::DesktopKde, Some(1));
+        assert_eq!(advance_instance(&last, first, bump), None, "a baseline");
+        let restart = (ActiveKind::DesktopKde, Some(2));
+        assert_eq!(
+            advance_instance(&last, restart, bump),
+            Some((
+                ActiveKind::DesktopKde,
+                Some(ActiveKind::DesktopKde),
+                false,
+                8
+            ))
+        );
+        assert_eq!(advance_instance(&last, restart, bump), None);
+        assert_eq!(
+            epoch.load(Ordering::Relaxed),
+            8,
+            "bumped once, by the decision"
         );
     }
 
@@ -764,7 +953,8 @@ mod instance_change_tests {
                 (ActiveKind::DesktopKde, Some(2))
             ),
             InstanceChange::NewInstance {
-                invalidate: Some(ActiveKind::DesktopKde)
+                invalidate: Some(ActiveKind::DesktopKde),
+                scrub: false,
             }
         );
         assert_eq!(
@@ -868,6 +1058,158 @@ mod tests {
         std::fs::write(rt.dir.join(format!("sway-ipc.{other}.500.sock")), b"").unwrap();
         let got = find_sway_socket(&no_inherited_env(), rt.path(), rt.uid, Some(500));
         assert_eq!(got, None);
+    }
+
+    /// No process has this pid: it is above the kernel's `pid_max` ceiling (2^22).
+    const DEAD_PID: u32 = 4_194_305;
+
+    /// Make `path` older than anything made after it, as a crashed compositor's leftover is.
+    fn backdate(path: &std::path::Path) {
+        let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(3600);
+        std::fs::File::open(path)
+            .and_then(|f| f.set_modified(then))
+            .unwrap();
+    }
+
+    /// A crashed sway leaves its socket. Inherited, it loses to the live one beside it, whether
+    /// or not detection named the live pid.
+    #[test]
+    fn an_inherited_socket_of_a_dead_sway_is_passed_over() {
+        let live = std::process::id();
+        let rt = FakeRuntime::new("deadsway", &[DEAD_PID, live]);
+        let stale = format!("{}/sway-ipc.{}.{DEAD_PID}.sock", rt.path(), rt.uid);
+        backdate(std::path::Path::new(&stale));
+        let env = EnvProbe {
+            swaysock: Some(stale),
+            ..EnvProbe::default()
+        };
+        let want = format!("{}/sway-ipc.{}.{live}.sock", rt.path(), rt.uid);
+        for pid in [Some(live), None] {
+            let got = find_sway_socket(&env, rt.path(), rt.uid, pid);
+            assert_eq!(got.as_deref(), Some(want.as_str()), "pid {pid:?}");
+        }
+    }
+
+    /// An inherited socket whose compositor runs is taken as it is, wherever it lives.
+    #[test]
+    fn an_inherited_socket_of_a_live_sway_is_kept() {
+        let rt = FakeRuntime::new("livesway", &[]);
+        let elsewhere = FakeRuntime::new("livesway-elsewhere", &[std::process::id()]);
+        let sock = format!(
+            "{}/sway-ipc.{}.{}.sock",
+            elsewhere.path(),
+            rt.uid,
+            std::process::id()
+        );
+        let env = EnvProbe {
+            swaysock: Some(sock.clone()),
+            ..EnvProbe::default()
+        };
+        assert_eq!(find_sway_socket(&env, rt.path(), rt.uid, None), Some(sock));
+    }
+
+    /// niri after a `kill -9` and a restart: the inherited `NIRI_SOCKET` names the dead one.
+    #[test]
+    fn an_inherited_socket_of_a_dead_niri_is_passed_over() {
+        let live = std::process::id();
+        let rt = FakeRuntime::new("deadniri", &[]);
+        let stale = rt.dir.join(format!("niri.wayland-1.{DEAD_PID}.sock"));
+        let fresh = rt.dir.join(format!("niri.wayland-1.{live}.sock"));
+        std::fs::write(&stale, b"").unwrap();
+        std::fs::write(&fresh, b"").unwrap();
+        backdate(&stale);
+        let env = EnvProbe {
+            niri_socket: Some(stale.to_string_lossy().into_owned()),
+            ..EnvProbe::default()
+        };
+        let want = fresh.to_string_lossy().into_owned();
+        for pid in [Some(live), None] {
+            let got = find_niri_socket(&env, rt.path(), rt.uid, pid);
+            assert_eq!(got.as_deref(), Some(want.as_str()), "pid {pid:?}");
+        }
+    }
+
+    /// Umbriel's socket: the inherited path while it exists, else the one named after the
+    /// Wayland socket, else the newest owned `umbriel-*.sock`.
+    #[test]
+    fn the_umbriel_socket_is_found_inherited_by_wayland_name_or_newest() {
+        let rt = FakeRuntime::new("umbriel", &[]);
+        let ours = rt.dir.join("umbriel-wayland-1.sock");
+        let other = rt.dir.join("umbriel-wayland-9.sock");
+        std::fs::write(&ours, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+        backdate(&ours);
+        let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let inherited = EnvProbe {
+            umbriel_socket: Some(path(&ours)),
+            ..EnvProbe::default()
+        };
+        let find = |env: &EnvProbe, w| find_umbriel_socket(env, rt.path(), rt.uid, w);
+        assert_eq!(find(&inherited, None), Some(path(&ours)));
+        let gone = EnvProbe {
+            umbriel_socket: Some(path(&rt.dir.join("umbriel-wayland-0.sock"))),
+            ..EnvProbe::default()
+        };
+        assert_eq!(find(&gone, Some("wayland-1")), Some(path(&ours)));
+        assert_eq!(find(&gone, None), Some(path(&other)), "the newest");
+    }
+
+    /// Only the listener carries `__SO_ACCEPTCON`; an accepted connection lists the same path.
+    #[test]
+    fn the_listening_socket_is_told_from_its_connections() {
+        let net = "Num       RefCount Protocol Flags    Type St Inode Path\n\
+            0000000000000000: 00000003 00000000 00000000 0001 03 4711 /run/user/1000/umbriel-wayland-1.sock\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 4242 /run/user/1000/umbriel-wayland-1.sock\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 99 /run/user/1000/wayland-1\n";
+        let sock = "/run/user/1000/umbriel-wayland-1.sock";
+        assert_eq!(listening_inode(net, sock), Some(4242));
+        assert_eq!(listening_inode(net, "/run/user/1000/nope.sock"), None);
+        // A pid holding no such socket is never the compositor.
+        assert_eq!(listener_pid(sock, &[std::process::id()]), None);
+    }
+
+    /// A Hyprland signature names no pid: the inherited one counts while its socket answers.
+    #[test]
+    fn an_inherited_hyprland_signature_counts_while_its_socket_answers() {
+        let rt = FakeRuntime::new("hypr", &[]);
+        let dead = rt.dir.join("hypr/dead_sig");
+        let live = rt.dir.join("hypr/live_sig");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(dead.join(".socket.sock"), b"").unwrap();
+        backdate(&dead);
+        let _listener = std::os::unix::net::UnixListener::bind(live.join(".socket.sock")).unwrap();
+        for inherited in ["dead_sig", "live_sig"] {
+            let env = EnvProbe {
+                hyprland_signature: Some(inherited.into()),
+                ..EnvProbe::default()
+            };
+            let got = find_hypr_signature(&env, rt.path(), rt.uid);
+            assert_eq!(got.as_deref(), Some("live_sig"), "inherited {inherited}");
+        }
+    }
+
+    /// A listening socket connects; a leftover file and a missing path do not.
+    #[test]
+    fn a_budgeted_connect_reaches_only_a_listener() {
+        let rt = FakeRuntime::new("connect", &[]);
+        let live = rt.dir.join("wayland-1");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        assert!(connect_within(&live).is_ok());
+        let stale = rt.dir.join("wayland-0");
+        std::fs::write(&stale, b"").unwrap();
+        assert!(connect_within(&stale).is_err());
+        assert!(connect_within(&rt.dir.join("wayland-9")).is_err());
+    }
+
+    /// Only the sway, scroll and niri name shapes carry a pid.
+    #[test]
+    fn only_a_known_ipc_socket_name_carries_a_pid() {
+        assert_eq!(ipc_socket_pid("/run/niri.wayland-1.4242.sock"), Some(4242));
+        assert_eq!(ipc_socket_pid("/run/sway-ipc.1000.77.sock"), Some(77));
+        assert_eq!(ipc_socket_pid("/run/scroll-ipc.1000.77.sock"), Some(77));
+        assert_eq!(ipc_socket_pid("/tmp/my.42.sock"), None);
+        assert_eq!(ipc_socket_pid("/run/hypr/sig/.socket.sock"), None);
     }
 
     /// A socket named as ours but owned by someone else must fail the metadata check — the name

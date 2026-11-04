@@ -12,6 +12,9 @@
 //! models. `PUNKTFUNK_FAKE_LIBRARY=<file.json>` feeds canned entries with no host
 //! (portrait paths starting with `/` load from disk), the GPU-only dev path.
 
+// Windows counts `Instant` from boot, so `now - 60 s` panics in a console started at log-in.
+#![warn(clippy::unchecked_time_subtraction)]
+
 use crate::session_main::{
     arg_flag, arg_value, fullscreen_mode, parse_host_port, session_params, stats_tier, window_pos,
 };
@@ -40,6 +43,194 @@ struct PendingApproval {
     addr: String,
     port: u16,
     fp_hex: String,
+}
+
+/// Where the console opens, and what it seeds.
+struct Entry {
+    entry: ConsoleEntry,
+    /// The window title's host, when a target named one.
+    label: Option<String>,
+    /// A target the store does not know, listed until the store or an advert covers it.
+    seed: Option<HostRow>,
+}
+
+/// An explicit target wins: paired, it opens straight into its library; unpaired or unknown,
+/// it lands on Home seeded into the list (one A from pairing). A bare launch asks the
+/// start-screen policy, reading `settings` only then. The fake-library hook fabricates a
+/// paired host with no network, and beats the policy too.
+fn console_entry(
+    target: Option<&str>,
+    known: &trust::KnownHosts,
+    fake: bool,
+    settings: impl FnOnce() -> trust::Settings,
+) -> Entry {
+    match target {
+        Some(target) => {
+            let (addr, port) = parse_host_port(target);
+            // `find_by_addr`, not a scan: a pinned record beats a placeholder saved at the
+            // same address, and an address can carry more than one identity.
+            let k = known.find_by_addr(&addr, port);
+            let mut row = seed_row(k, &addr, port);
+            row.paired |= fake;
+            let label = Some(row.name.clone());
+            let seed = k.is_none().then(|| row.clone());
+            let entry = if row.paired {
+                ConsoleEntry::Library(Box::new(row))
+            } else {
+                ConsoleEntry::Home
+            };
+            Entry { entry, label, seed }
+        }
+        None if fake => Entry {
+            entry: ConsoleEntry::Library(Box::new(fake_host_row())),
+            label: None,
+            seed: None,
+        },
+        None => {
+            let settings = settings();
+            let (default, source) = start::default_host_with_source(&settings, known);
+            tracing::info!(
+                start_in = start::StartIn::parse(&settings.start_in).as_str(),
+                default = default.map_or("none", |i| known.hosts[i].name.as_str()),
+                source = source.as_str(),
+                "console start"
+            );
+            let row = |i: usize| {
+                let k = &known.hosts[i];
+                Box::new(seed_row(Some(k), &k.addr, k.port))
+            };
+            let entry = match start::start_screen(&settings, known) {
+                start::Start::Hosts => ConsoleEntry::Home,
+                start::Start::Library(i) => ConsoleEntry::Library(row(i)),
+                start::Start::Stream(i) => ConsoleEntry::Stream(row(i)),
+            };
+            Entry {
+                entry,
+                label: None,
+                seed: None,
+            }
+        }
+    }
+}
+
+/// The session let us in. A request-access connect that just succeeded means the operator
+/// approved us: the host is saved as paired, keyed to the fingerprint we pinned. The host's
+/// library port from its Welcome is recorded after that persist, so a host saved by this very
+/// connect gets it too (`0` = none advertised, a no-op). A normal launch touches last-used only.
+fn note_connected(pending: &Mutex<Option<PendingApproval>>, fingerprint: [u8; 32], mgmt_port: u16) {
+    let fp_hex = trust::hex(&fingerprint);
+    trust::touch_last_used(&fp_hex);
+    if let Some(p) = pending.lock().unwrap().take() {
+        if p.fp_hex == fp_hex {
+            if let Err(e) = trust::persist_host(&p.name, &p.addr, p.port, &fp_hex, true, &[]) {
+                tracing::warn!(error = %format!("{e:#}"), "saving the approved host");
+            }
+        }
+    }
+    trust::learn_mgmt_port_by_fp(&fp_hex, mgmt_port);
+}
+
+/// What the launch handler holds across actions: the console's identity for the session,
+/// `--all-screens`, and the request-access hand-off slot [`note_connected`] reads.
+struct Launcher {
+    identity: (String, String),
+    all_screens: bool,
+    pending_approval: Arc<Mutex<Option<PendingApproval>>>,
+}
+
+impl Launcher {
+    /// One overlay action. A launch becomes the session's params, re-resolved from the
+    /// settings and the host's preset binding each time; the run-loop-side and Android-only
+    /// actions are handled there, listed so adding an action to the enum keeps failing
+    /// loudly here instead of falling into a wildcard that silently drops it.
+    fn act(
+        &self,
+        action: OverlayAction,
+        gamepad: &pf_client_core::gamepad::GamepadService,
+        native: punktfunk_core::config::Mode,
+        hdr: Option<punktfunk_core::quic::HdrMeta>,
+        force_software: Arc<AtomicBool>,
+        vulkan: Option<pf_client_core::video::VulkanDecodeDevice>,
+    ) -> ActionOutcome {
+        match action {
+            OverlayAction::Launch {
+                addr,
+                port,
+                fp_hex,
+                launch,
+                title,
+                request_access,
+                preset,
+                profile,
+            } => {
+                let Some(pin) = trust::parse_hex32(&fp_hex) else {
+                    // Connect (and request-access) pin the host's advertised fingerprint;
+                    // a pinless launch is a logic slip, never a silent TOFU.
+                    tracing::warn!(%addr, "launch without a stored pin — refusing");
+                    return ActionOutcome::Handled;
+                };
+                tracing::info!(%addr, %title, request_access,
+                    launch = launch.as_deref().unwrap_or("desktop"),
+                    "launching from the console");
+                // Re-resolved per launch, not latched: the settings screen may have moved
+                // the defaults since the last stream, and the host may carry a preset
+                // binding. A pinned card's one-off preset id wins over that binding, and a
+                // dangling id falls back to the defaults instead of blocking the connect.
+                let (settings, preset) = trust::effective_settings(
+                    Some(&fp_hex),
+                    &addr,
+                    port,
+                    preset.as_deref(),
+                    launch.as_deref(),
+                );
+                let preset_id = preset.as_ref().map(|p| p.id.clone());
+                let mut params = session_params(
+                    &settings,
+                    preset.map(|p| p.name),
+                    preset_id,
+                    // In-process launch: no spawner resolved a clipboard decision for us.
+                    None,
+                    addr.clone(),
+                    port,
+                    pin,
+                    self.identity.clone(),
+                    launch,
+                    gamepad,
+                    native,
+                    hdr,
+                    force_software,
+                    vulkan,
+                );
+                params.profile = profile;
+                params.shows_screens |= self.all_screens;
+                if request_access {
+                    // The host PARKS the connect until the operator approves — outlast its
+                    // approval window (host `PENDING_APPROVAL_WAIT`), matching the desktop
+                    // shells' 185 s. On success `note_connected` persists the host as paired.
+                    params.connect_timeout = Duration::from_secs(185);
+                    *self.pending_approval.lock().unwrap() = Some(PendingApproval {
+                        name: title.clone(),
+                        addr,
+                        port,
+                        fp_hex: fp_hex.clone(),
+                    });
+                }
+                ActionOutcome::Start(Box::new(params))
+            }
+            OverlayAction::CancelConnect => ActionOutcome::Handled, // run-loop-side
+            // Also run-loop-side: the clipboard belongs to SDL, which this handler has no
+            // handle on.
+            OverlayAction::CopyText(_) => ActionOutcome::Handled,
+            // This console is drawn OVER the session's stream, so the hold coming down is
+            // the shell's own business and the picture is already behind it.
+            OverlayAction::ShowStream => ActionOutcome::Handled,
+            // The console offers these on Android only.
+            OverlayAction::PinShortcut { .. } | OverlayAction::SaveLauncherFile { .. } => {
+                ActionOutcome::Handled
+            }
+            OverlayAction::Quit => ActionOutcome::Quit,
+        }
+    }
 }
 
 pub fn run(target: Option<&str>) -> u8 {
@@ -80,55 +271,13 @@ pub fn run(target: Option<&str>) -> u8 {
         }
     };
 
-    // Resolve the entry point. An explicit target wins: paired, it opens straight into its
-    // library; unpaired or unknown, it lands on Home seeded into the list (one A from
-    // pairing). A bare launch asks the start-screen policy instead. The fake-library hook
-    // fabricates a paired host with no network, and beats the policy too.
     let fake = std::env::var_os("PUNKTFUNK_FAKE_LIBRARY").is_some();
     let known = trust::KnownHosts::load();
-    let mut seed: Option<HostRow> = None;
-    let (entry, window_label) = match target {
-        Some(target) => {
-            let (addr, port) = parse_host_port(target);
-            // `find_by_addr`, not a scan: a pinned record beats a placeholder saved at the
-            // same address, and an address can carry more than one identity.
-            let k = known.find_by_addr(&addr, port);
-            let mut row = seed_row(k, &addr, port);
-            row.paired |= fake;
-            let label = row.name.clone();
-            if k.is_none() {
-                seed = Some(row.clone());
-            }
-            if row.paired {
-                (ConsoleEntry::Library(Box::new(row)), Some(label))
-            } else {
-                (ConsoleEntry::Home, Some(label))
-            }
-        }
-        None if fake => {
-            let row = fake_host_row();
-            (ConsoleEntry::Library(Box::new(row)), None)
-        }
-        None => {
-            let settings = trust::Settings::load();
-            let (default, source) = start::default_host_with_source(&settings, &known);
-            tracing::info!(
-                start_in = start::StartIn::parse(&settings.start_in).as_str(),
-                default = default.map_or("none", |i| known.hosts[i].name.as_str()),
-                source = source.as_str(),
-                "console start"
-            );
-            let row = |i: usize| {
-                let k = &known.hosts[i];
-                Box::new(seed_row(Some(k), &k.addr, k.port))
-            };
-            match start::start_screen(&settings, &known) {
-                start::Start::Hosts => (ConsoleEntry::Home, None),
-                start::Start::Library(i) => (ConsoleEntry::Library(row(i)), None),
-                start::Start::Stream(i) => (ConsoleEntry::Stream(row(i)), None),
-            }
-        }
-    };
+    let Entry {
+        entry,
+        label: window_label,
+        seed,
+    } = console_entry(target, &known, fake, trust::Settings::load);
     let opts = ConsoleOptions::desktop(trust::device_name(), is_steam_deck());
     let (overlay, handles) = match SkiaOverlay::console(opts, entry) {
         Ok(v) => v,
@@ -155,13 +304,9 @@ pub fn run(target: Option<&str>) -> u8 {
     // `--json-status`: a shell parent is reading stdout (the WinUI shell hides itself on
     // `{"ready":true}` and restores on exit) — plain CLI/gamescope runs stay silent.
     let json_status = arg_flag("--json-status");
+    // Seeds the window only. Every launch re-resolves settings and the preset binding, and the
+    // presenter adopts that launch's `SessionParams`: no setting waits for a console restart.
     let settings_at_start = trust::Settings::load();
-    // The console window and its input models are built once from the global defaults and live
-    // across launches, so the presentation-tier fields below (touch and mouse model, shortcut
-    // inhibit, match-window, render scale) latch here and no per-host preset can move them.
-    // What the host is told (mode, bitrate, codec, audio, pad) re-resolves per launch and honors
-    // the binding; anything else off this snapshot must ride `SessionParams` like the stats tier.
-    let latched_mouse = settings_at_start.mouse_mode();
 
     // Request-access hand-off: the launch handler stamps this when it starts a delegated-approval
     // connect; `on_connected` reads it once the host lets us in and persists the host as PAIRED,
@@ -177,45 +322,24 @@ pub fn run(target: Option<&str>) -> u8 {
         ),
         fullscreen: fullscreen_mode(),
         window_pos: window_pos(),
-        // Seeds the loop only — every launch carries its own freshly resolved tier.
         stats_verbosity: stats_tier(&settings_at_start),
         touch_mode: settings_at_start.touch_mode(),
         mouse_mode: settings_at_start.mouse_mode(),
         invert_scroll: settings_at_start.invert_scroll,
         inhibit_shortcuts: settings_at_start.inhibit_shortcuts,
-        overlay_actions: settings_at_start.overlay_actions.clone(),
-        // Presentation-tier like the rows above: latched at console start, a per-host
-        // preset cannot move it in this mode (the documented P4 gap).
         present_priority: settings_at_start.present_priority(),
         vsync: settings_at_start.vsync,
         allow_vrr: settings_at_start.allow_vrr,
         json_status,
         on_connected: Some(Box::new(move |fingerprint: [u8; 32], mgmt_port: u16| {
-            let fp_hex = trust::hex(&fingerprint);
-            trust::touch_last_used(&fp_hex);
-            // A request-access connect just succeeded → the operator approved us. Save the
-            // host as paired (it was unsaved/discovered), keyed to the fingerprint we pinned.
-            if let Some(p) = pending_cb.lock().unwrap().take() {
-                if p.fp_hex == fp_hex {
-                    if let Err(e) =
-                        trust::persist_host(&p.name, &p.addr, p.port, &fp_hex, true, &[])
-                    {
-                        tracing::warn!(error = %format!("{e:#}"), "saving the approved host");
-                    }
-                }
-            }
-            // Where this host serves its library, from the session's own Welcome — recorded
-            // AFTER the persist above so a host saved by this very connect gets it too. `0` =
-            // the host advertised none, and the call is a no-op.
-            trust::learn_mgmt_port_by_fp(&fp_hex, mgmt_port);
+            note_connected(&pending_cb, fingerprint, mgmt_port)
         })),
         overlay: Some(Box::new(overlay)),
         window_size: crate::session_main::window_size(&settings_at_start),
-        // Latched at console start (like the stats tier above): toggling Match window in
-        // the console's settings screen applies from the next console launch.
+        match_window: settings_at_start.match_window,
         // The console owns its own window across every launch, and no parent is listening to
         // its stdout, so it keeps persisting the size itself.
-        match_window: crate::session_main::match_window(&settings_at_start, true),
+        on_window_size: crate::session_main::on_window_size(true),
         render_scale: settings_at_start.render_scale,
         render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings_at_start.codec),
         video_fit: punktfunk_core::video_fit::VideoFit::from_name(&settings_at_start.video_fit),
@@ -223,92 +347,15 @@ pub fn run(target: Option<&str>) -> u8 {
         until_no_pads: arg_flag("--until-no-controller"),
     };
 
+    let launcher = Launcher {
+        identity,
+        all_screens: arg_flag("--all-screens"),
+        pending_approval,
+    };
     let result = pf_presenter::run_browse(
         opts,
         |action, gamepad, native, hdr, force_software, vulkan| {
-            match action {
-                OverlayAction::Launch {
-                    addr,
-                    port,
-                    fp_hex,
-                    launch,
-                    title,
-                    request_access,
-                    preset,
-                    profile,
-                } => {
-                    let Some(pin) = trust::parse_hex32(&fp_hex) else {
-                        // Connect (and request-access) pin the host's advertised fingerprint;
-                        // a pinless launch is a logic slip, never a silent TOFU.
-                        tracing::warn!(%addr, "launch without a stored pin — refusing");
-                        return ActionOutcome::Handled;
-                    };
-                    tracing::info!(%addr, %title, request_access,
-                        launch = launch.as_deref().unwrap_or("desktop"),
-                        "launching from the console");
-                    // Re-resolved per launch, not latched: the settings screen may have moved
-                    // the defaults since the last stream, and the host may carry a preset
-                    // binding. A pinned card's one-off preset id wins over that binding, and a
-                    // dangling id falls back to the defaults instead of blocking the connect.
-                    let (settings, preset) = trust::effective_settings(
-                        Some(&fp_hex),
-                        &addr,
-                        port,
-                        preset.as_deref(),
-                        launch.as_deref(),
-                    );
-                    let preset_id = preset.as_ref().map(|p| p.id.clone());
-                    let mut params = session_params(
-                        &settings,
-                        preset.map(|p| p.name),
-                        preset_id,
-                        // In-process launch: no spawner resolved a clipboard decision for us.
-                        None,
-                        addr.clone(),
-                        port,
-                        pin,
-                        identity.clone(),
-                        launch,
-                        gamepad,
-                        native,
-                        hdr,
-                        force_software,
-                        vulkan,
-                    );
-                    // cursor_forward tells the host the client draws the pointer, true only in
-                    // desktop mouse mode — so it follows the latched mode, not this launch's
-                    // preset. Otherwise the host composites no cursor and the stream shows none.
-                    params.cursor_forward = latched_mouse == trust::MouseMode::Desktop;
-                    params.profile = profile;
-                    if request_access {
-                        // The host PARKS the connect until the operator approves — outlast its
-                        // approval window (host `PENDING_APPROVAL_WAIT`), matching the desktop
-                        // shells' 185 s. On success `on_connected` persists the host as paired.
-                        params.connect_timeout = Duration::from_secs(185);
-                        *pending_approval.lock().unwrap() = Some(PendingApproval {
-                            name: title.clone(),
-                            addr,
-                            port,
-                            fp_hex: fp_hex.clone(),
-                        });
-                    }
-                    ActionOutcome::Start(Box::new(params))
-                }
-                OverlayAction::CancelConnect => ActionOutcome::Handled, // run-loop-side
-                // Also run-loop-side: the clipboard belongs to SDL, which this callback
-                // has no handle on. Unreachable in practice — listed so adding an action
-                // to the enum keeps failing loudly here instead of falling into a
-                // wildcard that silently drops it.
-                OverlayAction::CopyText(_) => ActionOutcome::Handled,
-                // This console is drawn OVER the session's stream, so the hold coming down is
-                // the shell's own business and the picture is already behind it.
-                OverlayAction::ShowStream => ActionOutcome::Handled,
-                // The console offers these on Android only.
-                OverlayAction::PinShortcut { .. } | OverlayAction::SaveLauncherFile { .. } => {
-                    ActionOutcome::Handled
-                }
-                OverlayAction::Quit => ActionOutcome::Quit,
-            }
+            launcher.act(action, gamepad, native, hdr, force_software, vulkan)
         },
     );
 
@@ -436,7 +483,7 @@ impl Service {
                     discovered: HashMap::new(),
                     probed: Arc::new(Mutex::new(HashMap::new())),
                     probe_inflight: Arc::new(AtomicBool::new(false)),
-                    last_probe: Instant::now() - Duration::from_secs(60),
+                    last_probe: None,
                     wake_cancel: None,
                     pair_gen: Arc::new(AtomicU64::new(0)),
                     rescan: None,
@@ -472,7 +519,9 @@ struct ServiceState {
     /// Probe results by row key, written by sweep threads.
     probed: Arc<Mutex<HashMap<String, bool>>>,
     probe_inflight: Arc<AtomicBool>,
-    last_probe: Instant,
+    /// When the last sweep ran; `None` runs one on the next tick. Never an instant in the
+    /// past: Windows' clock starts at boot, and subtracting past it panics.
+    last_probe: Option<Instant>,
     /// Cancels the active wake thread (it owns the model's wake status).
     wake_cancel: Option<Arc<AtomicBool>>,
     /// Bumped per pairing. A ceremony the player left still persists, but only the
@@ -526,7 +575,7 @@ impl ServiceState {
         // are rebuilt on a floor as well as when something could have moved them. The stores
         // under them are read again only when a file changed.
         let mut dirty = true;
-        let mut last_rows = Instant::now() - Duration::from_secs(1);
+        let mut last_rows = Instant::now();
         while !stop.load(Ordering::SeqCst) {
             // mDNS churn.
             while let Ok(ev) = discovery_rx.try_recv() {
@@ -541,7 +590,9 @@ impl ServiceState {
                 self.stores.forget();
             }
 
-            let probe_due = self.last_probe.elapsed() >= Duration::from_secs(10);
+            let probe_due = self
+                .last_probe
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(10));
             if dirty || probe_due || last_rows.elapsed() >= Duration::from_millis(500) {
                 self.publish_rows(probe_due);
                 last_rows = Instant::now();
@@ -576,7 +627,7 @@ impl ServiceState {
             self.learn_from_adverts();
         }
         if probe_due {
-            self.last_probe = Instant::now();
+            self.last_probe = Some(Instant::now());
             self.sweep(&rows);
             self.refresh_host_state(&rows);
         }
@@ -598,6 +649,12 @@ impl ServiceState {
             ConsoleCmd::FetchProfiles { addr, mgmt, fp_hex } => {
                 self.fetch_profiles(addr, mgmt, fp_hex)
             }
+            ConsoleCmd::FetchAvatar {
+                addr,
+                mgmt,
+                fp_hex,
+                url,
+            } => self.fetch_avatar(addr, mgmt, fp_hex, url),
             ConsoleCmd::WakeProfile {
                 addr,
                 mgmt,
@@ -698,12 +755,10 @@ impl ServiceState {
                 }
             }
             ConsoleCmd::Probe => {
-                self.last_probe = Instant::now() - Duration::from_secs(60);
-                // "Refresh presence" means the mDNS half too, not just the QUIC sweep: the browse
-                // runs for the process's lifetime and `mdns-sd` backs its re-query interval off to
-                // as much as an hour, so a host that appeared since startup may never be asked
-                // for again. (No console screen emits Probe yet — every face button on the home
-                // screen is spoken for — but the plumbing is correct for when one does.)
+                self.last_probe = None;
+                // Home's Rescan tile. It re-queries mDNS too: the browse lives as long as the
+                // process and `mdns-sd` backs its re-query off to an hour, so a host that
+                // appeared since startup may otherwise never be asked for.
                 if let Some(r) = &self.rescan {
                     r.request();
                 }
@@ -769,7 +824,7 @@ impl ServiceState {
         spawn_fetch(
             self.library.clone(),
             addr,
-            mgmt,
+            (port, mgmt),
             self.identity.clone(),
             fp_hex,
             macs,
@@ -793,7 +848,8 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-running".into())
             .spawn(move || {
-                let status = library::fetch_status(&addr, mgmt, &identity, pin);
+                let port = stream_port(&fp_hex);
+                let status = library::fetch_status(&addr, mgmt, port, &identity, pin);
                 if shared.fetch_epoch() == epoch {
                     shared.set_downloads(&status.downloads, status.grants);
                     shared.set_running(&status.games);
@@ -810,7 +866,8 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-profiles".into())
             .spawn(move || {
-                let answer = match profiles::fetch_enumerate(&addr, mgmt, &identity, pin) {
+                let port = stream_port(&fp_hex);
+                let answer = match profiles::fetch_enumerate(&addr, mgmt, port, &identity, pin) {
                     Ok(Some(listed)) => ProfilesAnswer::Listed(listed),
                     Ok(None) => ProfilesAnswer::NoProfiles,
                     Err(e) => {
@@ -823,6 +880,23 @@ impl ServiceState {
             .ok();
     }
 
+    /// A profile's picture for the faces the shell draws.
+    fn fetch_avatar(&self, addr: String, mgmt: u16, fp_hex: String, url: String) {
+        let console = self.console.clone();
+        let identity = self.identity.clone();
+        let pin = trust::parse_hex32(&fp_hex);
+        std::thread::Builder::new()
+            .name("punktfunk-avatar".into())
+            .spawn(move || {
+                let port = stream_port(&fp_hex);
+                let api = library::HostApi::new(&addr, mgmt, port, &identity, pin);
+                if let Some(bytes) = profiles::fetch_avatar(&api, &url) {
+                    console.set_avatar(&url, bytes);
+                }
+            })
+            .ok();
+    }
+
     /// Starts a profile's stopped seat. The shell polls the list for `ready` itself.
     fn wake_profile(&self, addr: String, mgmt: u16, fp_hex: String, id: String) {
         let identity = self.identity.clone();
@@ -830,7 +904,8 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-wake-seat".into())
             .spawn(move || {
-                if let Err(e) = profiles::wake(&addr, mgmt, &identity, pin, &id) {
+                let port = stream_port(&fp_hex);
+                if let Err(e) = profiles::wake(&addr, mgmt, port, &identity, pin, &id) {
                     tracing::info!(%addr, error = %e, "profile seat did not wake");
                 }
             })
@@ -846,14 +921,17 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-sendlogs".into())
             .spawn(move || {
-                console.set_notice(pf_client_core::logring::send_bundle(
-                    "punktfunk-session",
-                    &host_name,
-                    &addr,
-                    mgmt,
-                    &identity,
-                    &fp_hex,
-                ));
+                console.set_notice(
+                    pf_client_core::logring::send_bundle(
+                        "punktfunk-session",
+                        &host_name,
+                        &addr,
+                        (mgmt, stream_port(&fp_hex)),
+                        &identity,
+                        &fp_hex,
+                    )
+                    .unwrap_or_else(|e| e),
+                );
             })
             .ok();
     }
@@ -932,9 +1010,13 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-hostaction".into())
             .spawn(move || {
-                console.set_notice(pf_client_core::host_actions::run(
-                    &host_name, &addr, mgmt, &identity, &fp_hex, &action_id, &label,
-                ));
+                let port = stream_port(&fp_hex);
+                console.set_notice(
+                    pf_client_core::host_actions::run(
+                        &host_name, &addr, mgmt, port, &identity, &fp_hex, &action_id, &label,
+                    )
+                    .unwrap_or_else(|e| e),
+                );
             })
             .ok();
     }
@@ -959,10 +1041,11 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-endgame".into())
             .spawn(move || {
-                let outcome = library::end_game(&addr, mgmt, &identity, pin, &app_id);
+                let port = stream_port(&fp_hex);
+                let outcome = library::end_game(&addr, mgmt, port, &identity, pin, &app_id);
                 tracing::info!(app = %app_id, ?outcome, "end game");
                 console.set_notice(outcome.notice(&title));
-                let running = library::fetch_running(&addr, mgmt, &identity, pin);
+                let running = library::fetch_running(&addr, mgmt, port, &identity, pin);
                 if shared.fetch_epoch() == epoch {
                     shared.set_running(&running);
                 }
@@ -987,10 +1070,12 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-install".into())
             .spawn(move || {
-                let outcome = library::change_install(&addr, mgmt, &identity, pin, &app_id, action);
+                let port = stream_port(&fp_hex);
+                let outcome =
+                    library::change_install(&addr, mgmt, port, &identity, pin, &app_id, action);
                 tracing::info!(app = %app_id, ?action, ?outcome, "title install");
                 console.set_notice(outcome.notice(action, &title));
-                let status = library::fetch_status(&addr, mgmt, &identity, pin);
+                let status = library::fetch_status(&addr, mgmt, port, &identity, pin);
                 if shared.fetch_epoch() == epoch {
                     if outcome == library::InstallOutcome::Done
                         && action == library::InstallAction::Remove
@@ -1094,7 +1179,7 @@ impl ServiceState {
         if let Err(e) = saved {
             self.save_failed(&e);
         }
-        self.last_probe = Instant::now() - Duration::from_secs(60); // probe it now
+        self.last_probe = None; // probe it now
     }
 
     /// Edited in place, never removed and re-added: the pin, the learned MACs, the pinned
@@ -1111,7 +1196,7 @@ impl ServiceState {
             true
         });
         if found {
-            self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
+            self.last_probe = None; // the address moved
         }
     }
 
@@ -1128,7 +1213,7 @@ impl ServiceState {
         }
         // It may still be advertising, in which case it comes straight back as a
         // DISCOVERED row — unsaved and unpaired, which is the honest state.
-        self.last_probe = Instant::now() - Duration::from_secs(60);
+        self.last_probe = None;
     }
 
     fn unpair_host(&self, key: String) {
@@ -1307,8 +1392,8 @@ impl ServiceState {
     fn refresh_host_state(&self, rows: &[HostRow]) {
         for r in rows {
             if r.paired && r.online && r.pin.is_none() {
-                pf_client_core::host_actions::refresh(&r.addr, r.mgmt_port, &r.fp_hex);
-                library::refresh_running(&r.addr, r.mgmt_port, &r.fp_hex);
+                pf_client_core::host_actions::refresh(&r.addr, r.mgmt_port, r.port, &r.fp_hex);
+                library::refresh_running(&r.addr, r.mgmt_port, r.port, &r.fp_hex);
             }
         }
     }
@@ -1326,8 +1411,8 @@ impl ServiceState {
         )
     }
 
-    /// What each saved host's advert teaches it, while the advert is visible: mgmt port, OS
-    /// chain, wake MAC (a Deck in Gaming Mode runs only this console and the Decky panel),
+    /// What each saved host's advert teaches it, while the advert is visible: name, mgmt port,
+    /// OS chain, wake MAC (a Deck in Gaming Mode runs only this console and the Decky panel),
     /// and an address the sweep asks; the card moves only once its pin answers there.
     fn learn_from_adverts(&self) {
         for h in &self.stores.known.hosts {
@@ -1336,15 +1421,7 @@ impl ServiceState {
                 .values()
                 .find(|d| discovery::same_host(h, d));
             if let Some(a) = advert {
-                trust::learn_from_advert(
-                    &h.fp_hex,
-                    &h.addr,
-                    h.port,
-                    &a.addr,
-                    &a.mac,
-                    &a.os,
-                    a.mgmt_port,
-                );
+                trust::learn_from_advert(&h.fp_hex, &h.addr, h.port, a);
             }
         }
     }
@@ -1564,8 +1641,17 @@ fn save_preset(id: String, name: String, overrides: serde_json::Value) {
     }
 }
 
+/// The stream port of the saved host `fp_hex` pins, where its management API answers without
+/// TCP. 0 with no such record: HTTPS alone. Reads the hosts file, so call it on a worker.
+fn stream_port(fp_hex: &str) -> u16 {
+    trust::KnownHosts::load()
+        .find_by_fp(fp_hex)
+        .map_or(0, |h| h.port)
+}
+
 /// Fetch the library off the service thread, then stream poster art into the shared
-/// model as results land (the renderer drains `push_art` per frame).
+/// model as results land (the renderer drains `push_art` per frame). `(port, mgmt)`: the
+/// stream port the management tunnel tries first, then the HTTPS port.
 ///
 /// Three things happen before the host is ever asked, and the order is the point:
 /// 1. the CACHED catalog goes up immediately, marked stale — a library is the screen a player
@@ -1580,7 +1666,7 @@ fn save_preset(id: String, name: String, overrides: serde_json::Value) {
 fn spawn_fetch(
     shared: LibraryShared,
     addr: String,
-    mgmt: u16,
+    (port, mgmt): (u16, u16),
     identity: (String, String),
     fp_hex: String,
     macs: Vec<String>,
@@ -1626,7 +1712,7 @@ fn spawn_fetch(
             let mut last_err = None;
             let mut fetched = None;
             loop {
-                match library::fetch_games(&addr, mgmt, &identity, pin) {
+                match library::fetch_games(&addr, mgmt, port, &identity, pin) {
                     Ok(games) => {
                         fetched = Some(games);
                         break;
@@ -1697,13 +1783,14 @@ fn spawn_fetch(
                 // What the host has up right now, so a title the player can return to says so.
                 // Deliberately after the catalog — a slow `/status` must not hold the titles
                 // back — and never fatal: an older host answers nothing and every badge stays off.
-                let running = library::fetch_running(&addr, mgmt, &identity, pin);
+                let running = library::fetch_running(&addr, mgmt, port, &identity, pin);
                 if mine() {
                     shared.set_running(&running);
                 }
             }
             if !jobs.is_empty() {
-                let rx = library::spawn_art_fetch(base, identity, pin, jobs);
+                let api = library::HostApi::new(&addr, mgmt, port, &identity, pin);
+                let rx = library::spawn_art_fetch(api, jobs);
                 while let Ok((id, bytes)) = rx.recv_blocking() {
                     if !mine() {
                         return;

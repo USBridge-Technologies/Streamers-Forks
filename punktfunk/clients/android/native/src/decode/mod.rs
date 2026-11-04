@@ -1,26 +1,25 @@
 //! Android video decode (android-only): pull HEVC access units from the connector into NDK
 //! `AMediaCodec` — hardware decode, zero per-frame JNI.
 //!
-//! The decoded frames reach glass through one of two present backends (see [`asc_presenter`] and
-//! [`presenter`]). The default is the **ASurfaceControl** backend: the codec renders into an
-//! `AImageReader` and each frame is composited onto an `ASurfaceControl` layer via a transaction
-//! carrying a desired present time, scheduling against the panel's real present clock. The
-//! **SurfaceView** presenter — `releaseOutputBufferAtTime` straight to the SurfaceView's window — is
-//! the fallback for API < 29, ChromeOS, an ASC init failure, or the `present_backend=surfaceview`
-//! sysprop.
+//! The decoded frames reach glass through one of two present sinks ([`sink`]), both driven by the
+//! pure policy in [`crate::present`]. The default is the **ASurfaceControl** sink: the codec
+//! renders into an `AImageReader` and each frame is composited onto an `ASurfaceControl` layer via
+//! a transaction carrying a desired present time, scheduling against the panel's real present
+//! clock. The **SurfaceView** sink — `releaseOutputBufferAtTime` straight to the SurfaceView's
+//! window — is the fallback for API < 29, ChromeOS, an ASC init failure, or the
+//! `present_backend=surfaceview` sysprop.
 //!
 //! One-in/one-out: the host opens every stream with an IDR carrying VPS/SPS/PPS **in-band**, so the
 //! decoder needs no out-of-band codec-specific data — we configure with mime + the negotiated
 //! WxH (from [`NativeClient::mode`]) and feed each access unit as it arrives. The decode thread owns
 //! the codec + surface for its whole life; [`crate::session`] signals it to stop via the shared flag.
 
-mod asc_presenter;
 mod async_loop;
 mod display;
 mod latency;
-mod presenter;
 mod setup;
-mod surface_control;
+mod sink;
+pub(crate) mod surface_control;
 mod vsync;
 
 use async_loop::run_async;
@@ -28,10 +27,15 @@ pub(crate) use setup::{codec_label, codec_mime};
 // Shared with the PyroWave lane, which exists only where the codec is built (see `crate::pyro`).
 #[cfg(target_pointer_width = "64")]
 pub(crate) use async_loop::start_hint;
+// The PyroWave lane's `ASurfaceControl` present, 64-bit only like the lane.
+#[cfg(target_pointer_width = "64")]
+pub(crate) use async_loop::DecodeEvent;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use latency::now_realtime_ns;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use setup::boost_thread_priority;
+#[cfg(target_pointer_width = "64")]
+pub(crate) use sink::asc_backend_selected;
 
 use crate::input_stall::NoOutput;
 use ndk::native_window::NativeWindow;
@@ -93,7 +97,8 @@ impl Backstops {
 
     /// One pass. `handled` = AUs fed to the codec or withheld from it; `had_output` = the decoder
     /// produced this pass; `au_parked` = an AU is waiting for an input slot; `losses` = drops this
-    /// pass that are a loss in their own right (a parked-AU overflow).
+    /// pass that are a loss in their own right (a parked-AU overflow). A decoder that owes output
+    /// with no loss this pass reports starved, which the bitrate controller does not judge.
     pub(super) fn poll(
         &mut self,
         client: &NativeClient,
@@ -105,8 +110,10 @@ impl Backstops {
         let now = Instant::now();
         // Frozen with the ask, so the concealment a re-anchoring decoder emits stays off the glass.
         let starved = self.no_output.poll(handled, had_output, now);
-        if starved || losses > 0 {
+        if losses > 0 {
             client.recovery_lost();
+        } else if starved {
+            client.recovery_starved();
         }
         // Nothing has EVER arrived: the no-output window cannot see it.
         if handled == 0
@@ -132,6 +139,9 @@ pub(crate) struct DecodeOptions {
     /// The decoder Kotlin ranked from `MediaCodecList` (`VideoDecoders.pickDecoder`). `None`/empty ⇒
     /// let the platform resolve the default decoder for the MIME.
     pub decoder_name: Option<String>,
+    /// The MIME Kotlin ranked `decoder_name` for: a codec the host moved to later takes the
+    /// platform's default ([`DecodeOptions::decoder_for`]).
+    pub decoder_mime: &'static str,
     /// Whether Kotlin found the chosen decoder advertises `FEATURE_LowLatency` (queryable only via
     /// the Java `CodecCapabilities` API) — surfaced on the HUD next to the decoder name.
     pub ll_feature: bool,
@@ -139,15 +149,15 @@ pub(crate) struct DecodeOptions {
     /// pipeline thread boosts, ADPF max-performance and the forced TV mode switch. Off ⇒ the same
     /// loop and presenter with plain keys and no boosts — the per-device escape hatch.
     pub low_latency_mode: bool,
-    /// TV form factor (Kotlin's `UiModeManager`): actively drive the HDMI output into the stream's
-    /// refresh mode, vs. the softer seamless hint on a phone/tablet.
+    /// TV form factor (Kotlin's `UiModeManager`): the HDMI mode switch is forced only with
+    /// low-latency mode on ([`DecodeOptions::force_rate_switch`]).
     pub is_tv: bool,
     /// ChromeOS (ARC): present through the SurfaceView, never ASurfaceControl — see
-    /// [`asc_presenter::asc_backend_selected`].
+    /// [`sink::asc_backend_selected`].
     pub chromeos: bool,
     /// The user's presentation intent (`present_priority` setting): 0 = lowest latency
     /// (newest-wins), 1 = smoothness (a small FIFO). Resolved by
-    /// [`presenter::PresentPriority::resolve`]; anything else = latency.
+    /// [`crate::present::PresentPriority::resolve`]; anything else = latency.
     pub present_priority: i32,
     /// The smoothness buffer depth (`smooth_buffer` setting): 0 = automatic (2), else 1..=3.
     /// Only meaningful with `present_priority` = smooth.
@@ -180,6 +190,34 @@ pub(crate) struct DecodeOptions {
     pub restart: bool,
 }
 
+impl DecodeOptions {
+    /// Whether the stream's frame-rate vote may switch the panel non-seamlessly
+    /// (`CHANGE_FRAME_RATE_ALWAYS`). A phone or tablet always may: Android 15+ holds a game at
+    /// 60 Hz, and a seamless-only vote cannot leave a 60 Hz mode whose 120 Hz sibling sits in
+    /// another mode group. A TV only with low-latency mode on: its HDMI switch blanks the picture.
+    pub(crate) fn force_rate_switch(&self) -> bool {
+        !self.is_tv || self.low_latency_mode
+    }
+
+    /// The decoder to create for `mime` ([`ranked_for`]).
+    pub(crate) fn decoder_for(&self, mime: &str) -> Option<&str> {
+        let name = ranked_for(self.decoder_name.as_deref(), self.decoder_mime, mime);
+        if name.is_none() && self.decoder_name.is_some() {
+            log::info!(
+                "decode: {mime} takes the platform's default decoder (the ranked pick was for {})",
+                self.decoder_mime
+            );
+        }
+        name
+    }
+}
+
+/// Kotlin's pick `name`, ranked for `ranked`, when `mime` is that MIME; else the platform's
+/// default, which low-latency mode off always takes.
+fn ranked_for<'a>(name: Option<&'a str>, ranked: &str, mime: &str) -> Option<&'a str> {
+    name.filter(|_| mime == ranked)
+}
+
 /// The decode entry point on the `pf-decode` thread: dispatches to the codec's loop. All of
 /// them run until `shutdown` is set or the session closes.
 ///
@@ -198,4 +236,18 @@ pub fn run(
         return;
     }
     run_async(client, window, shutdown, stats, opts);
+}
+
+#[cfg(test)]
+mod ranked_tests {
+    use super::ranked_for;
+
+    /// A codec the host moved to after the pick never gets a decoder ranked for another MIME.
+    #[test]
+    fn a_pick_names_only_the_mime_it_was_ranked_for() {
+        let pick = Some("c2.qti.hevc.decoder.low_latency");
+        assert_eq!(ranked_for(pick, "video/hevc", "video/hevc"), pick);
+        assert_eq!(ranked_for(pick, "video/hevc", "video/avc"), None);
+        assert_eq!(ranked_for(None, "video/hevc", "video/hevc"), None);
+    }
 }

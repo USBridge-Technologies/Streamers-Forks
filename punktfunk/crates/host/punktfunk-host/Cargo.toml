@@ -10,7 +10,10 @@ repository.workspace = true
 
 [dependencies]
 # Managed emulators: install, detect, remove. Pinned to a commit until it is on crates.io.
-hermir = { git = "https://github.com/unom-io/hermir", rev = "6fdf0fa7bbef8b23e78ac1b967cba3c2db0f8b6e" }
+hermir = { git = "https://github.com/unom-io/hermir", rev = "ec32fd908c816178f2e80c07c6ff313cd42d237c" }
+# AC-3 / E-AC-3 encoder for the `0xD4` passthrough plane. Pinned to a commit until it is on
+# crates.io. Default features only: never `joc`.
+omur = { git = "https://github.com/unom-io/omur", rev = "18981af0cd66380b06cbf520ce340f51a195cc8c" }
 # `ureq-tls` is for `ctl`: ureq's own `TlsConfig` has no hook for a custom certificate verifier,
 # so the pinned operator client hands rustls a `ClientConfig` through core's shared glue — the same
 # path the tray and the desktop client already take. `quic` brings `tls` (and `PinVerify`) with it.
@@ -214,6 +217,8 @@ h2 = "0.4"
 tempfile = "3"
 # The C ABI, driven from Rust by the native plane's connection round-trip tests (native.rs).
 punktfunk-ffi = { path = "../../client/punktfunk-ffi", features = ["quic"] }
+# The scripted `FakeCapturer` the stream-loop tests drive.
+pf-capture = { path = "../pf-capture", features = ["test-support"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # A bus-less connection pair for the seat's session switch test (`seats/session_switch.rs`).
@@ -396,6 +401,11 @@ pyrowave = ["pf-encode/pyrowave"]
 # builds of this crate never execute the winresource block).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# x86 hosts seal every packet with aws-lc-rs's VAES kernels: 236 ns a packet against 500 on a
+# Zen 4. wasm and armv7 keep RustCrypto; the wire is the same.
+[target.'cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))'.dependencies]
+punktfunk-core = { path = "../../core/punktfunk-core", features = ["aes-aws-lc-rs"] }
 
 [lints]
 workspace = true

@@ -22,20 +22,32 @@ const PUNKTFUNK_GROUP: &str = "punktfunk";
 /// udev grants uinput/uhid here; not the same group as the vhci nodes.
 const INPUT_GROUP: &str = "input";
 
-/// Tests pass an isolated registry; the process-wide one is [`super::registry`].
-pub(crate) fn register_all(reg: &Diagnostics) {
-    reg.register(takeover_privilege);
-    reg.register(virtual_deck_vhci);
-    reg.register(uinput_access);
+/// Tests pass an isolated registry; the process-wide one is [`super::registry`]. The door opens
+/// no device and runs no plugin, and sits outside the device groups on purpose: it probes only
+/// the box's own checks, since any other would say nothing about it and its remedy would undo
+/// the separation.
+pub(crate) fn register_all(reg: &Diagnostics, door: bool) {
+    let local = |id: &'static str, probe: fn() -> HostCheck, why: &'static str| {
+        if door {
+            reg.register(move || HostCheck::inapplicable(id, why));
+        } else {
+            reg.register(probe);
+        }
+    };
+    let device = |id, probe| local(id, probe, "The door opens no device.");
+    device(ids::TAKEOVER_PRIVILEGE, takeover_privilege);
+    device(ids::VIRTUAL_DECK_VHCI, virtual_deck_vhci);
+    device(ids::UINPUT_ACCESS, uinput_access);
     reg.register(server_conflict);
-    reg.register(hyprland_permissions);
-    reg.register(niri_virtual_outputs);
+    device(ids::HYPRLAND_PERMISSIONS, hyprland_permissions);
+    device(ids::NIRI_VIRTUAL_OUTPUTS, niri_virtual_outputs);
     reg.register(omarchy_updates);
-    reg.register(vdisplay_driver);
-    reg.register(pad_audio);
-    reg.register(pad_driver);
-    reg.register(encoder_sharing);
-    reg.register(plugin_sandbox);
+    device(ids::VDISPLAY_DRIVER, vdisplay_driver);
+    device(ids::PAD_AUDIO, pad_audio);
+    device(ids::PAD_DRIVER, pad_driver);
+    device(ids::ENCODER_SHARING, encoder_sharing);
+    let no_plugins = "The door runs no plugins. The owner's host runs them.";
+    local(ids::PLUGIN_SANDBOX, plugin_sandbox, no_plugins);
     reg.register(restart_pending);
 }
 
@@ -1094,6 +1106,26 @@ fn capture(cmd: &mut Command) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A door probes only the box's own checks; every other row says why it doesn't apply.
+    #[test]
+    fn the_door_probes_only_the_box_s_checks() {
+        let reg = Diagnostics::new();
+        register_all(&reg, true);
+        reg.run_all(super::super::CheckSource::Startup);
+        let probed = [
+            ids::SERVER_CONFLICT,
+            ids::OMARCHY_UPDATES,
+            ids::RESTART_PENDING,
+        ];
+        for check in reg.report().checks {
+            if probed.contains(&check.id.as_str()) {
+                continue;
+            }
+            assert_eq!(check.status, CheckStatus::Inapplicable, "{}", check.id);
+            assert!(check.remedy.is_none(), "{}", check.id);
+        }
+    }
 
     /// The doctor must probe the sandbox the runner actually builds.
     #[cfg(target_os = "linux")]

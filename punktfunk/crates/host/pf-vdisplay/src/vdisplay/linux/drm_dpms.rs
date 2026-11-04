@@ -5,15 +5,24 @@
 //! (logind uaccess, session user), `SET_MASTER` (decline if another client is master), modeset
 //! each lit CRTC off (`SETCRTC` `fb_id=0, mode_valid=0, count_connectors=0`), `DROP_MASTER`,
 //! keep the fd. Darkness survives dropping master; the open fd is the hold. Relight is
-//! `close(fd)`: kernel last-close restores the console. No saved mode, no journal — a dead
-//! host lights the box. Best-effort: missing `/dev/dri`, a foreign master, or nothing lit
-//! contributes nothing and the stream proceeds.
+//! `close(fd)`: kernel last-close restores the console, so no saved mode and no journal — but
+//! any other fd on the GPU, a render node included, defers that close, and [`release`] reads
+//! the heads back from sysfs to name the ones still dark. Best-effort: missing `/dev/dri`, a
+//! foreign master, or nothing lit contributes nothing and the stream proceeds.
+//!
+//! [`lit_mode`] reads a lit CRTC's mode over the same ioctls; that needs no master.
 //!
 //! Ioctl numbers encode payload size; layouts are pinned by the `const` asserts below.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Where the kernel lists each connector as `cardN-<connector>`, with its `enabled` state.
+const SYSFS_DRM: &str = "/sys/class/drm";
+/// How long [`release`] waits for last close to re-light the heads it darkened.
+const RELIGHT_BUDGET: Duration = Duration::from_secs(2);
 
 // Hand-declared from `drm.h` / `drm_mode.h`. `_IO('d', nr)` / `_IOWR('d', nr, T)` — payload
 // sizes live in the ioctl numbers; the `const` asserts below pin the structs to those sizes.
@@ -95,12 +104,67 @@ impl Default for DrmModeCrtc {
     }
 }
 
-/// Open fds holding the panels dark. Drop closes them; kernel last-close re-lights.
+/// Open fds holding the panels dark. [`release`] closes them; kernel last-close re-lights.
 pub struct DrmDarken {
-    /// Kept solely for its `Drop`. The panel stays dark exactly as long as these are open.
-    _cards: Vec<File>,
+    /// The panel stays dark exactly as long as these are open.
+    cards: Vec<File>,
     /// Which `/dev/dri/cardN` we actually turned something off on — logging only.
     pub darkened: Vec<String>,
+    /// The connectors lit on those cards before the darken, by sysfs name (`card1-DP-1`).
+    heads: Vec<String>,
+}
+
+/// Close the hold, then read its heads back for up to [`RELIGHT_BUDGET`]: last close re-lights
+/// only once nothing else holds the GPU open. Logs the heads still dark; an unplugged one is not.
+pub fn release(d: DrmDarken) {
+    drop(d.cards);
+    let dark = still_dark(Path::new(SYSFS_DRM), &d.heads, RELIGHT_BUDGET);
+    if dark.is_empty() {
+        tracing::info!(cards = ?d.darkened, "DRM: the box's own CRTCs released — panel back on");
+    } else {
+        tracing::warn!(
+            cards = ?d.darkened, heads = ?dark,
+            "DRM: heads still dark after the release — the kernel re-lights them once nothing \
+             holds the GPU open; `fuser -v /dev/dri/*` names what does"
+        );
+    }
+}
+
+/// The connectors of `card` that `sysfs` reports `enabled`, sorted.
+fn lit_connectors(sysfs: &Path, card: &str) -> Vec<String> {
+    let prefix = format!("{card}-");
+    let Ok(dir) = std::fs::read_dir(sysfs) else {
+        return Vec::new();
+    };
+    let mut lit: Vec<String> = dir
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&prefix) && enabled(sysfs, name) == Some(true))
+        .collect();
+    lit.sort();
+    lit
+}
+
+/// `heads` that `sysfs` still reports `disabled` once `budget` is spent or none is left.
+fn still_dark(sysfs: &Path, heads: &[String], budget: Duration) -> Vec<String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let dark: Vec<String> = heads
+            .iter()
+            .filter(|h| enabled(sysfs, h) == Some(false))
+            .cloned()
+            .collect();
+        if dark.is_empty() || Instant::now() >= deadline {
+            return dark;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A connector's sysfs `enabled`; `None` when it is not listed.
+fn enabled(sysfs: &Path, connector: &str) -> Option<bool> {
+    let state = std::fs::read_to_string(sysfs.join(connector).join("enabled")).ok()?;
+    Some(state.trim() == "enabled")
 }
 
 /// Shared `ioctl` so there is one `unsafe` to justify, not one per call site.
@@ -118,10 +182,12 @@ fn ioctl<T>(fd: libc::c_int, req: libc::c_ulong, arg: &mut T) -> std::io::Result
 }
 
 /// Turn every lit CRTC on every DRM card off, and hold them off. `None` when nothing was darkened
-/// — no cards, none masterable, or none lit — and therefore nothing to restore.
+/// — no cards, none masterable, or none lit — and therefore nothing to restore. The connectors
+/// lit before are read first: what [`release`] checks.
 pub fn darken() -> Option<DrmDarken> {
     let mut cards = Vec::new();
     let mut darkened = Vec::new();
+    let mut heads = Vec::new();
     for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -132,6 +198,7 @@ pub fn darken() -> Option<DrmDarken> {
         if !name.starts_with("card") {
             continue;
         }
+        let lit = lit_connectors(Path::new(SYSFS_DRM), name);
         match darken_card(&path) {
             // Masterable, but nothing on this card was lit. Its fd is dropped here, which is
             // correct: we changed nothing, so there is nothing to hold.
@@ -139,6 +206,7 @@ pub fn darken() -> Option<DrmDarken> {
             Ok((card, n)) => {
                 tracing::debug!(card = name, crtcs = n, "DRM: CRTCs off");
                 darkened.push(name.to_string());
+                heads.extend(lit);
                 // This exact fd. Close-then-reopen is last-close: the console restore
                 // re-lights, and the fresh fd holds nothing.
                 cards.push(card);
@@ -150,27 +218,20 @@ pub fn darken() -> Option<DrmDarken> {
         return None;
     }
     Some(DrmDarken {
-        _cards: cards,
+        cards,
         darkened,
+        heads,
     })
 }
 
-/// Darken one card. Return the open fd (the hold) and how many CRTCs went off.
-/// Closing that fd is last-close and restores the console; count 0 may drop it.
-fn darken_card(path: &Path) -> std::io::Result<(File, usize)> {
-    let card = File::options().read(true).write(true).open(path)?;
-    let fd = card.as_raw_fd();
-    // Foreign master (live compositor, other gamescope) ⇒ not ours. Also the Attach
-    // guard: do not darken the picture being streamed.
-    ioctl(fd, DRM_IOCTL_SET_MASTER, &mut 0u64)?;
-
+/// Every CRTC id on `fd`: a count pass, then a data pass into a buffer of that size.
+fn crtc_ids(fd: libc::c_int) -> std::io::Result<Vec<u32>> {
     // Count pass: every pointer NULL, the kernel fills in the counts.
     let mut res = DrmModeCardRes::default();
     ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut res)?;
     let n = res.count_crtcs as usize;
     if n == 0 {
-        let _ = ioctl(fd, DRM_IOCTL_DROP_MASTER, &mut 0u64);
-        return Ok((card, 0));
+        return Ok(Vec::new());
     }
     // Data pass: hand back a buffer sized by that count and ask again.
     let mut ids = vec![0u32; n];
@@ -183,6 +244,71 @@ fn darken_card(path: &Path) -> std::io::Result<(File, usize)> {
     // The kernel may report FEWER than the count pass promised (a hotplug between the two); it
     // never reports more than the buffer we sized, so trust the second count.
     ids.truncate(res.count_crtcs as usize);
+    Ok(ids)
+}
+
+/// The mode `card`'s one lit CRTC runs, as `(width, height, mHz)` — what the panel shows now,
+/// where its EDID only says what it prefers. `None` when the card does not open, nothing is
+/// lit, or more than one CRTC is: which of those is the caller's head cannot be told here.
+/// No master is taken; the compositor keeps it, and `GETCRTC` never needs it.
+pub(crate) fn lit_mode(card: &str) -> Option<(u32, u32, u32)> {
+    let file = File::open(Path::new("/dev/dri").join(card)).ok()?;
+    let fd = file.as_raw_fd();
+    let mut lit = crtc_ids(fd).ok()?.into_iter().filter_map(|id| {
+        let mut crtc = DrmModeCrtc {
+            crtc_id: id,
+            ..Default::default()
+        };
+        ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &mut crtc).ok()?;
+        (crtc.mode_valid != 0).then_some(crtc.mode)
+    });
+    let mode = lit.next()?;
+    if lit.next().is_some() {
+        return None;
+    }
+    Some((
+        u32::from(mode.hdisplay),
+        u32::from(mode.vdisplay),
+        refresh_mhz(&mode),
+    ))
+}
+
+/// The kernel's `drm_mode_vrefresh` in mHz rather than rounded Hz: 59.94 stays apart from 60.
+fn refresh_mhz(m: &DrmModeModeinfo) -> u32 {
+    const INTERLACE: u32 = 1 << 4;
+    const DBLSCAN: u32 = 1 << 5;
+    let (htotal, vtotal) = (u64::from(m.htotal), u64::from(m.vtotal));
+    if htotal == 0 || vtotal == 0 {
+        return m.vrefresh.saturating_mul(1000);
+    }
+    // `clock` is kHz: ×1_000_000 over the pixel count per frame is mHz.
+    let mut num = u64::from(m.clock) * 1_000_000;
+    let mut den = htotal * vtotal;
+    if m.flags & INTERLACE != 0 {
+        num *= 2;
+    }
+    if m.flags & DBLSCAN != 0 {
+        den *= 2;
+    }
+    if m.vscan > 1 {
+        den *= u64::from(m.vscan);
+    }
+    (num / den) as u32
+}
+
+/// Darken one card. Return the open fd (the hold) and how many CRTCs went off.
+/// Closing that fd is last-close and restores the console; count 0 may drop it.
+fn darken_card(path: &Path) -> std::io::Result<(File, usize)> {
+    let card = File::options().read(true).write(true).open(path)?;
+    let fd = card.as_raw_fd();
+    // Foreign master (live compositor, other gamescope) ⇒ not ours. Also the Attach
+    // guard: do not darken the picture being streamed.
+    ioctl(fd, DRM_IOCTL_SET_MASTER, &mut 0u64)?;
+    let ids = crtc_ids(fd)?;
+    if ids.is_empty() {
+        let _ = ioctl(fd, DRM_IOCTL_DROP_MASTER, &mut 0u64);
+        return Ok((card, 0));
+    }
 
     let mut off = 0usize;
     for id in ids {
@@ -214,7 +340,55 @@ fn darken_card(path: &Path) -> std::io::Result<(File, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DrmModeCardRes, DrmModeCrtc, DrmModeModeinfo};
+    use super::{
+        lit_connectors, refresh_mhz, still_dark, DrmModeCardRes, DrmModeCrtc, DrmModeModeinfo,
+    };
+    use std::time::Duration;
+
+    /// sysfs over a temp dir: a card's lit connectors are its own (`card1-` is not `card10-`);
+    /// after the release only a head still `disabled` counts as dark, an unplugged one not.
+    #[test]
+    fn the_release_reads_the_heads_back_from_sysfs() {
+        let sysfs = std::env::temp_dir().join(format!("pf-drm-sysfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sysfs);
+        let set = |connector: &str, state: &str| {
+            std::fs::create_dir_all(sysfs.join(connector)).unwrap();
+            std::fs::write(sysfs.join(connector).join("enabled"), format!("{state}\n")).unwrap();
+        };
+        set("card1-DP-1", "enabled");
+        set("card1-HDMI-A-1", "enabled");
+        set("card1-DP-2", "disabled");
+        set("card10-DP-1", "enabled");
+        std::fs::create_dir_all(sysfs.join("card1")).unwrap();
+        std::fs::create_dir_all(sysfs.join("renderD128")).unwrap();
+        let lit = lit_connectors(&sysfs, "card1");
+        assert_eq!(lit, ["card1-DP-1", "card1-HDMI-A-1"]);
+
+        set("card1-DP-1", "disabled");
+        std::fs::remove_dir_all(sysfs.join("card1-HDMI-A-1")).unwrap();
+        assert_eq!(still_dark(&sysfs, &lit, Duration::ZERO), ["card1-DP-1"]);
+        set("card1-DP-1", "enabled");
+        assert!(still_dark(&sysfs, &lit, Duration::ZERO).is_empty());
+        let _ = std::fs::remove_dir_all(&sysfs);
+    }
+
+    /// `drm_mode_vrefresh`'s cases: a plain mode, 59.94 kept apart from 60, interlace doubling
+    /// the rate, and a mode with no timing falling back to the kernel's rounded field.
+    #[test]
+    fn the_lit_mode_rate_follows_the_kernels_formula() {
+        let mut m = DrmModeCrtc::default().mode;
+        // 4K120: 1188 MHz over 4400×2250.
+        (m.clock, m.htotal, m.vtotal) = (1_188_000, 4400, 2250);
+        assert_eq!(refresh_mhz(&m), 120_000);
+        // 1080p59.94: 148.352 MHz over 2200×1125.
+        (m.clock, m.htotal, m.vtotal) = (148_352, 2200, 1125);
+        assert_eq!(refresh_mhz(&m), 59_940);
+        // 1080i60: the same timing at half the pixel clock, interlaced.
+        (m.clock, m.flags) = (74_250, 1 << 4);
+        assert_eq!(refresh_mhz(&m), 60_000);
+        (m.htotal, m.vrefresh) = (0, 75);
+        assert_eq!(refresh_mhz(&m), 75_000);
+    }
 
     /// Payload sizes the ioctl numbers encode, plus the two offsets the count/data-pass uses.
     /// The `const` asserts fail the build; this restates them so a failure is greppable.

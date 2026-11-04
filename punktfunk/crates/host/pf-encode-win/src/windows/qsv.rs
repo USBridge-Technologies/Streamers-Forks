@@ -330,9 +330,13 @@ struct EncodeConfig {
     ten_bit: bool,
     /// BT.2020 PQ signalling; a 10-bit stream without it is BT.709.
     hdr: bool,
+    /// The range the input carries and the stream signals; `false` is studio.
+    full_range: bool,
     /// CO2 intra-refresh wave instead of LTR (mutually exclusive).
     intra_refresh: bool,
     hdr_meta: Option<pf_frame::HdrMeta>,
+    /// VDEnc, the fixed-function encoder. Gen9 has it for AVC only.
+    low_power: bool,
 }
 
 fn codec_id(codec: Codec) -> u32 {
@@ -355,7 +359,11 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
     };
     let mfx = mfx_of(&mut par);
     mfx.CodecId = codec_id(cfg.codec);
-    mfx.LowPower = vpl::MFX_CODINGOPTION_ON as u16;
+    mfx.LowPower = if cfg.low_power {
+        vpl::MFX_CODINGOPTION_ON
+    } else {
+        vpl::MFX_CODINGOPTION_OFF
+    } as u16;
     mfx.CodecProfile = match (cfg.codec, cfg.ten_bit) {
         (Codec::H264, _) => vpl::MFX_PROFILE_AVC_HIGH as u16,
         (Codec::H265, false) => vpl::MFX_PROFILE_HEVC_MAIN as u16,
@@ -438,15 +446,17 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         b
     });
 
-    // Colour signalling is unconditional: the input is BT.709 limited or BT.2020 PQ, or BGRA
-    // the encoder converts to BT.709 limited. "Unspecified" lets decoders pick 601 at sub-HD.
+    // Colour signalling is unconditional: BT.709 or BT.2020 PQ, at the range the host's NV12
+    // and P010 carry. The runtime's own RGB4 conversion is studio range whatever this says
+    // (measured), so `EncodeInput::choose` never opens QSV on BGRA. "Unspecified" lets decoders
+    // pick 601 at sub-HD.
     let hdr = cfg.hdr && cfg.codec != Codec::H264;
     let vsi = {
         let mut b = Box::new(vpl::mfxExtVideoSignalInfo::default());
         b.Header.BufferId = vpl::MFX_EXTBUFF_VIDEO_SIGNAL_INFO as u32;
         b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtVideoSignalInfo>() as u32;
         b.VideoFormat = 5; // unspecified
-        b.VideoFullRange = 0;
+        b.VideoFullRange = u16::from(cfg.full_range);
         b.ColourDescriptionPresent = 1;
         if hdr {
             b.ColourPrimaries = 9; // BT.2020
@@ -875,6 +885,8 @@ pub struct QsvEncoder {
     bitrate_bps: u64,
     ten_bit: bool,
     hdr: bool,
+    /// The range the input carries and the stream signals ([`Self::set_full_range`]).
+    full_range: bool,
     /// What the caller promised through [`Encoder::set_input_ring_depth`]
     /// ([`QsvEncoder::in_place`]).
     input_ring_depth: Option<usize>,
@@ -905,6 +917,8 @@ pub struct QsvEncoder {
     fail_submit_at: Option<i64>,
     /// Stall recovery since the last AU, cleared in `poll`.
     stall: Stall,
+    /// Ask for VDEnc; cleared once Init refuses it and opens without.
+    low_power: bool,
 }
 
 // SAFETY: raw VPL handles are not auto-`Send`, and none is thread-affine. Every call on this
@@ -962,6 +976,7 @@ impl QsvEncoder {
             bitrate_bps,
             ten_bit,
             hdr: hdr && ten_bit,
+            full_range: true,
             input_ring_depth: None,
             runtime_surfaces: false,
             inner: None,
@@ -979,7 +994,14 @@ impl QsvEncoder {
             #[cfg(test)]
             fail_submit_at: None,
             stall: Stall::Clear,
+            low_power: true,
         })
+    }
+
+    /// Signal studio range instead of full, before the first frame: the host's converters write
+    /// studio for a session advertised that way. A re-init keeps it.
+    pub fn set_full_range(&mut self, full: bool) {
+        self.full_range = full;
     }
 
     fn ltr_wanted(&self) -> bool {
@@ -1005,15 +1027,18 @@ impl QsvEncoder {
             bitrate_bps: self.bitrate_bps,
             ten_bit: self.ten_bit,
             hdr: self.hdr,
+            full_range: self.full_range,
             intra_refresh: intra_refresh_requested(),
             hdr_meta: self.hdr_meta,
+            low_power: self.low_power,
         }
     }
 
     /// Query-gate LTR/IR, Init, then size the bitstream pool from `BufferSizeInKB`. Also
-    /// returns the `FrameInfo` the encoder took, which surfaces of ours must carry.
+    /// returns the `FrameInfo` the encoder took, which surfaces of ours must carry. A runtime
+    /// that refuses VDEnc for this codec (HEVC on Gen9) gets the whole sequence again without it.
     fn init_encode(
-        &self,
+        &mut self,
         session: vpl::mfxSession,
     ) -> Result<(bool, bool, usize, vpl::mfxFrameInfo)> {
         let cfg = self.encode_config();
@@ -1049,6 +1074,19 @@ impl QsvEncoder {
         // Warnings (corrected params, partial acceleration) are logged but accepted.
         // SAFETY: `session` is live; `set` (params + ext chain) outlives the synchronous call.
         let sts = unsafe { vpl::MFXVideoENCODE_Init(session, &mut set.par) };
+        if sts == vpl::MFX_ERR_UNSUPPORTED && self.low_power {
+            self.low_power = false;
+            let full = self.init_encode(session);
+            match &full {
+                Ok(_) => tracing::info!(
+                    codec = ?self.codec,
+                    "QSV low-power encoder unsupported for this codec — using the full encoder"
+                ),
+                // The refusal may be the allocator's; the caller's retry asks for VDEnc again.
+                Err(_) => self.low_power = true,
+            }
+            return full;
+        }
         vpl_ok(sts, "MFXVideoENCODE_Init")?;
         if sts > vpl::MFX_ERR_NONE {
             tracing::debug!(status = sts_name(sts), "QSV Init returned a warning");
@@ -2002,27 +2040,32 @@ fn probe_query(codec: Codec, ten_bit: bool, adapter_luid: Option<LUID>) -> bool 
     let Ok((_loader, session, _api)) = opened else {
         return false;
     };
-    let cfg = EncodeConfig {
-        codec,
-        input: if ten_bit {
-            PixelFormat::P010
-        } else {
-            PixelFormat::Nv12
-        },
-        width: 640,
-        height: 480,
-        fps: 30,
-        bitrate_bps: 4_000_000,
-        ten_bit,
-        hdr: ten_bit,
-        intra_refresh: false,
-        hdr_meta: None,
-    };
-    let mut q_in = build_params(&cfg);
-    let mut q_out = build_params(&cfg);
-    // SAFETY: session is live; both param blocks + ext chains outlive the synchronous call.
-    let sts = unsafe { vpl::MFXVideoENCODE_Query(session.0, &mut q_in.par, &mut q_out.par) };
-    sts >= vpl::MFX_ERR_NONE
+    // With VDEnc or without, as `init_encode` opens it.
+    [true, false].into_iter().any(|low_power| {
+        let cfg = EncodeConfig {
+            codec,
+            input: if ten_bit {
+                PixelFormat::P010
+            } else {
+                PixelFormat::Nv12
+            },
+            width: 640,
+            height: 480,
+            fps: 30,
+            bitrate_bps: 4_000_000,
+            ten_bit,
+            hdr: ten_bit,
+            full_range: true,
+            intra_refresh: false,
+            hdr_meta: None,
+            low_power,
+        };
+        let mut q_in = build_params(&cfg);
+        let mut q_out = build_params(&cfg);
+        // SAFETY: session is live; both param blocks + ext chains outlive the synchronous call.
+        let sts = unsafe { vpl::MFXVideoENCODE_Query(session.0, &mut q_in.par, &mut q_out.par) };
+        sts >= vpl::MFX_ERR_NONE
+    })
 }
 
 #[cfg(test)]
@@ -2051,6 +2094,31 @@ mod tests {
             tracing::debug!(?codec, can, can10, "QSV probe");
             if can10 {
                 assert!(can, "10-bit implies base codec support");
+            }
+        }
+    }
+
+    /// The stream signals the range the encoder was given, on every codec.
+    #[test]
+    fn the_signal_info_carries_the_range() {
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            for full_range in [true, false] {
+                let set = build_params(&EncodeConfig {
+                    codec,
+                    input: PixelFormat::Nv12,
+                    width: 1920,
+                    height: 1080,
+                    fps: 60,
+                    bitrate_bps: 20_000_000,
+                    ten_bit: false,
+                    hdr: false,
+                    full_range,
+                    intra_refresh: false,
+                    hdr_meta: None,
+                    low_power: true,
+                });
+                let vsi = set.vsi.expect("signal info");
+                assert_eq!(vsi.VideoFullRange, u16::from(full_range), "{codec:?}");
             }
         }
     }

@@ -12,11 +12,12 @@ async fn host_info_reports_identity_and_ports() {
     // `os` is the icon-walk chain; `os_name` is the human label. Both copied from Host.
     assert_eq!(body["os"], "linux/arch/steamos");
     assert_eq!(body["os_name"], "SteamOS");
-    assert_eq!(body["ports"]["http"], HTTP_PORT);
+    // GameStream's ports only with GameStream on, which a test host is not.
+    assert_eq!(body["ports"]["http"], serde_json::Value::Null);
     assert_eq!(body["ports"]["mgmt"], DEFAULT_PORT);
-    // Assert against `host_wire_caps`, not a fixed set. HEVC serializes as "hevc", never "h265".
+    // Assert against `wire_caps`, not a fixed set. HEVC serializes as "hevc", never "h265".
     use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
-    let caps = crate::encode::host_wire_caps();
+    let caps = crate::encode::resolve().wire_caps();
     let expected: Vec<&str> = [
         (CODEC_H264, "h264"),
         (CODEC_HEVC, "hevc"),
@@ -54,6 +55,7 @@ async fn host_info_publishes_the_hosts_own_fingerprint() {
         Some([0xab; 32]),
         false,
         false,
+        None,
     ));
     let (status, body) = send(&app, get_req("/api/v1/host")).await;
     assert_eq!(status, StatusCode::OK);
@@ -79,7 +81,15 @@ async fn compositors_lists_all_backends_with_flags() {
         let ids: Vec<&str> = arr.iter().map(|c| c["id"].as_str().unwrap()).collect();
         assert_eq!(
             ids,
-            ["kwin", "gamescope", "mutter", "wlroots", "hyprland", "niri"]
+            [
+                "kwin",
+                "gamescope",
+                "mutter",
+                "wlroots",
+                "hyprland",
+                "niri",
+                "umbriel"
+            ]
         );
     }
     for c in arr {
@@ -391,17 +401,27 @@ async fn display_client_overlay_is_served_beside_the_policy_never_inside_it() {
     }
 }
 
-/// The bug this exists for: `clients` never rides the wire, so a host-wide PUT always arrives
-/// with an empty map, and the store replaces the whole policy. Without the carry-across, every
-/// preset click silently reverted every device to the host policy.
-///
-/// Pure on purpose — `policy::prefs()` is a process-global bound to the config dir at its first
-/// use anywhere in this binary, so a test that drove the real route would write to the
-/// developer's own `display-settings.json`.
+/// The host-wide PUT's body laid onto `stored`, as the route stores it.
+fn put_onto(
+    stored: &crate::vdisplay::policy::DisplayPolicy,
+    body: serde_json::Value,
+) -> crate::vdisplay::policy::DisplayPolicy {
+    let body = body.as_object().cloned().expect("a PUT body is an object");
+    crate::mgmt::display::merged(stored, body).unwrap()
+}
+
+/// A host-wide PUT is a merge: a key the body omits keeps its stored value and `null` clears it.
+/// Pure: `policy::prefs()` is bound to the config dir at its first use in this binary, so
+/// driving the route would write the developer's own `display-settings.json`.
 #[test]
-fn a_host_wide_save_carries_the_stored_overlays_across() {
+fn a_host_wide_put_keeps_every_key_it_omits() {
     use crate::vdisplay::policy::{ClientOverlay, DisplayPolicy, KeepAlive, Preset};
-    let mut stored = DisplayPolicy::default();
+    let mut stored = DisplayPolicy {
+        capture_monitor: Some("DP-1".into()),
+        keep_monitors: vec!["HDMI-A-1".into()],
+        keep_alive: KeepAlive::Duration { seconds: 30 },
+        ..DisplayPolicy::default()
+    };
     stored.clients.insert(
         "aa11".into(),
         ClientOverlay {
@@ -409,24 +429,45 @@ fn a_host_wide_save_carries_the_stored_overlays_across() {
             ..ClientOverlay::default()
         },
     );
-    // What the console sends back: the policy it was served, which carries no overlays.
-    let incoming = DisplayPolicy {
-        preset: Preset::Workstation,
-        ..DisplayPolicy::default()
-    };
-    assert!(incoming.clients.is_empty(), "the wire never carries them");
+    let stored = stored.sanitized();
 
-    let merged = crate::mgmt::display::with_stored_overlays(incoming, &stored);
     assert_eq!(
-        merged.preset,
-        Preset::Workstation,
-        "the operator's change lands"
+        put_onto(&stored, serde_json::json!({"preset": "gaming-rig"})),
+        DisplayPolicy {
+            preset: Preset::GamingRig,
+            ..stored.clone()
+        },
+        "a preset click keeps the pin, the lit monitors, the keep-alive and the overlays"
     );
     assert_eq!(
-        merged.effective_for(Some("aa11")).keep_alive,
-        KeepAlive::Forever,
-        "and the device keeps its own pin"
+        put_onto(&stored, serde_json::json!({})),
+        stored,
+        "an empty body changes nothing"
     );
+    assert_eq!(
+        put_onto(&stored, serde_json::json!({"capture_monitor": null})),
+        DisplayPolicy {
+            capture_monitor: None,
+            ..stored.clone()
+        },
+        "`null` clears the pin and nothing else"
+    );
+}
+
+/// A body that is not an object has no keys to merge.
+#[tokio::test]
+async fn the_host_wide_policy_put_refuses_a_body_that_is_not_an_object() {
+    let app = test_app(test_state(), None);
+    let (status, _) = send(
+        &app,
+        json_req(
+            Method::PUT,
+            "/api/v1/display/settings",
+            serde_json::json!([]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// A stale console must not be able to revert per-device work it never saw by
@@ -546,4 +587,30 @@ async fn gpu_endpoints_list_and_validate() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+/// The door's blockers name the account the host runs as: only the console reads them.
+#[tokio::test]
+async fn host_info_keeps_the_door_blockers_from_a_paired_device() {
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(crate::test_support::scratch().join("pf-mgmt-host-door.json")),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let fp = "deadbeefcafe";
+    np.add("couch", fp).unwrap();
+    let app = test_app_native(test_state(), np);
+    let mut req = get_req("/api/v1/host");
+    req.extensions_mut()
+        .insert(PeerCertFingerprint(Some(fp.to_string())));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(body["door_unavailable"].is_null(), "{body}");
 }

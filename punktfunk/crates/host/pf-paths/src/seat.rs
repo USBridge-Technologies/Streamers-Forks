@@ -20,7 +20,7 @@
 pub enum HostRole {
     /// No marker: the console host.
     Plain,
-    /// `serve --door` or `PUNKTFUNK_DOOR=1`, on a host that is no seat's: it advertises, pairs,
+    /// `serve --door`, on a host that is no seat's: it advertises, pairs,
     /// serves the console and places every connect on a seat, and never streams itself.
     Door,
     /// `PUNKTFUNK_SEAT_SESSION=1`: a supervisor-managed seat owns this host, not the console.
@@ -62,7 +62,6 @@ impl HostRole {
         seat_session: Option<&str>,
         seat_owner: Option<&str>,
         seat_headless: Option<&str>,
-        door: Option<&str>,
         door_flag: bool,
     ) -> HostRole {
         let on = |value: Option<&str>| value == Some("1");
@@ -72,7 +71,7 @@ impl HostRole {
             (true, true, false) => Some(SeatRole::Owner),
             (true, true, true) => Some(SeatRole::OwnerHeadless),
         };
-        match (seat, door_flag || on(door)) {
+        match (seat, door_flag) {
             (Some(seat), _) => HostRole::Seat(seat),
             (None, true) => HostRole::Door,
             (None, false) => HostRole::Plain,
@@ -137,7 +136,6 @@ fn read(door_flag: bool) -> (HostRole, bool) {
         var("PUNKTFUNK_SEAT_SESSION").as_deref(),
         var("PUNKTFUNK_SEAT_OWNER").as_deref(),
         var("PUNKTFUNK_SEAT_HEADLESS").as_deref(),
-        var("PUNKTFUNK_DOOR").as_deref(),
         door_flag,
     );
     let refused = var("PUNKTFUNK_PAIRING").as_deref() == Some("refused");
@@ -162,11 +160,10 @@ pub fn role() -> HostRole {
 }
 
 /// Each role variable, the one value that sets its marker, and what to say of any other.
-const MARKERS: [(&str, &str, &str); 5] = [
+const MARKERS: [(&str, &str, &str); 4] = [
     ("PUNKTFUNK_SEAT_SESSION", "1", ONLY_ONE),
     ("PUNKTFUNK_SEAT_OWNER", "1", ONLY_ONE),
     ("PUNKTFUNK_SEAT_HEADLESS", "1", ONLY_ONE),
-    ("PUNKTFUNK_DOOR", "1", ONLY_ONE),
     ("PUNKTFUNK_PAIRING", "refused", ONLY_REFUSED),
 ];
 const ONLY_ONE: &str = "only the value 1 sets it";
@@ -179,11 +176,11 @@ const ON_A_SEAT_HOST: &str = "a seat host is never the door";
 /// marker; the door asked for on a seat host. `values` are the role variables' in [`MARKERS`]
 /// order, `None` when unset. Naming a setting here changes no answer.
 pub fn ignored_values(
-    values: [Option<&str>; 5],
+    values: [Option<&str>; 4],
     door_flag: bool,
     seat_id_set: bool,
 ) -> Vec<(&'static str, &'static str)> {
-    let [seat_session, seat_owner, seat_headless, door, _] = values;
+    let [seat_session, seat_owner, seat_headless, _] = values;
     let mut ignored = Vec::new();
     for (value, (name, marker, why)) in values.into_iter().zip(MARKERS) {
         if value.is_some_and(|value| value != marker) {
@@ -191,8 +188,7 @@ pub fn ignored_values(
         }
     }
     let (stray, why) = if seat_session == Some("1") {
-        let door = vec![("PUNKTFUNK_DOOR", door == Some("1")), ("--door", door_flag)];
-        (door, ON_A_SEAT_HOST)
+        (vec![("--door", door_flag)], ON_A_SEAT_HOST)
     } else {
         let seat = vec![
             ("PUNKTFUNK_SEAT_OWNER", seat_owner == Some("1")),
@@ -253,11 +249,41 @@ pub fn seat_id() -> Result<Option<String>, &'static str> {
 
 /// The box's config dir a seat host reads its trust from (`PUNKTFUNK_TRUST_DIR`): the
 /// identity, the pairing store, `profiles.json` and the device display overlays. Read only;
-/// the box host is their one writer. `None` on the box host, and for a relative path.
+/// the box host is their one writer. `None` on a host that is no seat's, as for [`seat_id`],
+/// and for a relative path.
 pub fn trust_dir() -> Option<std::path::PathBuf> {
+    if !role().is_seat_host() {
+        return None;
+    }
     std::env::var_os("PUNKTFUNK_TRUST_DIR")
         .map(std::path::PathBuf::from)
         .filter(|dir| dir.is_absolute())
+}
+
+/// The file a Windows seat host writes into its config dir just before it drops its own session's
+/// connection: the time, in unix milliseconds as decimal text.
+pub const SEAT_DISCONNECT_MARK: &str = "disconnect-mark";
+
+/// How long after it was written a disconnect mark still excuses a drop.
+const DISCONNECT_MARK_LIFE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a [`SEAT_DISCONNECT_MARK`]'s text excuses the drop of a connection that began at
+/// `since`: its time is at or after `since` and at most 30 s before `now`. A mark from before the
+/// connection began belongs to an earlier one.
+pub fn mark_excuses_drop(
+    mark: &str,
+    since: std::time::SystemTime,
+    now: std::time::SystemTime,
+) -> bool {
+    let Some(marked) = mark.trim().parse().ok().and_then(|millis| {
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(millis))
+    }) else {
+        return false;
+    };
+    marked >= since
+        && now
+            .duration_since(marked)
+            .is_ok_and(|age| age <= DISCONNECT_MARK_LIFE)
 }
 
 /// Where a host reads the box's library from (`PUNKTFUNK_LIBRARY_DIR`): `library*.json`,
@@ -305,9 +331,36 @@ pub fn uinput_devname(account: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A mark excuses a drop only between the connection's start and 30 s after it was written.
+    #[test]
+    fn a_disconnect_mark_excuses_only_its_own_connection_for_30_s() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let since = UNIX_EPOCH + Duration::from_secs(1_000);
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let mark = |secs: u64| (secs * 1_000).to_string();
+        assert!(mark_excuses_drop(&mark(1_005), since, at(1_010)));
+        assert!(mark_excuses_drop(
+            &format!("{}\r\n", mark(1_000)),
+            since,
+            at(1_030)
+        ));
+        assert!(
+            !mark_excuses_drop(&mark(999), since, at(1_001)),
+            "before the connection"
+        );
+        assert!(!mark_excuses_drop(&mark(1_005), since, at(1_036)), "stale");
+        assert!(
+            !mark_excuses_drop(&mark(1_005), since, at(1_004)),
+            "from the future"
+        );
+        assert!(!mark_excuses_drop("", since, at(1_010)));
+        assert!(!mark_excuses_drop("soon", since, at(1_010)));
+        assert!(!mark_excuses_drop(&u64::MAX.to_string(), since, at(1_010)));
+    }
+
     /// What each predicate answers, by the markers set. Inputs: `S` `PUNKTFUNK_SEAT_SESSION=1`,
-    /// `O` `PUNKTFUNK_SEAT_OWNER=1`, `H` `PUNKTFUNK_SEAT_HEADLESS=1`, `D` the door (`serve --door`
-    /// or `PUNKTFUNK_DOOR=1`), `P` `PUNKTFUNK_PAIRING=refused`. Answers, in [`answers`]' order:
+    /// `O` `PUNKTFUNK_SEAT_OWNER=1`, `H` `PUNKTFUNK_SEAT_HEADLESS=1`, `D` `serve --door`, `P`
+    /// `PUNKTFUNK_PAIRING=refused`. Answers, in [`answers`]' order:
     /// `s` seat host, `o` owner seat, `c` follows the contract, `r` runs a seat session, `d` door,
     /// `p` pairing refused, `e` a missing seat id is an error.
     const TRUTH: [(&str, &str); 32] = [
@@ -347,11 +400,10 @@ mod tests {
 
     /// Each role variable in [`TRUTH`]'s input order: its name, the value that sets its marker,
     /// and a value that must not.
-    const VARS: [(&str, &str, &str); 5] = [
+    const VARS: [(&str, &str, &str); 4] = [
         ("PUNKTFUNK_SEAT_SESSION", "1", "true"),
         ("PUNKTFUNK_SEAT_OWNER", "1", "0"),
         ("PUNKTFUNK_SEAT_HEADLESS", "1", "yes"),
-        ("PUNKTFUNK_DOOR", "1", "true"),
         ("PUNKTFUNK_PAIRING", "refused", "1"),
     ];
 
@@ -359,7 +411,7 @@ mod tests {
     const CHILD: &str = "PF_ROLE_TRUTH_CHILD";
     const MARK: &str = "role-answers=";
     /// Every variable unset, set and near-missed, with and without the flag.
-    const COMBINATIONS: usize = 3 * 3 * 3 * 3 * 3 * 2;
+    const COMBINATIONS: usize = 3 * 3 * 3 * 3 * 2;
 
     fn answers() -> String {
         let role = role();
@@ -428,7 +480,7 @@ mod tests {
         let mut child = child("every_predicate_answers_its_truth_table_row");
         child.env(CHILD, if flag { "flag" } else { "none" });
         let mut digits = combination / 2;
-        let mut set = [false; 5];
+        let mut set = [false; 4];
         for (at, (name, on, near_miss)) in VARS.iter().enumerate() {
             match digits % 3 {
                 0 => child.env_remove(name),
@@ -439,11 +491,10 @@ mod tests {
             digits /= 3;
         }
         let row = |door_flag: bool| {
-            let mut set = set;
-            set[3] |= door_flag;
+            let [seat, owner, headless, pairing] = set;
             let inputs: String = "SOHDP"
                 .chars()
-                .zip(set)
+                .zip([seat, owner, headless, door_flag, pairing])
                 .map(|(letter, on)| if on { letter } else { '-' })
                 .collect();
             let row = TRUTH.iter().find(|(row, _)| *row == inputs);
@@ -496,29 +547,27 @@ mod tests {
 
     #[test]
     fn a_setting_that_changes_nothing_is_named_with_why() {
-        let (seat, owner, headless) = (VARS[0].0, VARS[1].0, VARS[2].0);
-        let (door, pairing) = (VARS[3].0, VARS[4].0);
+        let (seat, owner, headless, pairing) = (VARS[0].0, VARS[1].0, VARS[2].0, VARS[3].0);
         // A console host, a door, and the two seats a supervisor starts: nothing to say.
-        assert!(ignored_values([None; 5], false, false).is_empty());
-        assert!(ignored_values([None, None, None, Some("1"), None], true, false).is_empty());
-        let row = [Some("1"), None, Some("1"), None, Some("refused")];
+        assert!(ignored_values([None; 4], false, false).is_empty());
+        assert!(ignored_values([None; 4], true, false).is_empty());
+        let row = [Some("1"), None, Some("1"), Some("refused")];
         assert!(ignored_values(row, false, true).is_empty());
-        let owner_row = [Some("1"), Some("1"), Some("1"), None, Some("refused")];
+        let owner_row = [Some("1"), Some("1"), Some("1"), Some("refused")];
         assert!(ignored_values(owner_row, false, true).is_empty());
 
-        let near_misses = [Some("true"), Some("0"), Some("yes"), Some(""), Some("1")];
+        let near_misses = [Some("true"), Some("0"), Some("yes"), Some("1")];
         assert_eq!(
             ignored_values(near_misses, false, false),
             [
                 (seat, ONLY_ONE),
                 (owner, ONLY_ONE),
                 (headless, ONLY_ONE),
-                (door, ONLY_ONE),
                 (pairing, "only the value refused sets it"),
             ]
         );
         assert_eq!(
-            ignored_values([None, Some("1"), Some("1"), None, None], false, true),
+            ignored_values([None, Some("1"), Some("1"), None], false, true),
             [
                 (owner, NO_SEAT_MARKER),
                 (headless, NO_SEAT_MARKER),
@@ -526,8 +575,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            ignored_values([Some("1"), None, None, Some("1"), None], true, true),
-            [(door, ON_A_SEAT_HOST), ("--door", ON_A_SEAT_HOST)]
+            ignored_values([Some("1"), None, None, None], true, true),
+            [("--door", ON_A_SEAT_HOST)]
         );
     }
 
@@ -547,9 +596,8 @@ mod tests {
         assert_eq!(printed(&mut near_misses), [named]);
 
         let mut seat = child(TEST);
-        seat.env(CHILD, "flag")
-            .envs([(VARS[0].0, "1"), (VARS[3].0, "1")]);
-        assert_eq!(printed(&mut seat), ["PUNKTFUNK_DOOR --door"]);
+        seat.env(CHILD, "flag").env(VARS[0].0, "1");
+        assert_eq!(printed(&mut seat), ["--door"]);
     }
 
     /// A policy test walks [`HostRole::ALL`], so it holds each role the markers name, once.
@@ -558,7 +606,7 @@ mod tests {
         let mut named = Vec::new();
         for markers in 0..16u8 {
             let value = |bit: u8| (markers & bit != 0).then_some("1");
-            let role = HostRole::from_env_values(value(1), value(2), value(4), value(8), false);
+            let role = HostRole::from_env_values(value(1), value(2), value(4), markers & 8 != 0);
             if !named.contains(&role) {
                 named.push(role);
             }

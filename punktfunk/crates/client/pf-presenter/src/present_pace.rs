@@ -26,8 +26,8 @@ const STALE_REOPEN_NS: u64 = 100_000_000;
 pub(crate) struct FrameStore<T> {
     capacity: usize,
     frames: VecDeque<T>,
-    /// Newest-wins holds its frame until due or until the next one arrives (the latency
-    /// intent on a measured VRR panel).
+    /// Newest-wins holds its frame until due or until the next one arrives (the paced
+    /// latency intent).
     paced: bool,
     /// Newest-wins displacements; not a fault.
     replaced: u32,
@@ -99,6 +99,22 @@ impl<T> FrameStore<T> {
         self.frames.pop_front()
     }
 
+    /// Newest-wins at a latch slot, one frame of backlog allowed: the oldest frame `due`
+    /// goes out and one more may wait behind it; any older than those are replaced. A
+    /// stream above the panel rate so never queues behind the slot, while a successor
+    /// early by jitter waits for its own slot instead of displacing its predecessor.
+    /// Nothing due: `None`.
+    pub(crate) fn take_due_bounded(&mut self, due: impl Fn(&T) -> bool) -> Option<T> {
+        let n = self.frames.iter().take_while(|f| due(f)).count();
+        if n == 0 {
+            return None;
+        }
+        let drop = n.saturating_sub(2);
+        self.frames.drain(..drop);
+        self.replaced += drop as u32;
+        self.frames.pop_front()
+    }
+
     /// Next `take` candidate. The run loop waits until this frame is due.
     pub(crate) fn front(&self) -> Option<&T> {
         self.frames.front()
@@ -140,11 +156,12 @@ impl<T> FrameStore<T> {
 /// Panel latch grid: last on-glass instant plus the learned period, for slot targeting.
 ///
 /// Period is the shared [`punktfunk_core::phase::PanelGrid`], fed the median of each
-/// [`GRID_OBSERVE_EVERY`] spacings, snapped onto the mode period when it lies within
-/// [`grid_snap_ns`] of it. Present-wait stamps carry milliseconds of wake jitter; the
-/// min of a run reads that as a faster panel and every slot it predicts is phantom.
-/// A stream below panel rate lands at k×period and stays as measured: any multiple
-/// is a real latch.
+/// [`GRID_OBSERVE_EVERY`] spacings, snapped onto the learned period — the mode claim
+/// until one is learned — when it lies within [`grid_snap_ns`] of it. Present-wait
+/// stamps carry milliseconds of wake jitter; the min of a run reads that as a faster
+/// panel and every slot it predicts is phantom. A stream below panel rate lands at
+/// k×period and stays as measured: any multiple is a real latch. The claim is only a
+/// fallback: a Deck set to 60 Hz still reports its 90 Hz panel.
 pub(crate) struct LatchClock {
     anchor_ns: u64,
     /// Previous stamp, kept across calls. The run loop drains one present-wait sample
@@ -167,12 +184,16 @@ fn grid_snap_ns(period_ns: u64) -> u64 {
 }
 
 impl LatchClock {
+    /// `refresh_hz` 0 is a mode without a stated rate (SDL): the fallback is 60, where
+    /// `frame_interval_ns` falls back too, not 1 Hz. The grid itself starts unknown: the
+    /// first batch sets it, so a wrong claim lasts one batch, not a widen streak.
     pub(crate) fn new(refresh_hz: u32) -> LatchClock {
+        let refresh_hz = if refresh_hz == 0 { 60 } else { refresh_hz };
         LatchClock {
             anchor_ns: 0,
             last_ns: 0,
             pending: Vec::with_capacity(GRID_OBSERVE_EVERY),
-            grid: punktfunk_core::phase::PanelGrid::seeded(refresh_hz as i32),
+            grid: punktfunk_core::phase::PanelGrid::seeded(0),
             fallback_period_ns: 1_000_000_000 / u64::from(refresh_hz.max(1)),
         }
     }
@@ -180,11 +201,12 @@ impl LatchClock {
     /// Fold on-glass stamps (ascending). Spacing is against the previous stamp,
     /// whatever the batch size, so a one-sample-per-pass drain still feeds the learner.
     ///
-    /// `own_cadence`: the presents were scheduled on this clock's grid (the smoothing
-    /// drain). Then a spacing of whole refreshes is the drain skipping slots, not a slower
-    /// panel, and snaps to the mode — learning it fed back into a drain every second
-    /// slot for good. Arrival-driven presents keep teaching a panel slower than its
-    /// mode claim.
+    /// `own_cadence`: the presents were scheduled on this clock's grid (a paced drain).
+    /// Then a spacing of whole periods is the drain skipping slots, not a slower panel,
+    /// and snaps to the period — learning it fed back into a drain every second slot
+    /// for good. Before anything is learned that reading is no evidence for the claim
+    /// either way (doubled frames on a wrong claim look the same), so such a batch sets
+    /// nothing. Arrival-driven presents keep teaching a panel slower than its claim.
     pub(crate) fn note_batch(&mut self, stamps: &[u64], own_cadence: bool) {
         for &s in stamps {
             if self.last_ns != 0 && s > self.last_ns {
@@ -195,18 +217,18 @@ impl LatchClock {
                     if self.pending.len() >= GRID_OBSERVE_EVERY {
                         self.pending.sort_unstable();
                         let median = self.pending[self.pending.len() / 2];
-                        let mode = self.fallback_period_ns;
+                        let learned = self.grid.period_ns() > 0;
+                        let mode = self.period_ns();
                         let steps = if own_cadence {
                             ((median + mode / 2) / mode).max(1)
                         } else {
                             1
                         };
-                        let spacing = if median.abs_diff(steps * mode) <= grid_snap_ns(mode) {
-                            mode
-                        } else {
-                            median
-                        };
-                        self.grid.observe(spacing as i64);
+                        let snapped = median.abs_diff(steps * mode) <= grid_snap_ns(mode);
+                        if learned || !snapped || steps == 1 {
+                            let spacing = if snapped { mode } else { median };
+                            self.grid.observe(spacing as i64);
+                        }
                         self.pending.clear();
                     }
                 }
@@ -227,8 +249,14 @@ impl LatchClock {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn anchor_ns(&self) -> u64 {
         self.anchor_ns
+    }
+
+    /// An on-glass stamp anchors the grid; before one, every slot is a period out.
+    pub(crate) fn anchored(&self) -> bool {
+        self.anchor_ns != 0
     }
 
     /// First predicted latch strictly after `after_ns` (`anchor + k·period`). No
@@ -462,19 +490,17 @@ impl CadenceProbe {
 /// How the pacer serves frames.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PaceMode {
-    /// Smoothness on a fixed panel: due time snapped onto the latch grid.
+    /// Smoothness on a fixed panel: due time snapped onto the latch grid. Also the
+    /// unpaced latency intent, which never asks.
     Snap,
     /// Smoothness at the due time: measured VRR, or no glass grid to snap to.
     Free,
     /// The latency intent on a measured VRR panel: the due time with a tight cushion.
     VrrLatency,
-}
-
-/// `PUNKTFUNK_VRR_PACE=0` keeps the latency intent arrival-driven on a VRR panel: the
-/// A/B for the pacing, and the way out where a panel takes it badly.
-fn vrr_latency_pacing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_client_core::env_on("PUNKTFUNK_VRR_PACE") != Some(false))
+    /// The latency intent on a fixed grid: newest-wins snapped onto the latch grid, the
+    /// tight cushion. Presented on arrival, a frame lands on the compositor's deadline
+    /// whenever the source clock drifts there, and every frame is then a coin toss.
+    GridLatency,
 }
 
 /// Plays frames on the source cadence: a [`CadenceClock`] plus the two client
@@ -486,19 +512,31 @@ fn vrr_latency_pacing() -> bool {
 pub(crate) struct SourcePacer {
     clock: CadenceClock,
     mode: PaceMode,
+    /// The latency intent paces on a measured VRR panel and on a fixed grid; `false`
+    /// keeps it arrival-driven everywhere.
+    vrr_pace: bool,
+    /// Off the grid the hold also covers the late tail. On a grid the lead is that slack:
+    /// a tail that jumps the due times by a frame moves every aim a slot, and each jump
+    /// and its decay cost a hole or a dropped frame.
+    tail_cushion: bool,
 }
 
 impl SourcePacer {
-    pub(crate) fn new() -> SourcePacer {
+    /// `tail_cushion`: the hold covers the late tail as well as the MAD where frames go out
+    /// at their due time, else the MAD alone. `vrr_pace`: the latency intent paces where
+    /// the panel is measured. Both are knobs.
+    pub(crate) fn new(tail_cushion: bool, vrr_pace: bool) -> SourcePacer {
         SourcePacer {
             clock: CadenceClock::new(CadenceTuning::snapping()),
             mode: PaceMode::Snap,
+            vrr_pace,
+            tail_cushion,
         }
     }
 
     /// Fold an arriving frame and return when it is due, in `ready_ns`'s clock domain.
     ///
-    /// `None` under latency on a fixed panel: arrival-driven, so the loop never carries
+    /// `None` under the unpaced latency intent: arrival-driven, so the loop never carries
     /// an estimate built from samples it then ignored. Called at submit, not take:
     /// dropped frames are part of the arrival process; folding only survivors hides
     /// the jitter.
@@ -521,13 +559,16 @@ impl SourcePacer {
     /// this keys off the probe's published verdict, not a per-window reading.
     /// Smoothness with no glass grid (`grid_known` false: no present-wait) runs free — a
     /// grid anchored on submit instants learns the stream's own cadence as the panel.
-    /// The latency intent paces only where VRR is measured: a VRR panel shows every
-    /// millisecond of arrival jitter; a fixed one hides it under the quantization.
+    /// The latency intent paces where the panel is measured and `vrr_pace` holds: a VRR
+    /// panel shows every millisecond of arrival jitter, and a fixed grid shows a frame
+    /// presented on its deadline as a skipped frame plus a doubled one. With no grid it
+    /// stays arrival-driven.
     pub(crate) fn follow(&mut self, verdict: Cadence, grid_known: bool, smoothing: bool) {
         let mode = match (verdict == Cadence::Variable, smoothing) {
             (true, true) => PaceMode::Free,
-            (true, false) if vrr_latency_pacing() => PaceMode::VrrLatency,
+            (true, false) if self.vrr_pace => PaceMode::VrrLatency,
             (false, true) if !grid_known => PaceMode::Free,
+            (false, false) if grid_known && self.vrr_pace => PaceMode::GridLatency,
             _ => PaceMode::Snap,
         };
         if mode != self.mode {
@@ -535,20 +576,23 @@ impl SourcePacer {
             self.clock.retune(match mode {
                 PaceMode::Snap => CadenceTuning::snapping(),
                 PaceMode::Free => CadenceTuning::free_running(),
-                PaceMode::VrrLatency => CadenceTuning::vrr_latency(),
+                PaceMode::VrrLatency | PaceMode::GridLatency => CadenceTuning::vrr_latency(),
             });
+            let at_due = matches!(mode, PaceMode::Free | PaceMode::VrrLatency);
+            self.clock.set_tail_cushion(self.tail_cushion && at_due);
         }
     }
 
     /// Present at the due time instead of snapping to the latch grid: variable refresh
     /// measured live (the panel refreshes when we present), or no glass grid at all.
     pub(crate) fn free_running(&self) -> bool {
-        self.mode != PaceMode::Snap
+        matches!(self.mode, PaceMode::Free | PaceMode::VrrLatency)
     }
 
-    /// The latency intent is paced: measured VRR, newest-wins held for its due time.
+    /// The latency intent is paced: newest-wins held for its due time on measured VRR,
+    /// for its latch slot on a fixed grid.
     pub(crate) fn paces_latency(&self) -> bool {
-        self.mode == PaceMode::VrrLatency
+        matches!(self.mode, PaceMode::VrrLatency | PaceMode::GridLatency)
     }
 
     /// Re-anchor on the next frame (display change, accepted mode switch). Measured
@@ -728,6 +772,32 @@ mod tests {
         assert_eq!(s.take_counters(), (1, 0));
     }
 
+    /// At a latch slot the oldest due frame goes out and one more may wait behind it;
+    /// beyond that the oldest are replaced. A frame not yet due waits.
+    #[test]
+    fn a_due_frame_goes_out_at_the_slot_with_one_of_backlog() {
+        let mut s: FrameStore<u32> = FrameStore::new(0);
+        s.set_paced(true);
+        assert_eq!(s.take_due_bounded(|_| true), None);
+        s.submit(10);
+        s.submit(20);
+        assert_eq!(
+            s.take_due_bounded(|&v| v <= 20),
+            Some(10),
+            "an early successor waits for its own slot"
+        );
+        s.submit(30);
+        s.submit(40);
+        assert_eq!(
+            s.take_due_bounded(|_| true),
+            Some(30),
+            "three due: 20 is replaced, 40 waits"
+        );
+        assert_eq!(s.take_due_bounded(|&v| v <= 30), None, "40 is not due");
+        assert_eq!(s.take_due_bounded(|_| true), Some(40));
+        assert_eq!(s.take_counters(), (1, 0));
+    }
+
     #[cfg(feature = "pyrowave")]
     #[test]
     fn force_latency_collapses_to_one_slot() {
@@ -827,6 +897,15 @@ mod tests {
         assert_eq!(fast.period_ns(), 8_333_333);
     }
 
+    /// SDL reports 0 Hz for a mode without a stated rate: the seed is 60 Hz, never 1 Hz.
+    #[test]
+    fn an_unstated_refresh_seeds_sixty_hertz() {
+        assert_eq!(
+            LatchClock::new(0).period_ns(),
+            LatchClock::new(60).period_ns()
+        );
+    }
+
     /// The live drain is one stamp per pass. Spacings only within a batch observe
     /// nothing and the learner stays on its seed.
     #[test]
@@ -844,6 +923,58 @@ mod tests {
             "single-stamp batches must still feed the grid learner"
         );
         assert_eq!(c.anchor_ns(), t);
+    }
+
+    /// A Deck set to 60 Hz still claims its 90 Hz panel. The first batch off the claim's
+    /// grid sets the real period, and a later burst of doubled frames — three claim
+    /// periods each — never brings the claim back. Before anything is learned a doubled
+    /// ramp is no evidence for the claim either.
+    #[test]
+    fn latch_clock_drops_a_wrong_claim_at_the_first_batch() {
+        const REAL: u64 = 16_666_666;
+        const CLAIM: u64 = 11_111_111;
+        let mut c = LatchClock::new(90);
+        assert_eq!(
+            c.period_ns(),
+            CLAIM,
+            "the claim until a batch says otherwise"
+        );
+        let mut t = 1_000_000_000u64;
+        for _ in 0..=GRID_OBSERVE_EVERY {
+            t += REAL;
+            c.note_batch(&[t], true);
+        }
+        assert_eq!(
+            c.period_ns(),
+            REAL,
+            "one batch off the claim's grid sets the period"
+        );
+        for _ in 0..(GRID_OBSERVE_EVERY * 2) {
+            t += 2 * REAL;
+            c.note_batch(&[t], true);
+        }
+        assert_eq!(
+            c.period_ns(),
+            REAL,
+            "doubled frames are the drain skipping slots"
+        );
+
+        let mut ramp = LatchClock::new(90);
+        let mut t = 1_000_000_000u64;
+        for _ in 0..=GRID_OBSERVE_EVERY {
+            t += 2 * REAL;
+            ramp.note_batch(&[t], true);
+        }
+        assert_eq!(
+            ramp.period_ns(),
+            CLAIM,
+            "a multiple of the claim sets nothing"
+        );
+        for _ in 0..GRID_OBSERVE_EVERY {
+            t += REAL;
+            ramp.note_batch(&[t], true);
+        }
+        assert_eq!(ramp.period_ns(), REAL);
     }
 
     /// The mode refresh is a claim. A refused switch or a compositor at its own rate
@@ -1093,7 +1224,7 @@ mod tests {
     /// mid-stream collapse to latency (PyroWave) leaves no half-built loop.
     #[test]
     fn the_latency_intent_folds_no_frames_into_the_cadence_clock() {
-        let mut p = SourcePacer::new();
+        let mut p = SourcePacer::new(true, true);
         for k in 0..64u64 {
             assert_eq!(
                 p.due_ns(
@@ -1117,7 +1248,7 @@ mod tests {
     /// no conversion, however far the source stamps sit from it.
     #[test]
     fn a_due_time_comes_back_on_the_present_clocks_timeline() {
-        let mut p = SourcePacer::new();
+        let mut p = SourcePacer::new(true, true);
         fold(&mut p, true, 400);
         let k = 400u64;
         let due = p
@@ -1140,7 +1271,7 @@ mod tests {
     /// follows the published verdict.
     #[test]
     fn a_measured_vrr_verdict_switches_the_cushion_policy() {
-        let mut p = SourcePacer::new();
+        let mut p = SourcePacer::new(true, true);
         assert!(!p.free_running(), "snapping until the panel says otherwise");
         fold(&mut p, true, 200);
         p.follow(Cadence::Fixed, true, true);
@@ -1169,9 +1300,9 @@ mod tests {
 
         // With no jitter yet, free-running already holds a frame back more than
         // snapping, which rides the half-refresh the snap-up gives it.
-        let mut snap = SourcePacer::new();
+        let mut snap = SourcePacer::new(true, true);
         snap.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
-        let mut free = SourcePacer::new();
+        let mut free = SourcePacer::new(true, true);
         free.follow(Cadence::Variable, true, true);
         free.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         assert!(
@@ -1182,22 +1313,23 @@ mod tests {
         );
     }
 
-    /// The latency intent folds nothing on a fixed panel or with no grid at all, and
-    /// paces on a measured VRR panel with a cushion below the smooth intent's.
+    /// The latency intent folds nothing with no grid at all; on a measured VRR panel it
+    /// paces at the due time, on a fixed grid it snaps, both with a cushion below the
+    /// smooth intent's; the knob keeps it arrival-driven on either.
     #[test]
-    fn the_latency_intent_paces_only_on_a_measured_vrr_panel() {
-        let mut p = SourcePacer::new();
+    fn the_latency_intent_paces_on_a_measured_panel() {
+        let mut p = SourcePacer::new(true, true);
         p.follow(Cadence::Unknown, false, false);
         assert!(
             !p.paces_latency() && !p.free_running(),
-            "no grid is not VRR: latency stays arrival-driven"
+            "no grid: latency stays arrival-driven"
         );
         assert_eq!(p.due_ns(false, SRC_PTS0, SRC_READY0, SRC_P), None);
         p.follow(Cadence::Variable, true, false);
         assert!(p.paces_latency() && p.free_running());
         assert!(p.due_ns(false, SRC_PTS0, SRC_READY0, SRC_P).is_some());
         let tight = p.health().cushion_ns;
-        let mut smooth = SourcePacer::new();
+        let mut smooth = SourcePacer::new(true, true);
         smooth.follow(Cadence::Variable, true, true);
         smooth.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         assert!(
@@ -1207,8 +1339,53 @@ mod tests {
         );
         p.follow(Cadence::Fixed, true, false);
         assert!(
-            !p.paces_latency(),
-            "a fixed verdict returns the latency intent to arrival"
+            p.paces_latency() && !p.free_running(),
+            "a fixed grid: the latency intent snaps onto it"
+        );
+        assert_eq!(p.health().frames, 1, "re-tuning keeps the loop's history");
+        p.follow(Cadence::Unknown, true, false);
+        assert!(p.paces_latency(), "Unknown on a grid snaps like smoothing");
+        let mut off = SourcePacer::new(true, false);
+        off.follow(Cadence::Fixed, true, false);
+        assert!(
+            !off.paces_latency(),
+            "the knob keeps latency arrival-driven"
+        );
+        off.follow(Cadence::Variable, true, false);
+        assert!(!off.paces_latency());
+    }
+
+    /// The tail policy reaches the clock where frames go out at their due time: a late
+    /// frame widens the hold. On a grid the lead is the slack and the tail stays out.
+    #[test]
+    fn the_tail_policy_widens_the_hold_after_a_late_frame() {
+        let mut tail = SourcePacer::new(true, true);
+        let mut plain = SourcePacer::new(false, true);
+        let mut locked = SourcePacer::new(true, true);
+        tail.follow(Cadence::Variable, true, true);
+        plain.follow(Cadence::Variable, true, true);
+        locked.follow(Cadence::Fixed, true, true);
+        for p in [&mut tail, &mut plain, &mut locked] {
+            fold(p, true, 200);
+            let k = 200u64;
+            p.due_ns(
+                true,
+                SRC_PTS0 + k * SRC_P as u64,
+                SRC_READY0 + k * SRC_P as u64 + 5_000_000,
+                SRC_P,
+            );
+        }
+        assert!(
+            tail.health().cushion_ns > plain.health().cushion_ns + 3_000_000,
+            "tail {} vs plain {}",
+            tail.health().cushion_ns,
+            plain.health().cushion_ns
+        );
+        assert!(
+            locked.health().cushion_ns < tail.health().cushion_ns - 3_000_000,
+            "locked {} must not carry the tail {}",
+            locked.health().cushion_ns,
+            tail.health().cushion_ns
         );
     }
 

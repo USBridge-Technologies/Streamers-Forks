@@ -213,7 +213,7 @@ impl AppState {
 
 /// Run the host (blocks).
 ///
-/// Native punktfunk/1 (QUIC on `native.port`) and the management API always run and
+/// Native punktfunk/2 (QUIC on `native.port`) and the management API always run and
 /// share one [`crate::native_pairing`] handle. `gamestream` additionally brings up
 /// nvhttp pairing, RTSP, ENet control, and `_nvstream` mDNS. Those planes pair over
 /// plain HTTP and can reuse GCM nonces, so they are opt-in (`serve --gamestream`)
@@ -334,10 +334,13 @@ pub fn serve(
             "GameStream/Moonlight compat ENABLED (--gamestream): its pairing runs over plain HTTP and \
              its legacy control encryption can reuse GCM nonces (security-review #5/#9) — an on-path \
              LAN attacker could MITM pairing or recover input. Enable only on a TRUSTED network; prefer \
-             the native punktfunk/1 plane + clients for untrusted/WAN use."
+             the native punktfunk/2 plane + clients for untrusted/WAN use."
         );
     }
-    if let Some(bind) = native.webtransport_bind {
+    if let Some(bind) = native
+        .webtransport_bind
+        .filter(|_| !pf_paths::seat::role().is_seat_host())
+    {
         tracing::warn!(
             %bind,
             "WebTransport browser plane ENABLED (--webtransport): a second, externally-reachable \
@@ -351,8 +354,26 @@ pub fn serve(
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let native_opts = crate::native::native_serve_opts(&native);
         // Hook runner consumes the live event tail for the host's lifetime. Spawned
-        // before `host.started` so operator hooks observe the full lifecycle.
-        tokio::spawn(crate::hooks::runner());
+        // before `host.started` so operator hooks observe the full lifecycle. A door runs
+        // none: its events reach the owner's host, whose hooks run in the owner's session,
+        // and the seats' events reach the door's bus for the console.
+        if pf_paths::seat::role().is_door() {
+            crate::seats::events::fan_in("");
+            tokio::spawn(crate::seats::events::relay_to_owner());
+            #[cfg(target_os = "linux")]
+            crate::door::publish_owner_key();
+        } else {
+            #[cfg(target_os = "linux")]
+            if pf_paths::seat::role().is_seat_host() {
+                crate::seats::restart_when_replaced();
+            }
+            // The Windows box host runs its seats' plugins, so their games join its bus.
+            #[cfg(windows)]
+            if !pf_paths::seat::role().is_seat_host() {
+                crate::seats::events::fan_in("&kinds=game.*");
+            }
+            tokio::spawn(crate::hooks::runner());
+        }
         // A Linux seat answers "Return to Gaming Mode" itself, so the box's login is never asked.
         #[cfg(target_os = "linux")]
         crate::seats::session_switch::spawn();
@@ -375,9 +396,9 @@ pub fn serve(
                 pairing: np.clone(),
                 require_pairing: native.require_pairing,
             });
-        // Read before `web` is moved into the native plane below. The management API answers a
-        // cross-origin call only where there is a browser to answer.
-        let browser_plane = web.is_some();
+        // The management API answers a cross-origin call only where there is a browser to answer.
+        // A seat host's plane follows the box, but its own API is the loopback door's alone.
+        let browser_plane = pf_host_config::config().webtransport;
         // `host.started` as the planes come up; `host.stopping` on clean or error exit
         // so a consumer that reconnects still sees it.
         crate::events::emit(crate::events::EventKind::HostStarted {
@@ -395,7 +416,7 @@ pub fn serve(
                 let _advert = crate::gamestream::start(&state, native.mdns)?;
                 tracing::info!(
                     port = native.port,
-                    "unified host: GameStream/Moonlight compat + native punktfunk/1 (QUIC)"
+                    "unified host: GameStream/Moonlight compat + native punktfunk/2 (QUIC)"
                 );
                 tokio::try_join!(
                     crate::gamestream::nvhttp::run(state.clone()),
@@ -423,7 +444,7 @@ pub fn serve(
         } else {
             tracing::info!(
                 port = native.port,
-                "secure host: native punktfunk/1 (QUIC) + management API \
+                "secure host: native punktfunk/2 (QUIC) + management API \
                  (GameStream OFF — pass --gamestream for stock-Moonlight compat)"
             );
             tokio::try_join!(
@@ -686,10 +707,13 @@ mod session_tests {
                 packet_size: 1024,
                 bitrate_kbps: 20_000,
                 codec: crate::encode::Codec::H265,
+                chroma: crate::encode::ChromaFormat::Yuv420,
                 min_fec: 0,
                 hdr: false,
                 slices: 1, // no-request default; hardware decoders get single-slice AUs
                 encrypt_video: false,
+                studio_asked: crate::session_plan::StudioAsk::default(),
+                encoder: crate::encode::resolve(),
             });
         }
 

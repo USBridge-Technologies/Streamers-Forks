@@ -30,6 +30,25 @@ public final class DisplayLinkProxy: NSObject {
     @objc public func tick(_ link: CADisplayLink) { onTick(link) }
 }
 
+/// What a wedge report gets (the pipeline's own relink came first, `LinkStallPolicy`). When
+/// tvOS re-plumbs the display, the layer on screen never shows a frame again, and a fresh one
+/// shows only once the display finishes, about five seconds on: so one fresh layer, then hold
+/// with the link armed. A rebuild during that wait starts it over. A clean run longer than
+/// `resetAfter` earns the next wedge a fresh layer again. Internal for tests.
+struct WedgePolicy {
+    enum Action { case rebuild, hold }
+    let resetAfter: CFTimeInterval
+    private(set) var wedges = 0
+    private var last: CFTimeInterval = -.infinity
+    init(resetAfter: CFTimeInterval = 30) { self.resetAfter = resetAfter }
+    mutating func next(now: CFTimeInterval) -> Action {
+        if now - last > resetAfter { wedges = 0 }
+        last = now
+        wedges += 1
+        return wedges == 1 ? .rebuild : .hold
+    }
+}
+
 /// Selects a session's presentation mechanism.
 ///
 /// Stage-2/3/4 share explicit decode and the Metal renderer, using arrival, on-glass-gated, or
@@ -206,15 +225,31 @@ final class SessionPresenter {
         #endif
     }
 
+    #if os(visionOS)
+    /// The curved screen while a volume shows the picture.
+    private(set) var curve: CurveTarget?
+
+    /// Draw into `target`, or back into the layer with nil. Costs one IDR. Main thread.
+    func setCurve(_ target: CurveTarget?) {
+        guard target !== curve else { return }
+        curve = target
+        restartPresentation()
+    }
+    #endif
+
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
-    /// iOS: pushes `displayHeadroom` twice a second. It follows brightness and posts no change
+    /// iOS: runs `pushHeadroom` twice a second. Headroom follows brightness and posts no change
     /// notification; the linear HDR shaders roll highlights onto it.
     private var headroomTimer: Timer?
     #if os(iOS)
-    /// The EDR headroom of the screen the app is on.
-    private static var displayHeadroom: CGFloat { NativeDisplay.screen.currentEDRHeadroom }
+    /// Stage the EDR headroom of the screen the app is on, current and potential.
+    private static func pushHeadroom(to pipeline: Stage2Pipeline?) {
+        let screen = NativeDisplay.screen
+        pipeline?.setDisplayHeadroom(
+            screen.currentEDRHeadroom, potential: screen.potentialEDRHeadroom)
+    }
     #endif
     private var panel = PanelInfo(minHz: 0, maxHz: 0)
 
@@ -249,6 +284,9 @@ final class SessionPresenter {
     /// The window's Direct verdict (`setDirectPossible`), re-applied to each pipeline built.
     private var directPossible = true
     private var adaptiveSync: () -> Bool = { false }
+    /// The window, scene and display around the layer, for the wedge line. Main thread.
+    var surfaceState: (() -> String)?
+    private var wedgePolicy = WedgePolicy()
 
     /// Start the resolved presenter for `connection`.
     ///
@@ -259,6 +297,7 @@ final class SessionPresenter {
     ///
     /// Call `layout(in:contentsScale:)` after start so any Metal sublayer has valid geometry.
     /// `adaptiveSync` reads the hosting screen's fixed-vs-adaptive verdict on macOS, once per build.
+    /// `screen` past 0 presents that further screen of the session, on Metal only.
     func start(
         connection: PunktfunkConnection,
         baseLayer: AVSampleBufferDisplayLayer,
@@ -268,7 +307,8 @@ final class SessionPresenter {
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
         onFrameHDR: (@Sendable (Bool) -> Void)? = nil,
-        adaptiveSync: @escaping () -> Bool = { false }
+        adaptiveSync: @escaping () -> Bool = { false },
+        screen: UInt8 = 0
     ) {
         stop()
         self.connection = connection
@@ -283,7 +323,7 @@ final class SessionPresenter {
                 connection: connection, baseLayer: layer, endToEndMeter: endToEndMeter,
                 makeDisplayLink: makeDisplayLink,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
-                onFrameHDR: onFrameHDR, adaptiveSync: adaptiveSync)
+                onFrameHDR: onFrameHDR, adaptiveSync: adaptiveSync, screen: screen)
             setInteractionBoost(boost)
         }
 
@@ -311,8 +351,14 @@ final class SessionPresenter {
             bufferSetting: connection.settings.smoothBuffer)
         // Direct video presentation is the zero-buffer latency path. A user who asks for a
         // smoothness buffer keeps the existing deadline engine, where FrameStore owns that buffer.
-        let pacing = Self.effectivePacing(
+        let effective = Self.effectivePacing(
             selectedPacing, priority: priority, videoLayerCompatible: !connection.isChroma444)
+        #if os(visionOS)
+        // The curve's queue vends its own drawables: frames draw on arrival.
+        let pacing = curve != nil ? PresentPacing.arrival : effective
+        #else
+        let pacing = effective
+        #endif
         #if os(macOS)
         let vsyncPaced = priority != .latency && pacing == .arrival
         let adaptiveSlotPaced = Self.adaptiveSlotPaced(
@@ -343,6 +389,9 @@ final class SessionPresenter {
             }
             stage2 = pipeline
             pipeline.setDirectPossible(directPossible)
+            #if os(visionOS)
+            pipeline.setCurve(curve)
+            #endif
             // The ordinary link supplies the vsync grid, retries transient Metal drawable misses,
             // and polls which decoded IOSurface reached glass. Frame arrival remains the render
             // trigger. Deadline pacing owns its drawable-vending CAMetalDisplayLink instead.
@@ -359,9 +408,9 @@ final class SessionPresenter {
             }
             syncFrameRate(hz: connection.currentMode().refreshHz)
             #if os(iOS)
-            pipeline.setDisplayHeadroom(Self.displayHeadroom)
+            Self.pushHeadroom(to: pipeline)
             let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.stage2?.setDisplayHeadroom(Self.displayHeadroom) }
+                MainActor.assumeIsolated { Self.pushHeadroom(to: self?.stage2) }
             }
             RunLoop.main.add(timer, forMode: .common)
             headroomTimer = timer
@@ -369,8 +418,8 @@ final class SessionPresenter {
             pipeline.setPanel(panel)
             pipeline.start(
                 connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd,
-                onDecodedSize: onDecodedSize, onFrameHDR: onFrameHDR)
-        } else {
+                onDecodedSize: onDecodedSize, onFrameHDR: onFrameHDR, screen: screen)
+        } else if screen == 0 {
             let pump = StreamPump()
             pump.start(
                 connection: connection, layer: baseLayer, endToEndMeter: endToEndMeter,
@@ -510,9 +559,18 @@ final class SessionPresenter {
         // HDR mode (the session's AVDisplayManager request landed — see StreamViewIOS), and HDR
         // frames flip to PQ passthrough. The stream view also re-layouts on mode-switch/screen-
         // mode notifications, so a mid-session switch reaches here without a bounds change.
-        stage2?.setDisplayHeadroom(UIScreen.main.currentEDRHeadroom)
+        stage2?.setDisplayHeadroom(
+            UIScreen.main.currentEDRHeadroom, potential: UIScreen.main.potentialEDRHeadroom)
         #endif
     }
+
+    #if os(tvOS)
+    /// The HDMI output switched into (or out of) the session's HDR mode: HDR frames present as
+    /// PQ passthrough while it holds. Main thread; the stream view watches the switch.
+    func setHDROutput(_ on: Bool) {
+        stage2?.setHDROutput(on)
+    }
+    #endif
 
     /// Record the decoded frame's real dimensions (the view hops the pump's `onDecodedSize` to main
     /// and calls this) so `layout` aspect-fits to what's actually on screen instead of the possibly-
@@ -548,12 +606,21 @@ final class SessionPresenter {
         stage2?.setDirectPossible(possible)
     }
 
-    /// `onPresentWedged`'s cure, hopped to MAIN: a fresh pipeline, presenter and CAMetalLayer on
-    /// the SAME connection — the new pump asks the host for one IDR. Main thread.
+    /// `onPresentWedged`'s cure, hopped to MAIN, by `WedgePolicy`: a fresh pipeline, presenter
+    /// and CAMetalLayer on the SAME connection (the new pump asks the host for one IDR), or hold.
+    /// The line names the window, scene and display around the layer. Main thread.
     private func rebuildPresentation() {
         guard restart != nil, baseLayer != nil else { return }
-        presentLog.error("presenter wedged — rebuilding pipeline, presenter and layer")
-        restartPresentation()
+        let action = wedgePolicy.next(now: CACurrentMediaTime())
+        let what = action == .rebuild
+            ? "rebuilding pipeline, presenter and layer" : "holding, the link stays armed"
+        let layer = metalLayer.map {
+            "frame=\($0.frame) hidden=\($0.isHidden) opacity=\($0.opacity) drawable=\($0.drawableSize)"
+        } ?? "-"
+        let line = "presenter wedged ×\(wedgePolicy.wedges) — \(what); layer \(layer); "
+            + (surfaceState?() ?? "-")
+        presentLog.error("\(line, privacy: .public)")
+        if action == .rebuild { restartPresentation() }
     }
 
     /// Re-run `start` on the live base layer and replay the last layout so the new sublayer has

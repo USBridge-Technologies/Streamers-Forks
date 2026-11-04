@@ -27,10 +27,11 @@ pub enum PunktfunkError {
     #[error("session closed")]
     Closed,
     /// Host turned this connection away with a typed
-    /// [`crate::reject::RejectReason`]. Distinct from transport
-    /// ([`Self::Io`] / [`Self::Timeout`]) and a failed PIN ([`Self::Crypto`]).
+    /// [`crate::reject::RejectReason`], and the sentence it sent with it: empty when it had
+    /// none, and already sanitized. Distinct from transport ([`Self::Io`] / [`Self::Timeout`])
+    /// and a failed PIN ([`Self::Crypto`]).
     #[error("rejected by host: {0}")]
-    Rejected(crate::reject::RejectReason),
+    Rejected(crate::reject::RejectReason, String),
 }
 
 pub type Result<T> = core::result::Result<T, PunktfunkError>;
@@ -51,7 +52,10 @@ pub enum PunktfunkStatus {
     NullPointer = -8,
     Timeout = -9,
     Closed = -10,
-    // -11..-19 reserved. The -20 block mirrors `RejectReason` one-to-one
+    /// `next_audio_pcm`: the host changed the audio format at the next packet. Reopen the player
+    /// from the audio getters, which read the new format, then pull again.
+    AudioFormat = -11,
+    // -12..-19 reserved. The -20 block mirrors `RejectReason` one-to-one
     // so FFI callers can switch on the host's reason.
     RejectedNotArmed = -20,
     RejectedBoundOther = -21,
@@ -85,7 +89,7 @@ impl PunktfunkError {
             PunktfunkError::Io(_) => PunktfunkStatus::Io,
             PunktfunkError::Timeout => PunktfunkStatus::Timeout,
             PunktfunkError::Closed => PunktfunkStatus::Closed,
-            PunktfunkError::Rejected(r) => {
+            PunktfunkError::Rejected(r, _) => {
                 use crate::reject::RejectReason as R;
                 match r {
                     R::PairingNotArmed => PunktfunkStatus::RejectedNotArmed,

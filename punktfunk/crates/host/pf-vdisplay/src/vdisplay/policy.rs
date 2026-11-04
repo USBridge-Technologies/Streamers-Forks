@@ -353,11 +353,13 @@ impl ClientOverlay {
         *self == ClientOverlay::default()
     }
 
-    /// What follows this device onto a seat: its cap and its scale.
+    /// What follows this device onto a seat: its cap, its scale, and whether it shares an
+    /// occupied screen (`on_a_seat`).
     pub fn seat_part(self) -> ClientOverlay {
         ClientOverlay {
             max_mode: self.max_mode,
             scale: self.scale,
+            mode_conflict: self.mode_conflict.map(on_a_seat),
             ..ClientOverlay::default()
         }
     }
@@ -740,43 +742,57 @@ pub struct DisplayPolicyStore {
     box_overlays: Option<BoxOverlays>,
     /// A seat that follows the contract: [`seat_contract`] instead of any stored policy.
     contract: bool,
+    /// The door: the owner's host's policy as the supervisor copies it, never a file of its own.
+    follows: bool,
 }
 
-/// The box's `clients` map on a seat host. The box console writes it; the seat re-reads the
-/// box's file when its mtime moves, so an overlay edited there applies to the seat's next
-/// connect.
+/// The box's display policy on a seat host. The box console writes it; the seat re-reads the
+/// box's file when its mtime moves, so a change made there applies to the seat's next connect.
 struct BoxOverlays {
     path: PathBuf,
-    cache: Mutex<(
-        Option<std::time::SystemTime>,
-        BTreeMap<String, ClientOverlay>,
-    )>,
+    cache: Mutex<(Option<std::time::SystemTime>, DisplayPolicy)>,
 }
 
 impl BoxOverlays {
-    fn current(&self) -> BTreeMap<String, ClientOverlay> {
+    /// The box's whole policy: its overlays, and the second-device rule a contract seat takes.
+    fn current(&self) -> DisplayPolicy {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let stamp = std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
             .ok();
         if stamp != cache.0 {
-            cache.1 = std::fs::read(&self.path)
-                .ok()
-                .and_then(|bytes| DisplayPolicyStore::parse(&self.path, &bytes))
-                .map(|p| p.clients)
-                .unwrap_or_default();
-            cache.0 = stamp;
+            match std::fs::read(&self.path) {
+                Ok(bytes) => {
+                    cache.1 = DisplayPolicyStore::parse(&self.path, &bytes).unwrap_or_default();
+                    cache.0 = stamp;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    cache.1 = DisplayPolicy::default();
+                    cache.0 = stamp;
+                }
+                // A failed read is not a policy. Keep the last one read and the old stamp,
+                // so the next call tries again instead of serving defaults until the next edit.
+                Err(e) => tracing::warn!(path = %self.path.display(), error = %e,
+                    "the box's display policy could not be read — keeping the last one read"),
+            }
         }
         cache.1.clone()
     }
 }
 
 impl DisplayPolicyStore {
-    /// Missing file ⇒ unconfigured. Corrupt ⇒ per-axis salvage. Unreadable
-    /// ⇒ unconfigured + warn (never fail host startup).
+    /// Missing file ⇒ unconfigured. Corrupt ⇒ copied to `.json.bad`, then per-axis
+    /// salvage. Unreadable ⇒ unconfigured + warn (never fail host startup).
     pub fn load_from(path: PathBuf) -> Self {
         let cur = match std::fs::read(&path) {
-            Ok(bytes) => Self::parse(&path, &bytes),
+            Ok(bytes) => {
+                // The next save rewrites the file from memory. A document that does not
+                // read back as written is the operator's to recover, so keep its bytes.
+                if serde_json::from_slice::<DisplayPolicy>(&bytes).is_err() {
+                    copy_aside(&path, "display-settings.json");
+                }
+                Self::parse(&path, &bytes)
+            }
             // Exists-but-unreadable (EACCES, EIO) is not unconfigured: folding
             // it into silent `None` reverted the console to defaults with no log.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -793,6 +809,23 @@ impl DisplayPolicyStore {
             write: Mutex::new(()),
             box_overlays: None,
             contract: false,
+            follows: false,
+        }
+    }
+
+    /// The door's store: the owner's policy at `copy`, re-read when the supervisor's copy
+    /// moves. Nothing here writes it; the door passes every write to the owner's host.
+    pub fn following(copy: PathBuf) -> Self {
+        DisplayPolicyStore {
+            path: copy.clone(),
+            cur: Mutex::new(None),
+            write: Mutex::new(()),
+            box_overlays: Some(BoxOverlays {
+                path: copy,
+                cache: Mutex::new((None, DisplayPolicy::default())),
+            }),
+            contract: false,
+            follows: true,
         }
     }
 
@@ -800,7 +833,7 @@ impl DisplayPolicyStore {
     fn with_box_overlays(mut self, box_file: Option<PathBuf>) -> Self {
         self.box_overlays = box_file.map(|path| BoxOverlays {
             path,
-            cache: Mutex::new((None, BTreeMap::new())),
+            cache: Mutex::new((None, DisplayPolicy::default())),
         });
         self
     }
@@ -810,13 +843,16 @@ impl DisplayPolicyStore {
         self
     }
 
-    /// The contract with the box's per-device cap and scale: those follow a device onto any
-    /// desktop. The rest of an overlay is the owner's desktop's, and never reaches a seat.
+    /// The contract with what follows a device from the box ([`ClientOverlay::seat_part`]). The
+    /// box's own second-device rule applies to a device with none, so a device the door refuses
+    /// for an occupied seat is refused here too, when it dials the seat itself.
     fn contract_policy(&self) -> DisplayPolicy {
         let mut policy = seat_contract();
         if let Some(b) = &self.box_overlays {
-            policy.clients = b
-                .current()
+            let boxed = b.current();
+            policy.mode_conflict = on_a_seat(boxed.effective().mode_conflict);
+            policy.clients = boxed
+                .clients
                 .into_iter()
                 .map(|(fp, o)| (fp, o.seat_part()))
                 .filter(|(_, o)| !o.is_empty())
@@ -827,7 +863,7 @@ impl DisplayPolicyStore {
 
     fn with_box_clients(&self, mut policy: DisplayPolicy) -> DisplayPolicy {
         if let Some(b) = &self.box_overlays {
-            policy.clients = b.current();
+            policy.clients = b.current().clients;
         }
         policy
     }
@@ -838,7 +874,8 @@ impl DisplayPolicyStore {
     /// check: a future document is announced, not silently treated as ours,
     /// and an older one migrates ([`CURRENT_VERSION`]);
     /// (3) per-axis salvage — a member that fails alone is dropped, the rest
-    /// survive. Dropping one axis is smaller than reverting the whole file.
+    /// survive; the `clients` and `layout.positions` maps lose only the entry
+    /// that fails. Dropping one axis is smaller than reverting the whole file.
     ///
     /// Two things salvage must not do:
     ///
@@ -909,6 +946,7 @@ impl DisplayPolicyStore {
                         return None;
                     }
                 }
+                salvage_maps(&mut obj, path);
                 let before = obj.len();
                 obj.retain(|key, member| {
                     let ok = probe(key.as_str(), &*member);
@@ -954,7 +992,17 @@ impl DisplayPolicyStore {
         if self.contract {
             return self.contract_policy();
         }
+        if self.follows {
+            return self.followed().unwrap_or_default();
+        }
         self.with_box_clients(self.cur.lock().unwrap().clone().unwrap_or_default())
+    }
+
+    /// The owner's policy the door follows, `None` while the supervisor has no copy.
+    fn followed(&self) -> Option<DisplayPolicy> {
+        let owner = self.box_overlays.as_ref()?;
+        std::fs::metadata(&owner.path).ok()?;
+        Some(owner.current())
     }
 
     /// Console-configured policy, or `None` if no file. `None` ⇒ leave
@@ -963,6 +1011,9 @@ impl DisplayPolicyStore {
     pub fn configured(&self) -> Option<DisplayPolicy> {
         if self.contract {
             return None;
+        }
+        if self.follows {
+            return self.followed();
         }
         let policy = self.cur.lock().unwrap().clone()?;
         Some(self.with_box_clients(policy))
@@ -1049,6 +1100,9 @@ impl DisplayPolicyStore {
         if self.contract {
             anyhow::bail!("a seat's display follows the seat contract");
         }
+        if self.follows {
+            anyhow::bail!("the door's display policy is the owner's host's");
+        }
         Ok(())
     }
 
@@ -1071,18 +1125,40 @@ impl DisplayPolicyStore {
 pub fn prefs() -> &'static DisplayPolicyStore {
     static STORE: OnceLock<DisplayPolicyStore> = OnceLock::new();
     STORE.get_or_init(|| {
+        if pf_paths::seat::role().is_door() {
+            if let Some(dir) = pf_paths::seat::box_library_dir() {
+                return DisplayPolicyStore::following(dir.join("display-settings.json"));
+            }
+        }
+        let role = pf_paths::seat::role();
         DisplayPolicyStore::load_from(pf_paths::config_dir().join("display-settings.json"))
-            .with_box_overlays(
-                pf_paths::seat::trust_dir().map(|dir| dir.join("display-settings.json")),
-            )
-            .with_contract(pf_paths::seat::role().follows_contract())
+            .with_box_overlays(box_overlays_file(role, pf_paths::seat::trust_dir()))
+            .with_contract(role.follows_contract())
     })
 }
 
+/// Where a host reads the box's per-device overlays from: a contract seat, its trust copy. The
+/// owner's host keeps them in its own file, which is the box's, so it writes them too.
+fn box_overlays_file(role: pf_paths::seat::HostRole, trust: Option<PathBuf>) -> Option<PathBuf> {
+    role.follows_contract()
+        .then_some(trust?)
+        .map(|dir| dir.join("display-settings.json"))
+}
+
+/// A second device on a seat's one screen shares it, or is refused: a seat has no screen to
+/// give it, nor an occupant it may stop. The door decides the same before it redirects.
+fn on_a_seat(conflict: ModeConflict) -> ModeConflict {
+    match conflict {
+        ModeConflict::Join => ModeConflict::Join,
+        ModeConflict::Separate | ModeConflict::Steal | ModeConflict::Reject => ModeConflict::Reject,
+    }
+}
+
 /// A seat's desktop (`design/web-console-structure-2026-10.md` §2.1): one virtual screen, the
-/// seat's own. It never mirrors, keeps lit or powers off a real monitor, never routes a game to
-/// a session of its own, and a second device shares the occupant's screen. Linger, topology and
-/// identity stay the unconfigured host's, as they always were on a seat.
+/// seat's own. It never mirrors, keeps lit or powers off a real monitor, and never routes a game
+/// to a session of its own. A second device shares the occupant's screen when the box would let
+/// it join, and is refused otherwise (`contract_policy`). Linger, topology
+/// and identity stay the unconfigured host's, as they always were on a seat.
 pub fn seat_contract() -> DisplayPolicy {
     DisplayPolicy {
         mode_conflict: ModeConflict::Join,
@@ -1207,6 +1283,68 @@ impl From<StoredCustomPreset> for CustomPreset {
     }
 }
 
+/// Copy `path` to `<path>.bad` before a rewrite can lose it. Copy, not rename: the live path
+/// keeps serving. Best-effort — failing to preserve must not fail the operator's load or write.
+fn copy_aside(path: &std::path::Path, what: &str) {
+    let bad = path.with_extension("json.bad");
+    match std::fs::copy(path, &bad) {
+        Ok(_) => tracing::warn!(path = %bad.display(),
+            "{what} did not read back as written; the original was copied aside before this \
+             host rewrites it"),
+        Err(e) => tracing::warn!(error = %e, path = %bad.display(),
+            "unreadable {what} not preserved before the rewrite"),
+    }
+}
+
+/// The map members of a settings document, salvaged entry by entry before the axis probe:
+/// one device's or one pin's bad value must not empty every other's. An unknown layout
+/// mode falls to its default; its pins stay.
+fn salvage_maps(obj: &mut serde_json::Map<String, serde_json::Value>, path: &std::path::Path) {
+    salvage_entries(obj, path, "clients", |v| {
+        serde_json::from_value::<ClientOverlay>(v.clone()).is_ok()
+    });
+    let Some(layout) = obj
+        .get_mut("layout")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if layout
+        .get("mode")
+        .is_some_and(|m| serde_json::from_value::<LayoutMode>(m.clone()).is_err())
+    {
+        tracing::warn!(path = %path.display(),
+            "display-settings.json carries an unreadable layout mode — falling back to \
+             auto-row and keeping the pins");
+        layout.remove("mode");
+    }
+    salvage_entries(layout, path, "positions", |v| {
+        serde_json::from_value::<Position>(v.clone()).is_ok()
+    });
+}
+
+/// Drop the unreadable entries of the map at `key` and keep the rest. `keep` is the
+/// per-entry parse. A missing or non-map member is left for the axis probe.
+fn salvage_entries(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    path: &std::path::Path,
+    key: &str,
+    keep: impl Fn(&serde_json::Value) -> bool,
+) {
+    let Some(entries) = obj.get_mut(key).and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+    entries.retain(|name, v| {
+        let ok = keep(v);
+        if !ok {
+            tracing::warn!(path = %path.display(), field = %key, entry = %name,
+                "display-settings.json carries an unreadable entry here — dropping just this \
+                 one and keeping the rest");
+        }
+        ok
+    });
+}
+
 /// Parse **entry-wise**. Pure so recovery is unit-tested.
 ///
 /// Whole-document `from_slice::<Vec<CustomPreset>>` made one bad entry
@@ -1267,19 +1405,9 @@ fn read_catalog() -> Result<CatalogRead> {
     }
 }
 
-/// Copy aside to `display-presets.json.bad` before a non-round-trip save.
-/// Copy, not rename: a crash still leaves a catalog at the live path.
-/// Best-effort — failing to preserve must not fail the operator write.
+/// [`copy_aside`] for `display-presets.json` before a non-round-trip save.
 fn quarantine_catalog() {
-    let path = custom_presets_path();
-    let bad = path.with_extension("json.bad");
-    match std::fs::copy(&path, &bad) {
-        Ok(_) => tracing::warn!(path = %bad.display(),
-            "the custom-preset catalog held entries this host could not read; the original was \
-             copied aside before being rewritten"),
-        Err(e) => tracing::warn!(error = %e, path = %bad.display(),
-            "unreadable custom-preset catalog not preserved before the rewrite"),
-    }
+    copy_aside(&custom_presets_path(), "the custom-preset catalog");
 }
 
 /// Serializes catalog read → mutate → save. Without it concurrent add +
@@ -1399,6 +1527,25 @@ pub fn delete_custom_preset(id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A contract seat reads the box's overlays from its trust copy; the owner's host writes
+    /// its own, which become the box's.
+    #[test]
+    fn only_a_contract_seat_takes_its_overlays_from_the_trust_copy() {
+        use pf_paths::seat::{HostRole, SeatRole};
+        let trust = Some(PathBuf::from("/trust"));
+        assert_eq!(
+            box_overlays_file(HostRole::Seat(SeatRole::Contract), trust.clone()),
+            Some(PathBuf::from("/trust/display-settings.json"))
+        );
+        for role in [
+            HostRole::Seat(SeatRole::Owner),
+            HostRole::Seat(SeatRole::OwnerHeadless),
+            HostRole::Plain,
+        ] {
+            assert_eq!(box_overlays_file(role, trust.clone()), None, "{role:?}");
+        }
+    }
 
     #[test]
     fn custom_preset_serde_roundtrips_and_defaults_game_session() {
@@ -1728,8 +1875,9 @@ mod tests {
         );
     }
 
-    /// A contract seat never reads its own file, takes only a device's cap and scale from the
-    /// box, refuses every write, and stays unconfigured for linger, topology and identity.
+    /// A contract seat never reads its own file, takes only a device's cap, scale and
+    /// second-device rule from the box, refuses every write, and stays unconfigured for linger,
+    /// topology and identity.
     #[test]
     fn a_contract_seat_ignores_its_file_and_the_owners_policy() {
         let dir = std::env::temp_dir().join(format!("pf-disp-contract-{}", std::process::id()));
@@ -1761,14 +1909,55 @@ mod tests {
         let p = seat.get();
         assert_eq!(p.capture_monitor_for(Some("aa")), None);
         assert!(!p.ddc_power_off && !p.pnp_disable_monitors && p.keep_monitors.is_empty());
+        // The box gives "aa" its own screen, which a seat has none of.
         assert_eq!(
             p.effective_for(Some("aa")).mode_conflict,
-            ModeConflict::Join
+            ModeConflict::Reject
         );
         assert_eq!(p.cap_mode(Some("aa"), (3840, 2160, 120)), (1920, 1080, 60));
         assert!(seat.configured().is_none());
         assert!(seat.set(DisplayPolicy::default()).is_err());
         assert!(seat.update(|_| true).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A device dialing a seat directly gets the door's answer: it shares an occupied seat only
+    /// when the box joins it, by its own overlay or the box's rule, and is refused otherwise.
+    #[test]
+    fn a_contract_seat_joins_only_the_devices_the_box_joins() {
+        let dir = std::env::temp_dir().join(format!("pf-disp-occupied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seat_on = |name: &str, boxed: &DisplayPolicy| {
+            let box_file = dir.join(name);
+            std::fs::write(&box_file, serde_json::to_vec(boxed).unwrap()).unwrap();
+            DisplayPolicyStore::load_from(dir.join("seat.json"))
+                .with_box_overlays(Some(box_file))
+                .with_contract(true)
+                .get()
+        };
+        let overlay = |conflict| ClientOverlay {
+            mode_conflict: Some(conflict),
+            ..ClientOverlay::default()
+        };
+        let mut boxed = DisplayPolicy::default();
+        boxed
+            .clients
+            .insert("joiner".into(), overlay(ModeConflict::Join));
+        boxed
+            .clients
+            .insert("stealer".into(), overlay(ModeConflict::Steal));
+        let conflict = |p: &DisplayPolicy, fp| p.effective_for(Some(fp)).mode_conflict;
+
+        let p = seat_on("separate.json", &boxed);
+        assert_eq!(conflict(&p, "joiner"), ModeConflict::Join);
+        assert_eq!(conflict(&p, "stealer"), ModeConflict::Reject);
+        assert_eq!(conflict(&p, "anyone"), ModeConflict::Reject);
+
+        boxed.mode_conflict = ModeConflict::Join;
+        let p = seat_on("join.json", &boxed);
+        assert_eq!(conflict(&p, "anyone"), ModeConflict::Join);
+        assert_eq!(conflict(&p, "stealer"), ModeConflict::Reject);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1842,19 +2031,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The mgmt PUT merge must enumerate every axis. Bump this count only
-    /// in the same change that wires the new field.
-    #[test]
-    fn every_policy_axis_is_accounted_for() {
-        let v = serde_json::to_value(DisplayPolicy::default()).unwrap();
-        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-        assert_eq!(
-            keys.len(),
-            14,
-            "a display-policy axis was added or removed: {keys:?} — wire it into the mgmt PUT's \
-             per-axis merge (and into `EffectivePolicy` if it is a behavior axis) before bumping this"
-        );
-    }
+    // The mgmt PUT's key-by-key merge: punktfunk-host `a_host_wide_put_keeps_every_key_it_omits`.
 
     #[test]
     fn sanitize_clamps_an_absurd_linger_to_a_day() {
@@ -1959,6 +2136,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_overlay_or_pin_costs_only_itself() {
+        // A canary build's new variant, read back by stable: the one device and the one pin
+        // that carry it fall away; the other device's overlay and the other pin survive.
+        let doc = br#"{ "preset": "hotdesk",
+            "clients": { "aa": { "topology": "hologram" },
+                         "bb": { "keep_alive": { "mode": "forever" } } },
+            "layout": { "mode": "spiral",
+                        "positions": { "1": { "x": 10, "y": 0 }, "2": "there" } } }"#;
+        let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc)
+            .expect("one bad member must not discard the document");
+        assert_eq!(p.clients.keys().collect::<Vec<_>>(), ["bb"]);
+        assert_eq!(p.clients["bb"].keep_alive, Some(KeepAlive::Forever));
+        assert_eq!(
+            p.layout.mode,
+            LayoutMode::AutoRow,
+            "the unknown mode falls to default"
+        );
+        assert_eq!(p.layout.positions.keys().collect::<Vec<_>>(), ["1"]);
+    }
+
+    #[test]
     fn a_mistyped_scalar_falls_back_to_its_own_default_not_zero() {
         // `max_displays` serde-defaults to 4, not 0; a typo must not admit zero displays.
         let doc = br#"{ "max_displays": "four", "preset": "workstation" }"#;
@@ -2012,6 +2210,54 @@ mod tests {
             Preset::Hotdesk
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_settings_file_that_did_not_round_trip_is_copied_aside() {
+        // The next console save rewrites the file from memory; the operator's bytes survive
+        // beside it. A file that reads cleanly leaves no copy.
+        let dir = std::env::temp_dir().join(format!("pf-disp-bad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("display-settings.json");
+        let bad = path.with_extension("json.bad");
+        let _ = std::fs::remove_file(&bad);
+        let doc: &[u8] = br#"{ "preset": "hotdesk", "topology": "hologram" }"#;
+        std::fs::write(&path, doc).unwrap();
+        let store = DisplayPolicyStore::load_from(path.clone());
+        assert_eq!(
+            store.configured().unwrap().preset,
+            Preset::Hotdesk,
+            "salvaged"
+        );
+        assert_eq!(std::fs::read(&bad).unwrap(), doc, "the original is kept");
+        let _ = std::fs::remove_file(&bad);
+        std::fs::write(&path, br#"{"preset":"hotdesk"}"#).unwrap();
+        DisplayPolicyStore::load_from(path.clone());
+        assert!(!bad.exists(), "a clean read leaves nothing behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_box_policy_that_failed_to_read_is_not_replaced_by_defaults() {
+        // A directory at the path: `metadata` answers, `read` fails. The seat keeps the policy
+        // it last read and tries again on the next call.
+        let dir = std::env::temp_dir().join(format!("pf-box-read-{}", std::process::id()));
+        let path = dir.join("box.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&path).unwrap();
+        let seeded = DisplayPolicy {
+            preset: Preset::Hotdesk,
+            ..DisplayPolicy::default()
+        };
+        let overlays = BoxOverlays {
+            path: path.clone(),
+            cache: Mutex::new((None, seeded.clone())),
+        };
+        assert_eq!(overlays.current(), seeded);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, br#"{"preset":"workstation"}"#).unwrap();
+        assert_eq!(overlays.current().preset, Preset::Workstation, "re-read");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

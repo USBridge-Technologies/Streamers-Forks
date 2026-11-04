@@ -64,6 +64,11 @@ pub struct PluginManifest {
     /// Paths the plugin reads. Absolute, or `~`-rooted.
     #[serde(default)]
     pub reads: Vec<String>,
+    /// Folders it reads the files of, nothing below: a Windows library folder holds a game tree
+    /// that a `reads` entry would rewrite file by file. Bound like `reads` on Linux. Outside
+    /// [`Self::roots`]: a path below one is not the plugin's to hand a launch.
+    #[serde(default)]
+    pub files: Vec<String>,
     /// Paths it also writes.
     #[serde(default)]
     pub writes: Vec<String>,
@@ -87,6 +92,7 @@ impl PluginManifest {
     pub fn per_account(&self) -> bool {
         self.reads
             .iter()
+            .chain(self.files.iter())
             .chain(self.writes.iter())
             .any(|p| p == "~" || p.starts_with("~/") || p.starts_with("~\\"))
             || self
@@ -273,6 +279,7 @@ pub(crate) fn granted_roots_in(id: &str, config_dir: PathBuf) -> Vec<PathBuf> {
     crate::plugins::access::AccessStore::open(config_dir)
         .grants_for(id)
         .into_iter()
+        .filter(|g| !g.files)
         .flat_map(|g| expand_home(&g.path))
         .collect()
 }
@@ -292,10 +299,15 @@ pub fn granted_roots(id: &str) -> Vec<PathBuf> {
 /// Installed means what the runner discovers: the dependencies of `<config>/plugins/package.json`,
 /// not every package under `node_modules`, where a plugin's own libraries live too. Without that
 /// file the tree is scanned. An id is one lowercase path component, and an id two packages claim
-/// is refused for both. Read fresh: installs and updates land between launches. A Windows seat
-/// host reads the box's plugins dir, which its `exec` entries came from.
+/// is refused for both. Read fresh: installs and updates land between launches. A seat host reads
+/// the box's plugins dir, which its `exec` entries came from.
 pub fn installed() -> BTreeMap<String, PluginManifest> {
     installed_in(&pf_paths::seat::library_dir().join("plugins"))
+}
+
+/// The plugins this account's runner starts. A seat's are its own, not the box's [`installed`].
+pub fn runner_plugins() -> BTreeMap<String, PluginManifest> {
+    installed_in(&pf_paths::config_dir().join("plugins"))
 }
 
 fn installed_in(plugins: &Path) -> BTreeMap<String, PluginManifest> {
@@ -364,20 +376,19 @@ pub fn for_provider(id: &str) -> Option<PluginManifest> {
     installed().remove(id)
 }
 
-/// The provider id package `pkg` declares, read before an uninstall takes its files away.
-/// A bare name is the runner's first-party shorthand: `playnite` is `@punktfunk/plugin-playnite`.
-pub fn id_of_package(pkg: &str) -> Option<String> {
+/// The provider id package `pkg` declares in `plugins`, read before an uninstall takes its
+/// files away. A bare name is the runner's first-party shorthand: `playnite` is
+/// `@punktfunk/plugin-playnite`.
+pub fn id_of_package(plugins: &Path, pkg: &str) -> Option<String> {
     let pkg = match pkg.trim() {
         p if p.starts_with('@') || p.contains('/') || p.starts_with("punktfunk-plugin-") => {
             p.to_string()
         }
         bare => format!("@punktfunk/plugin-{bare}"),
     };
-    let dir = pf_paths::seat::library_dir()
-        .join("plugins")
-        .join("node_modules")
-        .join(pkg);
-    read_package(&dir).map(|m| m.id).filter(|id| valid_id(id))
+    read_package(&plugins.join("node_modules").join(pkg))
+        .map(|m| m.id)
+        .filter(|id| valid_id(id))
 }
 
 /// `node_modules/<name>` plus `node_modules/@scope/<name>`.
@@ -476,6 +487,24 @@ mod manifest_tests {
         assert!(installed_in(plugins).contains_key("kit-library"));
     }
 
+    /// The id comes from the dir the uninstall removes from, under every spelling of the name.
+    #[test]
+    fn a_package_id_is_read_from_the_dir_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let modules = tmp.path().join("node_modules");
+        package(&modules, "@punktfunk/plugin-steam", "steam");
+        package(&modules, "punktfunk-plugin-x", "x-games");
+        for (pkg, id) in [
+            ("steam", Some("steam")),
+            ("@punktfunk/plugin-steam", Some("steam")),
+            ("punktfunk-plugin-x", Some("x-games")),
+            ("missing", None),
+        ] {
+            assert_eq!(id_of_package(tmp.path(), pkg).as_deref(), id, "{pkg}");
+        }
+        assert_eq!(id_of_package(&tmp.path().join("elsewhere"), "steam"), None);
+    }
+
     #[test]
     fn params_take_only_their_own_shape() {
         assert!(param_ok(ParamKind::Name, "Hollow Knight: Silksong"));
@@ -527,6 +556,16 @@ mod manifest_tests {
         assert_eq!(m.root_of(&linked.join("snes/y.sfc")), Some(linked.clone()));
         assert_eq!(m.root_of(&roms.join("x.sfc")), Some(roms.clone()));
         assert_eq!(m.root_of(&root.join("home/u/other/y.sfc")), None);
+    }
+
+    #[test]
+    fn a_files_root_hands_no_launch_a_path_below_it() {
+        let m = PluginManifest {
+            files: vec!["/games/steamapps".into()],
+            ..manifest(&[])
+        };
+        assert!(!m.confines(Path::new("/games/steamapps/common/x.exe")));
+        assert!(!m.confines(Path::new("/games/steamapps")));
     }
 
     #[test]

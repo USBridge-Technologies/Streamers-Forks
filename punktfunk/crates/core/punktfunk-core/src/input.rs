@@ -366,6 +366,8 @@ pub mod gamepad {
     pub const BTN_TOUCHPAD: u32 = 0x10_0000;
     /// Misc / capture — Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
     pub const BTN_MISC1: u32 = 0x0020_0000;
+    /// SDL `Misc2`: the Switch 2 pads' C button. GameStream has no such bit.
+    pub const BTN_MISC2: u32 = 0x0040_0000;
 
     /// What a synthetic Quick Access tap presses, in order. A pad with the button
     /// ([`GamepadPref::has_quick_access`](crate::config::GamepadPref::has_quick_access)) takes
@@ -611,6 +613,18 @@ impl InputEvent {
         }
     }
 
+    /// The screen an absolute pointer, touch or pen event lands on, `0` the first. It rides
+    /// `_pad[0]`, which an embedder showing one screen leaves zero.
+    pub fn screen(&self) -> u8 {
+        self._pad[0]
+    }
+
+    /// This event, landing on screen `screen` ([`Self::screen`]).
+    pub fn on_screen(mut self, screen: u8) -> InputEvent {
+        self._pad[0] = screen;
+        self
+    }
+
     /// Serialize: [`INPUT_MAGIC`] + little-endian fields.
     pub fn encode(&self) -> [u8; INPUT_WIRE_LEN] {
         let mut b = [0u8; INPUT_WIRE_LEN];
@@ -623,6 +637,16 @@ impl InputEvent {
         b
     }
 
+    /// [`Self::encode`], then the screen as one more byte when it is not the first. A host that
+    /// reads only the fixed length lands the event on screen 0.
+    pub fn wire(&self) -> Vec<u8> {
+        let mut b = self.encode().to_vec();
+        if self.screen() != 0 {
+            b.push(self.screen());
+        }
+        b
+    }
+
     pub fn decode(buf: &[u8]) -> Option<InputEvent> {
         if buf.len() < INPUT_WIRE_LEN || buf[0] != INPUT_MAGIC {
             return None;
@@ -630,7 +654,7 @@ impl InputEvent {
         let kind = InputKind::from_u8(buf[1])?;
         let ev = InputEvent {
             kind,
-            _pad: [0; 3],
+            _pad: [buf.get(INPUT_WIRE_LEN).copied().unwrap_or(0), 0, 0],
             code: u32::from_le_bytes(buf[2..6].try_into().unwrap()),
             x: i32::from_le_bytes(buf[6..10].try_into().unwrap()),
             y: i32::from_le_bytes(buf[10..14].try_into().unwrap()),
@@ -698,6 +722,12 @@ mod tests {
         };
         assert_eq!(InputEvent::decode(&e.encode()), Some(e));
         assert!(InputEvent::decode(&[0u8; INPUT_WIRE_LEN]).is_none());
+        // Screen 0 keeps the fixed length; another screen adds one byte an older host skips.
+        assert_eq!(e.wire().len(), INPUT_WIRE_LEN);
+        let on_second = e.on_screen(1);
+        assert_eq!(on_second.wire().len(), INPUT_WIRE_LEN + 1);
+        assert_eq!(InputEvent::decode(&on_second.wire()), Some(on_second));
+        assert_eq!(InputEvent::decode(&on_second.encode()).unwrap().screen(), 0);
     }
 
     #[test]
@@ -1057,6 +1087,7 @@ mod tests {
             ("PADDLE4", BTN_PADDLE4),
             ("TOUCHPAD", BTN_TOUCHPAD),
             ("MISC1", BTN_MISC1),
+            ("MISC2", BTN_MISC2),
         ];
         let raw = include_str!("../testdata/gamepad-button-vectors.json");
         let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");

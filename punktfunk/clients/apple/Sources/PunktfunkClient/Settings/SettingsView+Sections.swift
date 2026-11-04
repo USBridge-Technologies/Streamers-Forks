@@ -54,12 +54,9 @@ extension SettingsView {
     @ViewBuilder var resolutionSection: some View {
         Section("Resolution") {
             #if os(iOS) || os(visionOS) || os(macOS)
-            // Match-window (design/midstream-resolution-resize.md D1): follow the session
-            // window/scene, renegotiating the host mode on a resize. Off → the explicit mode below.
-            // NO marker here even though this toggle writes one: match-window, width and
-            // height are ONE override (they are reset together), and hanging its marker off the
-            // first of the two controls that drive it read as if the toggle alone were
-            // overridden. It goes under the size control below, for the group.
+            // Match window follows the window, renegotiating the host mode on a resize; off, the
+            // mode below. Its marker sits under the size control: the toggle, width and height
+            // are one override.
             described(effective.matchWindow
                 ? "The host follows this window's size — pixel-exact through every resize."
                 : "Streams the fixed mode below, scaled to the window.") {
@@ -134,6 +131,9 @@ extension SettingsView {
                 .overlay { if !on { Capsule().strokeBorder(.quaternary, lineWidth: 1) } }
         }
         .buttonStyle(.plain)
+        #if os(visionOS)
+        .cardHover(Capsule())
+        #endif
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 
@@ -409,6 +409,28 @@ extension SettingsView {
                     options: VideoFit.allCases.map { (label: $0.label, tag: $0.rawValue) },
                     selection: scoped(SettingsFields.videoFit))
             }
+            #if os(macOS)
+            described("All monitors opens a window on each of this Mac's monitors, one host "
+                + "screen each, laid out as your monitors sit.", field: "screens") {
+                settingPicker(
+                    "Screens",
+                    options: [(label: "This monitor", tag: "this"), (label: "All monitors", tag: "all")],
+                    selection: scoped(SettingsFields.screens))
+            }
+            #endif
+            #if os(visionOS)
+            // How this headset bends the picture (tier G). An older stored name shows as its stop.
+            if !inPresetScope {
+                described("Flat, or bent like a curved monitor: the radius in millimetres, 800R "
+                    + "the tightest.") {
+                    settingPicker(
+                        "Screen",
+                        options: ScreenCurve.allCases.map { (label: $0.label, tag: $0.rawValue) },
+                        selection: Binding(
+                            get: { ScreenCurve(name: screen).rawValue }, set: { screen = $0 }))
+                }
+            }
+            #endif
             #if os(tvOS)
             tvBitrateRow
             #else
@@ -419,6 +441,14 @@ extension SettingsView {
                 Toggle("10-bit HDR", isOn: scoped(SettingsFields.hdrEnabled))
             }
             prioritizeRow
+            described("A preference — the host falls back if it can't encode it.",
+                      field: "codec") {
+                settingPicker(
+                    "Video codec",
+                    options: SettingsOptions.codecs(current: scoped(SettingsFields.codec).wrappedValue),
+                    selection: scoped(SettingsFields.codec))
+            }
+            pyrowaveQualityRows
         } header: {
             Text("Picture")
         } footer: {
@@ -443,14 +473,6 @@ extension SettingsView {
                 }
             }
             renderScaleRow
-            described("A preference — the host falls back if it can't encode it.",
-                      field: "codec") {
-                settingPicker(
-                    "Video codec",
-                    options: SettingsOptions.codecs(current: scoped(SettingsFields.codec).wrappedValue),
-                    selection: scoped(SettingsFields.codec))
-            }
-            pyrowaveQualityRows
             pictureDepthRows
             presentationRows
             described("The backend the host drives its virtual output with — honored only if "
@@ -471,8 +493,8 @@ extension SettingsView {
     }
 
     private static let displayAdvancedFields = [
-        "smooth_buffer", "render_scale", "codec", "pyrowave_bpp", "enable_444", "ten_bit_sdr",
-        "vsync", "allow_vrr", "compositor",
+        "smooth_buffer", "render_scale", "enable_444", "ten_bit_sdr", "vsync", "allow_vrr",
+        "compositor",
     ]
 
     /// Advanced display rows away from their defaults, for the collapsed section's count.
@@ -480,8 +502,7 @@ extension SettingsView {
         let e = effective, d = EffectiveSettings()
         var changed = [
             e.presentPriority == "smooth" && e.smoothBuffer != d.smoothBuffer,
-            e.renderScale != d.renderScale, e.codec != d.codec,
-            pyroWaveRate && e.pyrowaveBppX100 != d.pyrowaveBppX100, e.enable444 != d.enable444,
+            e.renderScale != d.renderScale, e.enable444 != d.enable444,
             e.tenBitSdr != d.tenBitSdr, e.compositor != d.compositor, !keepAwake,
         ]
         #if os(macOS)
@@ -608,10 +629,13 @@ extension SettingsView {
     }
 
     #if !os(tvOS)
-    /// The automatic-bitrate toggle + manual slider (and the >1 Gbps warning) rows. None under
-    /// PyroWave: its quality row stands in, and the stored rate waits for the next codec.
+    /// The automatic-bitrate toggle + manual slider (and the >1 Gbps warning) rows. Under
+    /// PyroWave only the toggle: its quality row stands in for the slider, and the stored rate
+    /// waits for the next codec.
     @ViewBuilder private var bitrateRows: some View {
-        if !pyroWaveRate {
+        if pyroWaveRate {
+            pyrowaveAutomaticRow
+        } else {
             described("Uses the host's default, 20 Mbps. Off to set it yourself.",
                 field: "bitrate_kbps") {
                 Toggle("Automatic bitrate", isOn: automaticBitrate)
@@ -636,9 +660,11 @@ extension SettingsView {
     }
     #else
     /// The TV's bitrate: a list of steps plus a typed rate, where the touch and desktop forms have
-    /// a switch and a slider. None under PyroWave, whose quality row stands in.
+    /// a switch and a slider. Under PyroWave only the switch, beside the quality row's rates.
     @ViewBuilder private var tvBitrateRow: some View {
-        if !pyroWaveRate {
+        if pyroWaveRate {
+            pyrowaveAutomaticRow
+        } else {
             described(effective.bitrateKbps > 1_000_000
                 ? Self.gigabitWarning : "Automatic uses the host's default, 20 Mbps.",
                 field: "bitrate_kbps") {
@@ -667,13 +693,22 @@ extension SettingsView {
     }
     #endif
 
+    /// Automatic under PyroWave: on, the session steps its quality down while the link falls
+    /// short; off, any fixed rate pins it at the quality row's.
+    private var pyrowaveAutomaticRow: some View {
+        described("Lowers PyroWave quality while the network falls short; off always streams at "
+            + "your quality.", field: "bitrate_kbps") {
+            Toggle("Automatic bitrate", isOn: automaticBitrate)
+        }
+    }
+
     /// The codec is PyroWave and this device decodes it: the session's rate is its quality's.
     var pyroWaveRate: Bool {
         effective.codec == "pyrowave" && MetalWaveletDecoder.supported
     }
 
-    /// The mode a connect would ask for: an attached monitor's on iPhone and iPad, else this
-    /// display's.
+    /// The mode a connect would ask for. Native is an attached monitor's on iPhone and iPad, else
+    /// this display's.
     private func connectMode(_ s: EffectiveSettings) -> (width: UInt32, height: UInt32, hz: UInt32) {
         #if os(iOS)
         if let mode = ExternalDisplay.streamMode(s) { return mode }
@@ -1167,6 +1202,15 @@ extension SettingsView {
             described("This device's microphone feeds the host's virtual mic.",
                       field: "mic_enabled") {
                 Toggle("Stream microphone", isOn: scoped(SettingsFields.micEnabled))
+            }
+            #endif
+            #if os(visionOS)
+            // Where this headset plays the sound (tier G).
+            if !inPresetScope {
+                described("On, the sound comes from the window. Off plays the game's own mix "
+                          + "straight to your ears.") {
+                    Toggle("Spatial audio", isOn: $spatialAudio)
+                }
             }
             #endif
             #if os(macOS)

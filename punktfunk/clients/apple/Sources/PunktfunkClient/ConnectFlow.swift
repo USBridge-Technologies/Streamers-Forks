@@ -118,7 +118,7 @@ struct ConnectFlow {
                 return
             }
             profileAsk = ProfileAsk(
-                hostName: host.displayName,
+                host: host,
                 content: .choose(rows, saved: rows.first { $0.id == saved?.id }?.id, gone: d.gone),
                 pick: { pick in
                     store.setProfile(host.id, pick)
@@ -272,6 +272,7 @@ struct ConnectFlow {
                 ? LibraryTarget(host: host, preset: preset) : nil,
             allowTofu: allowTofu,
             requestAccess: requestAccess,
+            autoWake: autoWake,
             onProfileUnknown: {
                 // One re-dial when the list still has the profile: a seat host refused a stale
                 // seat. Otherwise forget the pick, so the next connect asks.
@@ -396,11 +397,7 @@ struct ConnectFlow {
 
     /// A discovered host as a saved record, so a session has a stored identity to pin.
     private func save(_ d: DiscoveredHost) -> StoredHost {
-        let host = StoredHost(
-            name: d.name, address: d.host, port: d.port,
-            mgmtPort: d.mgmtPort,
-            macAddresses: d.macAddresses.isEmpty ? nil : d.macAddresses,
-            osChain: d.osChain.isEmpty ? nil : d.osChain)
+        let host = StoredHost(advert: d)
         store.add(host)
         return host
     }

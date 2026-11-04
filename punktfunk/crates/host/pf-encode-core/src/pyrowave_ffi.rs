@@ -12,9 +12,11 @@ pub fn pw_check(r: pw::pyrowave_result, what: &str) -> Result<()> {
     }
 }
 
-/// Packetize the frame `enc` last encoded into `bitstream` (resized to `cap`), at the boundary
-/// `wire_chunk` implies, and stamp the colour bits on the first packet. `(offset, size)` per
-/// packet. Dense mode (`None`) is exactly one packet.
+/// Packetize the frame `enc` last encoded into `bitstream` (resized to `cap`) and stamp the
+/// colour bits on the first packet: `(offset, size)` per packet, and how many leading packets
+/// are the head ([`crate::pyrowave_wire::HEAD_BANDS`]). Dense mode (`None`) is exactly one
+/// packet; chunked mode is the sequence header, then one packet per block, for
+/// [`crate::pyrowave_wire::AuLayout`] to pack.
 ///
 /// # Safety
 /// `enc` is a live encoder whose last encode has completed.
@@ -24,16 +26,49 @@ pub unsafe fn packetize(
     cap: usize,
     wire_chunk: Option<usize>,
     pq: bool,
-) -> Result<Vec<(usize, usize)>> {
+) -> Result<(Vec<(usize, usize)>, usize)> {
     bitstream.resize(cap, 0);
-    // Chunked mode reserves the 4-byte window prefix from the packetize boundary.
-    let boundary = crate::pyrowave_wire::packet_boundary(wire_chunk, cap);
+    // SAFETY: the caller's contract.
+    unsafe { packetize_into(enc, bitstream, cap, wire_chunk, pq) }
+}
+
+/// [`packetize`] into `bitstream`, which the encoder may fill up to `cap` bytes: a caller that
+/// owns the AU's final buffer packetizes a dense AU straight into it.
+///
+/// # Safety
+/// `enc` is a live encoder whose last encode has completed.
+pub unsafe fn packetize_into(
+    enc: pw::pyrowave_encoder,
+    bitstream: &mut [u8],
+    cap: usize,
+    wire_chunk: Option<usize>,
+    pq: bool,
+) -> Result<(Vec<(usize, usize)>, usize)> {
+    if bitstream.len() < cap {
+        bail!(
+            "pyrowave: {}-byte output under its {cap}-byte cap",
+            bitstream.len()
+        );
+    }
+    // A boundary of one byte closes a packet after every block.
+    let boundary = if wire_chunk.is_some() { 1 } else { cap };
     let mut n: usize = 0;
     // SAFETY: the caller's contract; `n` outlives the call.
     let r = unsafe { pw::pyrowave_encoder_compute_num_packets(enc, boundary, &mut n) };
     pw_check(r, "compute_num_packets")?;
     if n == 0 || (wire_chunk.is_none() && n != 1) {
         bail!("pyrowave: unexpected packet count {n} at boundary {boundary}");
+    }
+    // `pyrowave_encoder_packetize` ignores `cap` in release builds (`(void)size`). Dense mode
+    // is bounded by the check above; a datagram-aligned AU must fit `cap` as one packet too.
+    if wire_chunk.is_some() {
+        let mut whole: usize = 0;
+        // SAFETY: the caller's contract; `whole` outlives the call.
+        let r = unsafe { pw::pyrowave_encoder_compute_num_packets(enc, cap, &mut whole) };
+        pw_check(r, "compute_num_packets")?;
+        if whole != 1 {
+            bail!("pyrowave: AU exceeds its {cap}-byte buffer ({whole} packets at that boundary)");
+        }
     }
     let mut packets = vec![pw::pyrowave_packet { offset: 0, size: 0 }; n];
     let mut out_n: usize = 0;
@@ -51,12 +86,29 @@ pub unsafe fn packetize(
     };
     pw_check(r, "packetize")?;
     packets.truncate(out_n.max(1));
-    // Pyrowave's C API signals FULL range and centred siting; both CSCs emit limited-range,
-    // left-sited codes (BT.2020/PQ when `pq`). Stamp them so VUI-honouring clients keep blacks.
+    // Pyrowave's C API signals centred siting; both CSCs emit left-sited codes (BT.2020/PQ when
+    // `pq`). Stamp them so VUI-honouring clients site chroma right.
     if let Some(p) = packets.first() {
         crate::pyrowave_wire::stamp_color_bits(bitstream, p.offset, pq);
     }
-    Ok(packets.iter().map(|p| (p.offset, p.size)).collect())
+    let mut head: usize = 1;
+    if wire_chunk.is_some() {
+        // SAFETY: the caller's contract; `head` outlives the call.
+        let r = unsafe {
+            pw::pyrowave_encoder_compute_num_critical_packets(
+                enc,
+                crate::pyrowave_wire::HEAD_BANDS,
+                boundary,
+                0,
+                &mut head,
+            )
+        };
+        pw_check(r, "compute_num_critical_packets")?;
+    }
+    Ok((
+        packets.iter().map(|p| (p.offset, p.size)).collect(),
+        head.min(packets.len()),
+    ))
 }
 
 /// Upstream's CPU decoder as a test oracle for the encoder backends' GPU tests.

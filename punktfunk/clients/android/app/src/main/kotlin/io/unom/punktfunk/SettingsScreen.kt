@@ -917,8 +917,8 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
 
     // The GPU probe, not a MediaCodec one — PyroWave decodes as Vulkan compute.
     val pyrowaveCapable = remember { VideoDecoders.pyrowaveCapable() }
-    // PyroWave sets its own rate: its quality, after the codec row, stands in for Bitrate. The
-    // stored rate is kept for the other codecs.
+    // PyroWave sets its own rate: its quality, after the codec row, stands in for Bitrate's, and
+    // Bitrate offers Automatic or Fixed. The stored rate is kept for the other codecs.
     val pyrowaveOn = s.codec == "pyrowave" && pyrowaveCapable
     // HDR is only meaningful on a panel that can present HDR10; on an SDR display the toggle is
     // disabled (and HDR is never advertised) so the host doesn't send PQ the panel mis-tone-maps.
@@ -938,7 +938,18 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
         // Custom is read from the stored rate, like the resolution above; the flag only keeps the
         // field open between picking "Custom…" and typing a number.
         val showCustomBitrate = !pyrowaveOn && (customBitratePicked || s.isCustomBitrate())
-        if (!pyrowaveOn) {
+        if (pyrowaveOn) {
+            val fixed = PyroWaveQuality.FIXED_KBPS
+            SettingDropdown(
+                label = "Bitrate",
+                options = listOf(0 to "Automatic", fixed to "Fixed"),
+                selected = if (s.bitrateKbps == 0) 0 else fixed,
+                field = "bitrate_kbps",
+                caption = PyroWaveQuality.BITRATE_HINT,
+            ) { kbps ->
+                if ((kbps == 0) != (s.bitrateKbps == 0)) update("bitrate_kbps", s.copy(bitrateKbps = kbps))
+            }
+        } else {
             SettingDropdown(
                 label = "Bitrate",
                 options = BITRATE_OPTIONS + (CUSTOM_BITRATE to
@@ -977,6 +988,27 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
             caption = "Lowest latency shows each frame the moment it can reach the panel; " +
                 "Smoothness buffers a little to absorb network jitter.",
         ) { v -> update("present_priority", s.copy(presentPriority = v)) }
+        // Only codecs this device can actually decode are offered — a preference the client never
+        // advertises would be a dead setting (see [codecOptionsFor]).
+        val av1Capable = remember { VideoDecoders.pickDecoder("video/av01") != null }
+        // Mirror the Automatic AV1 rule in HostConnect (hardware AV1 AND no partial-frame
+        // support) so the picker says what "Automatic" actually does on THIS device.
+        val autoPrefersAv1 = remember {
+            VideoDecoders.decodableCodecBits() and 4 != 0 && !VideoDecoders.partialFrameCapable()
+        }
+        SettingDropdown(
+            label = "Video codec",
+            options = codecOptionsFor(s.codec, av1Capable, pyrowaveCapable),
+            selected = s.codec,
+            field = "codec",
+            caption = if (autoPrefersAv1) {
+                "A preference — the host falls back if it can't encode this one. " +
+                    "Automatic prefers AV1 on this device."
+            } else {
+                "A preference — the host falls back if it can't encode this one."
+            },
+        ) { c -> update("codec", s.copy(codec = c)) }
+        if (pyrowaveOn) PyroWaveQualityRow(s, update)
     }
 
     SettingsGroup("Second screen") {
@@ -997,16 +1029,13 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
         changed = changedCount(
             smoothing && s.smoothBuffer != d.smoothBuffer,
             s.renderScale != d.renderScale,
-            s.codec != d.codec,
-            pyrowaveOn && s.pyrowaveBppX100() != d.pyrowaveBppX100(),
             s.tenBitSdr != d.tenBitSdr,
             s.lowLatencyMode != d.lowLatencyMode,
             s.keepAwake != d.keepAwake,
             s.compositor != d.compositor,
         ),
         fields = setOf(
-            "smooth_buffer", "render_scale", "codec", "pyrowave_bpp", "ten_bit_sdr", "low_latency_mode",
-            "compositor",
+            "smooth_buffer", "render_scale", "ten_bit_sdr", "low_latency_mode", "compositor",
         ),
     ) {
         if (smoothing) {
@@ -1039,28 +1068,6 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
         if (showCustomScale) {
             RenderScaleField(s.renderScale) { scale -> update("render_scale", s.copy(renderScale = scale)) }
         }
-
-        // Only codecs this device can actually decode are offered — a preference the client never
-        // advertises would be a dead setting (see [codecOptionsFor]).
-        val av1Capable = remember { VideoDecoders.pickDecoder("video/av01") != null }
-        // Mirror the Automatic AV1 rule in HostConnect (hardware AV1 AND no partial-frame
-        // support) so the picker says what "Automatic" actually does on THIS device.
-        val autoPrefersAv1 = remember {
-            VideoDecoders.decodableCodecBits() and 4 != 0 && !VideoDecoders.partialFrameCapable()
-        }
-        SettingDropdown(
-            label = "Video codec",
-            options = codecOptionsFor(s.codec, av1Capable, pyrowaveCapable),
-            selected = s.codec,
-            field = "codec",
-            caption = if (autoPrefersAv1) {
-                "A preference — the host falls back if it can't encode this one. " +
-                    "Automatic prefers AV1 on this device."
-            } else {
-                "A preference — the host falls back if it can't encode this one."
-            },
-        ) { c -> update("codec", s.copy(codec = c)) }
-        if (pyrowaveOn) PyroWaveQualityRow(s, update)
 
         // Asks nothing of the panel, so no capability gate: an 8-bit display shows a dithered
         // Main10 stream, and the gain is gradients that do not band. Inert while HDR is on

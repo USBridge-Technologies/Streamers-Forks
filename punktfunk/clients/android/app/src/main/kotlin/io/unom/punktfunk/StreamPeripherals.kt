@@ -22,10 +22,11 @@ import io.unom.punktfunk.kit.deviceBodyVibrator
 
 /**
  * Everything that runs beside the picture for one session — the pad router and its chords, the
- * physical mouse and the TV remote-as-pointer, the shared clipboard, host→pad feedback, the phone
- * and pad sensors, and the two USB captures — built in [start] and released in [stop], in the
- * order the handle's lifetime needs. Writes its state through [ui]; reads the views it needs
- * through the lambdas, which resolve live (the views attach after this object exists).
+ * physical mouse, the host's cursor and the TV remote-as-pointer, the shared clipboard, host→pad
+ * feedback, the phone and pad sensors, and the two USB captures — built in [start] and released
+ * in [stop], in the order the handle's lifetime needs. Writes its state through [ui]; reads the
+ * views it needs through the lambdas, which resolve live (the views attach after this object
+ * exists).
  */
 internal class StreamPeripherals(
     private val context: Context,
@@ -47,6 +48,7 @@ internal class StreamPeripherals(
     private lateinit var router: GamepadRouter
     private lateinit var mouse: MouseForwarder
     private var remote: RemotePointer? = null
+    private var hostCursor: HostCursor? = null
     private var clip: ClipboardSync? = null
     private lateinit var feedback: GamepadFeedback
     private var phoneGyro: DeviceGyro? = null
@@ -56,9 +58,6 @@ internal class StreamPeripherals(
     private var ds: DsCapture? = null
     private var dsUsbReceiver: BroadcastReceiver? = null
     private var decor: android.view.View? = null
-    private var priorPointerIcon: android.view.PointerIcon? = null
-    private val hiddenPointer =
-        android.view.PointerIcon.getSystemIcon(context, android.view.PointerIcon.TYPE_NULL)
 
     fun start() {
         activity?.streamHandle = handle // route hardware keys to this session
@@ -111,17 +110,13 @@ internal class StreamPeripherals(
         ring.onOpenChange = { open ->
             router.setRingOpen(open)
             activity?.ringKeys = if (open) ({ nav -> ring.nav(nav) }) else null
-            // A mouse drives the ring like a finger: its own pointer, and no click lands in the game.
+            // A mouse drives the ring like a finger (StreamPointer shows its pointer), and no
+            // click lands in the game.
             mouse.setSuspended(open)
-            decor?.pointerIcon = if (open) priorPointerIcon else hiddenPointer
         }
         // Physical mouse: uncaptured hover/click/wheel forwards as absolute pointing; captured
         // (setting or the Ctrl+Alt+Shift+Q chord) raw deltas forward as relative mouse-look.
-        // The local cursor is hidden over the stream — the host's own cursor, composited into
-        // the video, is the one the user sees (twin of the desktop clients' hidden cursor).
         decor = activity?.window?.decorView
-        priorPointerIcon = decor?.pointerIcon
-        decor?.pointerIcon = hiddenPointer
         val viewConfig = android.view.ViewConfiguration.get(context)
         mouse = MouseForwarder(
             handle,
@@ -141,9 +136,11 @@ internal class StreamPeripherals(
                     if (map.isEmpty) return@let null
                     val loc = IntArray(2)
                     v.getLocationInWindow(loc)
-                    val cx = wx - (loc[0] - map.placement.dstX)
-                    val cy = wy - (loc[1] - map.placement.dstY)
-                    intArrayOf(map.x(cx), map.y(cy), map.width, map.height)
+                    val p = map.placement
+                    val cx = wx - (loc[0] - p.dstX)
+                    val cy = wy - (loc[1] - p.dstY)
+                    val onPicture = cx >= p.dstX && cx < p.dstX + p.dstW && cy >= p.dstY && cy < p.dstY + p.dstH
+                    intArrayOf(map.x(cx), map.y(cy), map.width, map.height, if (onPicture) 1 else 0)
                 }
             },
         )
@@ -161,6 +158,19 @@ internal class StreamPeripherals(
         // view it is still attached when stop() runs from the composable's dispose.
         mouse.onReleaseCapture = { decor?.releasePointerCapture() }
         activity?.mouseForwarder = mouse
+        // A host that forwards its cursor: the mouse pointer wears it while the mouse drives it.
+        hostCursor = if (NativeBridge.nativeCursorChannel(handle)) {
+            HostCursor(
+                handle,
+                mouseFree = { !mouse.captured && mouse.pointerGranted },
+                publish = { ui.hostPointer = it },
+            ).also {
+                mouse.onAbs = it::mouseAt
+                it.start()
+            }
+        } else {
+            null
+        }
         // TV remote-as-pointer: hold SELECT ≈ 0.8 s to toggle; the D-pad then glides the host
         // cursor (see RemotePointer). TV only — a phone's remote-less keys stay on the VK path.
         remote = if (isTv) {
@@ -171,7 +181,10 @@ internal class StreamPeripherals(
                     video().width.takeIf { it > 0 }
                         ?: videoView()?.width?.takeIf { it > 0 } ?: decor?.width ?: 1920
                 },
-                onActiveChanged = { on -> ui.remotePointerOn = on },
+                onActiveChanged = { on ->
+                    ui.remotePointerOn = on
+                    if (on) handBack() // the remote steers the host pointer now
+                },
                 // The toggle TYPES — summoning also needs the KEYBOARD grant (hiding is free).
                 onKeyboardToggle = {
                     keyCapture()?.let { v ->
@@ -333,6 +346,11 @@ internal class StreamPeripherals(
         activity?.recaptureUsbPads = ::recaptureUsbPads
     }
 
+    /** Touch or the remote moved the host pointer: a client-drawn cursor goes back to the host. */
+    fun handBack() {
+        hostCursor?.handBack()
+    }
+
     /**
      * A pad plugged back in mid-stream: capture it again when its grant already stands. An unplug
      * ends the link; without this the pad stays on the plain input path for the rest of the
@@ -373,6 +391,8 @@ internal class StreamPeripherals(
     fun stop() {
         activity?.recaptureUsbPads = null
         clip?.stop() // stop + join the clipboard poll thread BEFORE the handle is freed
+        mouse.onAbs = null
+        hostCursor?.stop() // same: its poll thread pulls through the handle
         feedback.onHidRaw = null
         feedback.sink = null
         feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed
@@ -395,12 +415,11 @@ internal class StreamPeripherals(
         router.onMotionUnreachable = null // same: no notice raised by a slot closing at teardown
         router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
         activity?.gamepadRouter = null
-        // Mouse/remote-pointer teardown: lift held buttons, drop the grab, restore the cursor.
+        // Mouse/remote-pointer teardown: lift held buttons, drop the grab.
         mouse.release()
         activity?.mouseForwarder = null
         remote?.release()
         activity?.remotePointer = null
-        decor?.pointerIcon = priorPointerIcon
         activity?.streamHandle = 0L
         activity?.streamAccess = SessionAccess.ALL // grants are per session, like the handle
         activity?.requestStreamExit = null

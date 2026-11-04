@@ -130,10 +130,8 @@ mod hostsys;
 use hostsys::{discovery, identity, osinfo, power, sleep_inhibit, wol};
 // HTTPS serving for nvhttp and the management API, and the device-key digest.
 mod https;
-// Shim: inject backends live in `pf-inject`; keep `crate::inject::*` for this crate's callers.
-mod inject {
-    pub(crate) use pf_inject::*;
-}
+// `pf-inject` at `crate::inject::*`, and the aim of its absolute mapping at a captured head.
+mod inject;
 mod pen_sink;
 // Unix wall clock every stored deadline and event stamp reads.
 mod clock;
@@ -385,6 +383,7 @@ fn is_management_cli(args: &[String]) -> bool {
         Some("plugins")
         | Some("driver")
         | Some("seats")
+        | Some("hooks")
         | Some("web")
         | Some("tray")
         // Loopback API client; `watch` is long-lived — do not take GPU clocks or the DXGI hook.
@@ -481,11 +480,6 @@ fn real_main() -> Result<()> {
         Some("--version") | Some("-V") | Some("version")
     ) {
         println!("punktfunk-host {}", crate::version::get());
-        return Ok(());
-    }
-    // The USBridge agent asks whether this build hands devices to its USB broker.
-    if args.first().map(String::as_str) == Some("usbridge-bridge") {
-        println!("{}", gamestream::usbridge::PROBE_LINE);
         return Ok(());
     }
 
@@ -640,7 +634,7 @@ fn parse_punktfunk1(args: &[String]) -> Result<native::Punktfunk1Options> {
         pairing_pin: None,
         paired_store: None,
         // QUIC idle timeout; flag overrides env; absent = core default (8 s).
-        idle_timeout: native::idle_timeout_from_env(),
+        idle_timeout: native::HostKnobs::get().idle_timeout,
         mdns: discovery::mdns_enabled(),
     };
     let mut source = "synthetic".to_string();
@@ -772,7 +766,7 @@ SERVE OPTIONS:
                                  added host. Also PUNKTFUNK_MDNS=0
     --door                       the box's host as a system service (Linux): advertise, pair,
                                  serve the console and place every connect on a seat of the
-                                 seat supervisor, and never open a display. Also PUNKTFUNK_DOOR=1
+                                 seat supervisor, and never open a display
 
 PUNKTFUNK1-HOST OPTIONS:
     --port <N>                   QUIC listen port (default: 9777)

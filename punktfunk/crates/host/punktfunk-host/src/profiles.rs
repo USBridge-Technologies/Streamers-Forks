@@ -19,6 +19,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::ToSchema;
 
+/// Take-turns profiles: a profile bound to a Windows account that takes the console in turn.
+pub(crate) mod take_turns;
+
 /// Bumped on a breaking change to a field's meaning; `serde(default)` covers additions.
 pub const PROFILES_SCHEMA_VERSION: u32 = 1;
 /// The longest profile id any wire or ABI carries.
@@ -196,7 +199,7 @@ pub enum ResolveVia {
 pub enum ProfileError {
     /// No profile has that id.
     Unknown,
-    /// A seat profile asked of another seat's host.
+    /// A profile asked of a seat host that doesn't play it.
     NotThisSeat,
     /// The profile's account needs a session broker this host does not have.
     SessionUnavailable,
@@ -243,9 +246,23 @@ pub struct ProfileCreate {
     #[serde(default)]
     pub home: Option<Home>,
     /// A desktop of its own (the default), or the box's own session under another name. A
-    /// desktop of its own needs seats on Windows and the door on Linux.
+    /// desktop of its own needs seats on Windows and the door on Linux. Ignored when
+    /// [`windows_account`](Self::windows_account) is set.
     #[serde(default = "yes")]
     pub seat: bool,
+    /// Bind this profile to a local Windows account that takes the console in turn
+    /// (`design/windows-take-turns.md`). When set, the profile is a take-turns profile and
+    /// `seat` does not apply.
+    #[serde(default)]
+    pub windows_account: Option<String>,
+    /// With `seat`, a local Windows standard account that already exists, which the seat signs
+    /// in to instead of one punktfunk makes. Windows Server only.
+    #[serde(default)]
+    pub seat_account: Option<String>,
+    /// That account's password, entered once and sealed by the host.
+    #[serde(default)]
+    #[schema(value_type = String)]
+    pub seat_password: Option<pf_seats::Secret>,
 }
 
 fn yes() -> bool {
@@ -262,6 +279,10 @@ pub struct ProfileUpdate {
     pub accent: Option<String>,
     #[serde(default)]
     pub home: Option<Home>,
+    /// The new password of an adopted account, after it changed in Windows.
+    #[serde(default)]
+    #[schema(value_type = String)]
+    pub seat_password: Option<pf_seats::Secret>,
 }
 
 /// Ids of removed profiles, for the sessions playing as them.
@@ -273,6 +294,12 @@ pub fn removed() -> tokio::sync::broadcast::Receiver<ProfileId> {
     REMOVED
         .get_or_init(|| tokio::sync::broadcast::channel(16).0)
         .subscribe()
+}
+
+fn announce_removed(id: &str) {
+    if let Some(tx) = REMOVED.get() {
+        let _ = tx.send(id.to_string());
+    }
 }
 
 /// A stored picture.
@@ -363,27 +390,33 @@ impl Profiles {
         default_profile(&self.lock().file).map(|p| p.id.clone())
     }
 
-    /// `seat` is the ledger row the profile's desktop runs on, which the caller makes for
-    /// `input.seat`; `None` shares the owner's desktop.
-    pub fn create(&self, input: ProfileCreate, seat: Option<String>) -> Result<Profile, EditError> {
+    /// The name [`create`](Self::create) would take `input` under, or what it would refuse. The
+    /// caller asks before it makes a seat's account for the profile.
+    pub fn vet_create(&self, input: &ProfileCreate) -> Result<String, EditError> {
+        let name = clean_name(&input.display_name)
+            .ok_or_else(|| EditError::Invalid("a profile needs a name".into()))?;
+        if let Some(accent) = &input.accent {
+            valid_accent(accent.clone())?;
+        }
+        refuse_new(&self.lock().file, &name)?;
+        Ok(name)
+    }
+
+    /// `os_account` is where the profile plays: a seat row the caller made, the owner's own
+    /// session, or a take-turns Windows account.
+    pub fn create(
+        &self,
+        input: ProfileCreate,
+        os_account: OsAccount,
+    ) -> Result<Profile, EditError> {
         let name = clean_name(&input.display_name)
             .ok_or_else(|| EditError::Invalid("a profile needs a name".into()))?;
         let accent = input.accent.map(valid_accent).transpose()?;
         let mut made = None;
         self.edit(|file| {
-            if file.profiles.len() >= PROFILES_MAX {
-                return Err(EditError::Full);
-            }
-            if name_taken(&file.profiles, &name, None) {
-                return Err(EditError::NameTaken);
-            }
+            refuse_new(file, &name)?;
             let now = now_unix();
-            let os_account = match &seat {
-                Some(row) => OsAccount::Seat {
-                    seat: Some(row.clone()),
-                },
-                None => OsAccount::Operator,
-            };
+            let os_account = os_account.clone();
             let profile = Profile {
                 id: new_id(&name),
                 display_name: name.clone(),
@@ -488,10 +521,25 @@ impl Profiles {
                 let _ = std::fs::remove_file(pf_paths::seat_record(id));
             }
         }
-        if let Some(tx) = REMOVED.get() {
-            let _ = tx.send(id.to_string());
-        }
+        announce_removed(id);
         Ok(gone)
+    }
+
+    /// A seat host's copy follows the box's file, so a profile the box deletes never runs
+    /// [`Self::delete`] here. Sends [`removed`] for each id that left the file since `known`,
+    /// then keeps the ids as they are. A file that is empty or doesn't parse says nothing.
+    pub fn announce_removals(&self, known: &mut std::collections::HashSet<ProfileId>) {
+        let now: std::collections::HashSet<ProfileId> = {
+            let state = self.lock();
+            if state.unparsed.is_some() || state.file.profiles.is_empty() {
+                return;
+            }
+            state.file.profiles.iter().map(|p| p.id.clone()).collect()
+        };
+        for gone in known.difference(&now) {
+            announce_removed(gone);
+        }
+        *known = now;
     }
 
     /// Where a device that names no profile lands; `None` is the owner.
@@ -727,10 +775,8 @@ impl Profiles {
                     .then(|| file.profiles.iter().find(|p| p.id == id))
                     .flatten()
                     .ok_or(ProfileError::Unknown)?;
-                if let (Some(mine), OsAccount::Seat { seat }) = (&self.seat, &found.os_account) {
-                    if seat.as_ref() != Some(mine) {
-                        return Err(ProfileError::NotThisSeat);
-                    }
+                if !self.serves(&found.os_account) {
+                    return Err(ProfileError::NotThisSeat);
                 }
                 (Some(found), ResolveVia::Asked)
             }
@@ -768,11 +814,19 @@ impl Profiles {
                 via,
             });
         };
-        if matches!(
-            profile.os_account,
-            OsAccount::Linux { .. } | OsAccount::Windows { .. }
-        ) {
-            return Err(ProfileError::SessionUnavailable);
+        // A take-turns profile plays here only once its account is the console. The client waits
+        // on the seat state (`mgmt`) until it is, so a dial that lands early is refused, not
+        // played under the wrong account. Linux's own-user kind is still unbuilt.
+        match &profile.os_account {
+            OsAccount::Linux { .. } => return Err(ProfileError::SessionUnavailable),
+            OsAccount::Windows { account_name, .. } => {
+                let on_console = take_turns::console_account()
+                    .is_some_and(|user| user.eq_ignore_ascii_case(account_name));
+                if !on_console {
+                    return Err(ProfileError::SessionUnavailable);
+                }
+            }
+            OsAccount::Operator | OsAccount::Seat { .. } => {}
         }
         Ok(Resolved {
             id: profile.id.clone(),
@@ -781,6 +835,16 @@ impl Profiles {
             home: profile.home,
             via,
         })
+    }
+
+    /// Whether this host plays a profile on `account`. A seat host plays its own row's profile;
+    /// only the owner's host also plays the box's own session.
+    fn serves(&self, account: &OsAccount) -> bool {
+        match (&self.seat, account) {
+            (None, _) => true,
+            (Some(mine), OsAccount::Seat { seat }) => seat.as_ref() == Some(mine),
+            (Some(_), _) => self.owner_host,
+        }
     }
 
     /// Stores `bytes` as `id`'s picture: PNG, JPEG or WebP by magic, at most
@@ -800,7 +864,9 @@ impl Profiles {
         let path = dir.join(format!("{id}.{ext}"));
         pf_paths::replace_file(&path, bytes)
             .with_context(|| format!("write {}", path.display()))?;
-        let url = format!("/api/v1/profiles/{id}/avatar");
+        let tag = etag(bytes);
+        // The tag makes a new picture a new URL, so a client's cache keyed by URL never lags.
+        let url = format!("/api/v1/profiles/{id}/avatar?v={tag}");
         let set = self.mutate(|file| {
             let p = find_mut(file, id)?;
             p.avatar = Some(url.clone());
@@ -812,7 +878,7 @@ impl Profiles {
             return Err(e);
         }
         remove_avatar_files(&dir, id, Some(ext));
-        Ok(etag(bytes))
+        Ok(tag)
     }
 
     pub fn avatar(&self, id: &str) -> Option<Avatar> {
@@ -966,6 +1032,17 @@ pub fn clean_name(raw: &str) -> Option<String> {
         .collect();
     let name = name.trim_end().to_string();
     (!name.is_empty()).then_some(name)
+}
+
+/// Why `file` takes no new profile called `name`.
+fn refuse_new(file: &ProfilesFile, name: &str) -> Result<(), EditError> {
+    if file.profiles.len() >= PROFILES_MAX {
+        return Err(EditError::Full);
+    }
+    if name_taken(&file.profiles, name, None) {
+        return Err(EditError::NameTaken);
+    }
+    Ok(())
 }
 
 fn name_taken(profiles: &[Profile], name: &str, except: Option<&str>) -> bool {

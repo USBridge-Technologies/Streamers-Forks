@@ -5,9 +5,9 @@ use super::*;
 use std::process::Stdio;
 
 /// Run `cmd` inside the live session (managed / SteamOS / attach — [`spawn()`]'s nesting does not
-/// apply). `DISPLAY` and gamescope's socket come from a process already inside, Wayland and GTK
-/// from [`shape_flatpak_command`] and [`GDK_X11`]; with no such process, host env (a
-/// `steam steam://…` still reaches the running Steam over its pipe).
+/// apply). The env is a gamescope child's ([`as_gamescope_child`]), read from a process already
+/// inside; with no such process, host env (a `steam steam://…` still reaches the running Steam
+/// over its pipe).
 pub fn launch_into_session(cmd: &str, seat: Option<&str>) -> Result<std::process::Child> {
     let flatpak = shape_flatpak_command(cmd);
     let mut c = Command::new("sh");
@@ -24,16 +24,7 @@ pub fn launch_into_session(cmd: &str, seat: Option<&str>) -> Result<std::process
                 gamescope = gamescope.as_deref().unwrap_or("-"),
                 "gamescope: launching into the live session"
             );
-            if let Some(d) = x11 {
-                c.env("DISPLAY", d);
-            }
-            if let Some(gs) = gamescope {
-                c.env("GAMESCOPE_WAYLAND_DISPLAY", gs);
-            }
-            c.env_remove("WAYLAND_DISPLAY");
-            if flatpak.is_none() {
-                c.env(GDK_X11.0, GDK_X11.1);
-            }
+            as_gamescope_child(&mut c, x11, gamescope, flatpak.is_some());
         }
         None => tracing::warn!(
             command = %cmd,
@@ -46,8 +37,33 @@ pub fn launch_into_session(cmd: &str, seat: Option<&str>) -> Result<std::process
         .context("spawn launch command into gamescope session")
 }
 
+/// The env gamescope gives its own children: its Xwayland, its socket's name, session type
+/// `x11`, desktop `gamescope`, no `WAYLAND_DISPLAY`, plus [`GDK_X11`] outside a flatpak.
+///
+/// The host's env names the desktop beside it. With that session type, or none, SDL3 opens
+/// `wayland-0`, the desktop's socket: a window the stream never shows. Qt follows the type too.
+fn as_gamescope_child(
+    c: &mut Command,
+    x11: Option<String>,
+    gamescope: Option<String>,
+    flatpak: bool,
+) {
+    if let Some(d) = x11 {
+        c.env("DISPLAY", d);
+    }
+    if let Some(gs) = gamescope {
+        c.env("GAMESCOPE_WAYLAND_DISPLAY", gs);
+    }
+    c.env_remove("WAYLAND_DISPLAY")
+        .env("XDG_SESSION_TYPE", "x11")
+        .env("XDG_CURRENT_DESKTOP", "gamescope");
+    if !flatpak {
+        c.env(GDK_X11.0, GDK_X11.1);
+    }
+}
+
 /// Steam tears down a running game (Proton included) on the way out.
-const STEAM_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
+pub(super) const STEAM_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
 /// Half of [`STEAM_SHUTDOWN_WAIT`]. `/usr/bin/steam` is `steam.sh`, not a thin IPC forwarder;
 /// `status_within` killpg's the group, so a 5 s bound kills the request before it leaves.
@@ -109,6 +125,60 @@ pub(super) fn home_steam_pid(home: &std::path::Path) -> Option<u32> {
     // Steam's own processes report comm `steam` (the ubuntu12_32 binary) or `steam.sh`; anything
     // else means the pid was recycled since Steam last ran.
     (matches!(comm.trim(), "steam" | "steam.sh") && crate::proc::pid_alive(pid)).then_some(pid)
+}
+
+/// The desktop's Steam autostart as systemd's XDG autostart generator names it. Bazzite's
+/// `/etc/xdg/autostart/steam.desktop` and Steam's own login entry both become this unit.
+const DESKTOP_STEAM_AUTOSTART: &str = "app-steam@autostart.service";
+
+/// The desktop starts Steam a few seconds in, while our Steam may still hold the single
+/// instance: that Steam hands its launch over and exits. Call once ours, which was running,
+/// is gone; starts the autostart again when it ran and no Steam runs. A desktop without the
+/// unit is left alone.
+pub(super) fn restart_swallowed_desktop_steam() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    if home_steam_pid(std::path::Path::new(&home)).is_some() {
+        return;
+    }
+    let Ok(out) = crate::proc::output_within(
+        Command::new("systemctl").args([
+            "--user",
+            "show",
+            DESKTOP_STEAM_AUTOSTART,
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "-p",
+            "ExecMainStartTimestampMonotonic",
+        ]),
+        UNIT_QUERY_BUDGET,
+    ) else {
+        return;
+    };
+    if !ran_and_exited(&String::from_utf8_lossy(&out.stdout)) {
+        return;
+    }
+    systemctl_user(&["start", "--no-block", DESKTOP_STEAM_AUTOSTART]);
+    tracing::info!(
+        unit = DESKTOP_STEAM_AUTOSTART,
+        "gamescope: started the desktop's Steam again — its autostart had handed its launch to our \
+         Steam and exited"
+    );
+}
+
+/// A `systemctl show` body of a unit that is loaded, inactive, and has run a main process.
+fn ran_and_exited(show: &str) -> bool {
+    let prop = |key: &str| {
+        show.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or("")
+    };
+    prop("LoadState") == "loaded"
+        && prop("ActiveState") == "inactive"
+        && !matches!(prop("ExecMainStartTimestampMonotonic"), "" | "0")
 }
 
 /// The box home's Steam, when it runs inside `unit` (a Game Mode session or [`SESSION_UNIT`]).
@@ -260,10 +330,11 @@ fn steam_up_since(path: &std::path::Path, from: &mut u64) -> bool {
     if f.seek(SeekFrom::Start(*from)).is_err() {
         return false;
     }
-    let mut tail = String::new();
-    // Bounded read: a cold Steam writes a few hundred KiB before it is up.
-    let _ = f.take(4 << 20).read_to_string(&mut tail);
-    tail.contains(STEAM_UP_MARKER)
+    let mut tail = Vec::new();
+    // Bounded read: a cold Steam writes a few hundred KiB before it is up. Bytes, not a
+    // string: Steam's log is not UTF-8 throughout, and one bad byte hid the marker.
+    let _ = f.take(4 << 20).read_to_end(&mut tail);
+    String::from_utf8_lossy(&tail).contains(STEAM_UP_MARKER)
 }
 
 /// Give the session's Steam `uri` once it is up ([`deferred_shortcut_uri`]).
@@ -323,6 +394,69 @@ pub(super) fn hand_launch_to_steam_when_up(uri: String, gamescope: u32) {
 mod tests {
     use super::*;
 
+    /// Only an autostart that ran and is gone is started again: one still running is the
+    /// desktop's Steam, one that never ran is the desktop's to start, a missing one was disabled.
+    #[test]
+    fn only_an_autostart_that_ran_and_exited_is_started_again() {
+        let show = |load: &str, active: &str, started: &str| {
+            format!(
+                "LoadState={load}\nActiveState={active}\nExecMainStartTimestampMonotonic={started}\n"
+            )
+        };
+        assert!(ran_and_exited(&show("loaded", "inactive", "1234567")));
+        assert!(!ran_and_exited(&show("loaded", "active", "1234567")));
+        assert!(!ran_and_exited(&show("loaded", "inactive", "0")));
+        assert!(!ran_and_exited(&show("not-found", "inactive", "0")));
+        assert!(!ran_and_exited(&show("loaded", "failed", "1234567")));
+        assert!(!ran_and_exited(""));
+    }
+
+    /// The restart reaches systemd only for an autostart that ran and exited, and never while a
+    /// Steam holds the box's home. `systemctl` is a fake on the child's PATH.
+    #[test]
+    fn a_swallowed_desktop_steam_is_started_again() {
+        let name = "a_swallowed_desktop_steam_is_started_again";
+        let (fake, path) = crate::gamescope::tests::fake_systemctl(name);
+        crate::fake::in_child(module_path!(), name, &[("PATH", &path)], || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let started = || {
+                std::fs::read_to_string(home.join("systemctl-calls"))
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l == format!("--user start --no-block {DESKTOP_STEAM_AUTOSTART}"))
+            };
+            let show = |active: &str| {
+                let body = format!(
+                    "LoadState=loaded\nActiveState={active}\nExecMainStartTimestampMonotonic=99\n"
+                );
+                std::fs::write(home.join("systemctl-show"), body).unwrap();
+            };
+            std::fs::write(home.join("systemctl-exit"), "0").unwrap();
+            show("active");
+            restart_swallowed_desktop_steam();
+            assert!(!started(), "the desktop's own Steam is still running");
+            show("inactive");
+            restart_swallowed_desktop_steam();
+            assert!(started(), "the swallowed autostart was not started again");
+        });
+        let _ = std::fs::remove_dir_all(&fake);
+    }
+
+    /// Steam's console log is not UTF-8 throughout. One such byte before the marker must not
+    /// hold a shortcut launch for the whole wait.
+    #[test]
+    fn steam_is_seen_up_past_a_byte_that_is_not_utf8() {
+        let dir = std::env::temp_dir().join(format!("pf-steam-log-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("console-linux.txt");
+        let mut bytes = b"\xff boot\n".to_vec();
+        bytes.extend_from_slice(STEAM_UP_MARKER.as_bytes());
+        bytes.push(b'\n');
+        std::fs::write(&log, bytes).unwrap();
+        assert!(steam_up_since(&log, &mut 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_steam_is_matched_to_its_own_unit_only() {
         let game_mode = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/\
@@ -367,6 +501,39 @@ mod tests {
         assert!(is_steam_launch("steam"));
         // A command that merely mentions steam elsewhere is not a Steam client launch.
         assert!(!is_steam_launch("mygame --steam-overlay"));
+    }
+
+    /// A launch into a gamescope beside a live desktop: the host's env names the desktop.
+    #[test]
+    fn a_launch_into_the_session_sees_gamescope_not_the_desktop() {
+        let env = |flatpak| {
+            let mut c = Command::new("true");
+            c.env("WAYLAND_DISPLAY", "wayland-0")
+                .env("XDG_SESSION_TYPE", "wayland")
+                .env("XDG_CURRENT_DESKTOP", "KDE");
+            as_gamescope_child(
+                &mut c,
+                Some(":1".into()),
+                Some("gamescope-0".into()),
+                flatpak,
+            );
+            c.get_envs()
+                .map(|(k, v)| {
+                    let s = |o: &std::ffi::OsStr| o.to_string_lossy().into_owned();
+                    (s(k), v.map(s))
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let native = env(false);
+        let get = |name: &str| native[name].as_deref();
+        assert_eq!(get("WAYLAND_DISPLAY"), None);
+        assert_eq!(get("XDG_SESSION_TYPE"), Some("x11"));
+        assert_eq!(get("XDG_CURRENT_DESKTOP"), Some("gamescope"));
+        assert_eq!(get("DISPLAY"), Some(":1"));
+        assert_eq!(get("GAMESCOPE_WAYLAND_DISPLAY"), Some("gamescope-0"));
+        assert_eq!(get("GDK_BACKEND"), Some("x11"));
+        // A flatpak takes Wayland from its command's prefix; GTK in it follows that.
+        assert!(!env(true).contains_key("GDK_BACKEND"));
     }
 
     #[test]

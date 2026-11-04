@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.44.1"
+    "version": "0.46.0"
   },
   "paths": {
     "/api/v1/actions": {
@@ -51,7 +51,7 @@
           "actions"
         ],
         "summary": "Invoke a host action",
-        "description": "Id-only, empty body: nothing in the request reaches the privileged path. Power actions\nanswer `202`, end every session (typed HostPower close), wait ~1 s so this response\nflushes, then act; paired-cert callers need Host power and are `409` while another\ndevice's session is live, the admin console never is. One power action at a time.\n`display.next` answers `200` with the monitor now streamed and ends nothing; a paired\ncert needs a live session of its own.",
+        "description": "Id-only, empty body: nothing in the request reaches the privileged path. Power actions\nanswer `202`, end every session (typed HostPower close), wait ~1 s so this response\nflushes, then act; paired-cert callers need Host power and are `409` while another\ndevice's session is live or a seat host doesn't answer, the admin console never is. One\npower action at a time.\n`display.next` answers `200` with the monitor now streamed and ends nothing; a paired\ncert needs a live session of its own.",
         "operationId": "invokeAction",
         "parameters": [
           {
@@ -109,7 +109,7 @@
             }
           },
           "409": {
-            "description": "Refused: an action is already in flight, another device's session is live (cert lane), or the platform said no (a foreign sleep inhibitor, a second local user, a single monitor, …)",
+            "description": "Refused: an action is already in flight, another device's session is live or a seat host doesn't answer (cert lane), or the platform said no (a foreign sleep inhibitor, a second local user, a single monitor, …)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1679,7 +1679,7 @@
           "emulators"
         ],
         "summary": "Check a platform's firmware",
-        "description": "Whether the best copy of the emulator has the platform's firmware, each file hashed against\nthe good dumps the catalog knows. `null` when the platform needs none.",
+        "description": "Whether the best copy of the emulator has the platform's firmware, each file hashed against\nthe good dumps the catalog knows. `null` when the platform needs none. With `profile`, that\nseat's copy; a Linux seat answers once its host has checked it at a launch.",
         "operationId": "getEmulatorFirmware",
         "parameters": [
           {
@@ -1696,6 +1696,15 @@
             "in": "query",
             "description": "A catalog platform id or alias, like `ps2`",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "description": "A profile with a seat of its own: that seat's copies, on the host with the plugins",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1740,7 +1749,17 @@
             }
           },
           "404": {
-            "description": "Not in the catalog",
+            "description": "Not in the catalog, a profile with no seat, or a seat that hasn't checked it yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`profile` on a seat host",
             "content": {
               "application/json": {
                 "schema": {
@@ -2023,7 +2042,7 @@
           "emulators"
         ],
         "summary": "List a platform's saves",
-        "description": "The save units of the platform on the best copy of the emulator: name, kind, size and a\nstamp that changes with the save. A plugin needs the operator's save grant.",
+        "description": "The save units of the platform on the best copy of the emulator: name, kind, size and a\nstamp that changes with the save. A plugin needs the operator's save grant. With `profile`,\nthat seat's units; a Linux seat's are what its host exported at its last launch or exit.",
         "operationId": "getEmulatorSaves",
         "parameters": [
           {
@@ -2048,6 +2067,15 @@
             "name": "game",
             "in": "query",
             "description": "The game's folder, for an emulator that keeps saves beside its games",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "description": "A profile with a seat of its own: that seat's copies, on the host with the plugins",
             "required": false,
             "schema": {
               "type": "string"
@@ -2099,7 +2127,17 @@
             }
           },
           "404": {
-            "description": "Not in the catalog",
+            "description": "Not in the catalog, or a profile with no seat",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`profile` on a seat host",
             "content": {
               "application/json": {
                 "schema": {
@@ -2117,7 +2155,7 @@
           "emulators"
         ],
         "summary": "Copy saves out",
-        "description": "Writes each named unit into `dir`: the save file, or a tar of a save folder with nothing in\nits headers that differs between machines. A plugin's `dir` is inside its own state folder.",
+        "description": "Writes each named unit into `dir`: the save file, or a tar of a save folder with nothing in\nits headers that differs between machines. A plugin's `dir` is inside its own state folder.\nWith `profile`, that seat's units; a Linux seat's files are its host's last export, and a\nunit it didn't export is left out.",
         "operationId": "exportEmulatorSaves",
         "parameters": [
           {
@@ -2125,6 +2163,15 @@
             "in": "path",
             "description": "The catalog id",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "description": "A profile with a seat of its own: that seat's copies, on the host with the plugins",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2185,7 +2232,17 @@
             }
           },
           "404": {
-            "description": "Not in the catalog",
+            "description": "Not in the catalog, or a profile with no seat",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`profile` on a seat host",
             "content": {
               "application/json": {
                 "schema": {
@@ -2203,7 +2260,7 @@
           "emulators"
         ],
         "summary": "Put saves back",
-        "description": "Each unit goes where the emulator keeps it, in the first of its kinds with a place for its\nname; what was there is kept in hermir's save backups. A unit with no place yet is a step\nthat says so. A plugin's files are inside its own state folder.",
+        "description": "Each unit goes where the emulator keeps it, in the first of its kinds with a place for its\nname; what was there is kept in hermir's save backups. A unit with no place yet is a step\nthat says so. A plugin's files are inside its own state folder. With `profile`, into that\nseat's copies; a Linux seat's host puts each back before its next game starts, and the step\nsays so.",
         "operationId": "importEmulatorSaves",
         "parameters": [
           {
@@ -2211,6 +2268,15 @@
             "in": "path",
             "description": "The catalog id",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "description": "A profile with a seat of its own: that seat's copies, on the host with the plugins",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2271,7 +2337,17 @@
             }
           },
           "404": {
-            "description": "Not in the catalog",
+            "description": "Not in the catalog, or a profile with no seat",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`profile` on a seat host",
             "content": {
               "application/json": {
                 "schema": {
@@ -2361,6 +2437,51 @@
         }
       }
     },
+    "/api/v1/events/relay": {
+      "post": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Relay an event from the box's door",
+        "description": "The door pairs and places, so `pairing.*`, `access.*`, `host.*`, `action.*` and `update.*`\nhappen there; this host's hooks run on them from here. A seat's `game.*` keeps its `seat`:\nthis host's plugins hear it, its hooks don't, and a `game.launching` with a `hold` answers\nonce the plugins that hold the stage are done. Admin lane only: the door holds this host's\ntoken. The event joins this host's bus as new.",
+        "operationId": "relayEvent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelayedEvent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The event is on this host's bus, and a seat's held launch is through this host's plugins"
+          },
+          "400": {
+            "description": "Not a host event",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/game/end": {
       "post": {
         "tags": [
@@ -2412,6 +2533,52 @@
           },
           "409": {
             "description": "No game in reach to end",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/game/holds/{token}/release": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Release a seat's held launch",
+        "description": "A seat host runs no plugins, so its `game.launching` carries a `hold` token and the launch\nwaits, up to the longest plugin hold plus 10 s, for the host with the plugins to call this\nonce they are done. Admin lane only: the door, or the Windows box host, holds the token.",
+        "operationId": "releaseGameHold",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "description": "The `hold` of the seat's `game.launching`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The launch goes ahead"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No launch waits on that token",
             "content": {
               "application/json": {
                 "schema": {
@@ -2578,7 +2745,7 @@
           "hooks"
         ],
         "summary": "Replace the hook configuration",
-        "description": "Whole-document PUT, not a patch. Applies from the next event. Commands run as the host\nuser (the interactive session on Windows).",
+        "description": "Whole-document PUT, not a patch. Applies from the next event. Commands run as the host\nuser (the interactive session on Windows). An `elevated` hook is refused until an\nadministrator turns elevated commands on at the host (`HostInfo.elevated_commands`).",
         "operationId": "setHooks",
         "requestBody": {
           "content": {
@@ -2602,7 +2769,7 @@
             }
           },
           "400": {
-            "description": "Structurally invalid configuration",
+            "description": "Structurally invalid configuration, or an `elevated` hook this host won't run",
             "content": {
               "application/json": {
                 "schema": {
@@ -5395,7 +5562,7 @@
           "plugin-access"
         ],
         "summary": "Grant, deny, or forget an access request",
-        "description": "`allow` turns a pending request into a grant (the platform ACL lands first, so a failed\ngrant stores nothing), or with `write` set grants a path the operator handed over, on\nbehalf of `form` when named; `deny` remembers the no; `forget` removes a grant or denial.",
+        "description": "`allow` turns a pending request into a grant (the platform ACL lands first, so a failed\ngrant stores nothing), or with `write` set grants a path the operator handed over, on\nbehalf of `form` when named; `deny` remembers the no; `forget` removes a grant or denial.\nA folder that takes longer answers 202 and lists its walk until the record lands.",
         "operationId": "decidePluginAccess",
         "parameters": [
           {
@@ -5421,6 +5588,16 @@
         "responses": {
           "200": {
             "description": "The plugin's access state after the decision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginAccessSnapshot"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The folder's access is still changing; `walks` lists it",
             "content": {
               "application/json": {
                 "schema": {
@@ -5514,6 +5691,16 @@
         "responses": {
           "200": {
             "description": "The plugin's access state after the release",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginAccessSnapshot"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The folder's access is still changing; `walks` lists it",
             "content": {
               "application/json": {
                 "schema": {
@@ -5850,6 +6037,7 @@
           "profiles"
         ],
         "summary": "List the profiles with what the console manages",
+        "description": "On the plugin lane each row is `id`, `display_name` and `avatar` alone.",
         "operationId": "listProfiles",
         "responses": {
           "200": {
@@ -5892,7 +6080,7 @@
           "profiles"
         ],
         "summary": "Add a profile",
-        "description": "A seat profile (the default) gets a desktop of its own, whose account is made here; one with\n`seat: false` plays the box's own session under its own name. A seat needs seats on\n(Windows) or the door (Linux).",
+        "description": "A seat profile (the default) gets a desktop of its own, whose account is made here, or on\nWindows Server signs in to `seat_account`, an existing local account, with `seat_password`.\nOne with `seat: false` plays the box's own session under its own name. A seat needs seats on\n(Windows) or the door (Linux).",
         "operationId": "createProfile",
         "requestBody": {
           "content": {
@@ -5916,7 +6104,7 @@
             }
           },
           "400": {
-            "description": "No name, or an accent that is not #RRGGBB",
+            "description": "No name, an accent that is not #RRGGBB, an unknown Windows account, or a password missing or refused",
             "content": {
               "application/json": {
                 "schema": {
@@ -5936,7 +6124,7 @@
             }
           },
           "409": {
-            "description": "Another profile has that name, seats are off (Windows), or the door is off (Linux)",
+            "description": "Another profile has that name or Windows account, seats are off (Windows), the door is off (Linux), or a Windows account a seat can't use",
             "content": {
               "application/json": {
                 "schema": {
@@ -6070,7 +6258,7 @@
           "profiles"
         ],
         "summary": "Turn Reachable without logging in on or off",
-        "description": "Linux. On moves the box's host to a system service that runs from boot, places every connect\non a seat of the box and keeps the box's files in `/var/lib/punktfunk`; the owner plays on a\nseat of their own. Off puts the files and the host back. The answer is 202 once the switch is\nqueued: the console reloads and polls `GET /host`, whose `door` says which host answers. The\nowner's user must be in the `punktfunk-update` group. Admin lane only.",
+        "description": "Linux. On moves the box's host to a system service that runs from boot, places every connect\non a seat of the box and keeps the box's files in `/var/lib/punktfunk`; the owner plays on a\nseat of their own. Off hands the door's own settings to the owner's host, then puts the files\nand the host back. The answer is 202 once the switch is\nqueued: the console reloads and polls `GET /host`, whose `door` says which host answers. The\nowner's user must be in the `punktfunk-update` group. Admin lane only.",
         "operationId": "setDoor",
         "requestBody": {
           "content": {
@@ -6119,8 +6307,18 @@
               }
             }
           },
+          "502": {
+            "description": "The owner's host didn't take the door's settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "503": {
-            "description": "systemd didn't take the switch",
+            "description": "systemd didn't take the switch, or the owner's host is starting",
             "content": {
               "application/json": {
                 "schema": {
@@ -6279,12 +6477,48 @@
         }
       }
     },
+    "/api/v1/profiles/windows-accounts": {
+      "get": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Windows accounts a new profile can bind to",
+        "description": "The enabled local Windows accounts on this PC that no profile holds: none a seat signs in to,\nnone a take-turns profile uses, none of punktfunk's own seat accounts. Empty on every other\nOS. The console's **Add profile** reads this for **Own account (take turns)** and for **Own\ndesktop** on an existing account.",
+        "operationId": "windowsAccounts",
+        "responses": {
+          "200": {
+            "description": "Bindable local Windows account names",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/profiles/{id}": {
       "put": {
         "tags": [
           "profiles"
         ],
         "summary": "Rename, recolour or rehome a profile",
+        "description": "`seat_password` gives a seat on an existing Windows account that account's new password.\nThe seat supervisor checks it with Windows before it keeps it, then the rest applies.",
         "operationId": "updateProfile",
         "parameters": [
           {
@@ -6319,7 +6553,7 @@
             }
           },
           "400": {
-            "description": "An empty name, or an accent that is not #RRGGBB",
+            "description": "An empty name, an accent that is not #RRGGBB, or a password Windows refused",
             "content": {
               "application/json": {
                 "schema": {
@@ -6349,7 +6583,17 @@
             }
           },
           "409": {
-            "description": "Another profile has that name",
+            "description": "Another profile has that name, or a password for a profile with no existing Windows account",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The seat supervisor didn't answer",
             "content": {
               "application/json": {
                 "schema": {
@@ -6365,7 +6609,7 @@
           "profiles"
         ],
         "summary": "Remove a profile",
-        "description": "Sessions playing as it end with `SEAT_UNAVAILABLE`. With `erase`, its Steam home and picture\ngo too; without, the home stays. A Windows seat's account goes with its profile, so removing\none needs `erase`.",
+        "description": "Sessions playing as it end with `SEAT_UNAVAILABLE`. With `erase`, its Steam home and picture\ngo too; without, the home stays. A Windows seat's account goes with its profile, and an\nexisting account a seat signs in to is released and stays; removing either needs `erase`.",
         "operationId": "deleteProfile",
         "parameters": [
           {
@@ -6890,6 +7134,20 @@
         "summary": "Stop the session",
         "description": "A deliberate stop: skip keep-alive linger and apply `game_on_session_end`.",
         "operationId": "stopSession",
+        "parameters": [
+          {
+            "name": "reason",
+            "in": "query",
+            "description": "Why the host stops. `power` closes every session the way a power action does, so clients\nread that the host is going down; the box's door sends it to its seat hosts. A host that\npredates it, and any other value, stop plainly.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "responses": {
           "204": {
             "description": "Session stopped (or none was active)"
@@ -8584,6 +8842,10 @@
           "path"
         ],
         "properties": {
+          "files": {
+            "type": "boolean",
+            "description": "`true` asks for the folder and the files directly in it, nothing below. On Windows this\nlands at once where a whole folder rewrites every file in its tree. Ignored with `write`."
+          },
           "path": {
             "type": "string",
             "description": "The directory the plugin wants, absolute on the host."
@@ -8627,6 +8889,30 @@
           "saves": {
             "type": "boolean",
             "description": "Ask to read and restore emulator saves. One yes covers every emulator on this host; the\nanswer names the folder the grant lands on."
+          }
+        }
+      },
+      "AccessWalk": {
+        "type": "object",
+        "description": "One folder whose access is changing.",
+        "required": [
+          "path",
+          "removing",
+          "seconds"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "removing": {
+            "type": "boolean",
+            "description": "The folder is being taken back, not opened."
+          },
+          "seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long it has been running.",
+            "minimum": 0
           }
         }
       },
@@ -8742,6 +9028,13 @@
           "plane": {
             "$ref": "#/components/schemas/Plane",
             "description": "`native`, `gamestream` or `web`."
+          },
+          "seat": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it."
           },
           "session_id": {
             "type": "integer",
@@ -11194,6 +11487,10 @@
               "game": {
                 "$ref": "#/components/schemas/GameRefPayload"
               },
+              "hold": {
+                "type": "string",
+                "description": "On a seat host, which runs no plugins: the launch also waits for the host with the\nplugins to `POST /game/holds/{hold}/release`. Absent everywhere else."
+              },
               "kind": {
                 "type": "string",
                 "enum": [
@@ -12234,6 +12531,10 @@
           "by": {
             "type": "string"
           },
+          "files": {
+            "type": "boolean",
+            "description": "The folder and the files directly in it, nothing below. Its ACE lands at once however\nlarge the tree under it is, where a recursive one rewrites every file."
+          },
           "forms": {
             "type": "array",
             "items": {
@@ -12340,6 +12641,10 @@
             "format": "int64",
             "description": "Minimum interval between firings, in milliseconds. 0 = fire every time. A `hold` ignores it.",
             "minimum": 0
+          },
+          "elevated": {
+            "type": "boolean",
+            "description": "Windows: `run` gets the signed-in administrator's full token, with no UAC prompt. Runs\nonly after an administrator ran `punktfunk-host hooks elevated on`."
           },
           "filter": {
             "oneOf": [
@@ -12536,6 +12841,10 @@
                 "format": "int32",
                 "minimum": 0
               },
+              "seat": {
+                "type": "string",
+                "description": "On a door, the profile whose host raised it: a seat's event, on the door's bus for the\nconsole. Absent on the host's own."
+              },
               "seq": {
                 "type": "integer",
                 "format": "int64",
@@ -12610,12 +12919,23 @@
             "type": "boolean",
             "description": "This host is the door (Linux, **Reachable without logging in**): a system service that\nplaces every connect on a seat and streams nothing itself."
           },
+          "door_switch_failed": {
+            "type": "boolean",
+            "description": "The switch this host last started ran and failed, so the console stops waiting for it.\nAdmin lane only."
+          },
           "door_unavailable": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Why turning the door on would be refused here, as the operator's next move: the files a\nchannel installs it with are missing, or the account isn't in `punktfunk-update`. `null`\nwhen it would start, and on the door itself."
+            "description": "Why turning the door on would be refused here, as the operator's next move: the files a\nchannel installs it with are missing, or the account isn't in `punktfunk-update`. `null`\nwhen it would start, on the door itself and on a seat host, and for every lane but the\nadmin one. The answer is up to 30 s old; a switch request drops it."
+          },
+          "elevated_commands": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether hooks and prep steps marked `elevated` run as administrator: `true` once an\nadministrator ran `punktfunk-host hooks elevated on` here. `null` where commands can't\nelevate (every OS but Windows), and for every lane but the admin one."
           },
           "fingerprint": {
             "type": [
@@ -13021,6 +13341,17 @@
           },
           "target": {
             "type": "string"
+          },
+          "walk": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AccessWalk",
+                "description": "The folder a running job is opening for its plugin right now."
+              }
+            ]
           }
         }
       },
@@ -14209,6 +14540,10 @@
             ],
             "description": "An emulator to install into `path` first: the operator's yes installs, then grants."
           },
+          "files": {
+            "type": "boolean",
+            "description": "The folder and the files directly in it, nothing below. See [`Grant::files`]."
+          },
           "path": {
             "type": "string"
           },
@@ -14221,6 +14556,13 @@
           "saves": {
             "type": "boolean",
             "description": "The plugin asks to read and restore emulator saves; `path` is the folder that grant lands on."
+          },
+          "spelled": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How the plugin spelled `path` when that goes through a link. An allow records it in\n[`PluginAccess::links`]: on Windows the link itself needs the runner's ACE."
           },
           "write": {
             "type": "boolean"
@@ -14314,6 +14656,13 @@
           },
           "plugin": {
             "type": "string"
+          },
+          "walks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessWalk"
+            },
+            "description": "Folders whose access is changing for this plugin right now."
           }
         }
       },
@@ -14531,20 +14880,20 @@
       },
       "PortMap": {
         "type": "object",
-        "description": "Ports a client needs. Moonlight derives stream ports from HTTP; a control pane should not.",
+        "description": "Ports a client needs. Moonlight derives stream ports from HTTP; a control pane should not.\nA port the host does not serve right now is left out.",
         "required": [
-          "mgmt",
-          "http",
-          "https",
-          "rtsp",
-          "video",
-          "control",
-          "audio"
+          "mgmt"
         ],
         "properties": {
           "audio": {
             "type": "integer",
             "format": "int32",
+            "minimum": 0
+          },
+          "browser": {
+            "type": "integer",
+            "format": "int32",
+            "description": "UDP: the browser client's plane, while it is on.",
             "minimum": 0
           },
           "control": {
@@ -14555,7 +14904,7 @@
           "http": {
             "type": "integer",
             "format": "int32",
-            "description": "nvhttp plain HTTP (serverinfo, pairing).",
+            "description": "nvhttp plain HTTP (serverinfo, pairing). This and the five below: GameStream only.",
             "minimum": 0
           },
           "https": {
@@ -14569,10 +14918,25 @@
             "format": "int32",
             "minimum": 0
           },
+          "native": {
+            "type": "integer",
+            "format": "int32",
+            "description": "UDP: the native stream port. Video, audio, control and the paired-device library.",
+            "minimum": 0
+          },
           "rtsp": {
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          },
+          "seats": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "UDP: each seat's stream port, while seats are on."
           },
           "video": {
             "type": "integer",
@@ -14609,6 +14973,10 @@
           "do": {
             "type": "string",
             "description": "Command run before launch. Same recipe and ownership checks as hook `run`; stdin is `{}`."
+          },
+          "elevated": {
+            "type": "boolean",
+            "description": "Windows: `do` and `undo` run as administrator, as a hook's `elevated` does."
           },
           "undo": {
             "type": [
@@ -14797,7 +15165,25 @@
           },
           "seat": {
             "type": "boolean",
-            "description": "A desktop of its own (the default), or the box's own session under another name. A\ndesktop of its own needs seats on Windows and the door on Linux."
+            "description": "A desktop of its own (the default), or the box's own session under another name. A\ndesktop of its own needs seats on Windows and the door on Linux. Ignored when\n[`windows_account`](Self::windows_account) is set."
+          },
+          "seat_account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "With `seat`, a local Windows standard account that already exists, which the seat signs\nin to instead of one punktfunk makes. Windows Server only."
+          },
+          "seat_password": {
+            "type": "string",
+            "description": "That account's password, entered once and sealed by the host."
+          },
+          "windows_account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bind this profile to a local Windows account that takes the console in turn\n(`design/windows-take-turns.md`). When set, the profile is a take-turns profile and\n`seat` does not apply."
           }
         }
       },
@@ -14906,6 +15292,10 @@
                 "$ref": "#/components/schemas/Home"
               }
             ]
+          },
+          "seat_password": {
+            "type": "string",
+            "description": "The new password of an adopted account, after it changed in Windows."
           }
         }
       },
@@ -15063,6 +15453,19 @@
               "$ref": "#/components/schemas/SessionSummary"
             },
             "description": "Newest first. Bounded in memory and lost on a host restart — this is the last\nfew sessions, not a history."
+          }
+        }
+      },
+      "RelayedEvent": {
+        "type": "object",
+        "description": "One event as another host's `GET /events` framed it. Wrapped, because a tagged union is no\nrequest body for every client generator.",
+        "required": [
+          "event"
+        ],
+        "properties": {
+          "event": {
+            "type": "object",
+            "description": "A `HostEvent`, as the `data:` of one frame."
           }
         }
       },
@@ -15505,6 +15908,13 @@
           "kind"
         ],
         "properties": {
+          "account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Windows account of a seat on an existing one, for the console's card and its Remove\nsentence. Absent for an account punktfunk made, and to a paired device."
+          },
           "detail": {
             "type": [
               "string",
@@ -15538,6 +15948,10 @@
           },
           "state": {
             "$ref": "#/components/schemas/SeatState"
+          },
+          "take_turns": {
+            "type": "boolean",
+            "description": "A take-turns profile: its own Windows account on the one console, not a host of its own.\nIt dials this host like the owner does, so it has no per-seat library of its own and\nremoving it leaves the Windows account alone."
           }
         }
       },
@@ -15936,6 +16350,13 @@
                 "description": "The profile the session plays as. Blank, like `client_name`, for another device's\nsession on the cert lane."
               }
             ]
+          },
+          "seat": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it."
           },
           "shared_path_with": {
             "type": "array",
@@ -17245,7 +17666,7 @@
     },
     {
       "name": "native",
-      "description": "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"
+      "description": "Native pairing: arm a window, display the host PIN, manage paired devices"
     },
     {
       "name": "session",

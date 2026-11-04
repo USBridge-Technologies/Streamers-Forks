@@ -441,6 +441,43 @@ bool pyrowave_device_confirm_interop_support(pyrowave_device device)
 	return true;
 }
 
+// PUNKTFUNK LOCAL EXTENSION (patches/0013-confirm-one-import.patch), not upstream.
+bool pyrowave_device_confirm_image_import_support(pyrowave_device device,
+		VkExternalMemoryHandleTypeFlagBits handle_type, VkFormat format, VkImageUsageFlags usage)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	if (!device || !device->device.get_device_features().supports_external)
+		return false;
+
+	VkExternalImageFormatProperties external_props = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+	VkImageFormatProperties2 props2 = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &external_props };
+	VkPhysicalDeviceExternalImageFormatInfo external_format_info =
+		{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO };
+	external_format_info.handleType = handle_type;
+
+	if (!device->device.get_image_format_properties(
+		format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &external_format_info, &props2))
+		return false;
+
+	return (external_props.externalMemoryProperties.externalMemoryFeatures &
+	        VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+}
+
+bool pyrowave_device_confirm_semaphore_import_support(pyrowave_device device,
+		VkExternalSemaphoreHandleTypeFlagBits handle_type)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	if (!device || !device->device.get_device_features().supports_external)
+		return false;
+
+	// No VkSemaphoreTypeCreateInfo, as upstream asks for a D3D12 fence above.
+	VkPhysicalDeviceExternalSemaphoreInfo sem_info = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO };
+	VkExternalSemaphoreProperties sem_props = { VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
+	sem_info.handleType = handle_type;
+	vkGetPhysicalDeviceExternalSemaphoreProperties(device->device.get_physical_device(), &sem_info, &sem_props);
+	return (sem_props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0;
+}
+
 pyrowave_result
 pyrowave_device_set_queue_type(pyrowave_device device, VkQueueFlagBits queue_flags)
 {
@@ -1617,6 +1654,17 @@ struct pyrowave_decoder_opaque
 	ChromaSubsampling chroma = {};
 	int width = 0;
 	int height = 0;
+	// PUNKTFUNK: plane views per output set the caller rotates through, wrapped once and
+	// kept. Stable views keep Granite's framebuffer cache hitting; fresh ones made and
+	// destroyed a framebuffer every frame. A set past the last slot replaces the oldest.
+	struct CachedViews
+	{
+		ImageHandle images[3];
+		ImageViewHandle views[3];
+		pyrowave_image_view key[3] = {};
+	};
+	CachedViews view_sets[4];
+	unsigned next_view_set = 0;
 };
 
 bool pyrowave_decoder_device_prefers_fragment_path(pyrowave_device device)
@@ -1671,6 +1719,30 @@ pyrowave_decoder_push_packet(pyrowave_decoder decoder, const void *data, size_t 
 	return ret ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_INVALID_ARGUMENT;
 }
 
+pyrowave_result
+pyrowave_decoder_set_payload_memory(pyrowave_decoder decoder, const pyrowave_payload_memory *memory)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	if (!memory)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	const uint64_t linear[3] = {
+		uint64_t(uintptr_t(memory->linear[0])),
+		uint64_t(uintptr_t(memory->linear[1])),
+		uint64_t(uintptr_t(memory->linear[2])),
+	};
+	bool ret = decoder->decoder.set_payload_memory(uint64_t(uintptr_t(memory->buffer)), memory->size,
+	                                               memory->copy_reserve, memory->host, linear, memory->rows);
+	return ret ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_INVALID_ARGUMENT;
+}
+
+pyrowave_result
+pyrowave_decoder_push_packet_in_place(pyrowave_decoder decoder, const void *data, size_t size)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	bool ret = decoder->decoder.push_packet_in_place(data, size);
+	return ret ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_INVALID_ARGUMENT;
+}
+
 // For error correction purposes, it may be okay to decode a frame which dropped some packets.
 bool pyrowave_decoder_decode_is_ready(pyrowave_decoder decoder, bool allow_partial_frame)
 {
@@ -1687,6 +1759,38 @@ bool pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bo
 	                                        active_block_mask, word_count);
 }
 
+// PUNKTFUNK: the decoder's plane views for these planes, from the cache or wrapped now.
+static bool cached_decoder_views(pyrowave_decoder decoder, const pyrowave_gpu_buffers *buffers,
+                                 ViewBuffers &views)
+{
+	pyrowave_decoder_opaque::CachedViews *set = nullptr;
+	for (auto &cached : decoder->view_sets)
+	{
+		bool same = bool(cached.views[0]);
+		for (int i = 0; same && i < 3; i++)
+			same = same_plane(cached.key[i], buffers->planes[i]);
+		if (same)
+			set = &cached;
+	}
+	if (!set)
+	{
+		WrappedViewBuffers fresh = {};
+		if (!fresh.wrap(decoder->device, buffers,
+		                decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT))
+			return false;
+		set = &decoder->view_sets[decoder->next_view_set++ % 4];
+		for (int i = 0; i < 3; i++)
+		{
+			set->images[i] = std::move(fresh.wrapped_images[i]);
+			set->views[i] = std::move(fresh.image_views[i]);
+			set->key[i] = buffers->planes[i];
+		}
+	}
+	for (int i = 0; i < 3; i++)
+		views.planes[i] = set->views[i].get();
+	return true;
+}
+
 pyrowave_result
 pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
                                    const pyrowave_gpu_sync_operation *acquire,
@@ -1700,8 +1804,8 @@ pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 	auto *device = decoder->device;
 	device->next_frame_context();
 
-	WrappedViewBuffers views = {};
-	if (!views.wrap(device, buffers, decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT))
+	ViewBuffers views = {};
+	if (!cached_decoder_views(decoder, buffers, views))
 		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
 
 	// Just use normal graphics queue here since the result will likely be consumed there.

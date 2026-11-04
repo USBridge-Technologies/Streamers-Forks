@@ -29,7 +29,9 @@ mod arming;
 mod sanitize;
 mod store;
 
-pub use approval::{classify_source, KnockSource, PairingDecision, PendingRequest};
+pub use approval::{
+    classify_relayed, classify_source, KnockSource, PairingDecision, PendingRequest,
+};
 pub use arming::PinAttempt;
 pub use store::{Access, PairedClient};
 
@@ -123,6 +125,9 @@ pub struct NativePairing {
     /// Live session counts plus last-out generation, keyed by lowercased fingerprint.
     /// Every admitted session counts; only a "this session" record reads the total.
     live: Mutex<Live>,
+    /// "This session" guests the startup sweep kept because they may play on a seat, and whether
+    /// a seat was seen to list them. [`Self::take_kept_at_start`] hands them out once.
+    kept_at_start: Mutex<Vec<(String, bool)>>,
 }
 
 /// Session counts and last-out generations behind one lock so a reconnect cannot
@@ -152,8 +157,21 @@ impl NativePairing {
         arm_at_start: bool,
     ) -> Result<NativePairing> {
         let store = store::TrustStore::open(store_path)?;
+        let np = NativePairing::with_store(store, fixed_pin, arm_at_start);
+        // A host with no seats answers `Some(false)`, and a seat host's read-only store never
+        // sweeps. The door, and a Windows host with seats on, ask the seat hosts for 10 s at most.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        np.drop_session_only_records(|fp| crate::seats::plays_on_a_seat_by(fp, deadline));
+        Ok(np)
+    }
+
+    fn with_store(
+        store: store::TrustStore,
+        fixed_pin: Option<String>,
+        arm_at_start: bool,
+    ) -> NativePairing {
         let refused = pf_paths::seat::pairing_refused() || store.read_only();
-        let np = NativePairing {
+        NativePairing {
             arm: arming::ArmState::new(arm_at_start && !refused, fixed_pin),
             store,
             approval: approval::ApprovalQueue::new(),
@@ -162,21 +180,36 @@ impl NativePairing {
                 counts: HashMap::new(),
                 last_out: HashMap::new(),
             }),
-        };
-        np.drop_session_only_records();
-        Ok(np)
+            kept_at_start: Mutex::new(Vec::new()),
+        }
     }
 
-    /// A host that is starting has no live sessions, so every "this session" grant has already
-    /// ended — by a restart, an update or a crash, which is how a session usually ends. The
-    /// counter is in memory only, so without this sweep those records would outlive the guest
-    /// forever and the list would keep exactly the leftover the grant exists to prevent.
-    fn drop_session_only_records(&self) {
+    /// A host that is starting has no live sessions of its own, so a "this session" grant has
+    /// ended with the restart, an update or a crash. The counter is in memory only, so without
+    /// this sweep the record would outlive the guest.
+    ///
+    /// A guest on a seat outlives the box's host: the seat hosts end a guest whose record is
+    /// gone. `on_seat` says whether the device plays there; unless it answers `Some(false)` the
+    /// record stays, and [`Self::take_kept_at_start`] names the guest for a hold.
+    fn drop_session_only_records(&self, on_seat: impl Fn(&str) -> Option<bool>) {
         if self.store.read_only() {
             return;
         }
         for client in self.store.list() {
             if !client.until_disconnect {
+                continue;
+            }
+            let seen = on_seat(&client.fingerprint);
+            if seen != Some(false) {
+                tracing::info!(
+                    name = %client.name,
+                    fingerprint = %client.fingerprint,
+                    "kept a this-session grant: its device may still play on a seat"
+                );
+                self.kept_at_start
+                    .lock()
+                    .unwrap()
+                    .push((client.fingerprint, seen == Some(true)));
                 continue;
             }
             match self.store.remove(&client.fingerprint) {
@@ -193,6 +226,11 @@ impl NativePairing {
                 ),
             }
         }
+    }
+
+    /// The guests the startup sweep kept, with whether a seat was seen to list each, once.
+    pub fn take_kept_at_start(&self) -> Vec<(String, bool)> {
+        std::mem::take(&mut *self.kept_at_start.lock().unwrap())
     }
 
     /// Arm with a fresh PIN for `ttl`, unbound (any well-formed attempt consumes it) and with
@@ -398,6 +436,24 @@ impl NativePairing {
         });
     }
 
+    /// Whether the store is the box's file, which another process writes.
+    pub fn follows_box(&self) -> bool {
+        self.store.read_only()
+    }
+
+    /// Publishes every watched fingerprint from the store as it is now. A seat host's store is
+    /// the box's file, so its edits arrive here and not through a mutator. A file that is missing
+    /// or garbled says nothing, so a glitch in the copy doesn't end every session.
+    pub fn republish_watched(&self) {
+        if !self.store.readable() {
+            return;
+        }
+        let watched: Vec<String> = self.access_watch.lock().unwrap().keys().cloned().collect();
+        for fp_hex in watched {
+            self.publish_current(&fp_hex);
+        }
+    }
+
     pub fn list(&self) -> Vec<PairedClient> {
         self.store.list()
     }
@@ -428,6 +484,11 @@ impl NativePairing {
             np: self.clone(),
             fp_hex: fp_hex.to_ascii_lowercase(),
         }
+    }
+
+    /// Whether `fp_hex` holds a "this session" record, which ends with its last session.
+    pub fn is_session_only(&self, fp_hex: &str) -> bool {
+        self.store.get(fp_hex).is_some_and(|c| c.until_disconnect)
     }
 
     /// Live sessions for `fp_hex` right now.
@@ -463,6 +524,10 @@ impl NativePairing {
     /// this waiter share the `live` lock so a reconnect cannot land between the live
     /// check and the remove. Lock order is live → store → watch.
     async fn drop_session_only_after_grace(&self, fp_hex: &str, last_out: u64) {
+        // A seat host reads the box's store; the box drops the record.
+        if self.store.read_only() {
+            return;
+        }
         tokio::time::sleep(RECONNECT_GRACE).await;
         let removed = {
             let live = self.live.lock().unwrap();
@@ -525,17 +590,21 @@ impl NativePairing {
 
     /// Record an unpaired knock. A re-knock from the same fingerprint refreshes in place
     /// (same id, new generation). The generation is what [`Self::wait_for_decision`] admits.
+    /// `client_addr` is the browser a bridge names; it only tightens the knock's source.
     pub fn note_pending(
         &self,
         name: &str,
         fp_hex: &str,
         src_ip: Option<IpAddr>,
+        client_addr: Option<IpAddr>,
         profile: Option<&str>,
     ) -> u32 {
         // Only a new fingerprint emits `pairing.pending`. A parked client's retries
         // must not notify the operator once per attempt.
         let was_pending = self.approval.pending_contains(fp_hex);
-        let seq = self.approval.note_pending(name, fp_hex, src_ip, profile);
+        let seq = self
+            .approval
+            .note_pending(name, fp_hex, src_ip, client_addr, profile);
         if !was_pending {
             crate::events::emit(crate::events::EventKind::PairingPending {
                 device: crate::events::DeviceRef {
@@ -692,8 +761,8 @@ mod tests {
         let np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
         assert!(np.pending().is_empty());
 
-        np.note_pending("device aa11", "AA11", Some(LAN_KNOCK), None);
-        np.note_pending("Bedroom TV", "aa11", Some(LAN_KNOCK), None);
+        np.note_pending("device aa11", "AA11", Some(LAN_KNOCK), None, None);
+        np.note_pending("Bedroom TV", "aa11", Some(LAN_KNOCK), None, None);
         let pend = np.pending();
         assert_eq!(pend.len(), 1, "re-knock dedups by fingerprint");
         assert_eq!(pend[0].name, "Bedroom TV");
@@ -704,7 +773,7 @@ mod tests {
         assert!(np.pending().is_empty());
         assert!(!np.is_paired("aa11"));
 
-        np.note_pending("device bb22", "BB22", Some(LAN_KNOCK), None);
+        np.note_pending("device bb22", "BB22", Some(LAN_KNOCK), None, None);
         let id = np.pending()[0].id;
         assert!(
             np.approve_pending(9999, None, None)
@@ -727,7 +796,7 @@ mod tests {
         // at PENDING_CAP and evicts the oldest non-parked entries first.
         for i in 0..(PENDING_CAP + 3) {
             let ip = IpAddr::from([10, 0, (i / 256) as u8, (i % 256) as u8]);
-            np.note_pending("flood", &format!("f{i:03}"), Some(ip), None);
+            np.note_pending("flood", &format!("f{i:03}"), Some(ip), None, None);
         }
         let pend = np.pending();
         assert_eq!(pend.len(), PENDING_CAP);
@@ -738,7 +807,7 @@ mod tests {
     fn pairing_clears_a_pending_knock() {
         let (_temp, p) = temp();
         let np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
-        np.note_pending("Knocker", "cc44", Some(LAN_KNOCK), None);
+        np.note_pending("Knocker", "cc44", Some(LAN_KNOCK), None, None);
         assert_eq!(np.pending().len(), 1);
         np.add("Knocker", "CC44").unwrap();
         assert!(
@@ -776,7 +845,7 @@ mod tests {
         let (_temp, p) = temp();
         let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
 
-        let seq = np.note_pending("Knocker", "ab01", Some(LAN_KNOCK), None);
+        let seq = np.note_pending("Knocker", "ab01", Some(LAN_KNOCK), None, None);
         let d = np
             .wait_for_decision("ab01", seq, Duration::from_millis(80))
             .await;
@@ -803,7 +872,7 @@ mod tests {
         assert_eq!(waiter.await.unwrap(), PairingDecision::Approved);
         assert!(np.is_paired("ab01"));
 
-        let seq = np.note_pending("Knock2", "cd02", Some(LAN_KNOCK), None);
+        let seq = np.note_pending("Knock2", "cd02", Some(LAN_KNOCK), None, None);
         let ready = np.approval.waiter_ready_generation();
         let np3 = np.clone();
         let waiter = tokio::spawn(async move {
@@ -850,13 +919,13 @@ mod tests {
         .unwrap();
         assert!(np.is_paired("aa77"), "expired but still listed");
 
-        let seq = np.note_pending("Old Guest", "aa77", Some(LAN_KNOCK), None);
+        let seq = np.note_pending("Old Guest", "aa77", Some(LAN_KNOCK), None, None);
         let d = np
             .wait_for_decision("aa77", seq, Duration::from_millis(120))
             .await;
         assert_eq!(d, PairingDecision::TimedOut);
 
-        let seq = np.note_pending("Old Guest", "aa77", Some(LAN_KNOCK), None);
+        let seq = np.note_pending("Old Guest", "aa77", Some(LAN_KNOCK), None, None);
         let ready = np.approval.waiter_ready_generation();
         let np2 = np.clone();
         let waiter = tokio::spawn(async move {
@@ -895,7 +964,7 @@ mod tests {
         let (_temp, p) = temp();
         let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
 
-        let seq1 = np.note_pending("iPad Pro", "ee01", Some(LAN_KNOCK), None);
+        let seq1 = np.note_pending("iPad Pro", "ee01", Some(LAN_KNOCK), None, None);
         let ready = np.approval.waiter_ready_generation();
         let np1 = np.clone();
         let waiter1 = tokio::spawn(async move {
@@ -904,7 +973,7 @@ mod tests {
         });
         np.approval.wait_for_waiter_ready(ready).await;
 
-        let seq2 = np.note_pending("iPad Pro", "ee01", Some(LAN_KNOCK), None);
+        let seq2 = np.note_pending("iPad Pro", "ee01", Some(LAN_KNOCK), None, None);
         assert_ne!(seq1, seq2);
         assert_eq!(waiter1.await.unwrap(), PairingDecision::Superseded);
         assert_eq!(np.pending().len(), 1);
@@ -1094,9 +1163,9 @@ mod tests {
         let np = NativePairing::load_with(Some(p), None, false).unwrap();
         let wan = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5));
 
-        np.note_pending("Roaming Laptop", "ab99", Some(LAN_KNOCK), None);
+        np.note_pending("Roaming Laptop", "ab99", Some(LAN_KNOCK), None, None);
         assert_eq!(np.pending()[0].source, KnockSource::Lan);
-        np.note_pending("Roaming Laptop", "ab99", Some(wan), None);
+        np.note_pending("Roaming Laptop", "ab99", Some(wan), None, None);
         assert_eq!(
             np.pending()[0].source,
             KnockSource::Wan,
@@ -1109,7 +1178,7 @@ mod tests {
         ));
 
         // And back again, so the honest direction is not a one-way door.
-        np.note_pending("Roaming Laptop", "ab99", Some(LAN_KNOCK), None);
+        np.note_pending("Roaming Laptop", "ab99", Some(LAN_KNOCK), None, None);
         assert_eq!(np.pending()[0].source, KnockSource::Lan);
     }
 
@@ -1154,6 +1223,46 @@ mod tests {
             restarted.is_paired("ee22"),
             "an ordinary grant survives a restart"
         );
+    }
+
+    /// A guest on a seat outlives the box's host, and the seat hosts end a guest whose record is
+    /// gone. The sweep keeps the record of a device a seat lists, or one no seat could rule out,
+    /// and drops the rest.
+    #[test]
+    fn a_restart_keeps_this_session_grants_of_guests_on_a_seat() {
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        let (_temp, path) = temp();
+        {
+            let np = NativePairing::load_with(Some(path.clone()), None, false).unwrap();
+            for (name, fp) in [("On seat", "dd11"), ("Unknown", "ee22"), ("Gone", "ff33")] {
+                let access = Access {
+                    grants: GRANT_GAMEPAD,
+                    expires_unix: None,
+                    until_disconnect: true,
+                };
+                np.add_with_access(name, fp, Some(access)).unwrap();
+            }
+        }
+
+        let restarted = NativePairing::with_store(store::TrustStore::at(path, false), None, false);
+        restarted.drop_session_only_records(|fp| match fp {
+            "dd11" => Some(true),
+            "ee22" => None,
+            _ => Some(false),
+        });
+        assert!(restarted.is_paired("dd11"), "a seat lists the guest");
+        assert!(
+            restarted.is_paired("ee22"),
+            "a silent seat may hold the guest"
+        );
+        assert!(!restarted.is_paired("ff33"), "no seat has the guest");
+        let mut kept = restarted.take_kept_at_start();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [("dd11".to_string(), true), ("ee22".to_string(), false)]
+        );
+        assert!(restarted.take_kept_at_start().is_empty(), "handed out once");
     }
 
     /// The address table the admission rules read. Anything not on a network the operator
@@ -1209,30 +1318,71 @@ mod tests {
         );
     }
 
-    /// 100.64/10 is Tailscale's range and a CGNAT ISP's alike, so the route back decides.
+    /// A bridge names the browser it dials for. The name only tightens: a LAN bridge passes a WAN
+    /// browser's class on, and nothing it names makes a WAN peer LAN.
     #[test]
-    fn a_cgnat_peer_is_lan_only_over_the_tailnet() {
-        use super::approval::{classify_with, is_tailscale_iface};
+    fn a_bridged_knock_takes_the_stricter_source() {
+        let wan: IpAddr = "203.0.113.5".parse().unwrap();
+        let lan: IpAddr = "10.0.0.9".parse().unwrap();
+        let cases = [
+            (Some(LAN_KNOCK), Some(wan), KnockSource::Wan),
+            (Some(wan), Some(lan), KnockSource::Wan),
+            (Some(LAN_KNOCK), Some(lan), KnockSource::Lan),
+            (
+                Some(LAN_KNOCK),
+                "not an address".parse().ok(),
+                KnockSource::Lan,
+            ),
+            (Some(wan), None, KnockSource::Wan),
+        ];
+        for (peer, named, want) in cases {
+            assert_eq!(
+                classify_relayed(peer, named),
+                want,
+                "{peer:?} naming {named:?}"
+            );
+        }
+
+        // The pending entry carries it, so a bare approve meets the WAN rule.
+        let (_temp, p) = temp();
+        let np = NativePairing::load_with(Some(p), None, false).unwrap();
+        np.note_pending("Office browser", "ab12", Some(LAN_KNOCK), Some(wan), None);
+        assert_eq!(np.pending()[0].source, KnockSource::Wan);
+        let id = np.pending()[0].id;
+        assert!(matches!(
+            np.approve_pending(id, None, None).unwrap(),
+            ApproveOutcome::WanNeedsBoundPin
+        ));
+    }
+
+    /// 100.64/10 is a mesh VPN's range and a CGNAT ISP's alike, so the route back decides.
+    #[test]
+    fn a_cgnat_peer_is_lan_only_over_a_mesh_vpn() {
+        use super::approval::{classify_with, is_mesh_iface};
         let peer: IpAddr = "100.96.0.7".parse().unwrap();
         assert_eq!(classify_with(Some(peer), |_| true), KnockSource::Lan);
         // The CGNAT neighbour: the same range, answered out of the ordinary uplink.
         assert_eq!(classify_with(Some(peer), |_| false), KnockSource::Wan);
         let mapped = "::ffff:100.96.0.7".parse().ok();
         assert_eq!(classify_with(mapped, |_| false), KnockSource::Wan);
-        // The tailnet is asked about 100.64/10 only.
+        // The mesh is asked about 100.64/10 only.
         for ip in ["203.0.113.5", "100.128.0.1"] {
             assert_eq!(classify_with(ip.parse().ok(), |_| true), KnockSource::Wan);
         }
 
-        for name in ["tailscale0", "Tailscale", "utun4"] {
-            assert!(is_tailscale_iface(name, peer), "{name}");
+        for name in ["tailscale0", "Tailscale", "utun4", "wt0"] {
+            assert!(is_mesh_iface(name, peer), "{name}");
         }
-        // An ISP puts its CGNAT address on the uplink.
-        for name in ["eth0", "en0", "ppp0", "Ethernet", "wlan0"] {
-            assert!(!is_tailscale_iface(name, peer), "{name}");
+        // An ISP puts its CGNAT address on the uplink, and only NetBird's default name counts.
+        for name in [
+            "eth0", "en0", "ppp0", "Ethernet", "wlan0", "wg0", "wt1", "wt0x",
+        ] {
+            assert!(!is_mesh_iface(name, peer), "{name}");
         }
-        // A utun without a 100.64/10 address is some other VPN.
-        assert!(!is_tailscale_iface("utun4", "10.8.0.2".parse().unwrap()));
+        // The name alone proves nothing: the address has to be 100.64/10 too.
+        for name in ["utun4", "wt0"] {
+            assert!(!is_mesh_iface(name, "10.8.0.2".parse().unwrap()), "{name}");
+        }
     }
 
     /// A knock from the internet carries a name it chose for itself, so the one-click approve
@@ -1242,7 +1392,7 @@ mod tests {
         let (_temp, p) = temp();
         let np = NativePairing::load_with(Some(p), None, false).unwrap();
         let wan = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5));
-        np.note_pending("Friend's Deck", "dd88", Some(wan), None);
+        np.note_pending("Friend's Deck", "dd88", Some(wan), None, None);
         let id = np.pending()[0].id;
         assert_eq!(np.pending()[0].source, KnockSource::Wan);
         assert!(matches!(
@@ -1253,7 +1403,7 @@ mod tests {
         assert_eq!(np.pending().len(), 1, "the knock is still waiting");
 
         // The same knock from the couch is admitted.
-        np.note_pending("Living Room", "ee99", Some(LAN_KNOCK), None);
+        np.note_pending("Living Room", "ee99", Some(LAN_KNOCK), None, None);
         let lan_id = np
             .pending()
             .iter()
@@ -1335,7 +1485,7 @@ mod tests {
         let np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
         let attacker = IpAddr::from([192, 168, 1, 66]);
         for i in 0..20 {
-            np.note_pending("flood", &format!("atk{i:03}"), Some(attacker), None);
+            np.note_pending("flood", &format!("atk{i:03}"), Some(attacker), None, None);
         }
         assert_eq!(
             np.pending().len(),
@@ -1343,11 +1493,11 @@ mod tests {
             "one IP can't exceed the per-IP cap"
         );
         let legit = IpAddr::from([192, 168, 1, 50]);
-        let seq = np.note_pending("Living Room", "legit01", Some(legit), None);
+        let seq = np.note_pending("Living Room", "legit01", Some(legit), None, None);
         np.set_parked("legit01", seq, true);
         for i in 0..(PENDING_CAP * 2) {
             let ip = IpAddr::from([10, 0, (i / 256) as u8, (i % 256) as u8]);
-            np.note_pending("flood2", &format!("g{i:04}"), Some(ip), None);
+            np.note_pending("flood2", &format!("g{i:04}"), Some(ip), None, None);
         }
         assert!(
             np.pending_contains("legit01"),
@@ -1439,7 +1589,7 @@ mod tests {
         let (_temp, p) = temp();
         let np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
         let now = wall_now();
-        np.note_pending("device bb22", "BB22", Some(LAN_KNOCK), None);
+        np.note_pending("device bb22", "BB22", Some(LAN_KNOCK), None, None);
         let id = np.pending()[0].id;
         let client = np
             .approve_pending(
@@ -1576,6 +1726,68 @@ mod tests {
         assert_eq!(rx.borrow().grants, GRANT_ALL);
 
         assert!(np.subscribe("zz99").borrow().revoked);
+    }
+
+    /// A later mtime than the seat's read, whatever the filesystem's clock granularity.
+    fn later_mtime(path: &std::path::Path, secs: u64) {
+        let later = std::time::SystemTime::now() + Duration::from_secs(secs);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(later).unwrap();
+    }
+
+    /// A box file that is missing or garbled says nothing: the seat's sessions stay until the
+    /// box's list reads again, and an empty list is an answer.
+    #[test]
+    fn a_seat_hosts_watch_ignores_a_box_file_it_cannot_read() {
+        let (_temp, p) = temp();
+        let box_np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+        box_np.add("Living Room", "ff67").unwrap();
+        let seat = NativePairing::with_store(store::TrustStore::at(p.clone(), true), None, false);
+        let rx = seat.subscribe("ff67");
+
+        std::fs::write(&p, b"{").unwrap();
+        later_mtime(&p, 5);
+        seat.republish_watched();
+        assert!(!rx.borrow().revoked, "a garbled file says nothing");
+        std::fs::remove_file(&p).unwrap();
+        seat.republish_watched();
+        assert!(!rx.borrow().revoked, "a missing file says nothing");
+
+        box_np.remove("ff67").unwrap();
+        later_mtime(&p, 10);
+        seat.republish_watched();
+        assert!(rx.borrow().revoked, "an empty list is the box's answer");
+    }
+
+    /// A seat host's store is the box's file, edited in another process: a live subscriber hears
+    /// a narrowed grant and an unpair once the watcher republishes.
+    #[test]
+    fn a_seat_hosts_watch_hears_the_boxes_edits() {
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        let (_temp, p) = temp();
+        let box_np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+        box_np.add("Living Room", "ff66").unwrap();
+        let seat = NativePairing::with_store(store::TrustStore::at(p.clone(), true), None, false);
+        assert!(seat.follows_box());
+        let rx = seat.subscribe("ff66");
+        assert_eq!(rx.borrow().grants, GRANT_ALL);
+
+        let stamp = |secs| later_mtime(&p, secs);
+        let narrow = Access {
+            grants: GRANT_GAMEPAD,
+            expires_unix: None,
+            until_disconnect: false,
+        };
+        box_np.set_access("ff66", narrow).unwrap();
+        stamp(5);
+        assert_eq!(rx.borrow().grants, GRANT_ALL, "nobody publishes by itself");
+        seat.republish_watched();
+        assert_eq!(rx.borrow().grants, GRANT_GAMEPAD);
+
+        box_np.remove("ff66").unwrap();
+        stamp(10);
+        seat.republish_watched();
+        assert!(rx.borrow().revoked);
     }
 
     /// Absent Moonlight record = ungoverned full control (the GameStream cert list is

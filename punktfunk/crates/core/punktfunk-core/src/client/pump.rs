@@ -9,7 +9,7 @@ use crate::config::Role;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
     wall_clock_ns, BitrateChanged, ClipState, ClockEcho, ClockResync, Hello, ProbeResult,
-    Reconfigure, Reconfigured, ResyncAdmit, ResyncGuard, ResyncStep, SetBitrate,
+    Reconfigure, Reconfigured, ResyncAdmit, ResyncGuard, ResyncStep, SetBitrate, SkewModel,
 };
 use crate::session::Session;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -29,6 +29,8 @@ mod rx_gap;
 enum PumpEvent {
     /// A mid-stream clock re-sync moved [`ClientShared::clock_offset`].
     ClockResynced,
+    /// A completed re-sync batch failed the congestion guard; the offset did not move.
+    ClockResyncRejected,
     /// A host `BitrateChanged`, with its reason (`None` from a host that does not name its
     /// limits).
     BitrateAck(u32, Option<crate::quic::AckReason>),
@@ -129,10 +131,15 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         clip_cmd_rx,
         ready_tx,
     } = args;
-    let bitrate_kbps = params.bitrate_kbps;
+    let negotiated_codec = welcome.codec;
+    let bitrate_kbps = crate::quic::session_bitrate_kbps(
+        params.bitrate_kbps,
+        params.preferred_codec,
+        params.video_codecs,
+        negotiated_codec,
+    );
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = welcome.bitrate_kbps;
-    let negotiated_codec = welcome.codec;
     // Host marks idle-keepalive repeats (`USER_FLAG_REPEAT`). Only then is an
     // unflagged AU new content; older hosts keep the legacy window arithmetic.
     let marks_repeats = welcome.host_caps2 & crate::quic::HOST_CAP2_REPEAT_MARK != 0;
@@ -140,9 +147,11 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // before the first frame instead of bursting beside it.
     let serves_ramp = welcome.host_caps2 & crate::quic::HOST_CAP2_RAMP != 0;
     // Wire budgets: `actual` is wire bytes plus this audio reservation, spent
-    // whether video flows or not. PCM is exact; Opus uses the default-tier ladder
-    // (a pinned tier skews a few hundred kbps, inside the ¾ utilization gate).
-    let audio_reserved_kbps = if welcome.audio_codec == crate::quic::AUDIO_CODEC_PCM {
+    // whether video flows or not. PCM and bitstream are exact; Opus uses the default-tier
+    // ladder (a pinned tier skews a few hundred kbps, inside the ¾ utilization gate).
+    let audio_reserved_kbps = if crate::audio::bitstream::is_bitstream(welcome.audio_codec) {
+        crate::audio::bitstream::bitrate_kbps(welcome.audio_codec, welcome.audio_channels)
+    } else if welcome.audio_codec == crate::quic::AUDIO_CODEC_PCM {
         crate::audio::pcm::bitrate_kbps(
             welcome.audio_rate_hz,
             welcome.audio_bits,
@@ -218,14 +227,15 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // Normalized scroll only toward HOST_CAP2_SCROLL; an older host gets each
     // event converted once at the outbound seam instead.
     let normalized_scroll = welcome.host_caps2 & crate::quic::HOST_CAP2_SCROLL != 0;
+    let scroll_axis_units = negotiated.scroll_axis_units;
     let _ = ready_tx.send(Ok(negotiated));
 
     // Snapshots only toward GAMEPAD_STATE. Flags 8/9 only toward PAD_AUDIO — an
     // older host reads the whole flags word as the pad index.
     let gamepad_snapshots = host_caps & crate::quic::HOST_CAP_GAMEPAD_STATE != 0;
     let pad_audio_arrivals = host_caps & crate::quic::HOST_CAP_PAD_AUDIO != 0;
-    // Key edges ride the control stream toward a host that reads them there, so a lost
-    // release cannot hold a key; an older host gets every event as a datagram.
+    // Key and mouse-button edges ride the control stream toward a host that reads them there,
+    // so a lost release cannot hold one down; an older host gets every event as a datagram.
     let reliable_edges = welcome.host_caps2 & crate::quic::HOST_CAP2_INPUT_EDGES != 0;
     tokio::spawn(input_task::run(
         conn.clone(),
@@ -236,6 +246,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         input_task::MouseArgs {
             client: shared.clone(),
             normalized_scroll,
+            scroll_axis_units,
             edges: reliable_edges.then(|| ctrl_tx.clone()),
         },
     ));
@@ -307,6 +318,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         conn.clone(),
         planes.datagram,
         encode_lat.clone(),
+        shared.clone(),
     ));
 
     // Bulk clip bytes only; metadata rides the control task. Always spawned: a
@@ -367,6 +379,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         refresh_hz,
         nack: !params.frame_parts,
         on_anchors: false,
+        partial_wait: Vec::new(),
+        held: std::collections::VecDeque::new(),
+        held_since: None,
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 

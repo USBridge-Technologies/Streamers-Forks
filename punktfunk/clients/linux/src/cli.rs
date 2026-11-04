@@ -78,10 +78,10 @@ pub fn exec_session() -> glib::ExitCode {
         "--preset",
         "--profile",
     ];
-    let mut cmd = std::process::Command::new(crate::app::spawn::session_binary());
+    let mut cmd = crate::app::spawn::session_process();
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
-        if a == "--fullscreen" || a == "--stats" {
+        if a == "--fullscreen" || a == "--stats" || a == "--all-screens" {
             cmd.arg(a);
         } else if forward.contains(&a.as_str()) {
             cmd.arg(&a);
@@ -157,7 +157,8 @@ pub fn headless_library(target: &str) -> glib::ExitCode {
     let port = explicit_port
         .or_else(|| saved.map(|h| h.effective_mgmt_port()))
         .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-    match pf_client_core::library::fetch_games(&addr, port, &identity, Some(pin)) {
+    let stream_port = saved.map_or(0, |h| h.port);
+    match pf_client_core::library::fetch_games(&addr, port, stream_port, &identity, Some(pin)) {
         Ok(games) => {
             // A fourth column, appended: `game` or `launcher` (design D4). Appended rather than
             // folded into an existing field so anything reading the first three columns is

@@ -476,6 +476,13 @@ impl Shell {
         }
     }
 
+    /// The host parked the connect for its operator: the card says "Waiting for approval".
+    pub(crate) fn session_awaiting_approval(&mut self) {
+        if let Some(c) = self.connect.card_mut() {
+            c.request_access = true;
+        }
+    }
+
     /// Client is redialing on its own (codec fallback). Raise the connecting
     /// modal: nothing sends `Launch` for this retry, so without it the shell
     /// is not streaming, not connecting, and a live pump is behind the
@@ -501,7 +508,7 @@ impl Shell {
     /// Every connect starts here. One that asks first waits for the box's profile list
     /// ([`Self::tick_asking`]), under any connect card already up; the rest dial now.
     pub(crate) fn start_connect(&mut self, mut intent: ConnectIntent) {
-        let Some(ask) = intent.ask.take().filter(|_| self.device.profiles) else {
+        let Some(ask) = intent.ask.take().filter(|_| self.profiles.asks()) else {
             return self.dial_when_seated(intent);
         };
         // An answer left from an earlier ask is not this one's.
@@ -618,7 +625,7 @@ impl Shell {
     /// offer who plays. One ask per host at a time; an ask already waited on covers it.
     pub(super) fn ask_profiles(&mut self, host: &HostRow) {
         let fp = &host.fp_hex;
-        if !self.device.profiles || !host.paired || fp.is_empty() || self.waits_on_profiles(fp) {
+        if !self.profiles.asks() || !host.paired || fp.is_empty() || self.waits_on_profiles(fp) {
             return;
         }
         if self.profiles.ask(fp) {
@@ -638,6 +645,27 @@ impl Shell {
             }
             if let Some(answer) = self.console.take_profiles(&fp) {
                 self.profiles.learn(&fp, &answer);
+            }
+        }
+    }
+
+    /// Takes the pictures that landed, and asks for those a paired host shows and nobody has.
+    pub(super) fn collect_pictures(&mut self) {
+        if !self.profiles.asks() {
+            return;
+        }
+        for (url, bytes) in self.console.take_avatars() {
+            crate::screens::profiles::offer_picture(url, bytes);
+        }
+        crate::screens::profiles::adopt_pictures();
+        for h in self.hosts.iter().filter(|h| h.paired) {
+            for url in self.profiles.pictures_to_ask(h) {
+                self.bus.send(ConsoleCmd::FetchAvatar {
+                    addr: h.addr.clone(),
+                    mgmt: h.mgmt_port,
+                    fp_hex: h.fp_hex.clone(),
+                    url,
+                });
             }
         }
     }

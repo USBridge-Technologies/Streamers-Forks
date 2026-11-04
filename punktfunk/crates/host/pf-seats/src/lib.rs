@@ -13,6 +13,9 @@ pub mod backend;
 pub mod backoff;
 #[cfg(any(windows, test))]
 pub mod bootstrap;
+/// The Windows doctor's row decisions; the tables run on every target.
+#[cfg(any(windows, test))]
+mod doctor;
 pub mod ipc;
 /// The Linux half. Its tests run wherever Unix does; only the daemon needs Linux.
 #[cfg(any(target_os = "linux", all(test, unix)))]
@@ -24,6 +27,7 @@ pub mod pin;
 /// The Windows supervisor's pure half, declared here so its tests run on every target.
 #[path = "windows/step.rs"]
 mod seat_step;
+mod secret;
 pub mod service;
 pub mod steam;
 #[cfg(windows)]
@@ -35,6 +39,7 @@ pub use ipc::{Command, CommandResult, Request, Response};
 pub use linux::LinuxBackend;
 pub use model::{CreateSeat, Ledger, RuntimeState, RuntimeStatus, Seat, SeatId};
 pub use persistence::{LedgerStore, SecretRoot, StoreError};
+pub use secret::Secret;
 pub use service::SeatService;
 #[cfg(windows)]
 pub use windows::WindowsBackend;

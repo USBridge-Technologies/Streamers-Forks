@@ -5,7 +5,7 @@
 //! mixed controller kinds to uinput/UHID (Linux) or XUSB/UMDF (Windows). Rumble and
 //! HID-output pump on the same thread.
 //!
-//! Pin `PUNKTFUNK_RUMBLE_ENVELOPE=0`, `PUNKTFUNK_RUMBLE_TTL_MS`, `PUNKTFUNK_XBOX_BACKEND=xusb`.
+//! Pin `PUNKTFUNK_RUMBLE_TTL_MS`, `PUNKTFUNK_XBOX_BACKEND=xusb`.
 //! Evidence: `design/gamescope-multiuser.md`, `design/rumble-envelope-plan.md`,
 //! `design/trigger-rumble-plane.md`, `design/pen-tablet-input.md`.
 
@@ -13,14 +13,24 @@ use super::*;
 
 /// Pointer/keyboard injector target, re-pointable without restarting [`input_thread`].
 /// Isolated gamescope sessions pin their own [`crate::inject::InjectorService`]; everyone
-/// else shares the host-lifetime one (`design/gamescope-multiuser.md`). A `Mutex<Sender>`
-/// per event, not a second channel: input is a few kHz and the clone is cheap.
+/// else shares the host-lifetime one (`design/gamescope-multiuser.md`). A `Mutex` per event,
+/// not a second channel: input is a few kHz and the clone is cheap.
 #[derive(Clone)]
-pub(crate) struct InputRoute(std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Sender<InputEvent>>>);
+pub(crate) struct InputRoute(std::sync::Arc<std::sync::Mutex<RouteTargets>>);
+
+/// The injector input goes to, and the one a switch moved it off until the input thread has
+/// let go of what was pressed there.
+struct RouteTargets {
+    live: std::sync::mpsc::Sender<InputEvent>,
+    retired: Option<std::sync::mpsc::Sender<InputEvent>>,
+}
 
 impl InputRoute {
     pub(crate) fn new(tx: std::sync::mpsc::Sender<InputEvent>) -> InputRoute {
-        InputRoute(std::sync::Arc::new(std::sync::Mutex::new(tx)))
+        InputRoute(std::sync::Arc::new(std::sync::Mutex::new(RouteTargets {
+            live: tx,
+            retired: None,
+        })))
     }
 
     /// Send error means the injector is gone. Input is lossy — drop it.
@@ -28,60 +38,89 @@ impl InputRoute {
         &self,
         ev: InputEvent,
     ) -> Result<(), std::sync::mpsc::SendError<InputEvent>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).send(ev)
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live
+            .send(ev)
     }
 
-    /// Mid-stream compositor switch. Does not restart [`input_thread`].
+    /// Mid-stream compositor switch. Does not restart [`input_thread`]; the old target is kept
+    /// for [`Self::take_retired`], so what is held there is released there.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn set(&self, tx: std::sync::mpsc::Sender<InputEvent>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = tx;
+        let mut t = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::mem::replace(&mut t.live, tx);
+        t.retired = Some(old);
+    }
+
+    /// The target a switch moved input off, once.
+    fn take_retired(&self) -> Option<std::sync::mpsc::Sender<InputEvent>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retired
+            .take()
+    }
+}
+
+/// What this session holds down on the injector, and the route its ups go out on. Dropping it
+/// sends them, so a thread that unwinds leaves no key or button down on the host.
+struct Held {
+    held: crate::inject::held::HeldInput,
+    route: InputRoute,
+}
+
+impl Held {
+    /// A compositor switch moved the route: let go, on the old target, of what was pressed
+    /// there. Its matching ups would otherwise reach the new one and leave the old one latched.
+    fn follow_route(&mut self) {
+        if let Some(old) = self.route.take_retired() {
+            for ev in self.held.release() {
+                let _ = old.send(ev);
+            }
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for ev in self.held.release() {
+            let _ = self.route.send(ev);
+        }
     }
 }
 
 /// Highest wire pad index (`flags` / snapshot `pad`). The uinput manager caps creation separately.
 const MAX_WIRE_PADS: usize = punktfunk_core::input::MAX_PADS;
 
-/// The per-OS virtual-pad backends. Off Linux and Windows a pad is Xbox360 or nothing.
-#[cfg(target_os = "linux")]
-#[path = "input/linux.rs"]
 mod backends;
-#[cfg(target_os = "windows")]
-#[path = "input/windows.rs"]
-mod backends;
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-mod backends {
-    #[derive(Default)]
-    pub(super) struct PadBackends;
-    impl PadBackends {
-        pub(super) fn route_handle(
-            &mut self,
-            _kind: super::GamepadPref,
-            _ev: &punktfunk_core::input::GamepadEvent,
-        ) -> bool {
-            false
-        }
-        pub(super) fn apply_rich(
-            &mut self,
-            _kind: super::GamepadPref,
-            _rich: punktfunk_core::quic::RichInput,
-        ) {
-        }
-        pub(super) fn steam_haptics_live(&self) -> bool {
-            false
-        }
-        pub(super) fn pump(
-            &mut self,
-            _rumble: &mut impl FnMut(u16, u16, u16, u16, u16),
-            _hidout: &mut impl FnMut(punktfunk_core::quic::HidOutput),
-        ) {
-        }
-        pub(super) fn heartbeat(&mut self) {}
-    }
-}
 use backends::PadBackends;
 
 /// How long a declared Steam Controller waits for its identity ([`Pads::waits_for_identity`]).
 const IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long an undeclared pad waits for its kind ([`Pads::waits_for_arrival`]). A client
+/// re-sends a lost arrival twice, 100 ms apart.
+const ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// When a pad's identity wait started, once it declared `resolved` over `previous`. The first
+/// declaration of an identity kind starts it, even when the session default already is one; a
+/// re-declare keeps the clock it started; any other kind has no wait.
+fn identity_wait_after(
+    previous: GamepadPref,
+    resolved: GamepadPref,
+    first_declaration: bool,
+    since: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    match (takes_identity(previous), takes_identity(resolved)) {
+        (false, true) => Some(now),
+        (true, true) if first_declaration => Some(now),
+        (true, true) => since,
+        (_, false) => None,
+    }
+}
 
 /// The kinds whose virtual pad answers as the physical one a client captured: both Steam
 /// Controllers.
@@ -128,6 +167,11 @@ struct Pads {
     identities: [Option<std::sync::Arc<crate::inject::triton_proto::Sc2Identity>>; MAX_WIRE_PADS],
     /// When each pad declared a kind that [`takes_identity`] ([`Pads::waits_for_identity`]).
     identity_since: [Option<std::time::Instant>; MAX_WIRE_PADS],
+    /// When each pad's first frame came with no kind declared ([`Pads::waits_for_arrival`]).
+    undeclared_since: [Option<std::time::Instant>; MAX_WIRE_PADS],
+    /// Pads whose raw reports may build them ([`Pads::raw_builds`]): set by a declaration,
+    /// cleared by a removal, so a report that lands after the remove builds nothing.
+    raw_armed: [bool; MAX_WIRE_PADS],
     /// Manager that holds a built device at this index (`None` = none). Stays put
     /// if `kinds[idx]` later changes (arrival-after-first-frame), so a pad is
     /// never duplicated and removal always hits the manager that owns it.
@@ -135,14 +179,21 @@ struct Pads {
     xbox360: Option<crate::inject::gamepad::GamepadManager>,
     /// Every other identity, per OS.
     backends: PadBackends,
+    /// The session's `PUNKTFUNK_STEAM_FORCE`, for every kind [`resolve_pad_kind`] folds.
+    steam_force: bool,
 }
 
 impl Pads {
     /// Every pad starts on the session kind ([`resolve_gamepad`]) until it declares otherwise.
     /// `id` names the device and the player slot it asked for, so its pads land on the
     /// same OS slots they had last connect ([`crate::inject::pad_pool::PadIdentity`]).
-    fn new(default: GamepadPref, id: crate::inject::pad_pool::PadIdentity) -> Pads {
-        let default = resolve_pad_kind(default);
+    /// `steam_force` is the session's `PUNKTFUNK_STEAM_FORCE`.
+    fn new(
+        default: GamepadPref,
+        id: crate::inject::pad_pool::PadIdentity,
+        steam_force: bool,
+    ) -> Pads {
+        let default = resolve_pad_kind(default, steam_force);
         tracing::info!(
             default = default.as_str(),
             preferred_slot = ?id.preferred,
@@ -157,18 +208,12 @@ impl Pads {
             declared: [None; MAX_WIRE_PADS],
             identities: Default::default(),
             identity_since: [None; MAX_WIRE_PADS],
+            undeclared_since: [None; MAX_WIRE_PADS],
+            raw_armed: [false; MAX_WIRE_PADS],
             owner: [None; MAX_WIRE_PADS],
             xbox360: None,
-            backends: {
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
-                {
-                    PadBackends::default()
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-                {
-                    PadBackends
-                }
-            },
+            backends: PadBackends::default(),
+            steam_force,
         }
     }
 
@@ -180,7 +225,7 @@ impl Pads {
         if idx >= MAX_WIRE_PADS {
             return;
         }
-        let resolved = resolve_pad_kind(kind);
+        let resolved = resolve_pad_kind(kind, self.steam_force);
         if self.kinds[idx] != resolved {
             tracing::info!(
                 pad = idx,
@@ -188,13 +233,16 @@ impl Pads {
                 "gamepad kind declared (per-pad)"
             );
         }
-        match (takes_identity(self.kinds[idx]), takes_identity(resolved)) {
-            (false, true) => self.identity_since[idx] = Some(std::time::Instant::now()),
-            (_, false) => self.identity_since[idx] = None,
-            (true, true) => {}
-        }
+        self.identity_since[idx] = identity_wait_after(
+            self.kinds[idx],
+            resolved,
+            self.declared[idx].is_none(),
+            self.identity_since[idx],
+            std::time::Instant::now(),
+        );
         self.kinds[idx] = resolved;
         self.declared[idx] = Some(kind);
+        self.raw_armed[idx] = true;
     }
 
     /// Who the Steam Controller on wire pad `id.pad` is, for the virtual pad built next.
@@ -227,6 +275,38 @@ impl Pads {
             && self.identity_since[idx].is_some_and(|t| t.elapsed() < IDENTITY_WAIT)
     }
 
+    /// Whether a raw report from wire pad `idx` stands for its first frame: a Steam Controller
+    /// declared since its last removal, with no device. Its raw reports are its state, and a
+    /// pad at rest, or driven only by trackpads and gyro, sends no typed frame to build it.
+    fn raw_builds(&self, idx: usize) -> bool {
+        idx < MAX_WIRE_PADS
+            && self.owner[idx].is_none()
+            && self.raw_armed[idx]
+            && takes_identity(self.kinds[idx])
+    }
+
+    /// A built pad never changes kind, so a frame that beats a lost arrival would pin the
+    /// session default for good. An undeclared pad waits up to [`ARRIVAL_WAIT`] from its first
+    /// frame for the re-sent arrival; a client that declares nothing gets the default after.
+    fn waits_for_arrival(&mut self, idx: usize) -> bool {
+        if self.owner[idx].is_some() || self.declared[idx].is_some() {
+            return false;
+        }
+        let since = *self.undeclared_since[idx].get_or_insert_with(std::time::Instant::now);
+        since.elapsed() < ARRIVAL_WAIT
+    }
+
+    /// The device pad `idx` is: the kind it was built as, else the one it will be built as
+    /// (the declared kind as this host resolves it). A DualSense the host folds to Xbox 360
+    /// has no speaker to stream to.
+    fn device_kind(&self, idx: usize) -> Option<GamepadPref> {
+        self.owner
+            .get(idx)
+            .copied()
+            .flatten()
+            .or_else(|| self.kinds.get(idx).copied())
+    }
+
     /// This pad as the Controllers feed reports it: the device the host built, the
     /// kind the client asked for, and the state this thread just applied.
     fn feed_frame(&self, idx: usize, wire: &WirePads) -> crate::pad_feed::PadFrame {
@@ -234,7 +314,11 @@ impl Pads {
         crate::pad_feed::PadFrame {
             pad: idx as u8,
             ts_ms: crate::clock::unix_ms(),
-            device: self.kinds[idx].as_str().to_string(),
+            device: self
+                .device_kind(idx)
+                .unwrap_or(GamepadPref::Xbox360)
+                .as_str()
+                .to_string(),
             declared: self.declared[idx].map(|k| k.as_str().to_string()),
             slot: self.slots.slot_of(idx),
             present: mask & (1 << idx) != 0,
@@ -264,7 +348,9 @@ impl Pads {
             }
             GamepadEvent::Arrival { index, .. } => (*index as usize, true),
         };
-        if idx >= MAX_WIRE_PADS || present && self.waits_for_identity(idx) {
+        if idx >= MAX_WIRE_PADS
+            || present && (self.waits_for_arrival(idx) || self.waits_for_identity(idx))
+        {
             return;
         }
         // The only wire→OS slot translation. Claim on present; a removal must not
@@ -333,9 +419,10 @@ impl Pads {
     }
 
     /// A wire pad that declared itself, and so reserved a slot, but never sent a frame has no
-    /// device to linger: its removal releases the slot at once.
+    /// device to linger: its removal releases the slot at once. A pad in its unplug grace is
+    /// not that pad: its device still lingers, and a re-sent removal must not free the slot.
     fn release_unbuilt(&mut self, idx: usize) {
-        if idx < MAX_WIRE_PADS && self.owner[idx].is_none() {
+        if idx < MAX_WIRE_PADS && self.owner[idx].is_none() && self.pending_release[idx].is_none() {
             self.pending_release[idx] = None;
             self.slots.release(idx);
         }
@@ -433,13 +520,21 @@ impl Pads {
         self.backends.apply_rich(kind, rich);
     }
 
-    /// Poll a Steam Controller's haptics at 1 ms so trackpad pulses do not sit 4 ms then
-    /// burst. Other backends stay at 4 ms to avoid idle churn.
+    /// How long the input thread may wait for the next event. A built Steam Controller polls
+    /// at 1 ms: Steam plays its trackpad haptics as single pulses, up to 1 kHz on a Triton, and
+    /// they must not sit 4 ms then burst. Any other device, or one in its unplug grace, pumps
+    /// feedback every 4 ms. With none, nothing is owed between events: 25 ms bounds how late
+    /// `stop` and a withdrawn grant are seen.
     fn feedback_poll_interval(&self) -> std::time::Duration {
-        if self.backends.steam_haptics_live() {
+        if self.owner.iter().flatten().any(|k| takes_identity(*k)) {
             return std::time::Duration::from_millis(1);
         }
-        std::time::Duration::from_millis(4)
+        if self.owner.iter().any(Option::is_some)
+            || self.pending_release.iter().any(Option::is_some)
+        {
+            return std::time::Duration::from_millis(4);
+        }
+        std::time::Duration::from_millis(25)
     }
 
     /// Pump every live backend. `rumble` is `(pad, low, high, lt, rt)` on 0xCA;
@@ -614,6 +709,19 @@ pub(super) enum ClientInput {
     PadIdentity(punktfunk_core::quic::PadIdentity),
 }
 
+/// Whether `input` is a person acting. A pad's 10 Hz snapshot beacon, its gyro and its raw HID
+/// reports stream while nobody touches anything, so they never hold off the suspend veto; a
+/// snapshot counts where it changes the pad ([`WirePads::changes`]).
+fn is_activity(input: &ClientInput) -> bool {
+    use punktfunk_core::quic::RichInput;
+    match input {
+        ClientInput::Event(ev) => ev.kind != InputKind::GamepadState,
+        ClientInput::Rich(RichInput::Touchpad { .. } | RichInput::TouchpadEx { .. }) => true,
+        ClientInput::Rich(_) | ClientInput::PadIdentity(_) => false,
+        ClientInput::Pen(_) => true,
+    }
+}
+
 /// Per-session stylus ([`crate::pen_sink::PenSink`]) plus the stroke timeout this
 /// lossy datagram plane needs.
 struct PenSession {
@@ -723,30 +831,19 @@ fn rumble_silent(lv: RumbleLevels) -> bool {
     lv == (0, 0, 0, 0)
 }
 
-/// One 0xCA rumble datagram. `envelope_on` selects v3 (default) or v1
-/// (`PUNKTFUNK_RUMBLE_ENVELOPE=0`). Best-effort, like every side-plane datagram.
+/// One 0xCA rumble datagram, always v3. Best-effort, like every side-plane datagram.
 ///
-/// v3 is unconditional while the envelope is on — not "only if a trigger is
-/// non-zero". A history-dependent wire form is a sequence bug; pre-v3 clients
-/// read the 10-byte prefix and ignore the tail.
-///
-/// The v1 hatch has no trigger tail. "Trigger rumble stopped" is an expected
-/// symptom of the hatch — do not bisect a trigger bug into it.
-fn rumble_datagram(envelope_on: bool, pad: u16, lv: RumbleLevels, seq: u8, ttl_ms: u16) -> Vec<u8> {
+/// v3 is unconditional — not "only if a trigger is non-zero". A history-dependent wire
+/// form is a sequence bug; pre-v3 clients read the 10-byte prefix and ignore the tail.
+fn rumble_datagram(pad: u16, lv: RumbleLevels, seq: u8, ttl_ms: u16) -> Vec<u8> {
     let (low, high, lt, rt) = lv;
-    if envelope_on {
-        punktfunk_core::quic::encode_rumble_datagram_v3(pad, low, high, seq, ttl_ms, lt, rt)
-            .to_vec()
-    } else {
-        punktfunk_core::quic::encode_rumble_datagram(pad, low, high).to_vec()
-    }
+    punktfunk_core::quic::encode_rumble_datagram_v3(pad, low, high, seq, ttl_ms, lt, rt).to_vec()
 }
 
 /// Per-pad 0xCA rumble leases. Rumble is v3 (`[level][seq][ttl_ms][trigger levels]`):
 /// an active level renews every `ttl × 3/10` and an abandoned one expires client-side
 /// (`design/rumble-envelope-plan.md`, `design/trigger-rumble-plane.md`). Four motors
-/// share one `seq` and one TTL. `PUNKTFUNK_RUMBLE_ENVELOPE=0` reverts to v1 plus a flat
-/// 500 ms refresh, which drops trigger rumble ([`rumble_datagram`]).
+/// share one `seq` and one TTL.
 struct RumbleLeases {
     lv: [RumbleLevels; MAX_WIRE_PADS],
     seen: [bool; MAX_WIRE_PADS],
@@ -754,39 +851,30 @@ struct RumbleLeases {
     /// by [`Self::clear`]: the client's gate has no reset (`client/pump/datagram_task.rs`).
     seq: [u8; MAX_WIRE_PADS],
     stop_burst: [u8; MAX_WIRE_PADS],
-    envelope_on: bool,
     ttl_ms: u16,
     every: std::time::Duration,
     last: std::time::Instant,
 }
 
 impl RumbleLeases {
-    fn from_env() -> RumbleLeases {
-        let ttl_ms = std::env::var("PUNKTFUNK_RUMBLE_TTL_MS")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
+    /// The session's `PUNKTFUNK_RUMBLE_TTL_MS`, held inside the floor and ceiling; unset is
+    /// [`RUMBLE_TTL_MS`].
+    fn with_ttl(ttl_ms: Option<u16>) -> RumbleLeases {
+        let ttl_ms = ttl_ms
             .map(|v| v.clamp(RUMBLE_TTL_FLOOR_MS, RUMBLE_TTL_CEIL_MS))
             .unwrap_or(RUMBLE_TTL_MS);
-        RumbleLeases::new(
-            pf_host_config::env_on("PUNKTFUNK_RUMBLE_ENVELOPE").unwrap_or(true),
-            ttl_ms,
-            std::time::Instant::now(),
-        )
+        RumbleLeases::new(ttl_ms, std::time::Instant::now())
     }
 
     /// Renew at 30 % of TTL (≈120 ms at 400) so 2–3 renewals cover the lease.
-    fn new(envelope_on: bool, ttl_ms: u16, now: std::time::Instant) -> RumbleLeases {
-        let every = if envelope_on {
-            std::time::Duration::from_millis((ttl_ms as u64 * 3 / 10).max(RUMBLE_RENEW_FLOOR_MS))
-        } else {
-            std::time::Duration::from_millis(500)
-        };
+    fn new(ttl_ms: u16, now: std::time::Instant) -> RumbleLeases {
+        let every =
+            std::time::Duration::from_millis((ttl_ms as u64 * 3 / 10).max(RUMBLE_RENEW_FLOOR_MS));
         RumbleLeases {
             lv: [(0, 0, 0, 0); MAX_WIRE_PADS],
             seen: [false; MAX_WIRE_PADS],
             seq: [0; MAX_WIRE_PADS],
             stop_burst: [0; MAX_WIRE_PADS],
-            envelope_on,
             ttl_ms,
             every,
             last: now,
@@ -799,7 +887,7 @@ impl RumbleLeases {
         let idx = pad as usize;
         if idx >= MAX_WIRE_PADS {
             // Out of range (backends never emit this): forwarded ungated.
-            return rumble_datagram(self.envelope_on, pad, lv, 0, self.ttl_ms);
+            return rumble_datagram(pad, lv, 0, self.ttl_ms);
         }
         let (silent, prev) = (rumble_silent(lv), self.lv[idx]);
         // Silent→active once per buzz, with the triggers, so "host never saw trigger
@@ -825,11 +913,11 @@ impl RumbleLeases {
         };
         // Any of the four motors → live TTL. See `rumble_silent`.
         let ttl = if silent { 0 } else { self.ttl_ms };
-        rumble_datagram(self.envelope_on, pad, lv, self.seq[idx], ttl)
+        rumble_datagram(pad, lv, self.seq[idx], ttl)
     }
 
     /// Once per interval: renew each active lease (bump `seq`, fresh TTL), drain a stop
-    /// burst, then go quiet. v1 re-sends every seen pad's handles instead.
+    /// burst, then go quiet.
     fn tick(&mut self, now: std::time::Instant, mut send: impl FnMut(Vec<u8>)) {
         if now.saturating_duration_since(self.last) < self.every {
             return;
@@ -837,10 +925,6 @@ impl RumbleLeases {
         self.last = now;
         for i in (0..MAX_WIRE_PADS).filter(|&i| self.seen[i]) {
             let lv = self.lv[i];
-            if !self.envelope_on {
-                send(rumble_datagram(false, i as u16, lv, 0, 0));
-                continue;
-            }
             let silent = rumble_silent(lv);
             if silent {
                 if self.stop_burst[i] == 0 {
@@ -850,7 +934,7 @@ impl RumbleLeases {
             }
             self.seq[i] = self.seq[i].wrapping_add(1);
             let ttl = if silent { 0 } else { self.ttl_ms };
-            send(rumble_datagram(true, i as u16, lv, self.seq[i], ttl));
+            send(rumble_datagram(i as u16, lv, self.seq[i], ttl));
         }
     }
 
@@ -886,6 +970,15 @@ impl WirePads {
         (0..MAX_WIRE_PADS).filter(|i| self.mask & (1 << i) != 0)
     }
 
+    /// Attach pad `idx` at rest, leaving the seq gate alone: a pad whose first state is a raw
+    /// report. Its removal then clears it like any attached pad.
+    fn attach_at_rest(&mut self, idx: usize) {
+        if idx < MAX_WIRE_PADS && self.mask & (1 << idx) == 0 {
+            self.mask |= 1 << idx;
+            self.state[idx] = Default::default();
+        }
+    }
+
     /// One button or axis event. `None` = bad index or unknown axis.
     fn fold(&mut self, ev: &InputEvent) -> Option<usize> {
         let idx = ev.flags as usize;
@@ -896,9 +989,35 @@ impl WirePads {
         Some(idx)
     }
 
-    /// A newer snapshot replaces the pad. An unchanged refresh (~100 ms) advances the
-    /// gate but returns `None`: re-emitting it churns the XInput packet number.
-    fn snapshot(&mut self, snap: punktfunk_core::input::GamepadSnapshot) -> Option<usize> {
+    /// Open every pad's seq gate. A client stamps a seq on each refresh even while its sends
+    /// are filtered, so after a gamepad grant comes back its seq can sit anywhere ahead.
+    fn forget_seqs(&mut self) {
+        self.seq = [None; MAX_WIRE_PADS];
+    }
+
+    /// Whether `snap` moves the pad: newer than the gate, and its first state or another one.
+    fn changes(&self, snap: &punktfunk_core::input::GamepadSnapshot) -> bool {
+        let idx = snap.pad as usize;
+        idx < MAX_WIRE_PADS
+            && punktfunk_core::input::GamepadSnapshot::seq_newer(snap.seq, self.seq[idx])
+            && (self.mask & (1 << idx) == 0
+                || self.state[idx]
+                    != punktfunk_core::input::GamepadSnapshot {
+                        pad: 0,
+                        seq: 0,
+                        ..*snap
+                    })
+    }
+
+    /// A newer snapshot replaces the pad. An unchanged refresh (~100 ms) of a `built` pad
+    /// advances the gate but returns `None`: re-emitting it churns the XInput packet number.
+    /// A pad with no device yet (its arrival, identity or slot still owed) gets every refresh,
+    /// so its build is retried without waiting for the player to move it.
+    fn snapshot(
+        &mut self,
+        snap: punktfunk_core::input::GamepadSnapshot,
+        built: bool,
+    ) -> Option<usize> {
         let idx = snap.pad as usize;
         if idx >= MAX_WIRE_PADS
             || !punktfunk_core::input::GamepadSnapshot::seq_newer(snap.seq, self.seq[idx])
@@ -911,7 +1030,7 @@ impl WirePads {
             seq: 0,
             ..snap
         };
-        if self.mask & (1 << idx) != 0 && self.state[idx] == state {
+        if built && self.mask & (1 << idx) != 0 && self.state[idx] == state {
             return None;
         }
         self.state[idx] = state;
@@ -978,9 +1097,13 @@ fn declare_pad(
     if !pad_audio_on {
         return;
     }
-    // DualSense-family with renderer bits. A re-declare without bits, or a kind with no
-    // pad audio, stops the streamer.
-    let dualsense = matches!(kind, GamepadPref::DualSense | GamepadPref::DualSenseEdge);
+    // A DualSense-family device with renderer bits. A re-declare without bits, or a device
+    // with no pad audio, stops the streamer.
+    let device = pads.device_kind(idx);
+    let dualsense = matches!(
+        device,
+        Some(GamepadPref::DualSense | GamepadPref::DualSenseEdge)
+    );
     let want = if dualsense { audio_caps } else { 0 };
     // The streamer captures what the pad's OS slot names, and the first frame that would
     // claim the slot may be seconds away, so the declaration reserves it. No slot = no device.
@@ -995,7 +1118,7 @@ fn declare_pad(
             pad,
             slot,
             want,
-            matches!(kind, GamepadPref::DualSenseEdge),
+            device == Some(GamepadPref::DualSenseEdge),
         ),
         None => streams.stop(idx),
     }
@@ -1011,7 +1134,7 @@ pub(super) fn spawn_datagram_reader(
     counters: Arc<crate::session_status::SessionCounters>,
     mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
     input_tx: std::sync::mpsc::SyncSender<ClientInput>,
-    feedback_tx: tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::v2::dgram::Feedback>,
+    feedback_tx: tokio::sync::mpsc::Sender<punktfunk_core::quic::v2::dgram::Feedback>,
 ) {
     tokio::spawn(async move {
         // Shared, not local: this task ends with the connection, which closes after the session
@@ -1034,7 +1157,7 @@ pub(super) fn spawn_datagram_reader(
             let d = match incoming {
                 super::link::Incoming::Plain(d) => d,
                 super::link::Incoming::Feedback(fb) => {
-                    let _ = feedback_tx.send(fb);
+                    let _ = feedback_tx.try_send(fb);
                     continue;
                 }
             };
@@ -1076,6 +1199,9 @@ pub(super) fn spawn_datagram_reader(
                     continue;
                 }
                 n.input_events.fetch_add(1, Ordering::Relaxed);
+                if matches!(ev.kind, InputKind::MouseMove | InputKind::MouseMoveAbs) {
+                    n.pointer_moves.fetch_add(1, Ordering::Relaxed);
+                }
                 // KEY_FLAG_SEMANTIC_VK is in-process (GameStream ingest). Strip it from the wire.
                 if matches!(
                     ev.kind,
@@ -1100,22 +1226,6 @@ pub(super) fn spawn_datagram_reader(
     });
 }
 
-/// Per-session input thread. Pointer/keyboard go through [`InputRoute`]; gamepad
-/// through [`Pads`] (Hello kind is the per-pad default). Rich input applies on
-/// arrival; rumble and HID-output pump between events. Gamepads die with the
-/// session; the pointer/keyboard injector (and its portal grant) outlives it.
-///
-/// Every pad state that reaches [`Pads`] also reaches `pad_feed`, which is what
-/// the console's Controllers page draws ([`crate::pad_feed`]). Wire pads fold in
-/// [`WirePads`]; rumble leases live in [`RumbleLeases`].
-///
-/// Ends on `stop` or when `rx` disconnects. The pads (and their OS slots) go
-/// before the streamer join, so a session that preempted this one can claim
-/// them inside its 1.5 s grace.
-///
-/// `pad_id` names the device its pads belong to and the player slot the operator
-/// picked for it; `pad_slots` and `pad_tx` publish the slots it ends up with,
-/// to `/status` and to the client's overlay.
 /// Input thread → control task: what the client hears about its pads on the reliable stream.
 pub(super) enum PadToClient {
     Slots(punktfunk_core::quic::PadSlots),
@@ -1123,201 +1233,251 @@ pub(super) enum PadToClient {
     Feature(punktfunk_core::quic::PadFeature),
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn input_thread(
-    rx: std::sync::mpsc::Receiver<ClientInput>,
+/// What [`input_thread`] holds between wakes, with one method per concern.
+struct InputLoop {
     conn: super::link::SessionLink,
-    inj_tx: InputRoute,
-    gamepad: GamepadPref,
     pad_audio_on: bool,
-    pad_id: crate::inject::pad_pool::PadIdentity,
     pad_slots: Arc<std::sync::atomic::AtomicU16>,
     pad_tx: Option<tokio::sync::mpsc::UnboundedSender<PadToClient>>,
-    // The client reads feature reports off the control stream (`FEATURE_PAD_WRITES`).
     pad_writes: bool,
-    // Live grant mask. Dispatch already drops non-granted traffic; the guards
-    // below are deny-at-setup: without `GRANT_GAMEPAD` no arm that could create
-    // a virtual pad or pad-audio streamer runs. One relaxed load per item.
     grants: Arc<AtomicU32>,
+    /// The grant mask as of the last [`Self::on_grants`].
+    granted: u32,
     frame_map: FrameMap,
-    // This session's Controllers-page tap. Every accepted pad state goes here as well
-    // as to the backends, so the page shows what was injected. Idle with nobody watching.
     pad_feed: Arc<crate::pad_feed::PadFeed>,
-    stop: Arc<AtomicBool>,
-    // Session gyro totals. This thread is joined after the summary is built, so the
-    // per-pad histogram below cannot be what the summary reads.
     counters: Arc<crate::session_status::SessionCounters>,
-) {
-    let mut pads = Pads::new(gamepad, pad_id);
-    // 0xD1 streamers; `pad_audio_on` is the negotiated Welcome cap.
-    let mut pad_streams = PadAudioSlots::new();
-    // Per-pad motion cadence, always on. Summarized at `info` on session end.
-    let mut motion_cadence = super::motion_cadence::MotionCadence::new();
-    let mut pad_uplink = super::pad_uplink::PadUplink::new(std::time::Instant::now());
-    let mut wire = WirePads::default();
-    let mut rumble = RumbleLeases::from_env();
-    // Injector is host-lifetime: matching ups for whatever is still held go out at session end.
-    let mut held = crate::inject::held::HeldInput::default();
-    let mut pen = PenSession::new();
-    let mut granted = grants.load(Ordering::Relaxed);
-    loop {
-        // A reconnect or steal sets `stop` while this connection is still open and
-        // claims this session's OS slots 1.5 s later; the channel outlives that.
-        if stop.load(Ordering::SeqCst) {
-            break;
+    pads: Pads,
+    /// 0xD1 streamers; `pad_audio_on` is the negotiated Welcome cap.
+    pad_streams: PadAudioSlots,
+    /// Per-pad motion cadence, always on. Summarized at `info` on session end.
+    motion_cadence: super::motion_cadence::MotionCadence,
+    pad_uplink: super::pad_uplink::PadUplink,
+    wire: WirePads,
+    rumble: RumbleLeases,
+    /// Its route is the injector every pointer and key goes to.
+    held: Held,
+    pen: PenSession,
+}
+
+impl InputLoop {
+    /// A grant withdrawn mid-session filters that class's releases from here on: let go of
+    /// what it holds now, or a key, button or stick stays down for the session. A regained
+    /// gamepad grant opens the seq gate. The held set first follows a moved route.
+    fn on_grants(&mut self) {
+        use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_KEYBOARD, GRANT_POINTER};
+        let now_granted = self.grants.load(Ordering::Relaxed);
+        let lost = self.granted & !now_granted;
+        let gained = now_granted & !self.granted;
+        self.granted = now_granted;
+        if gained & GRANT_GAMEPAD != 0 {
+            self.wire.forget_seqs();
         }
-        // A grant withdrawn mid-session filters that class's releases from here on: let go
-        // of what it holds now, or a key, button or stick stays down for the session.
-        let now_granted = grants.load(Ordering::Relaxed);
-        let lost = granted & !now_granted;
-        granted = now_granted;
-        if lost != 0 {
-            use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_KEYBOARD, GRANT_POINTER};
-            let ups = held.release_classes(lost & GRANT_KEYBOARD != 0, lost & GRANT_POINTER != 0);
-            for ev in ups {
-                let _ = inj_tx.send(ev);
-            }
-            if lost & GRANT_GAMEPAD != 0 {
-                for idx in wire.rest_all() {
-                    pads.apply_wire(&wire, idx, &pad_feed);
-                }
-            }
+        self.held.follow_route();
+        if lost == 0 {
+            return;
         }
-        // A console just opened the Controllers page. A held button sends no further
-        // frames, so re-publish every live pad or the page draws nothing until the
-        // next press. One relaxed load per wake when the page is closed.
-        if pad_feed.take_resync() {
-            for idx in wire.attached() {
-                pad_feed.publish(|| pads.feed_frame(idx, &wire));
+        let ups = self
+            .held
+            .held
+            .release_classes(lost & GRANT_KEYBOARD != 0, lost & GRANT_POINTER != 0);
+        for ev in ups {
+            let _ = self.held.route.send(ev);
+        }
+        if lost & GRANT_GAMEPAD != 0 {
+            for idx in self.wire.rest_all() {
+                self.pads.apply_wire(&self.wire, idx, &self.pad_feed);
             }
         }
-        // Pen in range: wake at least every 100 ms so check_timeout can meet its 200 ms deadline.
-        let poll = if pen.active() {
-            pads.feedback_poll_interval()
-                .min(std::time::Duration::from_millis(100))
+    }
+
+    /// A console just opened the Controllers page. A held button sends no further frames, so
+    /// every live pad is re-published, or the page draws nothing until the next press. One
+    /// relaxed load per wake when the page is closed.
+    fn resync_feed(&self) {
+        if self.pad_feed.take_resync() {
+            for idx in self.wire.attached() {
+                self.pad_feed
+                    .publish(|| self.pads.feed_frame(idx, &self.wire));
+            }
+        }
+    }
+
+    /// [`Pads::feedback_poll_interval`], at most 100 ms while the pen is in range so
+    /// [`PenSession::check_timeout`] meets its 200 ms deadline.
+    fn poll_interval(&self) -> std::time::Duration {
+        let poll = self.pads.feedback_poll_interval();
+        if self.pen.active() {
+            poll.min(std::time::Duration::from_millis(100))
         } else {
-            pads.feedback_poll_interval()
-        };
-        let arrived = rx.recv_timeout(poll);
-        if let Some(w) = pad_uplink.take_window(std::time::Instant::now()) {
-            tracing::info!(
-                updates = w.updates,
-                lost = w.lost,
-                max_gap_ms = w.max_gap_ms,
-                "controller uplink"
-            );
+            poll
         }
-        // Any arrival, before grant tests: a denied event still means a person is
-        // here, so drop a standing suspend veto (`sleep_inhibit`).
-        if arrived.is_ok() {
+    }
+
+    /// The uplink's window line, every wake and before the wake's input is counted.
+    fn log_uplink_window(&mut self) {
+        for w in self.pad_uplink.take_window(std::time::Instant::now()) {
+            w.log();
+        }
+    }
+
+    /// One item off the datagram reader. A person acting drops a standing suspend veto before
+    /// the grant tests: a denied event still means someone is here. The guards repeat
+    /// dispatch's grant test: an arm that creates a virtual pad, tablet or pad-audio streamer
+    /// stays unreachable if an upstream filter regresses. A missed grant drops the item.
+    fn on_input(&mut self, input: ClientInput) {
+        use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_POINTER};
+        if is_activity(&input) {
             crate::sleep_inhibit::note_input();
         }
-        match arrived {
-            Ok(ClientInput::Rich(rich))
-                if grants.load(Ordering::Relaxed) & punktfunk_core::quic::GRANT_GAMEPAD != 0 =>
-            {
-                if let punktfunk_core::quic::RichInput::Motion { pad, .. } = rich {
-                    counters.note_motion(motion_cadence.record(pad, std::time::Instant::now()));
-                }
-                pads.apply_rich(rich);
+        let mask = self.grants.load(Ordering::Relaxed);
+        match input {
+            ClientInput::Rich(rich) if mask & GRANT_GAMEPAD != 0 => self.on_rich(rich),
+            ClientInput::PadIdentity(id) if mask & GRANT_GAMEPAD != 0 => {
+                self.pads.set_identity(&id)
             }
-            Ok(ClientInput::PadIdentity(id))
-                if grants.load(Ordering::Relaxed) & punktfunk_core::quic::GRANT_GAMEPAD != 0 =>
-            {
-                pads.set_identity(&id);
+            ClientInput::Pen(batch) if mask & GRANT_POINTER != 0 => self.pen.apply(&reframe_pen(
+                &batch,
+                &self.frame_map.lock().unwrap_or_else(|e| e.into_inner()),
+            )),
+            ClientInput::Event(ev) if mask & punktfunk_core::quic::classify(ev.kind).bit() != 0 => {
+                self.on_event(ev)
             }
-            // Pointer-class (`classify`). The guard is deny-at-setup: a session
-            // that never passes it never creates the virtual tablet.
-            Ok(ClientInput::Pen(batch))
-                if grants.load(Ordering::Relaxed) & punktfunk_core::quic::GRANT_POINTER != 0 =>
-            {
-                pen.apply(&reframe_pen(
-                    &batch,
-                    &frame_map.lock().unwrap_or_else(|e| e.into_inner()),
-                ))
-            }
-            // Same classify as dispatch. Resource-creating arms (virtual pads,
-            // pad-audio) stay unreachable if an upstream filter regresses.
-            Ok(ClientInput::Event(ev))
-                if grants.load(Ordering::Relaxed)
-                    & punktfunk_core::quic::classify(ev.kind).bit()
-                    != 0 =>
-            {
-                match ev.kind {
-                    InputKind::GamepadButton | InputKind::GamepadAxis => {
-                        // Bad index / unknown axis: fall through, no `continue`.
-                        // The DualSense GET_REPORT handshake still has to run this tick.
-                        if let Some(idx) = wire.fold(&ev) {
-                            pads.apply_wire(&wire, idx, &pad_feed);
-                        }
-                    }
-                    InputKind::GamepadState => {
-                        use punktfunk_core::input::GamepadSnapshot;
-                        if let Some(snap) = GamepadSnapshot::from_event(&ev) {
-                            let now = std::time::Instant::now();
-                            if let Some(g) = pad_uplink.note(snap.pad as usize, snap.seq, now) {
-                                tracing::warn!(
-                                    pad = g.pad,
-                                    silence_ms = g.silence_ms,
-                                    lost = g.lost,
-                                    "controller updates stopped reaching the host — lost: \
-                                     updates the client sent that never arrived. lost near \
-                                     silence_ms / 100 = the path dropped them; 0 = the client \
-                                     sent none"
-                                );
-                            }
-                            if let Some(idx) = wire.snapshot(snap) {
-                                pads.apply_wire(&wire, idx, &pad_feed);
-                            }
-                        }
-                    }
-                    InputKind::GamepadRemove => {
-                        let (pad, seq) = punktfunk_core::input::decode_gamepad_remove(ev.flags);
-                        let idx = pad as usize;
-                        if let Some(attached) = wire.remove(pad, seq) {
-                            pad_uplink.forget(idx);
-                            if attached {
-                                pads.apply_wire(&wire, idx, &pad_feed);
-                                tracing::info!(pad = idx, "gamepad unplugged (native detach)");
-                            } else {
-                                pads.release_unbuilt(idx);
-                            }
-                            rumble.clear(idx);
-                            // Streamer goes with the pad. Seq-gated so a stale
-                            // removal cannot kill a re-plugged pad's stream.
-                            pad_streams.stop(idx);
-                        }
-                    }
-                    InputKind::GamepadArrival => {
-                        declare_pad(&mut pads, &mut pad_streams, &conn, &ev, pad_audio_on)
-                    }
-                    _ => {
-                        // Track press/release so a mid-press disconnect can be undone below.
-                        held.note(&ev);
-                        let mut ev = ev;
-                        reframe_input(
-                            &mut ev,
-                            &frame_map.lock().unwrap_or_else(|e| e.into_inner()),
-                        );
-                        // Host-lifetime injector. Send error = service gone; input is lossy.
-                        let _ = inj_tx.send(ev);
-                    }
-                }
-            }
-            // Grant missed: drop. Dispatch already counted; no second counter.
-            // This arm exists so the guarded matches above are exhaustive.
-            Ok(_) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            _ => {}
         }
-        pen.check_timeout();
-        // Every tick (≤1 ms Triton, ≤4 ms else): games block on EVIOCSFF and HID
-        // GET_REPORT. Rumble is 0xCA; rich HID-out is 0xCD.
-        pads.pump(
+    }
+
+    /// A raw report builds its Steam Controller ([`Pads::raw_builds`]) before it lands; any
+    /// other rich input only reaches a device that exists.
+    fn on_rich(&mut self, rich: punktfunk_core::quic::RichInput) {
+        use punktfunk_core::quic::RichInput;
+        match rich {
+            RichInput::Motion { pad, .. } => {
+                let now = std::time::Instant::now();
+                self.counters
+                    .note_motion(self.motion_cadence.record(pad, now));
+            }
+            RichInput::HidReport { pad, .. } if self.pads.raw_builds(usize::from(pad)) => {
+                let idx = usize::from(pad);
+                self.wire.attach_at_rest(idx);
+                self.pads.apply_wire(&self.wire, idx, &self.pad_feed);
+            }
+            _ => {}
+        }
+        self.pads.apply_rich(rich);
+    }
+
+    fn on_event(&mut self, ev: InputEvent) {
+        match ev.kind {
+            InputKind::GamepadButton | InputKind::GamepadAxis => {
+                // Bad index / unknown axis: nothing to apply, and the tick still runs: the
+                // DualSense GET_REPORT handshake is answered there.
+                if let Some(idx) = self.wire.fold(&ev) {
+                    self.pads.apply_wire(&self.wire, idx, &self.pad_feed);
+                }
+            }
+            InputKind::GamepadState => self.on_snapshot(&ev),
+            InputKind::GamepadRemove => self.on_remove(&ev),
+            InputKind::GamepadArrival => declare_pad(
+                &mut self.pads,
+                &mut self.pad_streams,
+                &self.conn,
+                &ev,
+                self.pad_audio_on,
+            ),
+            _ => self.inject(ev),
+        }
+    }
+
+    /// A pad's whole state. The uplink counts it as it arrived; it holds off the suspend veto
+    /// only when it moves the pad ([`WirePads::changes`]).
+    fn on_snapshot(&mut self, ev: &InputEvent) {
+        let Some(snap) = punktfunk_core::input::GamepadSnapshot::from_event(ev) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if let Some(g) = self.pad_uplink.note(snap.pad as usize, snap.seq, now) {
+            tracing::warn!(
+                pad = g.pad,
+                silence_ms = g.silence_ms,
+                lost = g.lost,
+                "controller updates stopped reaching the host — lost: updates the client sent \
+                 that never arrived. lost near silence_ms / 100 = the path dropped them; 0 = the \
+                 client sent none"
+            );
+        }
+        if self.wire.changes(&snap) {
+            crate::sleep_inhibit::note_input();
+        }
+        let built = self
+            .pads
+            .owner
+            .get(snap.pad as usize)
+            .is_some_and(Option::is_some);
+        if let Some(idx) = self.wire.snapshot(snap, built) {
+            self.pad_uplink.note_change(idx);
+            self.pads.apply_wire(&self.wire, idx, &self.pad_feed);
+        }
+    }
+
+    /// A hot-unplug. Its device, rumble lease and streamer go with it; the seq gate keeps a
+    /// stale removal off a re-plugged pad.
+    fn on_remove(&mut self, ev: &InputEvent) {
+        let (pad, seq) = punktfunk_core::input::decode_gamepad_remove(ev.flags);
+        let idx = pad as usize;
+        let Some(attached) = self.wire.remove(pad, seq) else {
+            return;
+        };
+        self.pads.raw_armed[idx] = false;
+        self.pad_uplink.forget(idx);
+        if attached {
+            self.pads.apply_wire(&self.wire, idx, &self.pad_feed);
+            tracing::info!(pad = idx, "gamepad unplugged (native detach)");
+        } else {
+            self.pads.release_unbuilt(idx);
+        }
+        self.rumble.clear(idx);
+        self.pad_streams.stop(idx);
+    }
+
+    /// Pointer and keyboard, noted in the held set first so a mid-press disconnect is undone.
+    /// The framing is the first screen's encoder's; the others are not cropped. A send error
+    /// means the injector is gone, and input is lossy.
+    fn inject(&mut self, mut ev: InputEvent) {
+        self.held.held.note(&ev);
+        if ev.screen() == 0 {
+            reframe_input(
+                &mut ev,
+                &self.frame_map.lock().unwrap_or_else(|e| e.into_inner()),
+            );
+        }
+        let _ = self.held.route.send(ev);
+    }
+
+    /// Every wake, after its input: the pen's timeout, the feedback pump, the heartbeat, the
+    /// slot report and the rumble leases.
+    fn on_tick(&mut self) {
+        self.pen.check_timeout();
+        self.pump_feedback();
+        // Held-steady UHID pads send no wire events; heartbeat re-emits. Xbox is a no-op.
+        self.pads.heartbeat();
+        self.report_slots();
+        let conn = &self.conn;
+        self.rumble.tick(std::time::Instant::now(), |d| {
+            conn.send_datagram(d);
+        });
+    }
+
+    /// Every wake (≤1 ms Triton, ≤4 ms else): games block on EVIOCSFF and HID GET_REPORT.
+    /// Rumble is 0xCA; rich HID-out is 0xCD, and a feature report goes to the control task
+    /// for a client that reads them there.
+    fn pump_feedback(&mut self) {
+        let (conn, rumble) = (&self.conn, &mut self.rumble);
+        let (pad_tx, pad_writes) = (&self.pad_tx, self.pad_writes);
+        self.pads.pump(
             |pad, low, high, lt, rt| {
                 conn.send_datagram(rumble.on_level(pad, (low, high, lt, rt)));
             },
-            |h| match (h, &pad_tx) {
+            |h| match (h, pad_tx) {
                 (punktfunk_core::quic::HidOutput::HidRaw { pad, kind, data }, Some(tx))
                     if pad_writes && kind == punktfunk_core::quic::HID_RAW_FEATURE =>
                 {
@@ -1331,43 +1491,130 @@ pub(super) fn input_thread(
                 }
             },
         );
-        // Held-steady UHID pads send no wire events; heartbeat re-emits. Xbox is a no-op.
-        pads.heartbeat();
-        // After `pump` reaped the unplug grace, so a re-plug inside it is not reported
-        // as a pad leaving and coming back. Silent while the slots stand.
-        if let Some(mask) = pads.take_slot_change() {
-            pad_slots.store(mask, std::sync::atomic::Ordering::Relaxed);
-            if let Some(tx) = &pad_tx {
+    }
+
+    /// After the pump reaped the unplug grace, so a re-plug inside it is not reported as a pad
+    /// leaving and coming back. Silent while the slots stand.
+    fn report_slots(&mut self) {
+        if let Some(mask) = self.pads.take_slot_change() {
+            self.pad_slots.store(mask, Ordering::Relaxed);
+            if let Some(tx) = &self.pad_tx {
                 let slots = punktfunk_core::quic::PadSlots { slots: mask };
                 let _ = tx.send(PadToClient::Slots(slots));
             }
         }
-        rumble.tick(std::time::Instant::now(), |d| {
-            conn.send_datagram(d);
-        });
     }
-    // Lift remaining ink (buttons → tip → proximity). VirtualPen drop destroys
-    // the tablet with this thread.
-    pen.release_all();
-    // Injector (and Mutter's implicit grab) outlives this session. Matching ups
-    // here, keyed off the session — that is where a client vanishes mid-press.
-    let ups = held.release();
-    if !ups.is_empty() {
-        tracing::debug!(
-            count = ups.len(),
-            "input: releasing held buttons/keys/contacts at session end"
-        );
+
+    /// Session end. Ink lifts (buttons → tip → proximity) and the held set lets go on the
+    /// injector, which outlives the session: a client that vanishes mid-press is undone here.
+    /// The pads and their OS slots go before the streamer join, which can sit ~5 s on a quiet
+    /// endpoint, so a session that preempted this one claims them inside its 1.5 s grace.
+    fn finish(self) {
+        let InputLoop {
+            mut pen,
+            mut held,
+            pads,
+            mut pad_streams,
+            motion_cadence,
+            mut pad_uplink,
+            ..
+        } = self;
+        pen.release_all();
+        let ups = held.held.release();
+        if !ups.is_empty() {
+            tracing::debug!(
+                count = ups.len(),
+                "input: releasing held buttons/keys/contacts at session end"
+            );
+        }
+        for ev in ups {
+            let _ = held.route.send(ev);
+        }
+        drop(pads);
+        pad_streams.stop_all();
+        // One line per motion pad, at `info`: the question is asked from a log after the fact.
+        motion_cadence.log_summary();
+        // A player stops a session soon after the pad dies: its last partial window is the
+        // evidence.
+        for w in pad_uplink.drain(std::time::Instant::now()) {
+            w.log();
+        }
     }
-    for ev in ups {
-        let _ = inj_tx.send(ev);
+}
+
+/// Per-session input thread. Pointer/keyboard go through [`InputRoute`]; gamepad through
+/// [`Pads`] (Hello kind is the per-pad default), and every pad state that reaches `Pads` also
+/// reaches `pad_feed`, which the console's Controllers page draws. Rich input applies on
+/// arrival; rumble and HID-output pump between events. Gamepads die with the session; the
+/// pointer/keyboard injector (and its portal grant) outlives it.
+///
+/// Ends on `stop` or when `rx` disconnects ([`InputLoop::finish`]). `pad_id` names the device
+/// its pads belong to and the player slot the operator picked for it; `pad_slots` and `pad_tx`
+/// publish the slots it ends up with, to `/status` and to the client's overlay.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn input_thread(
+    rx: std::sync::mpsc::Receiver<ClientInput>,
+    conn: super::link::SessionLink,
+    inj_tx: InputRoute,
+    gamepad: GamepadPref,
+    pad_audio_on: bool,
+    pad_id: crate::inject::pad_pool::PadIdentity,
+    pad_slots: Arc<std::sync::atomic::AtomicU16>,
+    pad_tx: Option<tokio::sync::mpsc::UnboundedSender<PadToClient>>,
+    // The client reads feature reports off the control stream (`FEATURE_PAD_WRITES`).
+    pad_writes: bool,
+    // Live grant mask. Dispatch already drops non-granted traffic; `InputLoop::on_input`
+    // tests it again, deny-at-setup: without `GRANT_GAMEPAD` no arm that could create a
+    // virtual pad or pad-audio streamer runs. One relaxed load per item.
+    grants: Arc<AtomicU32>,
+    frame_map: FrameMap,
+    // This session's Controllers-page tap. Every accepted pad state goes here as well
+    // as to the backends, so the page shows what was injected. Idle with nobody watching.
+    pad_feed: Arc<crate::pad_feed::PadFeed>,
+    stop: Arc<AtomicBool>,
+    // Session gyro totals. This thread is joined after the summary is built, so the
+    // per-pad `MotionCadence` histogram cannot be what the summary reads.
+    counters: Arc<crate::session_status::SessionCounters>,
+    knobs: super::SessionKnobs,
+) {
+    let mut lp = InputLoop {
+        pads: Pads::new(gamepad, pad_id, knobs.steam_force),
+        pad_streams: PadAudioSlots::new(),
+        motion_cadence: super::motion_cadence::MotionCadence::new(),
+        pad_uplink: super::pad_uplink::PadUplink::new(std::time::Instant::now()),
+        wire: WirePads::default(),
+        rumble: RumbleLeases::with_ttl(knobs.rumble_ttl_ms),
+        held: Held {
+            held: crate::inject::held::HeldInput::default(),
+            route: inj_tx,
+        },
+        pen: PenSession::new(),
+        granted: grants.load(Ordering::Relaxed),
+        conn,
+        pad_audio_on,
+        pad_slots,
+        pad_tx,
+        pad_writes,
+        grants,
+        frame_map,
+        pad_feed,
+        counters,
+    };
+    // A reconnect or steal sets `stop` while this connection is still open and
+    // claims this session's OS slots 1.5 s later; the channel outlives that.
+    while !stop.load(Ordering::SeqCst) {
+        lp.on_grants();
+        lp.resync_feed();
+        let arrived = rx.recv_timeout(lp.poll_interval());
+        lp.log_uplink_window();
+        match arrived {
+            Ok(input) => lp.on_input(input),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        lp.on_tick();
     }
-    // Slots back first: the join below can sit ~5 s on a quiet endpoint, and the
-    // session that preempted this one claims after 1.5 s.
-    drop(pads);
-    // After the instant release sends: stop_all can block on a quiet capturer timeout.
-    pad_streams.stop_all();
-    // One line per motion pad, at `info`: the question is asked from a log after the fact.
-    motion_cadence.log_summary();
+    lp.finish();
 }
 
 #[cfg(test)]
@@ -1414,6 +1661,38 @@ mod tests {
         );
     }
 
+    /// A key held across a compositor switch is let go on the injector it went down on, and a
+    /// thread that leaves, however it leaves, lets go of the rest.
+    #[test]
+    fn held_input_is_released_where_it_was_pressed() {
+        let key = |kind| InputEvent {
+            kind,
+            _pad: [0; 3],
+            code: 30,
+            x: 0,
+            y: 0,
+            flags: 0,
+        };
+        let (old_tx, old_rx) = std::sync::mpsc::channel::<InputEvent>();
+        let (new_tx, new_rx) = std::sync::mpsc::channel::<InputEvent>();
+        let route = InputRoute::new(old_tx);
+        let mut held = Held {
+            held: crate::inject::held::HeldInput::default(),
+            route: route.clone(),
+        };
+        held.held.note(&key(InputKind::KeyDown));
+        route.set(new_tx);
+        held.follow_route();
+        assert_eq!(old_rx.try_recv().map(|e| e.kind), Ok(InputKind::KeyUp));
+        held.held.note(&key(InputKind::KeyDown));
+        drop(held);
+        assert_eq!(
+            new_rx.try_recv().map(|e| e.kind),
+            Ok(InputKind::KeyUp),
+            "released on drop"
+        );
+    }
+
     /// Mid-stream compositor switch: later events land on the new target.
     #[test]
     fn input_route_swaps_targets_mid_flight() {
@@ -1443,7 +1722,7 @@ mod tests {
     #[test]
     fn rich_input_is_re_addressed_into_slot_space() {
         use punktfunk_core::quic::{RichInput, HID_REPORT_MAX};
-        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), false);
         let slot1 = pads.slots.claim_for(1).expect("a free OS slot");
         let slot0 = pads.slots.claim_for(0).expect("a free OS slot");
         assert_ne!(slot0, slot1, "two wire pads share an OS slot");
@@ -1470,7 +1749,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_steam_controller_waits_for_its_identity() {
-        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), false);
         // Set the resolved kind directly: a box without `/dev/uhid` folds an SC2 to Xbox 360.
         pads.kinds[1] = GamepadPref::SteamController2;
         pads.kinds[4] = GamepadPref::SteamController;
@@ -1492,11 +1771,107 @@ mod tests {
         assert!(!pads.waits_for_identity(3), "the wait ends");
     }
 
+    /// A declared Steam Controller with no device is built by its raw reports, and a pad
+    /// attached that way unplugs like any other. Nothing else is built from rich input.
+    #[test]
+    fn a_raw_report_builds_a_resting_steam_controller() {
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), false);
+        // Set the resolved kinds directly: a box without the backend folds them to Xbox 360.
+        pads.kinds = [GamepadPref::SteamController2; MAX_WIRE_PADS];
+        pads.raw_armed[0] = true;
+        pads.kinds[2] = GamepadPref::DualSense;
+        pads.raw_armed[2] = true;
+        pads.kinds[3] = GamepadPref::SteamController;
+        pads.raw_armed[3] = true;
+        pads.owner[3] = Some(GamepadPref::SteamController);
+        pads.set_kind(4, GamepadPref::Xbox360);
+        assert!(pads.raw_armed[4], "a declaration arms the pad");
+        assert!(pads.raw_builds(0));
+        assert!(!pads.raw_builds(1), "undeclared, or removed since");
+        assert!(!pads.raw_builds(2), "not a raw pad");
+        assert!(!pads.raw_builds(3), "already built");
+        assert!(!pads.raw_builds(MAX_WIRE_PADS));
+
+        let mut wire = WirePads::default();
+        wire.attach_at_rest(0);
+        assert!(wire.frame(0).active_mask & 1 != 0);
+        assert_eq!(wire.remove(0, 1), Some(true), "its removal unplugs it");
+        assert!(wire.frame(0).active_mask & 1 == 0);
+    }
+
+    /// Pad audio and the Controllers page follow the device: a pad already built as Xbox 360
+    /// that later declares a DualSense stays an Xbox 360 pad, with no speaker to stream to.
+    #[test]
+    fn a_pad_is_the_device_it_was_built_as() {
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), false);
+        pads.owner[0] = Some(GamepadPref::Xbox360);
+        pads.set_kind(0, GamepadPref::DualSense);
+        assert_eq!(pads.device_kind(0), Some(GamepadPref::Xbox360));
+        pads.set_kind(1, GamepadPref::Xbox360);
+        assert_eq!(
+            pads.device_kind(1),
+            Some(GamepadPref::Xbox360),
+            "unbuilt: as resolved"
+        );
+        assert_eq!(pads.device_kind(MAX_WIRE_PADS), None);
+    }
+
+    /// The thread polls as fast as its live devices need, not as its managers ever did: a
+    /// Steam Controller that left takes its 1 kHz with it, and no device means no feedback.
+    #[test]
+    fn the_input_thread_polls_for_the_pads_it_has() {
+        use std::time::Duration;
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), false);
+        assert_eq!(pads.feedback_poll_interval(), Duration::from_millis(25));
+        pads.owner[0] = Some(GamepadPref::SteamController2);
+        assert_eq!(pads.feedback_poll_interval(), Duration::from_millis(1));
+        pads.owner[0] = None;
+        pads.pending_release[0] = Some(std::time::Instant::now());
+        assert_eq!(
+            pads.feedback_poll_interval(),
+            Duration::from_millis(4),
+            "the grace"
+        );
+        pads.pending_release[0] = None;
+        pads.owner[1] = Some(GamepadPref::Xbox360);
+        assert_eq!(pads.feedback_poll_interval(), Duration::from_millis(4));
+    }
+
+    /// A session whose default is a Steam Controller still waits for each pad's identity:
+    /// the first declaration starts the clock, a re-declare keeps it.
+    #[test]
+    fn a_steam_controller_default_still_waits_for_its_identity() {
+        use GamepadPref::{SteamController2 as Sc2, Xbox360};
+        let (t0, t1) = (std::time::Instant::now(), std::time::Instant::now());
+        assert_eq!(identity_wait_after(Sc2, Sc2, true, None, t1), Some(t1));
+        assert_eq!(
+            identity_wait_after(Sc2, Sc2, false, Some(t0), t1),
+            Some(t0),
+            "re-declare"
+        );
+        assert_eq!(identity_wait_after(Xbox360, Sc2, false, None, t1), Some(t1));
+        assert_eq!(identity_wait_after(Sc2, Xbox360, true, Some(t0), t1), None);
+    }
+
+    /// A frame that beats its pad's arrival does not build the session default: the pad waits
+    /// for its kind, and one that never declares is built once the wait ends.
+    #[test]
+    fn an_undeclared_pad_waits_for_its_arrival() {
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), false);
+        assert!(pads.waits_for_arrival(0));
+        pads.set_kind(0, GamepadPref::SteamController2Puck);
+        assert!(!pads.waits_for_arrival(0), "the kind landed");
+        pads.undeclared_since[1] = Some(std::time::Instant::now() - ARRIVAL_WAIT);
+        assert!(!pads.waits_for_arrival(1), "the wait ends");
+        pads.owner[2] = Some(GamepadPref::Xbox360);
+        assert!(!pads.waits_for_arrival(2), "a built pad never waits");
+    }
+
     /// The console and the client are told which players this session is, once per
     /// change. Resent every frame it would be a control message per pad packet.
     #[test]
     fn the_slot_map_is_reported_only_when_it_moves() {
-        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), false);
         assert_eq!(pads.take_slot_change(), None, "no pad, nothing to say");
         let slot = pads.claim_os_slot(0).expect("a free OS slot");
         assert_eq!(pads.take_slot_change(), Some(1 << slot));
@@ -1510,7 +1885,7 @@ mod tests {
     /// first frame would have taken — never a second name for one pad.
     #[test]
     fn an_arrival_reserves_the_slot_the_first_frame_would_claim() {
-        let mut pads = Pads::new(GamepadPref::DualSense, PadIdentity::anonymous());
+        let mut pads = Pads::new(GamepadPref::DualSense, PadIdentity::anonymous(), false);
         let slot = pads.claim_os_slot(1).expect("a free OS slot");
         assert_eq!(pads.slots.claim_for(1), Some(slot), "first frame re-mints");
         assert_eq!(pads.claim_os_slot(1), Some(slot), "re-declare re-mints");
@@ -1567,6 +1942,7 @@ mod tests {
                     Arc::new(crate::pad_feed::PadFeed::new()),
                     stop,
                     Arc::new(crate::session_status::SessionCounters::default()),
+                    crate::native::SessionKnobs::read(),
                 )
             })
         };
@@ -1590,7 +1966,7 @@ mod tests {
     fn a_removed_pad_keeps_its_slot_through_the_unplug_grace() {
         use std::time::{Duration, Instant};
         let t = Instant::now();
-        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), false);
         let slot = pads.slots.claim_for(0).expect("a free OS slot");
         pads.owner[0] = Some(GamepadPref::Xbox360);
         pads.note_removed(0, true, t);
@@ -1617,6 +1993,17 @@ mod tests {
         pads.slots.claim_for(1).expect("a free OS slot");
         pads.release_unbuilt(1);
         assert_eq!(pads.slots.slot_of(1), None);
+        // The client re-sends a removal: the second one finds no device attached, but the
+        // first one's device still lingers in its grace.
+        let slot = pads.slots.claim_for(2).expect("a free OS slot");
+        pads.owner[2] = None;
+        pads.note_removed(2, true, t);
+        pads.release_unbuilt(2);
+        assert_eq!(
+            pads.slots.slot_of(2),
+            Some(slot),
+            "a re-sent removal freed the grace"
+        );
     }
 
     /// Incremental events fold in, a newer snapshot replaces the pad, and a removal
@@ -1652,7 +2039,7 @@ mod tests {
             ls_y: -100,
             ..Default::default()
         };
-        assert_eq!(wire.snapshot(snap), Some(1));
+        assert_eq!(wire.snapshot(snap, true), Some(1));
         let f = wire.frame(1);
         assert_eq!(
             (f.index, f.buttons, f.left_trigger),
@@ -1665,11 +2052,21 @@ mod tests {
             left_trigger: 10,
             ..snap
         };
-        assert_eq!(wire.snapshot(stale), None, "a reorder rolled state back");
+        assert_eq!(
+            wire.snapshot(stale, true),
+            None,
+            "a reorder rolled state back"
+        );
         assert_eq!(wire.frame(1).left_trigger, 255);
         // An unchanged refresh advances the gate but emits nothing.
-        assert_eq!(wire.snapshot(GamepadSnapshot { seq: 2, ..snap }), None);
-        assert_eq!(wire.snapshot(GamepadSnapshot { seq: 2, ..stale }), None);
+        assert_eq!(
+            wire.snapshot(GamepadSnapshot { seq: 2, ..snap }, true),
+            None
+        );
+        assert_eq!(
+            wire.snapshot(GamepadSnapshot { seq: 2, ..stale }, true),
+            None
+        );
 
         assert_eq!(wire.remove(1, 2), None, "a removal older than the gate");
         assert_eq!(wire.remove(1, 3), Some(true));
@@ -1681,8 +2078,99 @@ mod tests {
             seq: 5,
             ..Default::default()
         };
-        assert_eq!(wire.snapshot(replug), Some(1));
+        assert_eq!(wire.snapshot(replug, true), Some(1));
         assert_eq!(wire.attached().collect::<Vec<_>>(), [1]);
+    }
+
+    /// The client's seq moved on while the gamepad grant was off; once it is back, the
+    /// next snapshot lands wherever that seq now is.
+    #[test]
+    fn a_regained_grant_opens_the_seq_gate() {
+        use punktfunk_core::input::GamepadSnapshot;
+        let mut wire = WirePads::default();
+        let beacon = |seq| GamepadSnapshot {
+            pad: 0,
+            seq,
+            ..Default::default()
+        };
+        assert_eq!(wire.snapshot(beacon(1), true), Some(0));
+        // 20 s of 10 Hz refreshes the host never saw.
+        let later = GamepadSnapshot {
+            buttons: 1,
+            ..beacon(1u8.wrapping_add(200))
+        };
+        assert_eq!(
+            wire.snapshot(later, true),
+            None,
+            "read as older than the gate"
+        );
+        wire.forget_seqs();
+        assert_eq!(wire.snapshot(later, true), Some(0));
+    }
+
+    /// A parked controller's beacon and gyro are not a person: only input that moves
+    /// something holds off the suspend veto.
+    #[test]
+    fn only_a_person_acting_holds_off_the_suspend_veto() {
+        use punktfunk_core::input::GamepadSnapshot;
+        let ev = |kind| {
+            ClientInput::Event(InputEvent {
+                kind,
+                _pad: [0; 3],
+                code: 0,
+                x: 0,
+                y: 0,
+                flags: 0,
+            })
+        };
+        assert!(is_activity(&ev(InputKind::KeyDown)));
+        assert!(is_activity(&ev(InputKind::MouseMove)));
+        assert!(!is_activity(&ev(InputKind::GamepadState)), "the beacon");
+        let motion = punktfunk_core::quic::RichInput::Motion {
+            pad: 0,
+            gyro: [0; 3],
+            accel: [0; 3],
+        };
+        assert!(!is_activity(&ClientInput::Rich(motion)), "gyro on a table");
+
+        let mut wire = WirePads::default();
+        let beacon = |seq| GamepadSnapshot {
+            pad: 0,
+            seq,
+            ..Default::default()
+        };
+        assert!(wire.changes(&beacon(1)), "a pad's first state");
+        wire.snapshot(beacon(1), true);
+        assert!(!wire.changes(&beacon(2)), "the same state again");
+        let pressed = GamepadSnapshot {
+            buttons: 1,
+            ..beacon(3)
+        };
+        assert!(wire.changes(&pressed));
+    }
+
+    /// A pad whose build was deferred (its arrival or identity late, no slot free) is handed
+    /// to the backends again on the next unchanged beacon; a built one is not.
+    #[test]
+    fn an_unbuilt_pad_is_retried_on_an_unchanged_beacon() {
+        use punktfunk_core::input::GamepadSnapshot;
+        let mut wire = WirePads::default();
+        let beacon = |seq| GamepadSnapshot {
+            pad: 0,
+            seq,
+            ..Default::default()
+        };
+        assert_eq!(wire.snapshot(beacon(1), false), Some(0));
+        assert_eq!(
+            wire.snapshot(beacon(2), false),
+            Some(0),
+            "the deferred pad is retried"
+        );
+        assert_eq!(
+            wire.snapshot(beacon(3), true),
+            None,
+            "a built pad's refresh churns nothing"
+        );
     }
 
     /// The client's gate: accepts a seq newer than the last it applied.
@@ -1706,7 +2194,7 @@ mod tests {
     /// stored value (up to 128 sends).
     #[test]
     fn rumble_seq_survives_a_removal_so_the_client_gate_accepts() {
-        let mut leases = RumbleLeases::new(true, RUMBLE_TTL_MS, std::time::Instant::now());
+        let mut leases = RumbleLeases::new(RUMBLE_TTL_MS, std::time::Instant::now());
         let mut gate: Option<u8> = None;
         for i in 0..100u16 {
             assert!(deliver(
@@ -1728,7 +2216,7 @@ mod tests {
         );
 
         // Non-vacuity: a counter restarted at 0 is rejected for the whole forward window.
-        let mut restarted = RumbleLeases::new(true, RUMBLE_TTL_MS, std::time::Instant::now());
+        let mut restarted = RumbleLeases::new(RUMBLE_TTL_MS, std::time::Instant::now());
         let mut stranded = Some(100u8);
         assert!(
             (0..100u16).all(|i| !deliver(&restarted.on_level(0, (i + 1, 0, 0, 0)), &mut stranded)),
@@ -1743,7 +2231,7 @@ mod tests {
         use punktfunk_core::quic::decode_rumble_envelope;
         use std::time::Duration;
         let t0 = std::time::Instant::now();
-        let mut leases = RumbleLeases::new(true, 400, t0);
+        let mut leases = RumbleLeases::new(400, t0);
         assert_eq!(leases.every, Duration::from_millis(120));
         let tick = |leases: &mut RumbleLeases, at: Duration| {
             let mut out = Vec::new();
@@ -1773,16 +2261,6 @@ mod tests {
             }
         }
         assert_eq!(zeros, RUMBLE_STOP_BURST, "stop burst");
-
-        // The v1 hatch re-sends every seen pad's handles on its flat 500 ms clock.
-        let mut v1 = RumbleLeases::new(false, 400, t0);
-        v1.on_level(0, (7, 8, 9, 10));
-        let mut sent = Vec::new();
-        v1.tick(t0 + Duration::from_millis(500), |d| sent.push(d));
-        assert_eq!(
-            sent,
-            [punktfunk_core::quic::encode_rumble_datagram(0, 7, 8).to_vec()]
-        );
     }
 
     /// A rumble that drives only the impulse triggers must still get a live TTL
@@ -1792,7 +2270,7 @@ mod tests {
     /// the client silences on arrival with no error.
     #[test]
     fn a_trigger_only_rumble_gets_a_live_ttl() {
-        let mut leases = RumbleLeases::new(true, RUMBLE_TTL_MS, std::time::Instant::now());
+        let mut leases = RumbleLeases::new(RUMBLE_TTL_MS, std::time::Instant::now());
         let d = leases.on_level(0, (0, 0, 0x8000, 0));
         let u = punktfunk_core::quic::decode_rumble_envelope(&d).expect("v3 envelope decodes");
         assert_eq!(

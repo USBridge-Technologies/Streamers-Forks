@@ -7,6 +7,8 @@ import io.unom.punktfunk.kit.library.InstallOutcome
 import io.unom.punktfunk.kit.library.LibraryCache
 import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
+import io.unom.punktfunk.kit.library.mgmtBase
+import io.unom.punktfunk.kit.pictureUrl
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.posterHttp
 import java.util.concurrent.Executors
@@ -34,7 +36,7 @@ internal fun SkiaConsole.endGame(c: JSONObject) {
         return
     }
     ioPool.execute {
-        val outcome = LibraryClient.endGame(id, addr, mgmt, fp, appId)
+        val outcome = LibraryClient.endGame(id, addr, mgmt, fp, appId, streamPort(fp))
         state.launch {
             notice(outcome.notice(title))
             fetchLibrary(c, refreshOnly = true)
@@ -56,7 +58,7 @@ internal fun SkiaConsole.changeInstall(c: JSONObject) {
         return
     }
     ioPool.execute {
-        val outcome = LibraryClient.changeInstall(id, addr, mgmt, fp, appId, action)
+        val outcome = LibraryClient.changeInstall(id, addr, mgmt, fp, appId, action, streamPort(fp))
         state.launch {
             notice(outcome.notice(action, title))
             val removed = outcome == InstallOutcome.Done && action == InstallAction.Remove
@@ -78,13 +80,14 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
     val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
     val id = identity
     val kh = services.store.resolve(fp, addr, c.optInt("port"))
+    val port = kh?.port ?: c.optInt("port")
     if (refreshOnly) {
         // Silent path — no notice, but the failed load still gets its retry.
         if (id == null) { identities.blockedMessage(); return }
         // A newer fetch owns the shelf by the time a slow host answers: not its titles.
         val gen = fetchGen.get()
         ioPool.execute {
-            val status = LibraryClient.fetchStatus(addr, mgmt, id.certPem, id.privateKeyPem, fp)
+            val status = LibraryClient.fetchStatus(addr, mgmt, id.certPem, id.privateKeyPem, fp, port)
             val games = status.games
             state.launch {
                 if (handle == 0L) return@launch
@@ -122,6 +125,7 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
             addr, mgmt, id.certPem, id.privateKeyPem, fp,
             macs = kh?.mac.orEmpty(),
             autoWake = autoWake,
+            streamPort = port,
             isCancelled = { gen != fetchGen.get() },
             onWaking = { state.launch { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) } },
         )
@@ -130,7 +134,7 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
             is LibraryResult.Ok -> {
                 val games = r.games
                 cache.store(cacheKey, games)
-                val up = LibraryClient.fetchRunning(addr, mgmt, id.certPem, id.privateKeyPem, fp)
+                val up = LibraryClient.fetchRunning(addr, mgmt, id.certPem, id.privateKeyPem, fp, port)
                 state.launch {
                     if (gen != fetchGen.get()) return@launch
                     NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(req, games), false)
@@ -177,7 +181,7 @@ private fun SkiaConsole.pumpArt(
     offline: Boolean,
 ) {
     val app = appContext ?: return
-    val http = runCatching { posterHttp(app, id, addr, fp) }.getOrNull() ?: return
+    val http = runCatching { posterHttp(app, id, addr, fp, streamPort(fp)) }.getOrNull() ?: return
     for (g in games) {
         val candidates = g.art.posterCandidates
         if (candidates.isEmpty()) continue
@@ -186,6 +190,19 @@ private fun SkiaConsole.pumpArt(
             val bytes = fetchArt(candidates, http, offline) ?: return@execute
             state.launch { if (gen == fetchGen.get() && handle != 0L) NativeBridge.nativeConsoleLibraryArt(handle, g.id, bytes) }
         }
+    }
+}
+
+/** `ConsoleCmd::FetchAvatar`: a profile's picture, over the poster client and its cache. */
+internal fun SkiaConsole.fetchAvatar(c: JSONObject) {
+    val addr = c.optString("addr"); val fp = c.optString("fp_hex"); val path = c.optString("url")
+    val id = identity ?: return
+    val app = appContext ?: return
+    val url = pictureUrl(mgmtBase(addr, c.optInt("mgmt")), path) ?: return
+    artPool.execute {
+        val http = runCatching { posterHttp(app, id, addr, fp, streamPort(fp)) }.getOrNull() ?: return@execute
+        val bytes = fetchArt(listOf(url), http, offline = false) ?: return@execute
+        state.launch { if (handle != 0L) NativeBridge.nativeConsoleAvatar(handle, path, bytes) }
     }
 }
 

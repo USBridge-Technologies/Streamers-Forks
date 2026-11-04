@@ -10,7 +10,7 @@ use super::{focus_output, list_monitors};
 use crate::monitors::DISABLE_BUDGET;
 use crate::toplevels::{Toplevel, WindowVerb};
 use crate::topology_journal::{self as journal, Head, Undo};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -74,10 +74,10 @@ fn is_empty(space: &Workspace, windows: &[Window]) -> bool {
 
 /// `(claimed, restore)` for a launch on `output`.
 ///
-/// `want` is the workspace an earlier session claimed, honoured while the output still has it.
-/// Otherwise the output's empty workspace: the one it shows when that is empty, else the last.
-/// niri keeps one at the end of every output; a named workspace is the operator's and is never
-/// taken.
+/// `want` is the workspace an earlier session claimed, honoured while niri still has it on any
+/// output. Otherwise the output's empty workspace: the one it shows when that is empty, else the
+/// last. niri keeps one at the end of every output; a named workspace is the operator's and is
+/// never taken.
 fn pick_launch_workspace(
     spaces: &[Workspace],
     windows: &[Window],
@@ -92,7 +92,7 @@ fn pick_launch_workspace(
     };
     let id = want
         .and_then(|w| u64::try_from(w).ok())
-        .filter(|w| head().any(|s| s.id == *w))
+        .filter(|w| spaces.iter().any(|s| s.id == *w))
         .or_else(|| {
             head()
                 .filter(|s| s.name.is_none() && is_empty(s, windows))
@@ -102,14 +102,21 @@ fn pick_launch_workspace(
     Some((i64::try_from(id).ok()?, i64::try_from(restore).ok()?))
 }
 
-/// Workspace this launch gets on head `name`, as `(claimed, restore)`. `None` when the head's
-/// workspaces cannot be read or the switch is refused: the launch then opens where the head
-/// already looks.
+/// Workspace this launch gets on head `name`, as `(claimed, restore)`. A claimed workspace that
+/// another output holds is moved here first: focusing it alone would switch that output. `None`
+/// when the head's workspaces cannot be read or the switch is refused: the launch then opens
+/// where the head already looks.
 pub(crate) fn claim_workspace(name: &str, want: Option<i64>) -> Option<(i64, i64)> {
     let (spaces, windows) = (ipc::workspaces().ok()?, ipc::windows().ok()?);
     let (id, restore) = pick_launch_workspace(&spaces, &windows, name, want)?;
     if id != restore {
-        if let Err(e) = focus_workspace(id) {
+        let nid = niri_id(id).ok()?;
+        let moved = if on_other_output(&spaces, nid, name) {
+            ipc::action(move_workspace_action(nid, name))
+        } else {
+            Ok(())
+        };
+        if let Err(e) = moved.and_then(|()| ipc::action(focus_workspace_action(nid))) {
             tracing::warn!(
                 workspace = id, output = %name, error = %format!("{e:#}"),
                 "niri: workspace switch refused — this launch opens beside whatever the streamed \
@@ -119,6 +126,12 @@ pub(crate) fn claim_workspace(name: &str, want: Option<i64>) -> Option<(i64, i64
         }
     }
     Some((id, restore))
+}
+
+fn on_other_output(spaces: &[Workspace], id: u64, output: &str) -> bool {
+    spaces
+        .iter()
+        .any(|s| s.id == id && s.output.as_deref() != Some(output))
 }
 
 /// Switch to workspace `id`, on the output that holds it.
@@ -264,8 +277,8 @@ pub(crate) fn restore_heads(disabled: &[String]) -> Vec<String> {
     dark
 }
 
-/// Take back one journaled desk change. Only heads are journaled: a dead host's output goes
-/// through `reclaim_leftovers_once`.
+/// Take back one journaled desk change: re-light heads, or remove an output this niri named and
+/// still lists. Another niri's output is left alone (it may have reused the name).
 pub(crate) fn undo(undo: &Undo) -> Result<()> {
     match undo {
         Undo::EnableHeads { heads } => {
@@ -279,7 +292,16 @@ pub(crate) fn undo(undo: &Undo) -> Result<()> {
                 dark.join(", ")
             )
         }
-        Undo::RemoveOutput { .. } => Ok(()),
+        Undo::RemoveOutput { name, instance } => {
+            if journal::foreign_output("niri", name, instance, &ipc::instance()) {
+                return Ok(());
+            }
+            if !ipc::outputs()?.iter().any(|o| o.name == *name) {
+                return Ok(());
+            }
+            ipc::remove_virtual_output(name)
+                .with_context(|| format!("remove virtual output {name}"))
+        }
         Undo::Takeover { .. } => bail!("no undo in niri for {undo:?}"),
     }
 }
@@ -615,16 +637,19 @@ mod tests {
         );
     }
 
-    /// `want` is the workspace an earlier session claimed: honoured on its own head, ignored on
-    /// any other, and ignored once niri no longer has it.
+    /// `want` is the workspace an earlier session claimed: honoured on any output, since a
+    /// reconnect's head is new and the game's workspace moved off the old one. Ignored once
+    /// niri no longer has it. Only one on another output is moved.
     #[test]
-    fn want_is_honoured_only_on_that_head() {
+    fn want_is_honoured_wherever_niri_still_has_it() {
         let (spaces, windows) = (spaces(), windows());
         let pick = |head, want| pick_launch_workspace(&spaces, &windows, head, want);
         assert_eq!(pick("PF-1234-1", Some(5)), Some((5, 3)));
-        assert_eq!(pick("PF-1234-1", Some(2)), Some((4, 3)), "2 is DP-1's");
+        assert_eq!(pick("PF-1234-1", Some(2)), Some((2, 3)), "2 is DP-1's");
         assert_eq!(pick("PF-1234-1", Some(99)), Some((4, 3)), "99 is gone");
         assert_eq!(pick("PF-1234-1", Some(-1)), Some((4, 3)));
+        assert!(on_other_output(&spaces, 2, "PF-1234-1"));
+        assert!(!on_other_output(&spaces, 5, "PF-1234-1"));
     }
 
     #[test]

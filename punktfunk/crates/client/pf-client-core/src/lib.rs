@@ -31,16 +31,19 @@ pub mod audio_rt;
         target_os = "linux",
         windows,
         target_os = "android",
-        all(target_os = "freebsd", target_vendor = "sie")
+        all(target_os = "freebsd", target_vendor = "sie"),
+        target_os = "horizon"
     )
 ))]
 pub mod discovery;
 #[cfg(desktop)]
 pub mod gamepad;
-// The pad routing decision without SDL, so its table test also runs on the Mac.
+// The pad decisions without SDL (routing, feedback, DualSense packets), so their tests run on the Mac too.
 #[cfg(all(test, target_vendor = "apple"))]
 #[path = "gamepad"]
 mod gamepad {
+    mod ds5;
+    mod feedback;
     mod route;
     mod select_gesture;
 }
@@ -155,7 +158,7 @@ pub mod library_layout;
 // Linux only: Windows ships inside the host installer, macOS through `clients/apple`.
 #[cfg(all(desktop, target_os = "linux"))]
 pub mod update;
-// OS clipboard bridge (`design/clipboard-and-file-transfer.md`). Session clients; Windows-real, stub elsewhere.
+// OS clipboard bridge for the session client (`design/clipboard-and-file-transfer.md`): Win32 or SDL3.
 #[cfg(desktop)]
 pub mod clipboard;
 // The decode ladder lives in pf-client-video; these keep the `video` and `video_*` paths.

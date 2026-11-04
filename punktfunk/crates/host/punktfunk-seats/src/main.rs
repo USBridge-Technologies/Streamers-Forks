@@ -46,11 +46,15 @@ mod linux {
         \x20 list                        every seat and its state\n\
         \x20 create <name>               add a seat\n\
         \x20 adopt-owner <account>       the owner's row, for the user door-helper recorded\n\
+        \x20 release-owner               delete the owner's row, if there is one\n\
+        \x20 stop-all                    stop every seat that runs or starts\n\
+        \x20 check-owner on|off <account>  door-helper's account rules: `<uid> <home>` or `gone`\n\
         \x20 start <id> | stop <id> | delete <id>\n\
         \x20 doctor                      what a seat needs and what is missing\n\
         \x20 seating                     whether seats are on\n\
         \x20 fence                       udev's IMPORT{program}: whose a seat's pad is\n\
         \x20 ungate                      open the vhci gate and the box's hidraw (ExecStopPost)\n\
+        \x20 drain                       answer the seats' waiting uinput reads (ExecStop)\n\
         \x20 serve-usb                   a seat's USB pad server, which the supervisor starts\n";
 
     pub fn main() -> ExitCode {
@@ -64,6 +68,19 @@ mod linux {
     }
 
     fn run(args: Vec<String>) -> Result<(), String> {
+        // No flags here: the account is data from a unit's instance name.
+        if let [verb, direction, account] = args.as_slice()
+            && verb == "check-owner"
+        {
+            let on = match direction.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(USAGE.into()),
+            };
+            let line = pf_seats::linux::check_owner(account, on).map_err(|e| e.to_string())?;
+            println!("{line}");
+            return Ok(());
+        }
         let mut socket_path = PathBuf::from(SOCKET_PATH);
         let mut steam_source = None;
         let mut words = Vec::new();
@@ -99,11 +116,16 @@ mod linux {
                 pads::unbind();
                 return Ok(());
             }
+            "drain" => {
+                return crate::uinput::ask_to_drain().map_err(|e| format!("drain: {e}"));
+            }
             "serve-usb" => {
                 pf_seats::logging::to_stderr();
                 return pads::serve_usb_device();
             }
             "list" => Command::List,
+            "release-owner" => return release_owner(&socket_path),
+            "stop-all" => return stop_all(&socket_path),
             "create" => {
                 let name = argument.ok_or(format!("create needs a name\n{USAGE}"))?;
                 Command::Create(CreateSeat {
@@ -122,18 +144,52 @@ mod linux {
             "seating" => Command::Seating,
             _ => return Err(USAGE.into()),
         };
-        let result = socket::request(&socket_path, command)
-            .map_err(|e| format!("{:?}: {}", e.code, e.message))?;
-        print_result(&result)
+        print_result(&ask(&socket_path, command)?)
+    }
+
+    fn ask(socket_path: &std::path::Path, command: Command) -> Result<CommandResult, String> {
+        socket::request(socket_path, command).map_err(|e| format!("{:?}: {}", e.code, e.message))
+    }
+
+    fn seats(socket_path: &std::path::Path) -> Result<Vec<pf_seats::Seat>, String> {
+        match ask(socket_path, Command::List)? {
+            CommandResult::List { seats } => Ok(seats),
+            _ => Err("the supervisor answered a list with something else".into()),
+        }
+    }
+
+    /// Deletes the owner's row; none is not an error. The account and its home stay.
+    fn release_owner(socket_path: &std::path::Path) -> Result<(), String> {
+        let Some(owner) = seats(socket_path)?.into_iter().find(|s| s.owner) else {
+            return Ok(());
+        };
+        ask(socket_path, Command::Delete { id: owner.id }).map(drop)
+    }
+
+    /// Stops every seat that runs or starts. Each is asked even after one refuses; any refusal
+    /// fails the whole.
+    fn stop_all(socket_path: &std::path::Path) -> Result<(), String> {
+        let live = |s: &pf_seats::Seat| {
+            matches!(
+                s.runtime.state,
+                pf_seats::RuntimeState::Running | pf_seats::RuntimeState::Starting
+            )
+        };
+        let refused: Vec<String> = seats(socket_path)?
+            .into_iter()
+            .filter(live)
+            .filter_map(|s| ask(socket_path, Command::Stop { id: s.id }).err())
+            .collect();
+        if refused.is_empty() {
+            Ok(())
+        } else {
+            Err(refused.join("\n"))
+        }
     }
 
     /// `pf-seat-<n>` for the first n no seat uses.
     fn free_account(socket_path: &std::path::Path) -> Result<String, String> {
-        let CommandResult::List { seats } = socket::request(socket_path, Command::List)
-            .map_err(|e| format!("{:?}: {}", e.code, e.message))?
-        else {
-            return Err("the supervisor answered a list with something else".into());
-        };
+        let seats = seats(socket_path)?;
         (1..=pf_seats::model::MAX_SEATS)
             .map(|n| format!("pf-seat-{n}"))
             .find(|account| seats.iter().all(|s| &s.account != account))
@@ -161,8 +217,12 @@ mod linux {
             }
             CommandResult::Created { seat }
             | CommandResult::Started { seat }
-            | CommandResult::Stopped { seat } => line(seat),
+            | CommandResult::Stopped { seat }
+            | CommandResult::Resealed { seat } => line(seat),
             CommandResult::Deleted { id } => println!("{id} deleted"),
+            CommandResult::Flatpak { id, version } => {
+                println!("{id} {}", version.as_deref().unwrap_or("-"));
+            }
             CommandResult::Doctor { report } => {
                 for d in &report.diagnostics {
                     println!("{:?} {} {}", d.level, d.code, d.message);
@@ -195,6 +255,8 @@ mod linux {
         pf_seats::logging::to_stderr();
         // Adopts systemd's kept fds close-on-exec before anything here can spawn a child.
         crate::uinput::resume(pads::resume());
+        socket::ensure_door_group();
+        crate::uinput::listen_for_drain();
         let state = PathBuf::from(pf_seats::linux::STATE_DIR);
         let backend = LinuxBackend::open(pf_paths::config_dir(), state, steam_source)
             .map_err(|e| format!("open the seat backend: {e}"))?
@@ -217,7 +279,7 @@ mod linux {
         let pads_path = std::path::Path::new(pads::SOCKET_PATH);
         let pads_listener =
             pads::bind(pads_path).map_err(|e| format!("bind {}: {e}", pads_path.display()))?;
-        pads::refresh_hidraw();
+        pads::refresh_pad_nodes();
         let for_pads = Arc::clone(&service);
         std::thread::Builder::new()
             .name("seat-pads".into())

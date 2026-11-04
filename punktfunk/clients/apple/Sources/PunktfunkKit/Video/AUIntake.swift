@@ -9,7 +9,7 @@ import os
 
 private let intakeLog = ClientLog(category: "video")
 
-/// Thread-confined to one pump thread; one per session.
+/// Thread-confined to one pump thread; one per screen of a session.
 struct AUIntake {
     /// One AU the sink may take. The sink still honours `step.withhold`, after any check of its
     /// own that must see withheld AUs too.
@@ -18,19 +18,25 @@ struct AUIntake {
         let step: AUPumpState.Step
         /// The AU carries parameter sets (an IDR).
         let idr: Bool
+        /// The stream's format changed at this AU: the sink rebuilds its decoder first.
+        let newFormat: Bool
     }
 
     private(set) var pump = AUPumpState()
     private let connection: PunktfunkConnection
+    /// The session's screen this intake pulls: 0, or a further screen's (1 to 3).
+    private let screen: UInt8
     /// The decoder reads the RPS itself, so a lost reference is concealed in the bitstream first.
-    private let concealer: HevcConcealer?
+    /// HEVC only; a new format builds it again.
+    private var concealer: HevcConcealer?
     private var wasUnrecoverable = false
     /// When the current wait for parameter sets began, for the resume log.
     private var awaitingSince = Date.distantPast
 
-    init(connection: PunktfunkConnection) {
+    init(connection: PunktfunkConnection, screen: UInt8 = 0) {
         self.connection = connection
-        concealer = connection.videoCodec == .hevc ? HevcConcealer() : nil
+        self.screen = screen
+        concealer = connection.videoCodec == .hevc && screen == 0 ? HevcConcealer() : nil
     }
 
     /// Pull and vet the next AU (100 ms poll); nil when this iteration has nothing for the sink.
@@ -41,6 +47,7 @@ struct AUIntake {
         onDecodedSize: ((Int, Int) -> Void)?,
         onHdrMeta: ((PunktfunkConnection.HdrMeta) -> Void)? = nil
     ) throws -> Intake? {
+        if screen > 0 { return try nextOfScreen(onDecodedSize: onDecodedSize) }
         // Background: drain one AU for flow control and host pacing, skip all bookkeeping.
         // Nothing decodes, so the core's freeze is dropped: left up it would ask for a keyframe
         // every half second. exitBackground asks for an IDR and the resumed index gap re-arms.
@@ -60,6 +67,15 @@ struct AUIntake {
         // the concealer sees it: the concealer mirrors the decoder's DPB.
         let arrival = connection.recoveryOnFrame(au.frameIndex)
         onFrame?(au)
+        if au.newFormat {
+            // The old codec's parameter sets and reference state end here: wait for this
+            // format's own IDR, which this AU usually is.
+            concealer = connection.videoCodec == .hevc ? HevcConcealer() : nil
+            pump.requireIDR()
+            intakeLog.notice(
+                "video: the host changed the stream format — rebuilding the decoder for \(String(describing: connection.videoCodec), privacy: .public)"
+            )
+        }
         if !arrival.admit { return nil }
         let concealed = conceal(&au)
         let idrFormat = connection.videoCodec.formatDescription(fromKeyframe: au.data)
@@ -78,7 +94,24 @@ struct AUIntake {
                 "video: received AUs but no decodable format (missing/unparsed parameter sets) — requesting an IDR until one seeds it"
             )
         }
-        return Intake(au: au, step: step, idr: idrFormat != nil)
+        return Intake(au: au, step: step, idr: idrFormat != nil, newFormat: au.newFormat)
+    }
+
+    /// A further screen's AU. Its lane hands out whole frames from a keyframe on, so there is no
+    /// loss report and nothing to conceal; a decoder that needs a keyframe asks this screen's.
+    private mutating func nextOfScreen(onDecodedSize: ((Int, Int) -> Void)?) throws -> Intake? {
+        if connection.isVideoDropped {
+            _ = try connection.nextScreenAU(screen: screen, timeoutMs: 100)
+            return nil
+        }
+        if pump.awaitingIDR { connection.requestScreenKeyframe(screen) }
+        guard let au = try connection.nextScreenAU(screen: screen, timeoutMs: 100) else { return nil }
+        if au.newFormat { pump.requireIDR() }
+        let idrFormat = connection.videoCodec.formatDescription(fromKeyframe: au.data)
+        let step = pump.note(frameIndex: au.frameIndex, idrFormat: idrFormat, flags: au.flags)
+        if step.askKeyframe { connection.requestScreenKeyframe(screen) }
+        if let size = step.newSize { onDecodedSize?(size.width, size.height) }
+        return Intake(au: au, step: step, idr: idrFormat != nil, newFormat: au.newFormat)
     }
 
     /// The sink lost its decoder state: wait for the next IDR's parameter sets. Stamps the wait

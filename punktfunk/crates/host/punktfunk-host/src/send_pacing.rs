@@ -19,7 +19,6 @@ macro_rules! env_once {
         *CELL.get_or_init(|| $init)
     }};
 }
-pub(crate) use env_once;
 
 /// Native feeds this to the PUNKTFUNK_PERF histogram (pacing tail per frame).
 pub(crate) struct PaceStat {
@@ -184,15 +183,59 @@ pub(crate) enum Source {
     Floor,
 }
 
+/// An unmeasured `L` is refuted by the host's own evidence that the client cannot drain the
+/// stream: an IDR storm (three forced IDRs in a row the client asked past), or two report
+/// windows running with a frame lost. A window has lost a frame when an RFI ask landed in it,
+/// so parity could not repair a frame; a report a window late starts the run over, and a
+/// window whose loss sits at the frames' heads is the wake shape's, not the rate's. The first
+/// evidence is kept for the session, and the pacer then caps an unmeasured `L` at 1.5 × B
+/// ([`cap_bps`]). A measured `L` is never overridden.
+#[derive(Debug, Default)]
+pub(crate) struct Refutation(std::sync::OnceLock<Evidence>);
+
+/// What raised a [`Refutation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Evidence {
+    IdrStorm,
+    DeadWindows,
+}
+
+impl Evidence {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Evidence::IdrStorm => "idr_storm",
+            Evidence::DeadWindows => "dead_windows",
+        }
+    }
+}
+
+impl Refutation {
+    /// Keep `why`, unless earlier evidence is kept.
+    pub(crate) fn raise(&self, why: Evidence) {
+        let _ = self.0.set(why);
+    }
+
+    pub(crate) fn evidence(&self) -> Option<Evidence> {
+        self.0.get().copied()
+    }
+}
+
 /// The session's link rate `L`, and the ports' `L_hard` beside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LinkRate {
     pub(crate) kbps: u32,
     pub(crate) source: Source,
     pub(crate) hard_kbps: u32,
+    /// The host refuted this unmeasured `L` ([`Refutation`]).
+    pub(crate) refuted: bool,
 }
 
 impl LinkRate {
+    /// The client measured `L`. It reports the shared [`FLOOR_KBPS`] until it knows anything.
+    pub(crate) fn measured(&self) -> bool {
+        self.source == Source::Client && self.kbps != FLOOR_KBPS
+    }
+
     /// `L`: the client's report wins and this host's port caps it; with no report the
     /// host's port; with neither [`FLOOR_KBPS`], under the port too. `capped` holds the
     /// floor whatever the evidence.
@@ -211,6 +254,7 @@ impl LinkRate {
             kbps,
             source,
             hard_kbps: ports.hard_kbps(),
+            refuted: false,
         }
     }
 }
@@ -228,15 +272,18 @@ pub(crate) fn rate_bps(bitrate_kbps: u32, link: &LinkRate, pinned_wall: Option<u
 const CAP_STREAM_FACTOR: u64 = 3;
 const CAP_STREAM_DIV: u64 = 2;
 
-/// The most `R` may be, bits/s: the `L` the client measured, never under 1.5 × B, then
-/// 0.9 `L_hard` (the ports' speed) and 0.9 a pinned stream's proven link ([`pinned_wall`]).
-/// The bottleneck drains at `L` however fast a frame leaves. Paced under its own bitrate,
-/// a stream delivers only what the pacer lets out, and the next wall reads that.
-/// The client reports the shared [`FLOOR_KBPS`] until it knows anything; that caps nothing.
+/// The most `R` may be, bits/s: the `L` the client measured, never under 1.5 × B, or 1.5 × B
+/// where the host refuted an unmeasured `L` ([`Refutation`]); then 0.9 `L_hard` (the ports'
+/// speed) and 0.9 a pinned stream's proven link ([`pinned_wall`]). The bottleneck drains at
+/// `L` however fast a frame leaves. Paced under its own bitrate, a stream delivers only what
+/// the pacer lets out, and the next wall reads that. An unmeasured `L` alone caps nothing.
 pub(crate) fn cap_bps(bitrate_kbps: u32, link: &LinkRate, pinned_wall: Option<u32>) -> u64 {
     let room = u64::from(bitrate_kbps) * 1_000 * CAP_STREAM_FACTOR / CAP_STREAM_DIV;
-    let measured = (link.source == Source::Client && link.kbps != FLOOR_KBPS)
-        .then(|| (u64::from(link.kbps) * 1_000).max(room));
+    let measured = if link.measured() {
+        Some((u64::from(link.kbps) * 1_000).max(room))
+    } else {
+        link.refuted.then_some(room)
+    };
     let hard = [Some(link.hard_kbps), pinned_wall]
         .into_iter()
         .flatten()
@@ -350,6 +397,8 @@ pub(crate) struct Pacer {
     max_spread: Duration,
     ports: Ports,
     forced: Option<Forced>,
+    /// [`Self::refute`] was called: an unmeasured `L` is capped from then on.
+    refuted: bool,
     /// `R` from [`Self::update`]; a frame may raise its own, never past `cap_bps`.
     base_bps: u64,
     cap_bps: u64,
@@ -373,6 +422,7 @@ impl Pacer {
             max_spread: MAX_PACE_SPREAD,
             ports,
             forced,
+            refuted: false,
             base_bps: 1,
             cap_bps: u64::MAX,
             rate_bps: 1,
@@ -383,6 +433,12 @@ impl Pacer {
             paced: false,
             sock_ns: 0,
         }
+    }
+
+    /// A [`Refutation`] was raised: from the next update, for the session, an unmeasured `L`
+    /// is capped.
+    pub(crate) fn refute(&mut self) {
+        self.refuted = true;
     }
 
     /// Per AU: the stream rate, the client's link report (`0` = none yet), a pinned
@@ -397,6 +453,7 @@ impl Pacer {
         max_spread: Duration,
     ) -> u64 {
         self.link = LinkRate::resolve(Some(link_kbps), self.ports, self.forced);
+        self.link.refuted = self.refuted && !self.link.measured();
         self.shape = match self.forced {
             Some(Forced::Shape(s)) => s,
             _ => shape,
@@ -504,7 +561,7 @@ fn group_len<T: AsRef<[u8]>>(pkts: &[T], max_bytes: usize, max_packets: usize) -
 }
 
 /// `PUNKTFUNK_FRAME_DRIVEN=0` restores the fixed-cadence tick. On, the loop wakes on
-/// the capturer's arrival ([`pf_capture::Capturer::supports_arrival_wait`]) or on the
+/// a feed's arrival ([`pf_capture::Feed::wait_arrival`]) or on the
 /// next access unit of an encoder that publishes its own; a backend with neither
 /// keeps the tick. Shared by both video planes.
 pub(crate) fn frame_driven_enabled() -> bool {
@@ -527,6 +584,8 @@ pub(crate) struct CaptureCredit {
     /// it had only partly banked; the owed fraction is repaid before the next grab.
     credit: f32,
     last: Instant,
+    /// Repeat ticks since the last fresh frame; past [`IDLE_REPEATS`] the keep-alive backs off.
+    idle: u32,
 }
 
 impl CaptureCredit {
@@ -538,6 +597,7 @@ impl CaptureCredit {
         CaptureCredit {
             credit: Self::CAP,
             last: now,
+            idle: 0,
         }
     }
 
@@ -554,14 +614,29 @@ impl CaptureCredit {
 
     pub(crate) fn charge(&mut self) {
         self.credit -= 1.0;
+        self.idle = 0;
+    }
+
+    /// A tick that repeated the last frame: nothing arrived before the keep-alive ran out.
+    pub(crate) fn note_repeat(&mut self) {
+        self.idle = self.idle.saturating_add(1);
     }
 }
+
+/// Repeats at the keep-alive cadence before the idle backoff, about 190 ms at 120 Hz: on CBR
+/// they sharpen a still picture.
+pub(crate) const IDLE_REPEATS: u32 = 15;
 
 /// How long past `next` the arrival wait runs before a repeat goes out: half an interval
 /// with no measured source cadence, else until 1.25× the source period after the last
 /// submit. A steady slower source gets no repeat between its own frames; a stalled one
-/// re-sends after that same wait.
-fn keepalive_wait(interval: Duration, src_period_ns: Option<u64>) -> Duration {
+/// re-sends after that same wait. After [`IDLE_REPEATS`] repeats in a row the wait is three
+/// intervals: a still desktop re-encodes at a quarter of the rate, under every VRR floor, and
+/// the first real frame ends the wait at once.
+fn keepalive_wait(interval: Duration, src_period_ns: Option<u64>, idle_repeats: u32) -> Duration {
+    if idle_repeats >= IDLE_REPEATS {
+        return interval * 3;
+    }
     let half = interval.mul_f32(0.5);
     match src_period_ns {
         Some(p) => Duration::from_nanos(p)
@@ -605,7 +680,7 @@ pub(crate) fn wait_next_tick(
     if !frame_driven_enabled() {
         return sleep_to_grid(next);
     }
-    if capturer.supports_arrival_wait() {
+    if let Some(feed) = capturer.feed() {
         // Anchor the 0.9× floor to the capture, not `next`: a sync encoder folds encode into cadence.
         if let Some(t_cap) = fresh {
             credit.charge();
@@ -616,8 +691,10 @@ pub(crate) fn wait_next_tick(
             if let Some(d) = earliest.checked_duration_since(Instant::now()) {
                 std::thread::sleep(d);
             }
+        } else {
+            credit.note_repeat();
         }
-        capturer.wait_arrival(*next + keepalive_wait(interval, src_period_ns));
+        feed.wait_arrival(*next + keepalive_wait(interval, src_period_ns, credit.idle));
     } else if owed_aus(frame, enc, *next).is_none() {
         return sleep_to_grid(next);
     }
@@ -789,6 +866,7 @@ mod tests {
                 kbps: 940_000,
                 source: Source::Client,
                 hard_kbps: 1_000_000,
+                refuted: false,
             }
         );
         assert_eq!(l(Some(9_000_000), asym, None).kbps, 2_500_000);
@@ -831,6 +909,11 @@ mod tests {
         assert_eq!(rate_bps(12_000, &notched, None), 18_000_000);
         let unknown = LinkRate::resolve(Some(FLOOR_KBPS), Ports::default(), None);
         assert_eq!(rate_bps(400_000, &unknown, None), 1_200_000_000);
+        // A fixed rate on the client's floor, then on the stream's own rate once frames die.
+        assert_eq!(rate_bps(80_000, &unknown, None), 720_000_000);
+        let fixed = LinkRate::resolve(Some(80_000), Ports::default(), None);
+        assert_eq!(rate_bps(80_000, &fixed, None), 120_000_000);
+        assert_eq!(cap_bps(80_000, &fixed, None), 120_000_000);
 
         // Smooth ignores the link, until there is no stream rate to pace at.
         let mut p = Pacer::new(gbe(), None);
@@ -859,6 +942,47 @@ mod tests {
         assert_eq!(pinned_wall(true, 1_000_000, 778_000), None);
         assert_eq!(pinned_wall(false, 2_450_000, 1_427_000), None);
         assert_eq!(rate_bps(1_427_000, &unknown, None), 2_450_000_000);
+    }
+
+    /// A refutation caps an unmeasured `L` (the floor, the host's port, the client's echo of
+    /// the floor) at 1.5 × B, an IDR's spread floor included, frame after frame. A measured
+    /// `L` takes over and is never lowered; back at the floor, the cap holds again. The first
+    /// evidence raised is the one kept.
+    #[test]
+    fn a_refutation_caps_only_an_unmeasured_link() {
+        let r = Refutation::default();
+        assert_eq!(r.evidence(), None);
+        r.raise(Evidence::DeadWindows);
+        r.raise(Evidence::IdrStorm);
+        assert_eq!(r.evidence(), Some(Evidence::DeadWindows));
+        let d = Duration::from_millis(33);
+        let host = Ports::of((ETH, 2_500), (0, 0));
+        for (ports, report) in [(Ports::default(), 0), (host, 0), (host, FLOOR_KBPS)] {
+            let mut p = Pacer::new(ports, None);
+            assert!(p.update(80_000, report, None, Shape::Auto, d) >= 720_000_000);
+            p.refute();
+            for _ in 0..3 {
+                assert_eq!(p.update(80_000, report, None, Shape::Auto, d), 120_000_000);
+                assert!(p.link().refuted, "{ports:?} {report}");
+                p.begin(1_000_000);
+                assert_eq!(p.rate_bps, 120_000_000, "an IDR leaves under the cap");
+            }
+        }
+        for measured in [940_000, 93_000, 12_000] {
+            let mut fresh = Pacer::new(host, None);
+            let mut p = Pacer::new(host, None);
+            p.refute();
+            assert_eq!(
+                p.update(80_000, measured, None, Shape::Auto, d),
+                fresh.update(80_000, measured, None, Shape::Auto, d),
+                "{measured}"
+            );
+            assert!(!p.link().refuted);
+            assert_eq!(
+                p.update(80_000, FLOOR_KBPS, None, Shape::Auto, d),
+                120_000_000
+            );
+        }
     }
 
     /// (a) A 167 KB frame at 900 Mbit/s on known 1 GbE ports leaves in 1 ms groups, each on
@@ -1150,10 +1274,33 @@ mod tests {
     #[test]
     fn a_slower_steady_source_outlives_the_keepalive() {
         let i = Duration::from_micros(8_333);
-        assert_eq!(keepalive_wait(i, None), i.mul_f32(0.5));
-        assert_eq!(keepalive_wait(i, Some(i.as_nanos() as u64)), i.mul_f32(0.5));
-        let two = keepalive_wait(i, Some(2 * i.as_nanos() as u64));
+        assert_eq!(keepalive_wait(i, None, 0), i.mul_f32(0.5));
+        assert_eq!(
+            keepalive_wait(i, Some(i.as_nanos() as u64), 0),
+            i.mul_f32(0.5)
+        );
+        let two = keepalive_wait(i, Some(2 * i.as_nanos() as u64), 0);
         assert!(two > i.mul_f32(1.4) && two < i.mul_f32(1.6), "{two:?}");
+    }
+
+    /// A still desktop keeps the sharpening repeats, then waits three intervals a repeat
+    /// until a fresh frame is charged.
+    #[test]
+    fn an_idle_desktop_backs_off_after_the_sharpening_repeats() {
+        let i = Duration::from_micros(8_333);
+        assert_eq!(keepalive_wait(i, None, IDLE_REPEATS - 1), i.mul_f32(0.5));
+        assert_eq!(keepalive_wait(i, None, IDLE_REPEATS), i * 3);
+        assert_eq!(
+            keepalive_wait(i, Some(i.as_nanos() as u64), IDLE_REPEATS + 9),
+            i * 3
+        );
+        let mut credit = CaptureCredit::new(Instant::now());
+        for _ in 0..IDLE_REPEATS {
+            credit.note_repeat();
+        }
+        assert_eq!(credit.idle, IDLE_REPEATS);
+        credit.charge();
+        assert_eq!(credit.idle, 0);
     }
 
     #[test]

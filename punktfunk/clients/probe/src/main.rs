@@ -27,8 +27,8 @@ use punktfunk_core::quic::v2::hello::{ClientHello, Ready, ServerHello};
 use punktfunk_core::quic::v2::io as v2io;
 use punktfunk_core::quic::v2::msg::{decode, V2Message};
 use punktfunk_core::quic::{
-    endpoint, window_loss_ppm, BitrateChanged, CursorRenderMode, CursorShape, Hello, ProbeRequest,
-    ProbeResult, Reconfigure, Reconfigured, SetBitrate, Welcome,
+    endpoint, window_report_ppm, BitrateChanged, CursorRenderMode, CursorShape, Hello,
+    ProbeRequest, ProbeResult, Reconfigure, Reconfigured, SetBitrate, Welcome,
 };
 use punktfunk_core::session::test_frame;
 use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
@@ -56,6 +56,10 @@ struct Args {
     pad_audio_test: bool,
     /// `--pads N` — how many pads `--pad-audio-test` declares, 1 to 4.
     pads: u8,
+    /// `--pad-soak SECS` — drive pad 0 with moving snapshots for SECS; RT carries a frame counter.
+    pad_soak: Option<u64>,
+    /// `--pad-hz N` — `--pad-soak` send rate, default 125.
+    pad_hz: u32,
     /// `--quit` — close the connection with the deliberate-quit code (`QUIT_CLOSE_CODE`) at end of
     /// stream, so the host tears its virtual display down immediately (skips keep-alive linger). A
     /// bare exit closes with code 0 → the host lingers for a reconnect. Tests the #2 quit path.
@@ -79,7 +83,7 @@ struct Args {
     pair: Option<String>,
     /// `--name LABEL` — how the host labels this client when pairing.
     name: String,
-    /// `--compositor NAME` — request a host compositor backend (auto|kwin|wlroots|mutter|gamescope|hyprland|niri).
+    /// `--compositor NAME` — request a host compositor backend (auto|kwin|wlroots|mutter|gamescope|hyprland|niri|umbriel).
     compositor: CompositorPref,
     /// `--gamepad NAME` — request a host virtual-pad backend (auto|xbox360|dualsense).
     gamepad: GamepadPref,
@@ -159,6 +163,25 @@ struct Args {
     /// the headless validator for the host answering `ClockProbe` at any time (what the native
     /// clients' mid-stream re-sync relies on). Aborts the session when the re-probe fails.
     clock_resync: bool,
+    /// `--screens N` (2–4) — ask for N screens of `--mode` side by side and count each one's
+    /// frames; screen k's go to `<out>.s<stream>`. 1 asks for none.
+    screens: u8,
+}
+
+/// The screens `--screens` asks for: `--mode` each, left to right; empty for one.
+fn screens_ask(args: &Args) -> Vec<punktfunk_core::quic::v2::msg::Screen> {
+    if args.screens < 2 {
+        return Vec::new();
+    }
+    (0..args.screens)
+        .map(|i| punktfunk_core::quic::v2::msg::Screen {
+            index: i,
+            mode: args.mode,
+            x: i32::from(i) * args.mode.width as i32,
+            primary: i == 0,
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// The control stream's halves; `punktfunk/2`'s cross the translation edges.
@@ -256,7 +279,7 @@ fn parse_argv(argv: Vec<String>) -> Args {
         Some(s) => match CompositorPref::from_name(s) {
             Some(c) => c,
             None => {
-                eprintln!("--compositor: auto, kwin, mutter, hyprland, niri, wlroots or gamescope");
+                eprintln!("--compositor: auto, kwin, mutter, hyprland, niri, umbriel, wlroots or gamescope");
                 std::process::exit(2);
             }
         },
@@ -288,6 +311,11 @@ fn parse_argv(argv: Vec<String>) -> Args {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1)
             .clamp(1, PAD_AUDIO_PADS as u8),
+        pad_soak: get("--pad-soak").and_then(|s| s.parse().ok()),
+        pad_hz: get("--pad-hz")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(125)
+            .clamp(1, 1000),
         quit: argv.iter().any(|a| a == "--quit"),
         seconds: get("--seconds").and_then(|s| s.parse().ok()),
         pin,
@@ -375,6 +403,10 @@ fn parse_argv(argv: Vec<String>) -> Args {
         cursor_capture: argv.iter().any(|a| a == "--cursor-capture"),
         cursor_nochannel: argv.iter().any(|a| a == "--cursor-nochannel"),
         cursor_channel: argv.iter().any(|a| a == "--cursor-channel"),
+        screens: get("--screens")
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(1)
+            .clamp(1, punktfunk_core::quic::v2::msg::SCREENS_MAX as u8),
     }
 }
 
@@ -549,6 +581,8 @@ struct Counters {
     /// The windowed loss estimate the loss relay sends in its feedback window, so the host sizes
     /// FEC to the link. `u32::MAX` = no fresh sample this window.
     loss_ppm: AtomicU32,
+    /// What the window's dead frames add to `loss_ppm`, sent beside it.
+    dead_ppm: AtomicU32,
     /// The session's cumulative unrecoverable-frame count. The loss relay requests a keyframe
     /// when it grows, the loss trigger under infinite GOP (see `NativeClient::frames_dropped`).
     dropped_frames: AtomicU64,
@@ -629,18 +663,24 @@ async fn session(mut args: Args) -> Result<()> {
             Err(e) => return Err(e),
         },
     };
+    // Screens past the first: their keyframe asks leave on this connection.
+    let screen_asks = server
+        .features
+        .has(punktfunk_core::quic::v2::registry::FEATURE_SCREENS)
+        .then(|| quic.clone());
     let welcome = server.welcome;
     // Media on the dialing socket, under keys from the connection's exporter.
     let suite = server.suite.context("unsealed native media")?;
     let keys =
         endpoint::media_keys(&quic, &server.session_id, suite).context("native media keys")?;
-    shared.stats().set_host(quic.remote_address());
+    shared.set_host(quic.remote_address());
     let media = (
         shared,
         punktfunk_core::session::MediaV2 {
             clock_origin_ns: server.clock_origin_ns,
             keys: Some(keys),
             clock: None,
+            clear_placement: false,
         },
     );
     let clock_offset_ns = clock(&mut send, &mut recv, args.clock_resync).await?;
@@ -663,6 +703,9 @@ async fn session(mut args: Args) -> Result<()> {
     }
     if args.pad_audio_test {
         spawn_pad_audio_test(&conn, args.pads);
+    }
+    if let Some(secs) = args.pad_soak {
+        spawn_pad_soak(&conn, secs, args.pad_hz);
     }
     // Closed-flag for the blocking receive loop.
     {
@@ -697,6 +740,7 @@ async fn session(mut args: Args) -> Result<()> {
             clock_offset_ns,
             dp_counters,
             host_timing_rx,
+            screen_asks,
         )
     })
     .await?;
@@ -749,6 +793,7 @@ async fn connect(
         args.pin,
         identity,
         &[punktfunk_core::quic::v2::registry::ALPN],
+        Some(remote.ip()),
     );
     let (ep, media) = r.map_err(|e| anyhow!("QUIC client endpoint: {e}"))?;
     let conn = ep
@@ -836,6 +881,8 @@ async fn handshake(
             audio_layout: 0,
             // The probe dumps the frame as sent; no view to fill.
             video_fit: 0,
+            // No receiver behind the probe: it decodes Opus itself.
+            audio_bitstreams: 0,
             // The probe just dumps the bitstream (no decode), so it advertises every codec — HEVC
             // (the host default) AND H.264 (so it can drive a GPU-less software host,
             // `PUNKTFUNK_ENCODER=software`) AND AV1. The host picks one and reports it in
@@ -884,13 +931,8 @@ async fn handshake(
             // the probe accepts a mid-session shard change (and jumbo growth) up to the
             // receive ceiling — and it's exactly the tool to measure both.
             max_shard_payload: punktfunk_core::config::max_shard_payload() as u16,
-            // `0`/`0` is UNSPECIFIED. For the shipping clients that distinction decides the
-            // capability bit — `advertised_client_caps` sets it when either field is non-zero,
-            // because it keys on "the caller specified a format", so that 48 kHz/16-bit (the
-            // cheapest lossless rung) is not the one format nobody can request. This `Hello` is
-            // hand-built and does not use that helper, so here the two are set together above and
-            // the sentinel is about honesty rather than mechanism: an inert format on the wire
-            // invites exactly the misreading that a rate alone asks for something.
+            // `0`/`0` is UNSPECIFIED. This hand-built `Hello` sets the cap bit and the format
+            // together, so no inert format reaches the wire to read as a request.
             audio_rate_hz: args.audio_format.map(|(r, _)| r).unwrap_or(0),
             audio_bits: args.audio_format.map(|(_, b)| b).unwrap_or(0),
         },
@@ -900,19 +942,24 @@ async fn handshake(
         link: Default::default(),
         probe_only: false,
         pyrowave_bpp_x100: 0,
+        slices: 0,
         resume: extra.resume,
         suites: extra.suites,
         // A host answers a `Redirect` only to a client that says it follows one.
         features: {
-            let none = punktfunk_core::quic::v2::features::FeatureSet::default();
+            use punktfunk_core::quic::v2::registry::{FEATURE_PROFILES, FEATURE_SCREENS};
+            let mut set = punktfunk_core::quic::v2::features::FeatureSet::default();
             if args.as_profile.is_some() {
-                none.with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES)
-            } else {
-                none
+                set = set.with(FEATURE_PROFILES);
             }
+            if args.screens > 1 {
+                set = set.with(FEATURE_SCREENS);
+            }
+            set
         },
         profile: args.as_profile.clone(),
         access_only: false,
+        screens: screens_ask(args),
     };
     v2io::send(send, &hello).await?;
     // `Pending` repeats while the host asks its console about this probe.
@@ -1047,8 +1094,35 @@ async fn control_plane(
         spawn_cursor_test(conn, send, recv, args.cursor_capture, args.cursor_channel);
     } else {
         spawn_loss_relay(conn.conn.clone(), send, counters, link_kbps);
+        spawn_screen_log(recv);
     }
     Ok(())
+}
+
+/// Log what the host says about screens past the first: each layout and each stream's config.
+fn spawn_screen_log(mut recv: CtlRx) {
+    use punktfunk_core::quic::v2::msg::{ScreenLayout, StreamConfig};
+    tokio::spawn(async move {
+        while let Ok((ty, body)) = recv.read_frame().await {
+            if let Ok(layout) = decode::<ScreenLayout>(ty, &body) {
+                for s in &layout.screens {
+                    tracing::info!(
+                        screen = s.index,
+                        stream = s.stream,
+                        mode = %format!("{}x{}@{}", s.mode.width, s.mode.height, s.mode.refresh_hz),
+                        x = s.x,
+                        y = s.y,
+                        "host screen layout"
+                    );
+                }
+            } else if let Some(cfg) = decode::<StreamConfig>(ty, &body)
+                .ok()
+                .filter(|c| c.stream != 0)
+            {
+                tracing::info!(stream = cfg.stream, epoch = cfg.epoch, mode = ?cfg.mode, codec = cfg.codec, "screen stream config");
+            }
+        }
+    });
 }
 
 /// `--remode`: after a delay, ask the host to switch modes on the still-open control stream.
@@ -1069,10 +1143,11 @@ fn spawn_remode(mut rs: CtlTx, mut rr: CtlRx, new_mode: Mode, after_secs: u32) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(after_secs as u64)).await;
         tracing::info!(?new_mode, "requesting mid-stream mode switch");
-        if v2io::send(&mut rs, &Reconfigure { mode: new_mode })
-            .await
-            .is_err()
-        {
+        let ask = Reconfigure {
+            mode: new_mode,
+            exclude_codecs: 0,
+        };
+        if v2io::send(&mut rs, &ask).await.is_err() {
             tracing::error!("Reconfigure write failed");
             return;
         }
@@ -1343,7 +1418,7 @@ fn spawn_loss_relay(conn: quinn::Connection, ls: CtlTx, counters: &Arc<Counters>
         let send = |fb: Feedback| conn.send_datagram(fb.encode().into()).is_ok();
         let mut last_report = std::time::Instant::now();
         let mut last_dropped = 0u64;
-        let mut loss_ppm = 0u32;
+        let (mut loss_ppm, mut dead_ppm) = (0u32, 0u32);
         let (mut window, mut ask) = (0u32, 0u16);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1366,14 +1441,17 @@ fn spawn_loss_relay(conn: quinn::Connection, ls: CtlTx, counters: &Arc<Counters>
                 last_report = std::time::Instant::now();
                 // A window without a fresh loss sample repeats the last: what a dead data
                 // plane looks like is the delivery count standing still, not a silent window.
-                let v = c.loss_ppm.swap(u32::MAX, Relaxed);
+                let v = c
+                    .loss_ppm
+                    .swap(u32::MAX, std::sync::atomic::Ordering::Acquire);
                 if v != u32::MAX {
-                    loss_ppm = v;
+                    (loss_ppm, dead_ppm) = (v, c.dead_ppm.load(Relaxed));
                 }
                 window = window.wrapping_add(1).max(1);
                 let fb = Feedback {
                     window,
                     loss_ppm,
+                    dead_ppm,
                     packets_received: c.rx_wire_packets.load(Relaxed),
                     link_kbps,
                     ..Default::default()
@@ -1565,6 +1643,45 @@ fn spawn_touch_test(conn: &Wire, mode: Mode) {
 /// DualSense), then drive its touchpad (drag a finger across) + motion (gyro wobble) over the
 /// 0xCC plane. Proves the rich client→host path; the 0xCD feedback is logged by the receive
 /// loop below. Requires the host on the DualSense backend (`PUNKTFUNK_GAMEPAD=dualsense`).
+/// Pad 0 as a player holds it: every stick and trigger moves each frame and A taps once a
+/// second, as `GamepadState` snapshots. RT counts frames, so a reader can tell lost from late.
+fn spawn_pad_soak(conn: &Wire, secs: u64, hz: u32) {
+    let conn2 = conn.clone();
+    tokio::spawn(async move {
+        use punktfunk_core::input::{gamepad::BTN_A, GamepadSnapshot};
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tracing::info!(secs, hz, "pad-soak: driving pad 0");
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_micros(1_000_000 / u64::from(hz)));
+        let t0 = std::time::Instant::now();
+        let (mut seq, mut sent) = (0u8, 0u64);
+        while t0.elapsed().as_secs() < secs {
+            tick.tick().await;
+            let t = t0.elapsed().as_secs_f64();
+            let w = std::f64::consts::TAU * t;
+            let stick = |x: f64| (30000.0 * x) as i16;
+            seq = seq.wrapping_add(1);
+            let snap = GamepadSnapshot {
+                pad: 0,
+                seq,
+                buttons: if t % 1.0 < 0.1 { BTN_A } else { 0 },
+                left_trigger: (127.0 + 127.0 * (w / 0.7).sin()) as u8,
+                right_trigger: sent as u8,
+                ls_x: stick((w / 2.0).sin()),
+                ls_y: stick((w / 1.7).cos()),
+                rs_x: stick((w / 1.3).sin()),
+                rs_y: stick((w / 0.9).cos()),
+            };
+            let _ = conn2.send_datagram(snap.to_event().encode().to_vec());
+            sent += 1;
+            if sent % (u64::from(hz) * 10) == 0 {
+                tracing::info!(sent, "pad-soak: snapshots sent");
+            }
+        }
+        tracing::info!(sent, "pad-soak: done");
+    });
+}
+
 fn spawn_rich_input_test(conn: &Wire) {
     let conn2 = conn.clone();
     tokio::spawn(async move {
@@ -1656,6 +1773,348 @@ fn spawn_pad_audio_test(conn: &Wire, pads: u8) {
 /// Host→client datagrams: count Opus audio + rumble (playback is the platform clients'
 /// job; here we verify the planes flow), decode the audio, and forward per-AU host timings
 /// to the data plane.
+/// One datagram off the side planes, by its kind byte. A PCM datagram is audio only on a
+/// lossless session: the RESOLVED codec off the Welcome, never what was asked for, since a
+/// probe that assumed its own request would mis-parse what it was actually sent.
+enum SideDatagram<'a> {
+    PadAudio(punktfunk_core::quic::PadAudioFrame),
+    Pcm(&'a [u8]),
+    Opus(&'a [u8]),
+    Rumble(punktfunk_core::quic::RumbleUpdate),
+    HdrMeta(punktfunk_core::quic::HdrMeta),
+    Hid(punktfunk_core::quic::HidOutput),
+    HostTiming(punktfunk_core::quic::HostTiming),
+    Other,
+}
+
+fn classify_side_datagram(d: &[u8], lossless: bool) -> SideDatagram<'_> {
+    use punktfunk_core::quic as q;
+    if let Some(frame) = q::decode_pad_audio_datagram(d) {
+        return SideDatagram::PadAudio(frame);
+    }
+    if lossless {
+        if let Some((_, _, pcm)) = q::decode_audio_pcm_datagram(d) {
+            return SideDatagram::Pcm(pcm);
+        }
+    }
+    if let Some((_, _, opus)) = q::decode_audio_datagram(d) {
+        SideDatagram::Opus(opus)
+    } else if let Some(u) = q::decode_rumble_envelope(d) {
+        SideDatagram::Rumble(u)
+    } else if let Some(meta) = q::decode_hdr_meta_datagram(d) {
+        SideDatagram::HdrMeta(meta)
+    } else if let Some(hid) = q::HidOutput::decode(d) {
+        SideDatagram::Hid(hid)
+    } else if let Some(t) = q::decode_host_timing_datagram(d) {
+        SideDatagram::HostTiming(t)
+    } else {
+        SideDatagram::Other
+    }
+}
+
+/// The probe's audio decode on the host-RESOLVED layout, so it decodes the surround stream
+/// it was sent (the headless validator for the encode path), written raw interleaved f32 LE
+/// to `--audio-out` when asked: the rate and channel count are on the stats line and in the
+/// log. The first decoded frame is logged so a loopback test can assert surround decoded.
+struct AudioTap {
+    channels: u8,
+    rate_hz: u32,
+    bits: u8,
+    dec: Option<opus::MSDecoder>,
+    pcm: Vec<f32>,
+    lossless_pcm: Vec<f32>,
+    logged: bool,
+    out: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl AudioTap {
+    fn new(
+        channels: u8,
+        rate_hz: u32,
+        bits: u8,
+        lossless: bool,
+        layout_wire: u8,
+        out_path: Option<&str>,
+    ) -> AudioTap {
+        let audio_layout =
+            punktfunk_core::audio::AudioLayout::from_wire(layout_wire).unwrap_or_default();
+        let layout = punktfunk_core::audio::layout_for(channels, audio_layout);
+        let dec = (!lossless)
+            .then(|| {
+                opus::MSDecoder::new(48_000, layout.streams, layout.coupled, layout.mapping).ok()
+            })
+            .flatten();
+        let out = out_path.and_then(|p| {
+            std::fs::File::create(p)
+                .map(std::io::BufWriter::new)
+                .map_err(|e| tracing::error!(path = p, error = %e, "--audio-out did not open"))
+                .ok()
+        });
+        AudioTap {
+            channels,
+            rate_hz,
+            bits,
+            dec,
+            pcm: vec![0f32; 5760 * channels as usize],
+            lossless_pcm: Vec::new(),
+            logged: false,
+            out,
+        }
+    }
+
+    /// A lossless PCM datagram (0xD3), at the Welcome's bit depth.
+    fn pcm(&mut self, wire: &[u8]) {
+        if punktfunk_core::audio::pcm::to_f32(wire, self.bits, &mut self.lossless_pcm).is_none() {
+            return;
+        }
+        if !self.logged {
+            self.logged = true;
+            tracing::info!(
+                channels = self.channels,
+                rate_hz = self.rate_hz,
+                bits = self.bits,
+                samples_per_channel = self.lossless_pcm.len() / self.channels.max(1) as usize,
+                "audio decoded (lossless PCM, 0xD3)"
+            );
+        }
+        Self::write(&mut self.out, &self.lossless_pcm);
+    }
+
+    /// An Opus multistream datagram, decoded and validated: the per-channel sample count must
+    /// be a legal Opus frame size.
+    fn opus(&mut self, opus: &[u8]) {
+        let Some(dec) = self.dec.as_mut() else {
+            return;
+        };
+        match dec.decode_float(opus, &mut self.pcm, false) {
+            Ok(samples) => {
+                if !self.logged {
+                    self.logged = true;
+                    tracing::info!(
+                        channels = self.channels,
+                        samples_per_channel = samples,
+                        "audio decoded (Opus multistream)"
+                    );
+                }
+                Self::write(&mut self.out, &self.pcm[..samples * self.channels as usize]);
+            }
+            Err(e) => tracing::debug!(error = %e, "probe audio decode"),
+        }
+    }
+
+    fn write(out: &mut Option<std::io::BufWriter<std::fs::File>>, samples: &[f32]) {
+        if let Some(f) = out.as_mut() {
+            let mut bytes = Vec::with_capacity(samples.len() * 4);
+            for s in samples {
+                bytes.extend_from_slice(&s.to_le_bytes());
+            }
+            let _ = std::io::Write::write_all(f, &bytes);
+        }
+    }
+}
+
+/// capture→received in µs: our receive instant in the host clock (`now_ns + offset_ns`)
+/// minus the host's capture pts. None when the pts is not in our past or the two clocks are
+/// ten seconds or more apart: the offset is 0 same-host or against an old host, and such a
+/// sample is only noise.
+fn capture_latency_us(now_ns: u64, offset_ns: i64, pts_ns: u64) -> Option<u64> {
+    let lat = (now_ns as i128 + offset_ns as i128 - pts_ns as i128).max(0) as u64;
+    (lat > 0 && lat < 10_000_000_000).then_some(lat / 1000)
+}
+
+/// When the receive loop ends: every expected frame checked, the peer closed and quiet for
+/// 300 ms, the `--seconds` cap (120 s by default), or 45 s with no frame.
+fn stream_over(
+    expected: u32,
+    checked: u32,
+    closed: bool,
+    since_rx: std::time::Duration,
+    since_start: std::time::Duration,
+    cap_secs: u64,
+) -> bool {
+    (expected > 0 && checked >= expected)
+        || (closed && since_rx > std::time::Duration::from_millis(300))
+        || since_start > std::time::Duration::from_secs(cap_secs)
+        || since_rx > std::time::Duration::from_secs(45)
+}
+
+/// The host/network split from the per-AU 0xCF timings (design/stats-unification.md Phase
+/// 2): host = the host's own capture→sent, network = capture→received minus it, tiled per
+/// frame. Received AUs wait here for their timing, bounded, since an old host sends none.
+/// The T0.1 stage tail (queue, encode, pace and the derived seal/xfer residual) stays empty
+/// against a host that predates it.
+#[derive(Default)]
+struct LatencySplit {
+    pending: std::collections::VecDeque<(u64, u64)>,
+    host_us: Vec<u64>,
+    net_us: Vec<u64>,
+    queue_us: Vec<u64>,
+    enc_us: Vec<u64>,
+    xfer_us: Vec<u64>,
+    pace_us: Vec<u64>,
+}
+
+impl LatencySplit {
+    fn received(&mut self, pts_ns: u64, lat_us: u64) {
+        self.pending.push_back((pts_ns, lat_us));
+        if self.pending.len() > 1024 {
+            self.pending.pop_front();
+        }
+    }
+
+    fn host_timing(&mut self, t: punktfunk_core::quic::HostTiming) {
+        let Some(i) = self.pending.iter().position(|(p, _)| *p == t.pts_ns) else {
+            return;
+        };
+        let (_, hostnet_us) = self.pending.remove(i).unwrap();
+        self.host_us.push(t.host_us as u64);
+        self.net_us
+            .push(hostnet_us.saturating_sub(t.host_us as u64));
+        if let Some(s) = t.stages {
+            self.queue_us.push(s.queue_us as u64);
+            self.enc_us.push(s.encode_us as u64);
+            self.pace_us.push(s.pace_us as u64);
+            self.xfer_us.push(
+                (t.host_us as u64)
+                    .saturating_sub(s.queue_us as u64 + s.encode_us as u64 + s.pace_us as u64),
+            );
+        }
+    }
+
+    fn report(&mut self) {
+        if self.host_us.is_empty() {
+            tracing::info!("no host timing datagrams (0xCF) — old host; host+network unsplit");
+            return;
+        }
+        tracing::info!(
+            timing_samples = self.host_us.len(),
+            host_p50_us = percentile(&mut self.host_us, 0.50),
+            host_p95_us = percentile(&mut self.host_us, 0.95),
+            net_p50_us = percentile(&mut self.net_us, 0.50),
+            net_p95_us = percentile(&mut self.net_us, 0.95),
+            "host/network latency split (host = capture→sent on the host; network = wire + \
+             reassembly)"
+        );
+        if self.queue_us.is_empty() {
+            return;
+        }
+        // The T0.1 per-stage host attribution: queue (capture→submit) → encode
+        // (submit→bitstream) → xfer (seal/FEC + send-channel wait, derived residual)
+        // → pace (the microburst spread). The four tile host_us per frame.
+        tracing::info!(
+            stage_samples = self.queue_us.len(),
+            queue_p50_us = percentile(&mut self.queue_us, 0.50),
+            queue_p95_us = percentile(&mut self.queue_us, 0.95),
+            encode_p50_us = percentile(&mut self.enc_us, 0.50),
+            encode_p95_us = percentile(&mut self.enc_us, 0.95),
+            xfer_p50_us = percentile(&mut self.xfer_us, 0.50),
+            xfer_p95_us = percentile(&mut self.xfer_us, 0.95),
+            pace_p50_us = percentile(&mut self.pace_us, 0.50),
+            pace_p95_us = percentile(&mut self.pace_us, 0.95),
+            "host stage split (queue → encode → xfer → pace tile the host figure)"
+        );
+    }
+}
+
+/// Packet-level receive counters mirrored for the speed-test reporter (it reads their
+/// delta), and the adaptive-FEC loss window: a fresh windowed estimate for the loss relay
+/// every 750 ms.
+struct StatsMirror {
+    last_report: std::time::Instant,
+    /// The counters the last loss window closed on.
+    at: punktfunk_core::stats::Stats,
+}
+
+impl StatsMirror {
+    fn publish(&mut self, session: &Session, counters: &Counters) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = session.stats();
+        counters.rx_wire_packets.store(s.packets_received, Relaxed);
+        counters.rx_wire_bytes.store(s.bytes_received, Relaxed);
+        counters.dropped_frames.store(s.frames_dropped, Relaxed);
+        if self.last_report.elapsed() < std::time::Duration::from_millis(750) {
+            return;
+        }
+        let at = std::mem::replace(&mut self.at, s);
+        let (loss_ppm, dead_ppm) = window_report_ppm(
+            s.fec_recovered_shards.wrapping_sub(at.fec_recovered_shards),
+            s.fec_late_shards.wrapping_sub(at.fec_late_shards),
+            s.partial_shards_lost.wrapping_sub(at.partial_shards_lost),
+            s.dead_shards_lost.wrapping_sub(at.dead_shards_lost),
+            s.packets_received.wrapping_sub(at.packets_received),
+        );
+        // Released by the `loss_ppm` store, which the relay acquires before it reads this.
+        counters.dead_ppm.store(dead_ppm, Relaxed);
+        counters
+            .loss_ppm
+            .store(loss_ppm, std::sync::atomic::Ordering::Release);
+        self.last_report = std::time::Instant::now();
+    }
+}
+
+/// The video AUs this run took: counted and, in verification mode, checked against the
+/// deterministic test pattern, else written to `--out`.
+struct VideoTally {
+    ok: u32,
+    mismatched: u32,
+    bytes: u64,
+    sink: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl VideoTally {
+    /// A frame under four bytes carries no index and checks as zeros.
+    fn note(&mut self, data: &[u8], expected: u32) -> Result<()> {
+        self.bytes += data.len() as u64;
+        if expected == 0 {
+            self.ok += 1;
+            if let Some(s) = self.sink.as_mut() {
+                s.write_all(data).context("write AU")?;
+            }
+            return Ok(());
+        }
+        let idx = data.first_chunk().map_or(0, |b| u32::from_le_bytes(*b));
+        if data == test_frame(idx, data.len()) {
+            self.ok += 1;
+        } else {
+            self.mismatched += 1;
+        }
+        Ok(())
+    }
+
+    fn checked(&self) -> u32 {
+        self.ok + self.mismatched
+    }
+}
+
+/// PUNKTFUNK_PERF: the cumulative receive-path stage split for the whole run — where the
+/// receive core's time went (kernel drain vs AES-GCM open vs reassembly+FEC), the
+/// measurement tool's view of the client-pump wall.
+fn report_pump_perf(session: &mut Session) {
+    let Some(p) = session.take_pump_perf() else {
+        return;
+    };
+    let per_pkt = |ns: u64| ns.checked_div(p.packets).unwrap_or(0);
+    tracing::info!(
+        recv_ms = p.recv_ns / 1_000_000,
+        decrypt_ms = p.decrypt_ns / 1_000_000,
+        reasm_ms = p.reasm_ns / 1_000_000,
+        packets = p.packets,
+        pkts_per_batch = p.packets.checked_div(p.batches.max(1)).unwrap_or(0),
+        decrypt_ns_pkt = per_pkt(p.decrypt_ns),
+        reasm_ns_pkt = per_pkt(p.reasm_ns),
+        "receive stage split (whole run, PUNKTFUNK_PERF)"
+    );
+}
+
+/// The `p`-th percentile of `v`, which it sorts in place; 0 when empty.
+fn percentile(v: &mut [u64], p: f64) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    v.sort_unstable();
+    v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
+}
+
 fn spawn_datagram_rx(
     conn: &Wire,
     welcome: &Welcome,
@@ -1666,149 +2125,173 @@ fn spawn_datagram_rx(
     let c = counters.clone();
     let ht_tx = host_timing_tx;
     let conn2 = conn.clone();
-    // Build a multistream decoder for the host-RESOLVED layout so the probe actually decodes
-    // the surround stream (not just counts bytes) — the headless validator for the encode path.
-    let audio_channels = welcome.audio_channels;
-    // The RESOLVED format, off the Welcome — never what was asked for. The host may decline
-    // hi-res for any of the reasons in §8.4 and answer Opus, and a probe that assumed its own
-    // request would then mis-parse every datagram it was actually sent.
-    let audio_codec = welcome.audio_codec;
-    let audio_rate_hz = welcome.audio_rate_hz;
-    let audio_bits = welcome.audio_bits;
-    let audio_layout =
-        punktfunk_core::audio::AudioLayout::from_wire(welcome.audio_layout).unwrap_or_default();
+    let (channels, rate_hz, bits) = (
+        welcome.audio_channels,
+        welcome.audio_rate_hz,
+        welcome.audio_bits,
+    );
+    let lossless = welcome.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM;
+    let layout_wire = welcome.audio_layout;
     tokio::spawn(async move {
         use std::sync::atomic::Ordering::Relaxed;
         let mut hdr_logged = false;
         let mut rumble_logged = false;
-        let lossless = audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM;
-        let layout = punktfunk_core::audio::layout_for(audio_channels, audio_layout);
-        let mut audio_dec = (!lossless)
-            .then(|| {
-                opus::MSDecoder::new(48_000, layout.streams, layout.coupled, layout.mapping).ok()
-            })
-            .flatten();
-        let mut pcm = vec![0f32; 5760 * audio_channels as usize];
-        let mut lossless_pcm: Vec<f32> = Vec::new();
-        let mut audio_decoded_logged = false;
-        let mut audio_out = audio_out_path.as_deref().and_then(|p| {
-            std::fs::File::create(p)
-                .map(std::io::BufWriter::new)
-                .map_err(|e| tracing::error!(path = p, error = %e, "--audio-out did not open"))
-                .ok()
-        });
-        // Raw interleaved f32 LE, so the reader needs no container — the rate and channel
-        // count are on the stats line and in this log.
-        let write_pcm = move |samples: &[f32], w: &mut Option<_>| {
-            if let Some(f) = w.as_mut() {
-                let mut bytes = Vec::with_capacity(samples.len() * 4);
-                for s in samples {
-                    bytes.extend_from_slice(&s.to_le_bytes());
-                }
-                let _ = std::io::Write::write_all(f, &bytes);
-            }
-        };
+        let mut audio = AudioTap::new(
+            channels,
+            rate_hz,
+            bits,
+            lossless,
+            layout_wire,
+            audio_out_path.as_deref(),
+        );
         while let Ok(d) = conn2.read_datagram().await {
-            if let Some(frame) = punktfunk_core::quic::decode_pad_audio_datagram(&d) {
-                if let Some(lane) = c
-                    .pad_audio_pkts
-                    .get(usize::from(frame.pad))
-                    .and_then(|pad| pad.get(usize::from(frame.kind)))
-                {
-                    lane.fetch_add(1, Relaxed);
+            match classify_side_datagram(&d, lossless) {
+                SideDatagram::PadAudio(frame) => {
+                    if let Some(lane) = c
+                        .pad_audio_pkts
+                        .get(usize::from(frame.pad))
+                        .and_then(|pad| pad.get(usize::from(frame.kind)))
+                    {
+                        lane.fetch_add(1, Relaxed);
+                    }
+                    if !frame.opus.is_empty() {
+                        c.pad_audio_voiced.fetch_add(1, Relaxed);
+                    }
                 }
-                if !frame.opus.is_empty() {
-                    c.pad_audio_voiced.fetch_add(1, Relaxed);
+                SideDatagram::Pcm(wire) => {
+                    c.audio_pkts.fetch_add(1, Relaxed);
+                    c.audio_bytes.fetch_add(wire.len() as u64, Relaxed);
+                    audio.pcm(wire);
                 }
-                continue;
-            }
-            if let Some((_, _, pcm_wire)) =
-                punktfunk_core::quic::decode_audio_pcm_datagram(&d).filter(|_| lossless)
-            {
-                c.audio_pkts.fetch_add(1, Relaxed);
-                c.audio_bytes.fetch_add(pcm_wire.len() as u64, Relaxed);
-                if punktfunk_core::audio::pcm::to_f32(pcm_wire, audio_bits, &mut lossless_pcm)
-                    .is_some()
-                {
-                    if !audio_decoded_logged {
-                        audio_decoded_logged = true;
+                SideDatagram::Opus(opus) => {
+                    c.audio_pkts.fetch_add(1, Relaxed);
+                    c.audio_bytes.fetch_add(opus.len() as u64, Relaxed);
+                    audio.opus(opus);
+                }
+                SideDatagram::Rumble(u) => {
+                    // Log the first rumble so a loopback test can see the self-terminating v2
+                    // envelope tail (seq + TTL) arrived, not just the level. `lt`/`rt` are the v3
+                    // impulse-trigger levels, printed beside the envelope: the wire-leg check for
+                    // trigger rumble is "non-zero lt/rt AND the envelope still present".
+                    if !rumble_logged {
+                        rumble_logged = true;
                         tracing::info!(
-                            channels = audio_channels,
-                            rate_hz = audio_rate_hz,
-                            bits = audio_bits,
-                            samples_per_channel =
-                                lossless_pcm.len() / audio_channels.max(1) as usize,
-                            "audio decoded (lossless PCM, 0xD3)"
+                            pad = u.pad,
+                            low = u.low,
+                            high = u.high,
+                            lt = u.left_trigger,
+                            rt = u.right_trigger,
+                            envelope = ?u.envelope,
+                            "rumble (0xCA)"
                         );
                     }
-                    write_pcm(&lossless_pcm, &mut audio_out);
+                    // A v2 tail was present: the seq/ttl contract check for
+                    // PUNKTFUNK_TEST_FEEDBACK, asserted at report time.
+                    if u.envelope.is_some() {
+                        c.saw_v2_rumble.store(true, Relaxed);
+                    }
+                    c.rumble_pkts.fetch_add(1, Relaxed);
                 }
-            } else if let Some((_, _, opus)) = punktfunk_core::quic::decode_audio_datagram(&d) {
-                c.audio_pkts.fetch_add(1, Relaxed);
-                c.audio_bytes.fetch_add(opus.len() as u64, Relaxed);
-                // Decode + validate: the per-channel sample count must be a legal Opus frame
-                // size; log the first success so a loopback test can assert surround decoded.
-                if let Some(dec) = audio_dec.as_mut() {
-                    match dec.decode_float(opus, &mut pcm, false) {
-                        Ok(samples) if !audio_decoded_logged => {
-                            audio_decoded_logged = true;
-                            tracing::info!(
-                                channels = audio_channels,
-                                samples_per_channel = samples,
-                                "audio decoded (Opus multistream)"
-                            );
-                            write_pcm(&pcm[..samples * audio_channels as usize], &mut audio_out);
-                        }
-                        Ok(samples) => {
-                            write_pcm(&pcm[..samples * audio_channels as usize], &mut audio_out)
-                        }
-                        Err(e) => tracing::debug!(error = %e, "probe audio decode"),
+                SideDatagram::HdrMeta(meta) => {
+                    // Logged once so a loopback test can assert the host sent it for an HDR session.
+                    if !hdr_logged {
+                        hdr_logged = true;
+                        tracing::info!(?meta, "HDR static metadata (0xCE)");
                     }
                 }
-            } else if let Some(u) = punktfunk_core::quic::decode_rumble_envelope(&d) {
-                // Log the first rumble so a loopback test can see the self-terminating v2
-                // envelope tail (seq + TTL) arrived, not just the level. `lt`/`rt` are the v3
-                // impulse-trigger levels: printed beside the envelope because the wire-leg
-                // check for trigger rumble is exactly "non-zero lt/rt AND the envelope still
-                // present" — i.e. the trigger tail did not displace the seq/TTL tail.
-                if !rumble_logged {
-                    rumble_logged = true;
-                    tracing::info!(
-                        pad = u.pad,
-                        low = u.low,
-                        high = u.high,
-                        lt = u.left_trigger,
-                        rt = u.right_trigger,
-                        envelope = ?u.envelope,
-                        "rumble (0xCA)"
-                    );
+                SideDatagram::Hid(hid) => {
+                    // The DualSense feedback plane (lightbar / player LEDs / adaptive triggers):
+                    // the first few logged so a playtest can see them arrive without spam.
+                    if c.hidout_pkts.fetch_add(1, Relaxed) < 12 {
+                        tracing::info!(?hid, "DualSense HID output (0xCD)");
+                    }
                 }
-                // Record that a v2 tail was present — the Rust-side seq/ttl contract check for
-                // PUNKTFUNK_TEST_FEEDBACK (asserted at report time).
-                if u.envelope.is_some() {
-                    c.saw_v2_rumble.store(true, Relaxed);
+                // Per-AU host timing (0xCF), to the stream loop for the host/network split.
+                SideDatagram::HostTiming(t) => {
+                    let _ = ht_tx.try_send(t);
                 }
-                c.rumble_pkts.fetch_add(1, Relaxed);
-            } else if let Some(meta) = punktfunk_core::quic::decode_hdr_meta_datagram(&d) {
-                // HDR static metadata (0xCE). Log the first receipt so a loopback test can
-                // assert the host sent it for an HDR session.
-                if !hdr_logged {
-                    hdr_logged = true;
-                    tracing::info!(?meta, "HDR static metadata (0xCE)");
-                }
-            } else if let Some(hid) = punktfunk_core::quic::HidOutput::decode(&d) {
-                // The DualSense feedback plane (lightbar / player LEDs / adaptive triggers).
-                // Log the first few so a playtest can see triggers/LEDs arrive without spam.
-                if c.hidout_pkts.fetch_add(1, Relaxed) < 12 {
-                    tracing::info!(?hid, "DualSense HID output (0xCD)");
-                }
-            } else if let Some(t) = punktfunk_core::quic::decode_host_timing_datagram(&d) {
-                // Per-AU host timing (0xCF) — forwarded to the stream loop for the
-                // host/network latency split.
-                let _ = ht_tx.try_send(t);
+                SideDatagram::Other => {}
             }
         }
     });
+}
+
+/// Frames of the screens past the first, per stream: counted, written beside `--out`, and a
+/// keyframe asked on the first frame after a gap.
+#[derive(Default)]
+struct ScreenTally {
+    streams: std::collections::BTreeMap<u8, StreamTally>,
+}
+
+#[derive(Default)]
+struct StreamTally {
+    frames: u32,
+    keyframes: u32,
+    gaps: u32,
+    last_index: Option<u32>,
+    asks: u16,
+    bytes: u64,
+    sink: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl ScreenTally {
+    fn note(
+        &mut self,
+        frame: &punktfunk_core::session::Frame,
+        out: Option<&str>,
+        asks: Option<&quinn::Connection>,
+    ) -> Result<()> {
+        let t = self.streams.entry(frame.stream).or_default();
+        if t.sink.is_none() {
+            if let Some(path) = out {
+                let path = format!("{path}.s{}", frame.stream);
+                let file =
+                    std::fs::File::create(&path).with_context(|| format!("create {path}"))?;
+                t.sink = Some(std::io::BufWriter::new(file));
+            }
+        }
+        let gap = t
+            .last_index
+            .is_some_and(|last| frame.frame_index.wrapping_sub(last) != 1);
+        t.last_index = Some(frame.frame_index);
+        let key = frame.flags & u32::from(punktfunk_core::packet::FLAG_SOF) != 0;
+        if gap && !key {
+            t.gaps += 1;
+            t.asks = t.asks.wrapping_add(1).max(1);
+            let fb = Feedback {
+                stream: frame.stream,
+                ask: t.asks,
+                keyframe: true,
+                ..Default::default()
+            };
+            if let Some(conn) = asks {
+                let _ = conn.send_datagram(fb.encode().into());
+            }
+        }
+        t.frames += 1;
+        t.keyframes += u32::from(key);
+        t.bytes += frame.data.len() as u64;
+        if let Some(s) = t.sink.as_mut() {
+            s.write_all(&frame.data).context("write screen AU")?;
+        }
+        Ok(())
+    }
+
+    fn report(&mut self) {
+        for (stream, t) in &mut self.streams {
+            if let Some(s) = t.sink.as_mut() {
+                s.flush().ok();
+            }
+            tracing::info!(
+                stream,
+                frames = t.frames,
+                keyframes = t.keyframes,
+                gaps = t.gaps,
+                mb = t.bytes / 1_000_000,
+                "screen stream complete"
+            );
+        }
+    }
 }
 
 /// The data plane, on a blocking thread (native threads only on the frame path): receives
@@ -1826,233 +2309,122 @@ fn data_plane(
     clock_offset_ns: Option<i64>,
     counters: Arc<Counters>,
     host_timing_rx: std::sync::mpsc::Receiver<punktfunk_core::quic::HostTiming>,
+    // Some when the host took screens: further screens' keyframe asks leave here.
+    screen_asks: Option<quinn::Connection>,
 ) -> Result<()> {
     let cfg = welcome.session_config(Role::Client);
     let expected = welcome.frames;
-    // Express our receive time in the host clock before differencing against the host-stamped
-    // capture pts. 0 ⇒ same-host or an old host that didn't answer the skew handshake (the latency
-    // is then only valid same-host, as before).
+    // Our receive time in the host clock before differencing against the host-stamped capture
+    // pts. 0 ⇒ same-host or an old host that didn't answer the skew handshake (the latency is
+    // then only valid same-host, as before).
     let clock_offset = clock_offset_ns.unwrap_or(0);
     let skew_corrected = clock_offset_ns.is_some();
     let mut session =
         Session::new(cfg, media, Box::new(shared)).map_err(|e| anyhow!("client session: {e:?}"))?;
-    let mut sink = match &out_path {
+    session.set_screens(screen_asks.is_some());
+    let mut screens = ScreenTally::default();
+    let sink = match &out_path {
         Some(p) => Some(std::io::BufWriter::new(
             std::fs::File::create(p).with_context(|| format!("create {p}"))?,
         )),
         None => None,
     };
 
-    let mut ok = 0u32;
-    let mut mismatched = 0u32;
-    let mut bytes = 0u64;
+    let mut video = VideoTally {
+        ok: 0,
+        mismatched: 0,
+        bytes: 0,
+        sink,
+    };
     let mut latencies_us: Vec<u64> = Vec::new();
-    // Host/network split: received AUs awaiting their 0xCF host timing (pts → capture→received
-    // µs), matched as the datagrams arrive. Bounded — an old host never sends any.
-    let mut pending_split: std::collections::VecDeque<(u64, u64)> =
-        std::collections::VecDeque::new();
-    let mut host_us_v: Vec<u64> = Vec::new();
-    let mut net_us_v: Vec<u64> = Vec::new();
-    // T0.1 host-stage split (extended 0xCF): queue/encode/pace + the derived seal/xfer
-    // residual. Empty against a host that predates the stage tail.
-    let mut queue_us_v: Vec<u64> = Vec::new();
-    let mut enc_us_v: Vec<u64> = Vec::new();
-    let mut xfer_us_v: Vec<u64> = Vec::new();
-    let mut pace_us_v: Vec<u64> = Vec::new();
+    let mut split = LatencySplit::default();
     let mut last_rx = std::time::Instant::now();
     let started = std::time::Instant::now();
     // Stream-duration cap: `--seconds N`, else the 120s default. Ending the loop here reaches the
     // graceful `conn.close` below (with the deliberate-quit code if `--quit`).
     let cap_secs = seconds.unwrap_or(120);
-    // Adaptive-FEC loss window: publish a fresh estimate every 750 ms for the loss relay.
-    let mut last_loss_report = std::time::Instant::now();
-    let (mut last_recovered, mut last_late, mut last_received) = (0u64, 0u64, 0u64);
+    let mut mirror = StatsMirror {
+        last_report: started,
+        at: Default::default(),
+    };
     loop {
-        // Mirror packet-level receive counters for the speed-test reporter (reads their delta),
-        // and publish a windowed loss estimate for the loss relay.
-        {
-            use std::sync::atomic::Ordering::Relaxed;
-            let s = session.stats();
-            counters.rx_wire_packets.store(s.packets_received, Relaxed);
-            counters.rx_wire_bytes.store(s.bytes_received, Relaxed);
-            counters.dropped_frames.store(s.frames_dropped, Relaxed);
-            if last_loss_report.elapsed() >= std::time::Duration::from_millis(750) {
-                counters.loss_ppm.store(
-                    window_loss_ppm(
-                        s.fec_recovered_shards.wrapping_sub(last_recovered),
-                        s.fec_late_shards.wrapping_sub(last_late),
-                        s.packets_received.wrapping_sub(last_received),
-                    ),
-                    Relaxed,
-                );
-                last_loss_report = std::time::Instant::now();
-                last_recovered = s.fec_recovered_shards;
-                last_late = s.fec_late_shards;
-                last_received = s.packets_received;
-            }
-        }
-        if expected > 0 && ok + mismatched >= expected {
+        mirror.publish(&session, &counters);
+        if stream_over(
+            expected,
+            video.checked(),
+            counters.closed.load(std::sync::atomic::Ordering::SeqCst),
+            last_rx.elapsed(),
+            started.elapsed(),
+            cap_secs,
+        ) {
             break;
         }
-        if counters.closed.load(std::sync::atomic::Ordering::SeqCst)
-            && last_rx.elapsed() > std::time::Duration::from_millis(300)
-        {
-            break;
-        }
-        if started.elapsed() > std::time::Duration::from_secs(cap_secs)
-            || last_rx.elapsed() > std::time::Duration::from_secs(45)
-        {
-            break;
-        }
-        match session.poll_frame() {
-            Ok(frame) => {
-                last_rx = std::time::Instant::now();
-                // Speed-test filler isn't video: it's measured via the packet-level counters
-                // mirrored at the loop head — skip verification / the --out sink.
-                if frame.flags & FLAG_PROBE as u32 != 0 {
-                    continue;
-                }
-                bytes += frame.data.len() as u64;
-                // capture→received: our receive instant in the host clock (now + offset)
-                // minus the host's capture pts. offset is 0 same-host / old host.
-                let lat = (punktfunk_core::quic::wall_clock_ns() as i128 + clock_offset as i128
-                    - frame.pts_ns as i128)
-                    .max(0) as u64;
-                if lat > 0 && lat < 10_000_000_000 {
-                    latencies_us.push(lat / 1000);
-                    pending_split.push_back((frame.pts_ns, lat / 1000));
-                    if pending_split.len() > 1024 {
-                        pending_split.pop_front();
-                    }
-                }
-                // Match any host timings (0xCF) that have arrived: host = the reported
-                // capture→sent, network = our capture→received minus it (per-frame tiling).
-                while let Ok(t) = host_timing_rx.try_recv() {
-                    if let Some(i) = pending_split.iter().position(|(p, _)| *p == t.pts_ns) {
-                        let (_, hostnet_us) = pending_split.remove(i).unwrap();
-                        host_us_v.push(t.host_us as u64);
-                        net_us_v.push(hostnet_us.saturating_sub(t.host_us as u64));
-                        if let Some(s) = t.stages {
-                            queue_us_v.push(s.queue_us as u64);
-                            enc_us_v.push(s.encode_us as u64);
-                            pace_us_v.push(s.pace_us as u64);
-                            xfer_us_v.push((t.host_us as u64).saturating_sub(
-                                s.queue_us as u64 + s.encode_us as u64 + s.pace_us as u64,
-                            ));
-                        }
-                    }
-                }
-                if expected > 0 {
-                    // Verification mode: deterministic content. A frame under four bytes
-                    // carries no index and checks as zeros.
-                    let idx = frame
-                        .data
-                        .first_chunk()
-                        .map_or(0, |b| u32::from_le_bytes(*b));
-                    if frame.data == test_frame(idx, frame.data.len()) {
-                        ok += 1;
-                    } else {
-                        mismatched += 1;
-                    }
-                } else {
-                    ok += 1;
-                    if let Some(s) = sink.as_mut() {
-                        s.write_all(&frame.data).context("write AU")?;
-                    }
-                }
-            }
+        let frame = match session.poll_frame() {
+            Ok(frame) => frame,
             Err(PunktfunkError::NoFrame) => {
                 std::thread::sleep(std::time::Duration::from_micros(300));
+                continue;
             }
             Err(e) => return Err(anyhow!("poll_frame: {e:?}")),
+        };
+        last_rx = std::time::Instant::now();
+        // Speed-test filler isn't video: it's measured via the packet-level counters
+        // mirrored at the loop head — skip verification / the --out sink.
+        if frame.flags & FLAG_PROBE as u32 != 0 {
+            continue;
         }
+        if frame.stream != punktfunk_core::packet::V2_STREAM_VIDEO {
+            screens.note(&frame, out_path.as_deref(), screen_asks.as_ref())?;
+            continue;
+        }
+        if let Some(lat) = capture_latency_us(
+            punktfunk_core::quic::wall_clock_ns(),
+            clock_offset,
+            frame.pts_ns,
+        ) {
+            latencies_us.push(lat);
+            split.received(frame.pts_ns, lat);
+        }
+        // Match any host timings (0xCF) that have arrived.
+        while let Ok(t) = host_timing_rx.try_recv() {
+            split.host_timing(t);
+        }
+        video.note(&frame.data, expected)?;
     }
-    if let Some(mut s) = sink {
+    if let Some(mut s) = video.sink.take() {
         s.flush().ok();
     }
+    screens.report();
 
-    // PUNKTFUNK_PERF: cumulative receive-path stage split for the whole run — where the
-    // receive core's time went (kernel drain vs AES-GCM open vs reassembly+FEC). This is
-    // the measurement tool's view of the client-pump wall the 2026-07-14 sweeps pinned.
-    if let Some(p) = session.take_pump_perf() {
-        let per_pkt = |ns: u64| ns.checked_div(p.packets).unwrap_or(0);
-        tracing::info!(
-            recv_ms = p.recv_ns / 1_000_000,
-            decrypt_ms = p.decrypt_ns / 1_000_000,
-            reasm_ms = p.reasm_ns / 1_000_000,
-            packets = p.packets,
-            pkts_per_batch = p.packets.checked_div(p.batches.max(1)).unwrap_or(0),
-            decrypt_ns_pkt = per_pkt(p.decrypt_ns),
-            reasm_ns_pkt = per_pkt(p.reasm_ns),
-            "receive stage split (whole run, PUNKTFUNK_PERF)"
-        );
-    }
+    report_pump_perf(&mut session);
 
-    latencies_us.sort_unstable();
-    let pct = |p: f64| -> u64 {
-        if latencies_us.is_empty() {
-            return 0;
-        }
-        let i = ((latencies_us.len() as f64 * p) as usize).min(latencies_us.len() - 1);
-        latencies_us[i]
-    };
     tracing::info!(
-        frames = ok,
-        mismatched,
-        mb = bytes / 1_000_000,
-        lat_p50_us = pct(0.50),
-        lat_p95_us = pct(0.95),
-        lat_p99_us = pct(0.99),
+        frames = video.ok,
+        mismatched = video.mismatched,
+        mb = video.bytes / 1_000_000,
+        lat_p50_us = percentile(&mut latencies_us, 0.50),
+        lat_p95_us = percentile(&mut latencies_us, 0.95),
+        lat_p99_us = percentile(&mut latencies_us, 0.99),
         lat_max_us = latencies_us.last().copied().unwrap_or(0),
         skew_corrected,
         "stream complete (capture→received latency; skew_corrected=true ⇒ \
          cross-machine valid, false ⇒ same-host clock)"
     );
-    if !host_us_v.is_empty() {
-        // The host/network split from the per-AU 0xCF timings (design/stats-unification.md
-        // Phase 2): host = the host's own capture→sent, network = capture→received minus it.
-        let pcts = |v: &mut Vec<u64>, p: f64| -> u64 {
-            if v.is_empty() {
-                return 0;
-            }
-            v.sort_unstable();
-            v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
-        };
-        tracing::info!(
-            timing_samples = host_us_v.len(),
-            host_p50_us = pcts(&mut host_us_v, 0.50),
-            host_p95_us = pcts(&mut host_us_v, 0.95),
-            net_p50_us = pcts(&mut net_us_v, 0.50),
-            net_p95_us = pcts(&mut net_us_v, 0.95),
-            "host/network latency split (host = capture→sent on the host; network = wire + \
-             reassembly)"
-        );
-        if !queue_us_v.is_empty() {
-            // The T0.1 per-stage host attribution: queue (capture→submit) → encode
-            // (submit→bitstream) → xfer (seal/FEC + send-channel wait, derived residual)
-            // → pace (the microburst spread). The four tile host_us per frame.
-            tracing::info!(
-                stage_samples = queue_us_v.len(),
-                queue_p50_us = pcts(&mut queue_us_v, 0.50),
-                queue_p95_us = pcts(&mut queue_us_v, 0.95),
-                encode_p50_us = pcts(&mut enc_us_v, 0.50),
-                encode_p95_us = pcts(&mut enc_us_v, 0.95),
-                xfer_p50_us = pcts(&mut xfer_us_v, 0.50),
-                xfer_p95_us = pcts(&mut xfer_us_v, 0.95),
-                pace_p50_us = pcts(&mut pace_us_v, 0.50),
-                pace_p95_us = pcts(&mut pace_us_v, 0.95),
-                "host stage split (queue → encode → xfer → pace tile the host figure)"
-            );
-        }
-    } else {
-        tracing::info!("no host timing datagrams (0xCF) — old host; host+network unsplit");
-    }
+    split.report();
     if expected > 0 {
-        anyhow::ensure!(mismatched == 0, "{mismatched} corrupted frames");
-        anyhow::ensure!(ok == expected, "received {ok}/{expected} frames");
+        anyhow::ensure!(
+            video.mismatched == 0,
+            "{} corrupted frames",
+            video.mismatched
+        );
+        anyhow::ensure!(
+            video.ok == expected,
+            "received {}/{expected} frames",
+            video.ok
+        );
         tracing::info!("verification PASSED");
     } else {
-        anyhow::ensure!(ok > 0, "no frames received");
+        anyhow::ensure!(video.ok > 0, "no frames received");
     }
     Ok(())
 }
@@ -2134,5 +2506,130 @@ mod tests {
         follow(&mut a, &to).unwrap();
         assert_eq!(a.connect, "10.0.0.3:9780");
         assert_eq!(a.pin, Some([0xcd; 32]));
+    }
+
+    /// The side planes sort by kind byte, and a PCM datagram is audio only on a lossless session.
+    #[test]
+    fn side_datagrams_sort_by_kind_and_the_welcomes_codec() {
+        use punktfunk_core::quic as q;
+        let pcm = q::encode_audio_pcm_datagram(1, 2, &[0; 8]);
+        assert!(matches!(classify_side_datagram(&pcm, true), SideDatagram::Pcm(b) if b.len() == 8));
+        assert!(
+            matches!(classify_side_datagram(&pcm, false), SideDatagram::Other),
+            "PCM on an Opus session is not audio"
+        );
+        let opus = q::encode_audio_datagram(1, 2, &[1, 2, 3]);
+        assert!(
+            matches!(classify_side_datagram(&opus, true), SideDatagram::Opus(b) if b == [1, 2, 3])
+        );
+        let pad = q::encode_pad_audio_datagram(1, 0, 3, 4, &[9]);
+        assert!(matches!(
+            classify_side_datagram(&pad, false),
+            SideDatagram::PadAudio(f) if f.pad == 1 && f.opus == [9]
+        ));
+        let rumble = q::encode_rumble_datagram_v2(0, 10, 20, 5, 100);
+        assert!(matches!(
+            classify_side_datagram(&rumble, false),
+            SideDatagram::Rumble(u) if u.envelope.is_some()
+        ));
+        let t = q::HostTiming {
+            pts_ns: 7,
+            host_us: 300,
+            stages: None,
+        };
+        assert!(matches!(
+            classify_side_datagram(&q::encode_host_timing_datagram(&t), false),
+            SideDatagram::HostTiming(got) if got.pts_ns == 7
+        ));
+        assert!(matches!(
+            classify_side_datagram(&[], false),
+            SideDatagram::Other
+        ));
+    }
+
+    #[test]
+    fn the_data_plane_decides_its_latency_sample_and_its_end() {
+        assert_eq!(capture_latency_us(2_000_000, 0, 1_000_000), Some(1_000));
+        assert_eq!(
+            capture_latency_us(2_000_000, -1_500_000, 1_000_000),
+            None,
+            "a pts in our future"
+        );
+        assert_eq!(capture_latency_us(1_000_000, 500_000, 1_000_000), Some(500));
+        assert_eq!(
+            capture_latency_us(20_000_000_000, 0, 1),
+            None,
+            "ten seconds apart is noise"
+        );
+        let ms = std::time::Duration::from_millis;
+        let s = std::time::Duration::from_secs;
+        assert!(!stream_over(0, 0, false, ms(0), ms(0), 120));
+        assert!(
+            stream_over(10, 10, false, ms(0), ms(0), 120),
+            "every expected frame checked"
+        );
+        assert!(!stream_over(10, 9, false, ms(0), ms(0), 120));
+        assert!(
+            stream_over(0, 0, true, ms(301), ms(0), 120),
+            "closed and quiet"
+        );
+        assert!(!stream_over(0, 0, true, ms(299), ms(0), 120));
+        assert!(stream_over(0, 0, false, ms(0), s(121), 120), "the cap");
+        assert!(
+            stream_over(0, 0, false, s(46), s(0), 120),
+            "45 s with no frame"
+        );
+    }
+
+    #[test]
+    fn host_timings_split_the_latency_they_match() {
+        use punktfunk_core::quic::{HostStages, HostTiming};
+        let mut split = LatencySplit::default();
+        split.received(10, 5_000);
+        split.received(20, 6_000);
+        split.host_timing(HostTiming {
+            pts_ns: 20,
+            host_us: 2_000,
+            stages: None,
+        });
+        split.host_timing(HostTiming {
+            pts_ns: 99,
+            host_us: 1,
+            stages: None,
+        });
+        split.host_timing(HostTiming {
+            pts_ns: 10,
+            host_us: 9_000,
+            stages: Some(HostStages {
+                queue_us: 1_000,
+                encode_us: 2_000,
+                pace_us: 500,
+            }),
+        });
+        assert_eq!(split.host_us, [2_000, 9_000]);
+        assert_eq!(split.net_us, [4_000, 0], "the network never goes negative");
+        assert_eq!(
+            (
+                &split.queue_us[..],
+                &split.enc_us[..],
+                &split.pace_us[..],
+                &split.xfer_us[..]
+            ),
+            (&[1_000][..], &[2_000][..], &[500][..], &[5_500][..])
+        );
+        assert!(split.pending.is_empty());
+        for pts in 0..2000 {
+            split.received(pts, 1);
+        }
+        assert_eq!(split.pending.len(), 1024, "bounded against an old host");
+        let mut v = vec![5, 1, 4, 2, 3];
+        assert_eq!(
+            (
+                percentile(&mut v, 0.5),
+                percentile(&mut v, 0.95),
+                percentile(&mut [], 0.5)
+            ),
+            (3, 5, 0)
+        );
     }
 }

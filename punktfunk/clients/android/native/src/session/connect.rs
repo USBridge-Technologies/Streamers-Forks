@@ -7,6 +7,7 @@ use jni::sys::{jboolean, jint, jlong};
 use jni::EnvUnowned;
 use punktfunk_core::client::{ConnectParams, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,20 +19,47 @@ use super::{hex, jni_guard, lock_recover, parse_hex32, SessionHandle, SESSIONS};
 /// — the moko0878-class support threads). The app runs one attempt at a time, so one slot
 /// suffices; a stale token is harmless (it is taken immediately after the failed call).
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+/// What the host said with that failure's refusal, beside its token; empty when it said nothing.
+static LAST_SAID: Mutex<String> = Mutex::new(String::new());
+/// The dial `nativeConnect` is blocked on was parked by the host for its operator.
+static DIAL_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Stable token for a failed pair/connect cause, matched by Kotlin (`ConnectErrors.kt`):
 /// a typed host rejection yields its `RejectReason::as_str()` token ("not-armed", "denied",
 /// "approval-timeout", …); transport-level causes map to "crypto" / "timeout" / "io" / "error".
 fn note_error(e: &punktfunk_core::error::PunktfunkError) {
     use punktfunk_core::error::PunktfunkError as E;
-    let token = match e {
-        E::Rejected(r) => r.as_str(),
-        E::Crypto => "crypto",
-        E::Timeout => "timeout",
-        E::Io(_) => "io",
-        _ => "error",
+    let (token, said) = match e {
+        E::Rejected(r, said) => (r.as_str(), said.as_str()),
+        E::Crypto => ("crypto", ""),
+        E::Timeout => ("timeout", ""),
+        E::Io(_) => ("io", ""),
+        _ => ("error", ""),
     };
     *lock_recover(&LAST_ERROR) = token.to_string();
+    *lock_recover(&LAST_SAID) = said.to_string();
+}
+
+/// `NativeBridge.nativeTakeLastSaid(): String` — the host's own sentence with the most recent
+/// refusal, cleared on read (`""` when it said none). Read beside `nativeTakeLastError`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTakeLastSaid<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> JString<'local> {
+    let said = std::mem::take(&mut *lock_recover(&LAST_SAID));
+    env.with_env(|env| env.new_string(said))
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeDialPending(): Boolean` — the dial `nativeConnect` is blocked on was
+/// parked by the host for its operator's approval; it now waits for that verdict.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDialPending(
+    _env: EnvUnowned,
+    _this: JObject,
+) -> jboolean {
+    DIAL_PENDING.load(Ordering::Relaxed)
 }
 
 /// `NativeBridge.nativeTakeLastError(): String` — the machine token of the most recent failed
@@ -376,6 +404,9 @@ struct ConnectRequest {
     pad_audio_ok: bool,
     #[serde(default)]
     keep_host_audio: bool,
+    /// Ask for the host's cursor out of band (`CLIENT_CAP_CURSOR`): Desktop mouse mode.
+    #[serde(default)]
+    client_cursor: bool,
     /// The `video_fit` setting (`"fit"`/`"crop"`/`"stretch"`); absent reads as fit.
     #[serde(default)]
     video_fit: String,
@@ -391,6 +422,10 @@ struct ConnectRequest {
     /// The host profile to play as; rides the Hello as `profile`.
     #[serde(default)]
     profile: Option<String>,
+    /// This display shows full-range video as studio (Kotlin's Qualcomm decoder probe): the
+    /// `FEATURE_STUDIO_RANGE` ask.
+    #[serde(default)]
+    studio_range: bool,
 }
 
 /// `NativeBridge.nativeConnect(requestJson): Long` — see [`ConnectRequest`]. Returns an opaque
@@ -451,11 +486,13 @@ fn connect(req: ConnectRequest) -> jlong {
         device_name,
         pad_audio_ok,
         keep_host_audio,
+        client_cursor,
         video_fit,
         dialer,
         preset_id,
         preset_name,
         profile,
+        studio_range,
     } = req;
     // Which shell asked, for the host's `handshake complete` line. Set before the dial: core reads
     // it once the host says it parses the block.
@@ -484,12 +521,14 @@ fn connect(req: ConnectRequest) -> jlong {
     // inert client-side unless BOTH probes pass — this line is the one place that says which.
     log::info!(
         target: "pf.caps",
-        "decoder caps: multi_slice={} partial_frame={}{} hdr={} ten_bit_sdr={} codec_bits={:#x}",
+        "decoder caps: multi_slice={} partial_frame={}{} hdr={} ten_bit_sdr={} studio_range={} \
+         codec_bits={:#x}",
         multi_slice_ok,
         frame_parts_ok,
         if force_parts { " (FORCED by sysprop)" } else { "" },
         hdr_enabled,
         ten_bit_sdr,
+        studio_range,
         video_codecs,
     );
     let pin: Option<[u8; 32]> = if pin_hex.is_empty() {
@@ -523,6 +562,8 @@ fn connect(req: ConnectRequest) -> jlong {
         gamepad: GamepadPref::from_u8(gamepad_pref),
         bitrate_kbps, // 0 = host default
         pyrowave_bpp_x100,
+        // The audio supervisor reopens its device on a packet in a new format.
+        reopens_audio: true,
         video_caps: video_caps(hdr_enabled, ten_bit_sdr, multi_slice_ok),
         audio_channels,
         // The audio format this session ASKS for (resolved above). A non-default pair is what
@@ -557,8 +598,6 @@ fn connect(req: ConnectRequest) -> jlong {
         // No display-volume forwarding from Android yet (the panel tone-maps PQ itself via the
         // Surface dataspace + static metadata) — the host keeps its virtual-display EDID defaults.
         display_hdr: None,
-        // No CLIENT_CAP_CURSOR: this client does not render the host cursor locally (no
-        // shape/state planes in the jni surface) — advertising it would stream cursor-less.
         // CLIENT_CAP_PAD_AUDIO is the SESSION-level negotiation, separate from the per-pad
         // arrival bits: without it the host never sets HOST_CAP_PAD_AUDIO and never emits 0xD1,
         // so declaring a pad's render caps later would have nothing to gate. Gated on the
@@ -577,27 +616,48 @@ fn connect(req: ConnectRequest) -> jlong {
                 punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
             } else {
                 0
+            }
+            // Desktop mouse mode with a mouse: Kotlin's HostCursor wears the host's pointer and
+            // tells the host when to composite it instead.
+            | if client_cursor {
+                punktfunk_core::quic::CLIENT_CAP_CURSOR
+            } else {
+                0
             },
         // Slice-progressive delivery, by decoder truth (Kotlin probes FEATURE_PartialFrame on
         // every decoder this device would use; `debug.punktfunk.force_parts` overrides for the
         // on-glass experiment): AU prefixes then arrive as `Frame::part` pieces and the decode
         // loop feeds them with BUFFER_FLAG_PARTIAL_FRAME.
         frame_parts,
+        // The decode loop rebuilds its codec on a frame in a new format (`RunEnd::Reformat`).
+        rebuilds_decoder: true,
         launch, // a store-qualified library id to boot into a game, or None for the desktop
         name: device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
         pin,    // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)
         preset,
         profile,
+        // An older Qualcomm display shows full-range BT.709 as studio, so ask for studio SDR. The
+        // decode path takes the range from the Welcome either way.
+        studio_range,
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
         // (the host parks the connection until the operator approves the device — see ConnectScreen).
         // No `cancel`: Kotlin drops the result (`Dial.cancelled`) rather than abort the dial — its
         // connect runs on a pool thread, so a parked one costs a thread, not a stuck UI.
+        on_pending: Some(Arc::new(|| DIAL_PENDING.store(true, Ordering::Relaxed))),
         ..ConnectParams::new(&host, port, mode, Duration::from_millis(timeout_ms))
     };
-    match NativeClient::connect(params) {
+    DIAL_PENDING.store(false, Ordering::Relaxed);
+    let dialed = NativeClient::connect(params);
+    DIAL_PENDING.store(false, Ordering::Relaxed);
+    match dialed {
         Ok(client) => {
             let client = Arc::new(client);
+            // A forwarded cursor starts out of the picture: the host composites it until the
+            // mouse takes it (Kotlin's HostCursor), so no session starts without a pointer.
+            if client.host_caps() & punktfunk_core::quic::HOST_CAP_CURSOR != 0 {
+                let _ = client.set_cursor_render(false);
+            }
             let handle = SessionHandle {
                 stats: Arc::new(crate::stats::VideoStats::new(client.hud_shared())),
                 client,
@@ -747,6 +807,78 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
             .get(handle)
             .map(|session| session.client.end_reason() as jint)
             .unwrap_or(0)
+    })
+}
+
+/// `NativeBridge.nativeRedialDelayMs(endReason, attempt)` — milliseconds before redial `attempt`
+/// (0-based) of a session that ended with `endReason`, on the schedule every client shares; `-1`
+/// means stay ended. Only a lost connection redials.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRedialDelayMs(
+    _env: EnvUnowned,
+    _this: JObject,
+    end_reason: jint,
+    attempt: jint,
+) -> jlong {
+    jni_guard(-1, || {
+        punktfunk_core::client::PunktfunkEndReason::from_u8(end_reason as u8)
+            .redial_delay(attempt.max(0) as u32)
+            .map_or(-1, |d| d.as_millis() as jlong)
+    })
+}
+
+/// `sinceFirstMs` as the core reads it: negative is no refusal yet.
+fn since_first(since_first_ms: jlong) -> Option<Duration> {
+    u64::try_from(since_first_ms)
+        .ok()
+        .map(Duration::from_millis)
+}
+
+/// `NativeBridge.nativeWakeRedialDelayMs(autoWake, token, sinceFirstMs)` — milliseconds before
+/// dialing again a host that refused a connect with `token` (`nativeTakeLastError`),
+/// `sinceFirstMs` after its first such refusal (`-1`: the first); `-1` means show the refusal.
+/// The rule every client shares (`punktfunk_core::reject::wake_redial_delay`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeWakeRedialDelayMs<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    auto_wake: jboolean,
+    token: JString<'local>,
+    since_first_ms: jlong,
+) -> jlong {
+    let token = env
+        .with_env(|env| token.try_to_string(env))
+        .resolve::<LogErrorAndDefault>();
+    jni_guard(-1, || {
+        let refused = punktfunk_core::reject::RejectReason::from_token(&token);
+        punktfunk_core::reject::wake_redial_delay(
+            auto_wake,
+            refused,
+            false,
+            since_first(since_first_ms),
+        )
+        .map_or(-1, |d| d.as_millis() as jlong)
+    })
+}
+
+/// `NativeBridge.nativeSessionWakeRedialDelayMs(handle, autoWake, sinceFirstMs)` — the same for
+/// a session that ended: its typed close counts only before any frame. `-1` for a missing key.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionWakeRedialDelayMs(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    auto_wake: jboolean,
+    since_first_ms: jlong,
+) -> jlong {
+    jni_guard(-1, || {
+        SESSIONS
+            .get(handle)
+            .and_then(|s| {
+                s.client
+                    .wake_redial_delay(auto_wake, since_first(since_first_ms))
+            })
+            .map_or(-1, |d| d.as_millis() as jlong)
     })
 }
 

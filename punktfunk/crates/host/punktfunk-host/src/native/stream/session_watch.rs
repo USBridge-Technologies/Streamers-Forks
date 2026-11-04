@@ -42,10 +42,10 @@ impl SessionSwitch {
     }
 }
 
-/// `PUNKTFUNK_SESSION_WATCH` on/off wins. Auto is on for Bazzite/SteamOS (they flip
-/// Gaming↔Desktop mid-stream) and off elsewhere.
-pub(super) fn session_watch_enabled() -> bool {
-    pf_host_config::row_tri("PUNKTFUNK_SESSION_WATCH").unwrap_or_else(is_steam_htpc_platform)
+/// The session's `PUNKTFUNK_SESSION_WATCH` (`row`) on/off wins. Auto is on for Bazzite/SteamOS
+/// (they flip Gaming↔Desktop mid-stream) and off elsewhere.
+pub(super) fn session_watch_enabled(row: Option<bool>) -> bool {
+    row.unwrap_or_else(is_steam_htpc_platform)
 }
 
 /// Bazzite or SteamOS (`ID`/`ID_LIKE`). Absent os-release (non-Linux) → false.
@@ -77,9 +77,6 @@ pub(super) fn session_watcher_loop(
         }
         match pending {
             Some((k, since)) if k == cur && since.elapsed() >= DEBOUNCE => {
-                // Unmask before compositor_for_kind: a switch we cannot follow still has to unbar
-                // "Return to Gaming Mode" (a masked autologin unit will not start).
-                vdisplay::release_autologin_mask(cur);
                 match vdisplay::compositor_for_kind(cur) {
                     Some(comp) => {
                         tracing::info!(from = ?current, to = ?cur, compositor = comp.id(),
@@ -100,6 +97,9 @@ pub(super) fn session_watcher_loop(
                     None => tracing::debug!(to = ?cur,
                         "session watcher: no usable backend for the new session — staying put"),
                 }
+                // After the signal: it waits out our Steam quitting. Also for a switch we cannot
+                // follow, or "Return to Gaming Mode" meets a masked autologin unit.
+                vdisplay::release_autologin_mask(cur);
                 pending = None;
             }
             Some((k, _)) if k == cur => {}

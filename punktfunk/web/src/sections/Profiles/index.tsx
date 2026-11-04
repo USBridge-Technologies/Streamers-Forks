@@ -13,6 +13,7 @@ import {
 	getGetSeatingQueryKey,
 	getGetSeatsDoctorQueryKey,
 	getListProfilesQueryKey,
+	getWindowsAccountsQueryKey,
 	setDoor,
 	setProfileAvatar,
 	startProfileSeat,
@@ -24,6 +25,7 @@ import {
 	useListProfiles,
 	useSetSeating,
 	useUpdateProfile,
+	useWindowsAccounts,
 } from "@/api/gen/profiles/profiles";
 import { useDialogs } from "@/components/dialogs";
 import { apiErrorMessage } from "@/lib/errors";
@@ -35,6 +37,7 @@ import {
 	DoorDialog,
 	ProfilesView,
 	RemoveProfileDialog,
+	SeatPasswordDialog,
 	SeatsDialog,
 } from "./view";
 
@@ -74,16 +77,24 @@ export const SectionProfiles: FC = () => {
 	const seatHost = windows || door;
 	const seating = useGetSeating({ query: { enabled: seatHost } });
 	const seatsOn = seating.data?.enabled === true;
+	// Local Windows accounts no profile holds, for take turns and a seat; only Windows has any.
+	const winAccounts = useWindowsAccounts({ query: { enabled: windows } });
 	const doctor = useGetSeatsDoctor({
 		query: { enabled: seatHost && seatsOn, refetchInterval: 60_000 },
 	});
 	const [doorAsk, setDoorAsk] = useState<boolean | null>(null);
 	useEffect(() => {
-		if (switching === null || host.data?.door !== switching) return;
+		if (switching === null) return;
+		if (host.data?.door_switch_failed) {
+			toast.error(m.profiles_door_failed());
+			setSwitching(null);
+			return;
+		}
+		if (host.data?.door !== switching) return;
 		setSwitching(null);
 		// Every list now answers from the other host.
 		void qc.invalidateQueries();
-	}, [host.data?.door, switching, qc]);
+	}, [host.data?.door, host.data?.door_switch_failed, switching, qc]);
 	useEffect(() => {
 		if (switching === null) return;
 		const slow = setTimeout(() => {
@@ -97,8 +108,7 @@ export const SectionProfiles: FC = () => {
 	const ownerName = profiles.data?.find((p) => p.owner)?.display_name ?? "";
 	const [adding, setAdding] = useState(false);
 	const [removing, setRemoving] = useState<ProfileAdmin | null>(null);
-	const [versions, setVersions] = useState<Record<string, number>>({});
-
+	const [passwordFor, setPasswordFor] = useState<ProfileAdmin | null>(null);
 	const refresh = () =>
 		qc.invalidateQueries({ queryKey: getListProfilesQueryKey() });
 	const failed = (fallback: string) => (e: unknown) =>
@@ -175,10 +185,7 @@ export const SectionProfiles: FC = () => {
 		picture.mutate(
 			{ id, file },
 			{
-				onSuccess: () => {
-					setVersions((v) => ({ ...v, [id]: (v[id] ?? 0) + 1 }));
-					refresh();
-				},
+				onSuccess: refresh,
 				onError: () => toast.error(m.profiles_picture_failed()),
 			},
 		);
@@ -226,7 +233,6 @@ export const SectionProfiles: FC = () => {
 		<>
 			<ProfilesView
 				profiles={profiles}
-				avatarVersions={versions}
 				seats={
 					seatHost
 						? {
@@ -234,6 +240,7 @@ export const SectionProfiles: FC = () => {
 								onStart: (p) => act(p, "start"),
 								onStop: (p) => act(p, "stop"),
 								onEnd: (p) => act(p, "end"),
+								onPassword: setPasswordFor,
 								doctor: doctorLine,
 							}
 						: undefined
@@ -248,7 +255,11 @@ export const SectionProfiles: FC = () => {
 							}
 						: undefined
 				}
-				onAdd={() => setAdding(true)}
+				onAdd={() => {
+					// The pickers list what is free now: a profile added or removed since changes it.
+					void qc.invalidateQueries({ queryKey: getWindowsAccountsQueryKey() });
+					setAdding(true);
+				}}
 				onRename={onRename}
 				onPicture={(p, file) => upload(p.id, file)}
 				onRemovePicture={(p) =>
@@ -275,6 +286,7 @@ export const SectionProfiles: FC = () => {
 						(c) => c.code === "windows_server" && c.level === "error",
 					) === true
 				}
+				windowsAccounts={winAccounts.data ?? []}
 				takenAccents={profiles.data?.map((p) => p.accent ?? "") ?? []}
 				onCancel={() => setAdding(false)}
 				onCreate={onCreate}
@@ -333,6 +345,14 @@ export const SectionProfiles: FC = () => {
 				profile={removing}
 				onCancel={() => setRemoving(null)}
 				onRemove={onRemove}
+			/>
+			<SeatPasswordDialog
+				profile={passwordFor}
+				onUpdate={async (id, password) => {
+					await update.mutateAsync({ id, data: { seat_password: password } });
+					refresh();
+				}}
+				onClose={() => setPasswordFor(null)}
 			/>
 		</>
 	);

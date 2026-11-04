@@ -46,8 +46,9 @@ restart*.
 | Full color 4:4:4 | `PUNKTFUNK_444` | `on` · `off` | `on` | next session |
 | Game frame limit (Linux) | `PUNKTFUNK_MAX_FPS` | 0–240 fps | `0` | next session |
 | Display refresh multiple (Linux, Windows) | `PUNKTFUNK_VDISPLAY_HZ_MULT` | 0–4 × | `0` | next session |
+| Extra resolutions (Windows) | `PUNKTFUNK_VDISPLAY_RESOLUTIONS` | comma list | `3840x2160`, `3440x1440`, `2560x1600`, `2560x1440`, `2560x1080`, `1920x1200`, `1920x1080`, `1680x1050`, `1600x900`, `1440x900`, `1366x768`, `1280x800`, `1280x720` | next session |
 | Cursor capture (Linux) | `PUNKTFUNK_PORTAL_CURSOR_MODE` | `auto` · `embedded` · `metadata` · `hidden` | `auto` | next session |
-| Vulkan encoding (Linux) | `PUNKTFUNK_VULKAN_ENCODE` | `on` · `off` | `off` | next session |
+| Vulkan encoding (Linux) | `PUNKTFUNK_VULKAN_ENCODE` | `on` · `off` | `on` | next session |
 | Direct capture (Linux) | `PUNKTFUNK_DIRECT_CAPTURE` | `on` · `off` | `on` | next session |
 | On-demand capture (Linux) | `PUNKTFUNK_LAZY_CAPTURE` | `on` · `off` | `on` | next session |
 | KWin capture pacing (Linux) | `PUNKTFUNK_KWIN_PACED` | `on` · `off` | `off` | next session |
@@ -65,7 +66,6 @@ restart*.
 | Pen input (Linux, Windows) | `PUNKTFUNK_PEN` | `on` · `off` | `on` | next session |
 | Steam USB gadget (Linux) | `PUNKTFUNK_STEAM_GADGET` | `auto` · `on` · `off` | `auto` | next session |
 | DualSense over USB/IP (Linux) | `PUNKTFUNK_DUALSENSE_USBIP` | `on` · `off` | `off` | next session |
-| Attach mode (Linux) | `PUNKTFUNK_GAMESCOPE_ATTACH` | `on` · `off` | `off` | next session |
 | Game Mode HDR (Linux) | `PUNKTFUNK_GAMESCOPE_HDR` | `on` · `off` | `on` | next session |
 | Force managed mode (Linux) | `PUNKTFUNK_GAMESCOPE_MANAGED` | `on` · `off` | `off` | next session |
 | Adaptive sync (Linux) | `PUNKTFUNK_GAMESCOPE_VRR` | `on` · `off` | `on` | next session |
@@ -83,6 +83,7 @@ restart*.
 | Seat game exit (Linux, Windows) | `PUNKTFUNK_SEAT_END_ON_GAME_EXIT` | `on` · `off` | `on` | next session |
 | Seat mode cap (Linux, Windows) | `PUNKTFUNK_SEAT_MAX_MODE` | text, up to 24 characters | — | next session |
 | Seats update games (Linux) | `PUNKTFUNK_SEAT_LIBRARY_WRITABLE` | `on` · `off` | `on` | next session |
+| Players keep controllers (Windows) | `PUNKTFUNK_SEAT_BACKGROUND_INPUT` | `on` · `off` | `on` | at once |
 | Check for updates | `PUNKTFUNK_UPDATE_CHECK` | `on` · `off` | `on` | at once |
 | Console updates | `PUNKTFUNK_UPDATE_APPLY` | `on` · `off` | `on` | at once |
 | Tray autostart (Linux, Windows) | `PUNKTFUNK_TRAY_AUTOSTART` | `on` · `off` | `on` | at once |
@@ -106,7 +107,7 @@ The table shows the Linux values. On Windows, **Encoder** takes `auto` · `nvenc
 | **Display refresh multiple** | Runs the virtual display at a multiple of the stream rate, so a frame that just misses the desktop's next paint still shows. The stream stays at its own rate. `0` lets the host pick: 2× on Windows for streams up to 500 Hz, otherwise off. `1` turns it off. A game with V-Sync on renders at the display's rate unless something caps it. |
 | **Cursor capture** | A troubleshooting knob: which cursor mode the host asks the screen-cast portal for. `auto` settles on one the portal offers. |
 | **Vulkan encoding** | AMD and Intel: HEVC and AV1 through Vulkan Video, which recovers from loss without a full keyframe. Off uses VAAPI. |
-| **Direct capture** | wlroots, Hyprland and niri: capture the output directly instead of through the screen cast, on GPU sessions. A failure falls back to the screen cast. |
+| **Direct capture** | wlroots, Hyprland and niri: capture the output directly instead of through the screen cast, on GPU sessions. A failure falls back to the screen cast. Umbriel has no screen cast, so it can't stream with this off. |
 | **On-demand capture** | GNOME 49+: the virtual monitor paints once per streamed frame instead of on a timer. |
 | **KWin capture pacing** | KWin 6.7+: keep KWin's own recording throttle. |
 | **PyroWave quality** | The most bits per pixel a [PyroWave](/docs/pyrowave) session uses when the client sends no quality of its own; a client's **PyroWave quality** takes its place. With the client's bitrate on **Automatic** the session adapts between 0.5 and this value; a fixed client bitrate runs at it. |
@@ -135,7 +136,7 @@ Desktop) and rewrites them on every connect.
 
 | Variable | Values | What it does |
 |---|---|---|
-| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` · `niri` (also `kde`, `plasma`, `gnome`, `sway`, `wlr`, `river`, `hypr`, `biri`) | Pins the virtual-display backend and turns session following off, so a Game Mode ↔ Desktop switch ends the stream. For single-purpose appliances only. |
+| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` · `niri` · `umbriel` (also `kde`, `plasma`, `gnome`, `sway`, `wlr`, `river`, `hypr`, `biri`) | Pins the virtual-display backend and turns session following off, so a Game Mode ↔ Desktop switch ends the stream. For single-purpose appliances only. |
 | `PUNKTFUNK_INPUT_BACKEND` | `libei` · `kwin` · `gamescope` · `wlr` | Pins input injection. Detected with the compositor; an unknown value is ignored. |
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` (default) · `portal` | Moonlight sessions only: `portal` streams an existing monitor, which the GNOME 50+ HDR mirror needs — see [HDR](/docs/hdr#linux--gnome). |
 | `PUNKTFUNK_CAPTURE_MONITOR` | connector name, e.g. `DP-2`; on Windows the display name, e.g. `\\.\DISPLAY1` | Linux and Windows: stream this physical monitor instead of a virtual display, overriding the console. `punktfunk-host list-monitors` lists the names; one that matches nothing fails the session. See [Virtual displays](/docs/virtual-displays#stream-a-real-monitor-instead). |
@@ -152,8 +153,9 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 | Variable | Values | What it does |
 |---|---|---|
 | `PUNKTFUNK_GAMESCOPE_SESSION` | `steam` | Own a `gamescope-session-plus` session at the client's mode — for a headless appliance. |
+| `PUNKTFUNK_GAMESCOPE_ATTACH` | `1` · `0` | Stream the box's running gamescope at its own mode and never stop it, instead of taking Game Mode over. A change takes a host restart. Outranks `PUNKTFUNK_GAMESCOPE_SESSION`. To stream the screen the box drives, pick it under **Displays** → **Stream this monitor** instead. |
 | `PUNKTFUNK_GAMESCOPE_NODE` | `auto` · node id | Attach to a running gamescope's video node at its own mode. Outranks `PUNKTFUNK_GAMESCOPE_SESSION`. |
-| `PUNKTFUNK_GAMESCOPE_APP` | command | What a bare gamescope session runs, e.g. `vkcube`. |
+| `PUNKTFUNK_GAMESCOPE_APP` | command | What a bare gamescope session runs, e.g. `vkcube --wsi xcb`. |
 | `PUNKTFUNK_GAMESCOPE_BIN` | path | The gamescope binary for sessions the host starts. Unset: `punktfunk-gamescope` on `PATH`, then `gamescope`. |
 | `PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR` | path | Where the Vulkan layer that gives nested games an HDR10 swapchain lives (default `/usr/lib/punktfunk/vulkan/implicit_layer.d`; the NixOS module sets it). |
 
@@ -180,6 +182,7 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 | `PUNKTFUNK_OH264_THREADS` | number (default `2`) | Software encoder threads. |
 | `PUNKTFUNK_OH264_GOP` | frames (default fps × 600) | Software encoder keyframe interval; `0` lets the encoder decide. |
 | `PUNKTFUNK_NVENC_RAW` | `1` · `0` | NVIDIA on Linux: convert the captured buffer straight into NVENC's input, on by default. `0` uses the copy-and-blend path. |
+| `PUNKTFUNK_NVENC_DIRECT` | `1` · `0` | NVIDIA on Linux: NVENC encodes a LINEAR captured buffer where it lies, with no copy, on by default. `0` copies it into NVENC's input first. |
 | `PUNKTFUNK_VULKAN_DIRECT_PLANES` | `1` · `0` | Vulkan Video on Linux: write the converted picture straight into the encoder where the driver allows, on by default. `0` keeps the extra copy. |
 
 ## Gamepads
@@ -214,19 +217,39 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 | `PUNKTFUNK_NO_ISOLATE` | `1` | Extend the desktop onto the virtual display instead of making it the only one. **Topology** in [Virtual displays](/docs/virtual-displays) supersedes it. |
 | `PUNKTFUNK_HOST_CMD` | `serve` | The command the service runs; every install writes `serve`. With no line the service runs `serve --gamestream`, which `punktfunk-host service install` rewrites to `serve` with **GameStream** kept on. |
 | `PUNKTFUNK_WEB_CONSOLE` | `off` | Don't run the web console alongside the service. |
+| `PUNKTFUNK_AMF_FULL_RANGE` | `on` · `off` | AMD: whether this GPU's encoder writes full-range colour. Unset, the host tests the GPU once at the first stream; Radeon RX 9000 cards write limited range whatever they are asked, so their 8-bit streams are sent and labelled limited range. `off` sends limited range on any AMD GPU; `on` skips the test. Leave it unset. |
+
+### Virtual display driver switches
+
+The virtual display's driver reads three switches of its own. They are A/B switches for a bug
+report, not tuning knobs: set one to compare two runs, then clear it. The driver reads them from
+the machine environment, not from `host.env`. Set one from an elevated prompt with
+`setx /M PFVD_NO_RT_GPU 1`; clear it with `setx /M PFVD_NO_RT_GPU ""`. Setting one takes effect
+as the table says. Clearing one that was already set when Windows started needs a restart of
+Windows: the driver's host process keeps the environment it was started with.
+
+| Variable | Values | What it does |
+|---|---|---|
+| `PFVD_NO_RT_GPU` | any value | Turns off the driver's real-time GPU priority, which keeps a game that saturates the GPU from starving the frames on their way to the encoder. Unset, the raise is on. After an adapter restart. |
+| `PFVD_DEBUG_LOG` | any value | Writes the driver's log, `pfvd-driver.log`, to `C:\Windows\ServiceProfiles\LocalService\AppData\Local\Temp`. Unset, a release driver writes no log file. After an adapter restart. |
+| `PFVD_POOL_BYPASS` | `0` · any other value | Whether the encoder reads the display's frame in place or from a copy. `0` copies every frame; any other value reads in place on every encoder that can. Unset, the NVIDIA, AMD and Intel encoders read in place and the Media Foundation encoder copies. When the next stream starts. |
+
+Restarting the adapter restarts one device, not the PC. With no stream running, open **Device
+Manager**, expand **Display adapters**, disable **Punktfunk Virtual Display**, then enable it again.
 
 ## Network & discovery
 
 | Variable | Values | What it does |
 |---|---|---|
 | `PUNKTFUNK_NATIVE_PORT` | port (default `9777`) | The native QUIC port, as `serve --native-port`. Clients learn it from discovery. A value that isn't a port stops the host at startup. |
-| `PUNKTFUNK_DSCP` | `1` · `0` | QoS marking on media packets. Default: on toward private-network clients, off toward internet addresses. `1` always, `0` never. |
-| `PUNKTFUNK_JUMBO` | `1` | Jumbo frames (about 9000-byte packets) on a wired LAN — see below. |
-| `PUNKTFUNK_WIRE_MTU` | on-wire MTU, e.g. `9000` or `1400` | Above 1500: jumbo frames at that size. Below 1500: smaller packets from the start, for a VPN or tunnel. Use the MTU your network adapter reports. |
+| `PUNKTFUNK_DSCP` | `1` · `0` | QoS marking on media packets, host to client and client to host. Default: on toward a private-network peer, off toward internet addresses. `1` always, `0` never. |
+| `PUNKTFUNK_JUMBO` | `0` · `1` | Jumbo frames follow the network adapters — see below. `0` turns them off, `1` forces 9000. |
+| `PUNKTFUNK_WIRE_MTU` | on-wire MTU, e.g. `9000` or `1400` | Pins the packet size for every session. Above 1500: jumbo frames at that size. Below 1500: smaller packets from the start, for a VPN or tunnel. Use the MTU your network adapter reports (`9000` for a Windows "9014 Bytes" jumbo packet), not a `ping -l` size. |
 
-Jumbo frames need every NIC and switch on the path set to MTU `9000` first. The host probes the path
-and switches mid-session only once the client confirms; a path that can't carry them stays at
-standard size. Native protocol only.
+Jumbo frames turn on by themselves when the host's and the client's network adapters are both set
+above MTU 1500. Set every switch on the path to match. The host tests the path and switches
+mid-session once the client confirms; a PyroWave stream switches on the next connect. A path that
+can't carry them stays at standard size. Native protocol only.
 
 ## Auth, API & paths
 
@@ -250,7 +273,7 @@ standard size. Native protocol only.
 | Variable | Values | What it does |
 |---|---|---|
 | `PUNKTFUNK_FRAME_DRIVEN` | `1` · `0` | Encode when a frame arrives instead of on a fixed tick, on by default. `0` restores the tick, which adds about half a frame of latency. |
-| `PUNKTFUNK_GSO` | `1` · `0` | UDP segmentation offload: several packets leave in one send call. On by default on every platform. `0` turns it off, which costs send CPU: every packet takes its own call, and past about 1 Gbps the host may not keep up. |
+| `PUNKTFUNK_GSO` | `1` · `0` | UDP segmentation offload: several packets leave in one send call. On by default on every platform, and a session whose client reports sustained loss drops back to one packet per call for the rest of that session. `1` pins it on and disables that guard. `0` turns it off, which costs send CPU: every packet takes its own call, and past about 1 Gbps the host may not keep up. |
 | `PUNKTFUNK_DELIVERY` | `auto` · `wake` · `burst` · `capped` · `smooth` | How each frame's packets leave, for every session, over what the client asks. Unset, every frame is paced at the rate the link carries, which the client measures and both ends' ports bound. `wake` sends a small first group and a short gap on every frame; `burst` sends each frame at line rate; `capped` paces at about 0.8 Gbit/s whatever the link says; `smooth` spreads every frame at three times its bitrate, which costs a few milliseconds per frame. |
 | `PUNKTFUNK_ACKED_REFS` | `on` · `off` | While the link loses packets, each frame is encoded against one the client confirmed it received, so a lost frame is skipped rather than repaired. Unset, this turns on when the client reports loss and off ten seconds after the last; `on` keeps it on, `off` never uses it. Vulkan Video, VA-API, AMF and QSV. |
 | `PUNKTFUNK_SPLIT_ENCODE` | `0` · `1` · `2` · `3` | NVENC split encode for very high pixel rates. Unset splits on its own from about 4K120; `1` forces a split, `2` and `3` force two or three ways, `0` never splits. |
@@ -258,8 +281,8 @@ standard size. Native protocol only.
 | `PUNKTFUNK_NVENC_SUBFRAME` | `0` · `1` | NVENC sub-frame readback for lower latency, on where the GPU supports it and the stream has more than one slice. `0` never, `1` on every multi-slice stream. |
 | `PUNKTFUNK_NVENC_PRESET` | `1` … `7` or `p1` … `p7` (default `1`) | The NVENC preset. A higher one looks better at the same bitrate but takes longer to encode each frame, which adds latency and can drop frames at 4K or high refresh rates. Leave it at `1` unless the picture looks soft and the GPU has room to spare. |
 | `PUNKTFUNK_NVENC_SPLIT_ARBITRATE` | `1` | Lets NVENC change its split decision mid-session as the pixel rate moves. |
-| `PUNKTFUNK_GPU_PRIORITY_CLASS` | `realtime` (default) · `high` · `normal` · `off` | Windows: GPU priority of capture and encode under a heavy game; `realtime` preempts the game at some cost to its frame rate. Try `high` if NVENC freezes with HAGS on and VRAM nearly full. The display driver's own raise turns off with `setx /M PFVD_NO_RT_GPU 1` and a device restart. |
-| `PUNKTFUNK_IDD_ADAPTIVE` | `1` · `0` | Windows: adapt the encode pipeline depth to overruns, on by default. `0` pins the full depth and turns off the encode-cadence detector. |
+| `PUNKTFUNK_GPU_PRIORITY_CLASS` | `realtime` (default) · `high` · `normal` · `off` | Windows: GPU priority of capture and encode under a heavy game; `realtime` preempts the game at some cost to its frame rate. Try `high` if NVENC freezes with HAGS on and VRAM nearly full. The display driver's own raise has its own switch, [`PFVD_NO_RT_GPU`](#virtual-display-driver-switches). |
+| `PUNKTFUNK_IDD_ADAPTIVE` | `1` · `0` | Watches whether encoding keeps up with the frame rate, on by default. While it falls behind, the bitrate stops climbing, Instant Replay pauses under **Pause Instant Replay** `auto`, and an NVENC, VA-API or Vulkan Video encoder on Linux hands back finished frames about a frame later. `0` turns all three off. Moonlight sessions don't use it. |
 | `PYROWAVE_QUEUE_PRIORITY` | `realtime` (default) · `high` · `off` | [PyroWave](/docs/pyrowave): ask the GPU to run the encode ahead of the game. On Linux an NVIDIA GPU defaults to `high`, because its `realtime` queue slows every submit. On Linux only `punktfunk-encode-worker` may raise it, never the host — see [GPU scheduling priority](/docs/running-as-a-service#gpu-scheduling-priority). `off` if the desktop stutters while streaming. |
 | `PUNKTFUNK_ENCODE_WORKER` | path · `off` | Where the host finds `punktfunk-encode-worker` (default beside the host, then `PATH`; the NixOS module sets it). `off` runs PyroWave and the NVIDIA frame convert from the host binary at normal priority. |
 | `PUNKTFUNK_SCRIPTING` | path | Where the host finds the `punktfunk-scripting` plugin runner. Set it when `punktfunk-host plugins add` works but the console says the runner isn't installed — the service's `PATH` is shorter than your shell's. |
@@ -289,13 +312,15 @@ like the host's: `0`, `false`, `off` or `no` (any case) is off, any other value 
 | `PUNKTFUNK_PAD_SPEAKER_PATH` · `PUNKTFUNK_PAD_SPEAKER_VOLUME` | byte (default `0x20` / `0x64`) | Which DualSense output [controller audio](/docs/controller-audio) plays to, and how loud. Change them only if the pad's speaker stays silent. |
 | `PUNKTFUNK_PAD_AUDIO_PROFILE` | `0` | Linux: don't switch a wired DualSense's sound card to **Pro Audio** while streaming controller audio. Without it the voice coils fold into the speaker pair. |
 | `PUNKTFUNK_OSD_SCALE` | multiplier (default `1`) | Size of the in-stream overlay on top of display scaling, from 0.5 to 4. |
-| `PUNKTFUNK_CONFIG_DIR` | path | Where this client keeps its identity, saved hosts and settings (default `~/.config/punktfunk`, `%APPDATA%\punktfunk` on Windows). Empty is ignored. Moving it moves that identity, so paired hosts need pairing again. The Flatpak only sees `~/.config/punktfunk`. The private key is readable only by the account that created it. |
+| `PUNKTFUNK_CONFIG_DIR` | path | Where this client keeps its identity, saved hosts and settings (default `$XDG_CONFIG_HOME/punktfunk`, which is `~/.config/punktfunk` unless that variable is set, and `%APPDATA%\punktfunk` on Windows). Empty is ignored. Moving it moves that identity, so paired hosts need pairing again. The Flatpak keeps its own in `~/.var/app/io.unom.punktfunk/config/punktfunk` and copies an older `~/.config/punktfunk` the first time it starts. The private key is readable only by the account that created it. |
 | `PUNKTFUNK_AUDIO_HIRES` | `1` · `48000` · `96000` · `<rate>/<bits>` · `0` | Asks for lossless audio, over the client's audio-format setting: `1` is 96 kHz/24-bit, a bare rate is 24-bit, `48000/16` is the cheapest. `0` or empty forces Opus; anything else is ignored. The host's **Lossless audio** reads the same name as on/off. |
 | `PUNKTFUNK_NO_AEC` | `1` | Turn microphone echo cancellation off for this run. |
 | `PUNKTFUNK_PRESENT_MODE` | `mailbox` · `fifo` · `immediate` · `fifo_relaxed` | Vulkan present mode. With V-sync on the default is `mailbox`, else `fifo` (AMD's Windows driver has no mailbox); in fullscreen on a driver whose surface offers `FIFO_LATEST_READY`, that mode comes first. With V-sync off `immediate` comes first, which on Wayland asks the compositor to tear. |
 | `PUNKTFUNK_PRESENTER` | `arrival` | Show frames the moment they decode, bypassing frame pacing. A diagnostic. |
+| `PUNKTFUNK_PRESENT_BACKEND` | `d3d11` · `vulkan` | Windows: how the client draws to the screen. Unset uses Vulkan where the GPU's Vulkan driver can show hardware-decoded video, and Direct3D 11 otherwise. Any other value is ignored. |
 | `PUNKTFUNK_VRR_FIFO` | `1` | Follow a variable-refresh screen on a driver too old for the modern mode; costs latency on a fixed-refresh screen. The Detailed [stats overlay](/docs/stats) shows `vrr yes` when it works. |
-| `PUNKTFUNK_VRR_PACE` | `0` | Shows each frame as it arrives on a variable-refresh screen, instead of holding it a moment to even out the spacing. Try it if *Lowest latency* feels uneven on such a screen. |
+| `PUNKTFUNK_VRR_PACE` | `0` | Shows each frame as it arrives, instead of holding it a moment for an even spacing — on a variable-refresh screen a moment of jitter, on a fixed one up to a refresh. Try it if *Lowest latency* feels uneven or slow. |
+| `PUNKTFUNK_PACE_TAIL` | `0` | Sizes the hold from the typical jitter alone, instead of also covering the latest late arrivals. The default hold keeps a link with a long tail from showing frames late; this is the way back if it holds too long. Only where frames are shown at their due time (a variable-refresh screen, or no on-screen timing): on a fixed screen the client times frames to the refresh and the tail stays out. |
 | `PUNKTFUNK_PRESENT_WAIT2` | `1` | Time frames with the newer `VK_KHR_present_wait2` where the driver's on-screen stamps are not in use (Linux turns it on with them). An experiment elsewhere: on AMD's Windows driver it drops frames below the screen's refresh rate. |
 | `PUNKTFUNK_PRESENT_TIMING` | `0` or `1` | Read each frame's on-screen time from the driver (`VK_EXT_present_timing`) instead of timing it from the client. On by default on Linux, where Mesa and NVIDIA offer it; `0` turns it off, `1` tries it elsewhere. The presenter's summary line says `glass=timing` when it is in use. |
 | `PUNKTFUNK_SURFACE_FEEDBACK` | `0` | Linux: stop asking the compositor for its own on-screen time of each frame (`wp_presentation`), which also drops the window's game content tag. On by default; it is what the stats line's `scanout` / `composited` word reads, and what times frames on a Mesa without `VK_EXT_present_timing`. |
@@ -306,7 +331,7 @@ like the host's: `0`, `false`, `off` or `no` (any case) is off, any other value 
 | `PUNKTFUNK_VAAPI_EXPLICIT_SYNC` | `0` | Linux: wait each VAAPI decode on the CPU before handing it to the presenter, instead of passing the GPU's own fence along. Costs one decode time of pipelining per frame; the way out if a driver shows a frame before it is done. |
 | `PUNKTFUNK_DIRECT_PRESENT` | `0` | Draw every frame through the intermediate video image and a blit, as before, instead of straight into the swapchain image. An A/B; the direct path saves most of the present cost on an iGPU at 4K. |
 | `PUNKTFUNK_NATIVE_SCANOUT` | `1` · `flip` | Linux desktop, Wayland: decoded pictures go to the compositor as the window's own buffer instead of through Vulkan, so it can put them on a display plane. Off by default. After two seconds on screen the client keeps it only where the compositor really scans the picture out (KWin composites it, so Vulkan presents there), and while the stats overlay is up Vulkan draws the frame. VAAPI pictures go as decoded; Vulkan Video and 4:2:0 PyroWave pictures are copied into a buffer the compositor can import first. HDR pictures join only after the compositor has scanned SDR ones out, and a compositor that answers no frame for a second sends the client back to Vulkan; letterboxed pictures stay on Vulkan, and so does every picture where the compositor refuses the buffers (NVIDIA under GNOME). `flip` hands the window between the two paths every three seconds, a bring-up check. |
-| `PUNKTFUNK_VKDECODE_ARRANGEMENT` | `distinct` | Vulkan Video: decode into separate reference and output images on a device that also offers the shared arrangement. The way around a driver whose shared path faults at the first decode. |
+| `PUNKTFUNK_VKDECODE_ARRANGEMENT` | `distinct` · `sampler` | Vulkan Video. `distinct` decodes into separate reference and output images on a device that also offers the shared arrangement, the way around a driver whose shared path faults at the first decode. `sampler` reads each picture through a sampler Y'CbCr conversion instead of per-plane views, which a device without those views does on its own. An A/B for that route. |
 | `PUNKTFUNK_ABR_PROBE_KBPS` | kbps | Upper limit for the startup link measurement. |
 | `PUNKTFUNK_ABR_PROBE` | `0` | Skip the startup link measurement; Automatic then opens at the starting rate and climbs. |
 | `PUNKTFUNK_ABR_MAX_MBPS` | Mbps | Cap on Automatic's ceiling, for a client whose decoder can't keep up with what the link carries. |

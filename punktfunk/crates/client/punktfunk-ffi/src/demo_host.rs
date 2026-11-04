@@ -342,6 +342,7 @@ async fn serve(
         clock_origin_ns: clock.origin_ns(),
         keys: Some(keys),
         clock: Some(clock.clone()),
+        clear_placement: false,
     };
     let open: OpenSession = Box::new(move || Session::new(config, media, Box::new(sender)));
     let video = tokio::task::spawn_blocking(move || send_video(open, video_rx));
@@ -438,6 +439,7 @@ async fn control_loop(
             let answer = Reconfigured {
                 accepted: true,
                 mode,
+                exclude_codecs: 0,
             };
             v2io::send(&mut send, &answer).await?;
         }

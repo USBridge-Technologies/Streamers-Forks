@@ -34,7 +34,7 @@ pub(super) fn panel_tick_ns(display_hz: u32, stream_hz: u32) -> Option<u64> {
     (display_hz > stream_hz).then(|| 1_000_000_000 / u64::from(display_hz))
 }
 
-/// Display + pipeline built on the prep thread while Start RTT and hole-punch are in flight.
+/// Display + pipeline built on the prep thread while the Start round trip is in flight.
 pub(in crate::native) struct PreparedDisplay {
     pub(super) vd: Box<dyn crate::vdisplay::VirtualDisplay>,
     pub(super) pipeline: Pipeline,
@@ -48,7 +48,7 @@ pub(in crate::native) type PrepHandle = (
 
 /// What every pipeline build of one session asks for. A rebuild moves a field or two: the
 /// mode, the rate, the wire index its encoder continues at.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct BuildRequest {
     pub(super) mode: punktfunk_core::Mode,
     /// The wire budget; the encoder opens at what `enc_of` derives from it.
@@ -57,9 +57,17 @@ pub(super) struct BuildRequest {
     pub(super) bit_depth: u8,
     pub(super) enc_of: EncDerive,
     pub(super) plan: crate::session_plan::SessionPlan,
+    /// The session's `PUNKTFUNK_PYROWAVE_MAX_MBPS` cap, kbps, for a pin re-resolved at the
+    /// delivered size.
+    pub(super) pyrowave_max_kbps: Option<u32>,
+    /// The session's encode resolution: capture and the encoder open on it, whatever the
+    /// Encoder row says now.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
     pub(super) client_hdr: Option<pf_frame::HdrMeta>,
     /// The loop's `au_seq`: a driver encoder's wire index continues there.
     pub(super) wire_seq_base: u32,
+    /// The session's screen this build shows, `0` the first ([`super::screens`]).
+    pub(super) screen: u8,
 }
 
 /// The session a Welcome-time [`prepare_display`] builds for, as the handshake settled it.
@@ -69,31 +77,39 @@ pub(in crate::native) struct DisplayPrep {
     pub(in crate::native) client_identity: Option<[u8; 32]>,
     pub(in crate::native) client_hdr: Option<pf_frame::HdrMeta>,
     pub(in crate::native) cursor_forward: bool,
-    pub(in crate::native) multi_slice: bool,
+    pub(in crate::native) slices: u32,
     pub(in crate::native) bitrate_kbps: u32,
     pub(in crate::native) bitrate_auto: bool,
     pub(in crate::native) bit_depth: u8,
     pub(in crate::native) hdr: bool,
+    /// The colours the client asked to get at studio range
+    /// ([`crate::session_plan::SessionPlan::studio_asked`]).
+    pub(in crate::native) studio_asked: crate::session_plan::StudioAsk,
     pub(in crate::native) enc_of: EncDerive,
     pub(in crate::native) chroma: crate::encode::ChromaFormat,
     pub(in crate::native) codec: crate::encode::Codec,
     pub(in crate::native) pyrowave_bpp: f64,
+    pub(in crate::native) pyrowave_max_kbps: Option<u32>,
     pub(in crate::native) shard_payload: u16,
     /// A joiner's view and fit; `Some` for a session `mode_conflict: join` admitted.
     pub(in crate::native) reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
+    /// The handshake's encode resolution, which the session keeps.
+    pub(in crate::native) encoder: Arc<crate::encode::Resolved>,
 }
 
-/// A virtual-display session's plan on `compositor`, `pyrowave_bpp` the session's. Bring-up
-/// and the Welcome-time prep both resolve here, so a prepared pipeline is built from the plan
-/// its session runs. `multi_slice` names no count, so it takes the host's default.
+/// A virtual-display session's plan on `compositor`, `pyrowave_bpp` and `encoder` the
+/// session's, at the range `studio_asked` leads to. Bring-up, the Welcome-time prep and a codec
+/// change all resolve here, so a prepared pipeline is built from the plan its session runs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_plan(
+    encoder: &crate::encode::Resolved,
     bit_depth: u8,
     hdr: bool,
     chroma: crate::encode::ChromaFormat,
     codec: crate::encode::Codec,
+    studio_asked: crate::session_plan::StudioAsk,
     cursor_forward: bool,
-    multi_slice: bool,
+    slices: u32,
     compositor: crate::vdisplay::Compositor,
     route: Option<&crate::vdisplay::GamescopeRoute>,
     pyrowave_bpp: f64,
@@ -102,6 +118,7 @@ pub(super) fn resolve_plan(
     join_live: bool,
 ) -> crate::session_plan::SessionPlan {
     let mut plan = crate::session_plan::SessionPlan::resolve(
+        encoder,
         bit_depth,
         hdr,
         chroma,
@@ -113,13 +130,10 @@ pub(super) fn resolve_plan(
             bit_depth,
             hdr,
             route,
+            encoder,
         ),
         cursor_forward,
-        if multi_slice {
-            crate::session_plan::DEFAULT_SLICES
-        } else {
-            1
-        },
+        slices,
     );
     // After resolve: a self-painting gamescope node would otherwise get a second XFixes pointer.
     plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(
@@ -127,6 +141,7 @@ pub(super) fn resolve_plan(
         route,
     );
     plan.sdr10_native = crate::session_plan::sdr10_native_for(&plan, compositor, route);
+    plan.studio_asked = studio_asked;
     plan.pyrowave_bpp = pyrowave_bpp;
     if codec == crate::encode::Codec::PyroWave {
         plan.wire_chunk = Some(shard_payload);
@@ -153,26 +168,31 @@ pub(in crate::native) fn prepare_display(
         client_identity,
         client_hdr,
         cursor_forward,
-        multi_slice,
+        slices,
         bitrate_kbps,
         bitrate_auto,
         bit_depth,
         hdr,
+        studio_asked,
         enc_of,
         chroma,
         codec,
         pyrowave_bpp,
+        pyrowave_max_kbps,
         shard_payload,
         reframe_to,
+        encoder,
     } = prep;
     let join_live = reframe_to.is_some();
     let plan = resolve_plan(
+        &encoder,
         bit_depth,
         hdr,
         chroma,
         codec,
+        studio_asked,
         cursor_forward,
-        multi_slice,
+        slices,
         compositor,
         None,
         pyrowave_bpp,
@@ -212,32 +232,59 @@ pub(in crate::native) fn prepare_display(
         bit_depth,
         enc_of,
         plan,
+        pyrowave_max_kbps,
+        encoder,
         client_hdr,
         wire_seq_base: 0,
+        screen: 0,
     };
-    let pipeline = build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 8, Some(trace))?;
+    let pipeline = build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 1..=8, Some(trace))?;
     Ok(PreparedDisplay { vd, pipeline })
 }
 
 /// Run [`prepare_display`] on the thread that becomes the stream thread once Start delivers its
-/// [`SessionContext`]. A dropped sender (handshake abort, punch failure) drops what was built,
-/// which hands the monitor to keep-alive like a normal session end. `None` when the thread
-/// does not spawn: bring-up then builds inline. Compiled on every host; only Windows calls it.
+/// [`SessionContext`]. A dropped sender (handshake abort, a data plane that failed to bind) drops what was built,
+/// which hands the monitor to keep-alive like a normal session end. `scope_done` is the
+/// session scope's [`prep_done`](crate::native::scope::SessionScope::prep_done): the thread
+/// sends on it once the stream takes it over and holds it to its last statement, so the
+/// session's teardown waits for a prep it never took over. `None` when the thread does not
+/// spawn: bring-up then builds inline. Compiled on every host; only Windows calls it.
 pub(in crate::native) fn spawn_display_prep(
     prep: DisplayPrep,
     quit: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     trace: Arc<crate::bringup::Trace>,
+    scope_done: std::sync::mpsc::SyncSender<()>,
 ) -> Option<PrepHandle> {
     let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel::<SessionContext>(1);
     std::thread::Builder::new()
         .name("punktfunk1-stream".into())
         .spawn(move || -> Result<()> {
-            let prepared = prepare_display(prep, &quit, &stop, &trace);
-            let Ok(ctx) = ctx_rx.recv() else {
-                return Ok(());
-            };
-            virtual_stream(ctx, Some(prepared?))
+            // Declared first, so it drops last: after the display this thread built.
+            let scope_done = scope_done;
+            let done = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                // Start lands while the display builds: its plane serves the client's ramp
+                // meanwhile. A failed spawn drops `ctx_rx`, and the caller builds inline.
+                let (done, scope_done) = (&done, &scope_done);
+                let ramp = std::thread::Builder::new()
+                    .name("punktfunk-ramp".into())
+                    .spawn_scoped(s, move || {
+                        let mut ctx = ctx_rx.recv().ok()?;
+                        let _ = scope_done.try_send(());
+                        super::ramp::serve_while_prepping(&mut ctx.common, done);
+                        Some(ctx)
+                    })?;
+                let prepared = prepare_display(prep, &quit, &stop, &trace);
+                done.store(true, Ordering::SeqCst);
+                let ctx = ramp
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the bring-up ramp thread panicked"))?;
+                match ctx {
+                    Some(ctx) => virtual_stream(ctx, Some(prepared?)),
+                    None => Ok(()),
+                }
+            })
         })
         .map(|handle| (ctx_tx, handle))
         .map_err(|e| {
@@ -254,14 +301,16 @@ const FIRST_ATTEMPT_FRAME_BUDGET: std::time::Duration = std::time::Duration::fro
 /// render device, which gets one adapter reload first ([`cycled_driver_for`]). Each failed
 /// attempt drops its capturer so the next create is clean. `supersedes` is the lease this
 /// build replaces (create-before-drop): without it the registry counts the old lease as a live
-/// sibling and the new display extends the group instead of heading it.
+/// sibling and the new display extends the group instead of heading it. `attempts` are the
+/// attempt numbers to run: attempt 1 takes [`FIRST_ATTEMPT_FRAME_BUDGET`], every other the
+/// capturer's default, and a later attempt checks `stop` before it starts.
 pub(super) fn build_pipeline_with_retry(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     req: &BuildRequest,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     supersedes: Option<u64>,
-    max_attempts: u32,
+    attempts: std::ops::RangeInclusive<u32>,
     trace: Option<&crate::bringup::Trace>,
 ) -> Result<Pipeline> {
     // IDD-push: hold one lease across attempts so a failed capturer drop does not Lingering-preempt.
@@ -277,7 +326,8 @@ pub(super) fn build_pipeline_with_retry(
         None
     };
     let mut backoff = std::time::Duration::from_millis(500);
-    for attempt in 1..=max_attempts {
+    let last = *attempts.end();
+    for attempt in attempts {
         if attempt > 1 && stop.load(Ordering::SeqCst) {
             anyhow::bail!(
                 "session ended (client disconnected) during pipeline build — aborting retries \
@@ -296,7 +346,7 @@ pub(super) fn build_pipeline_with_retry(
             Err(e) => {
                 let chain = format!("{e:#}");
                 let permanent = is_permanent_build_error(&chain) && !cycled_driver_for(&e);
-                if permanent || attempt == max_attempts {
+                if permanent || attempt == last {
                     let why = if permanent {
                         "permanent"
                     } else {
@@ -308,7 +358,7 @@ pub(super) fn build_pipeline_with_retry(
                 }
                 tracing::warn!(
                     attempt,
-                    max = max_attempts,
+                    max = last,
                     backoff_ms = backoff.as_millis() as u64,
                     error = %chain,
                     "pipeline build failed — retrying"
@@ -387,6 +437,12 @@ pub(super) fn is_permanent_build_error(chain: &str) -> bool {
         "no monitor named",
         // Stock niri stays without virtual outputs until its owner installs biri.
         "this niri has no virtual outputs",
+        // An output with no PipeWire node has nothing to fall back to.
+        "has no pipewire node",
+        // An Umbriel without virtual outputs stays so until it is updated.
+        "predates virtual outputs",
+        // Every request to this Umbriel fails the same way until the host is updated.
+        "parses neither request shape",
     ];
     let lower = chain.to_ascii_lowercase();
     PERMANENT.iter().any(|p| lower.contains(p))
@@ -424,50 +480,51 @@ pub(super) fn pacing_hz(session_hz: u32, achieved_hz: u32) -> u32 {
     achieved_hz.min(session_hz).max(1)
 }
 
-/// What [`open_session_encoder`] asks [`crate::encode::open_video`] for.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct VideoOpen {
-    codec: crate::encode::Codec,
-    format: pf_frame::PixelFormat,
-    width: u32,
-    height: u32,
-    hz: u32,
-    bitrate_bps: u64,
-    cuda: bool,
-    bit_depth: u8,
-    hdr: bool,
-    chroma: crate::encode::ChromaFormat,
-    cursor_blend: bool,
-    slices: u32,
-}
-
-impl VideoOpen {
-    fn open(self) -> Result<Box<dyn crate::encode::Encoder>> {
-        crate::encode::open_video(
-            self.codec,
-            self.format,
-            self.width,
-            self.height,
-            self.hz,
-            self.bitrate_bps,
-            self.cuda,
-            self.bit_depth,
-            self.hdr,
-            self.chroma,
-            self.cursor_blend,
-            self.slices,
-        )
+/// Log a display that runs below the rate the session asked. A mirrored head
+/// ([`DisplayOwnership::External`]) was asked for none and runs at its own: that is a fact
+/// about the head, not a compositor refusing a request.
+fn report_achieved_hz(
+    ownership: crate::vdisplay::DisplayOwnership,
+    display_hz: u32,
+    achieved_hz: u32,
+    session_hz: u32,
+) {
+    if achieved_hz < session_hz {
+        if ownership == crate::vdisplay::DisplayOwnership::External {
+            tracing::info!(
+                head = achieved_hz,
+                session = session_hz,
+                "the mirrored head runs below the session rate — encoding at the head's rate"
+            );
+        } else {
+            tracing::warn!(
+                requested = display_hz,
+                achieved = achieved_hz,
+                session = session_hz,
+                "compositor did not honor the requested refresh — encoding at the achieved rate"
+            );
+        }
+    } else if achieved_hz < display_hz {
+        tracing::info!(
+            requested = display_hz,
+            achieved = achieved_hz,
+            session = session_hz,
+            "compositor did not honor the multiplied display refresh — the session rate is unaffected"
+        );
     }
 }
 
-/// Open the session's encoder for `frame` — framed for a joiner, or at the client's `negotiated`
-/// size when a larger head is mirrored (`session_plan::open_encoder_fitted`) — with the plan's
-/// chunking, slice ceiling and the capturer's ring depth applied, and return the framing it
-/// encodes. `bitrate_bps` is asked for that size. An IDD-push source gets the driver's encoder
-/// instead, its wire-index domain continuing at `wire_seq_base` (the loop's `au_seq`). Both
-/// stream loops open here: GameStream's plan carries the client's own slice count.
+/// Open the session's encoder for `frame` on `encoder`, the session's resolution — framed for a
+/// joiner, or at the client's `negotiated` size when a larger head is mirrored
+/// (`session_plan::open_encoder_fitted`) — with the plan's chunking, slice ceiling and the
+/// capturer's ring depth applied, and return the framing it encodes. `bitrate_bps` is asked for
+/// that size; depth and HDR are what the source composes now (`session_plan::live_depth`). An
+/// IDD-push source gets the driver's encoder instead, its wire-index domain continuing at
+/// `wire_seq_base` (the loop's `au_seq`). Both stream loops open here: GameStream's plan carries
+/// the client's own slice count.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_session_encoder(
+    encoder: &crate::encode::Resolved,
     plan: &crate::session_plan::SessionPlan,
     capturer: &dyn crate::capture::Capturer,
     frame: &crate::capture::CapturedFrame,
@@ -482,6 +539,7 @@ pub(crate) fn open_session_encoder(
     punktfunk_core::video_fit::Reframe,
 )> {
     open_session_encoder_with(
+        encoder,
         plan,
         capturer,
         frame,
@@ -491,13 +549,14 @@ pub(crate) fn open_session_encoder(
         bit_depth,
         client_hdr,
         wire_seq_base,
-        VideoOpen::open,
+        crate::encode::open_video,
     )
 }
 
 /// [`open_session_encoder`] through `open_video`, which a test replaces.
 #[allow(clippy::too_many_arguments)]
-fn open_session_encoder_with(
+pub(super) fn open_session_encoder_with(
+    encoder: &crate::encode::Resolved,
     plan: &crate::session_plan::SessionPlan,
     capturer: &dyn crate::capture::Capturer,
     frame: &crate::capture::CapturedFrame,
@@ -507,7 +566,10 @@ fn open_session_encoder_with(
     bit_depth: u8,
     client_hdr: Option<pf_frame::HdrMeta>,
     wire_seq_base: u32,
-    mut open_video: impl FnMut(VideoOpen) -> Result<Box<dyn crate::encode::Encoder>>,
+    mut open_video: impl FnMut(
+        &crate::encode::Resolved,
+        crate::encode::OpenParams,
+    ) -> Result<Box<dyn crate::encode::Encoder>>,
 ) -> Result<(
     Box<dyn crate::encode::Encoder>,
     punktfunk_core::video_fit::Reframe,
@@ -530,31 +592,38 @@ fn open_session_encoder_with(
             )
         });
     }
+    let (hdr, bit_depth) =
+        crate::session_plan::live_depth(plan.hdr, capturer.colour().hdr_meta.is_some(), bit_depth);
     let (mut enc, framed) = crate::session_plan::open_encoder_fitted(
         frame,
         negotiated,
         plan.reframe_to,
         |width, height| {
-            open_video(VideoOpen {
-                codec: plan.codec,
-                format: frame.format,
-                width,
-                height,
-                hz,
-                bitrate_bps: bitrate_bps(width, height),
-                cuda: frame.is_cuda(),
-                bit_depth,
-                hdr: plan.hdr,
-                chroma: plan.chroma,
-                cursor_blend: plan.cursor_blend,
-                slices: plan.slices,
-            })
+            open_video(
+                encoder,
+                crate::encode::OpenParams {
+                    codec: plan.codec,
+                    format: frame.format,
+                    width,
+                    height,
+                    fps: hz,
+                    bitrate_bps: bitrate_bps(width, height),
+                    cuda: frame.is_cuda(),
+                    bit_depth,
+                    hdr,
+                    chroma: plan.chroma,
+                    cursor_blend: plan.cursor_blend,
+                    slices: plan.slices,
+                    full_range: plan.full_range(hdr, bit_depth),
+                },
+            )
         },
     )?;
     if let Some(c) = plan.wire_chunk {
         enc.set_wire_chunking(c);
     }
-    enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
+    // The host submits one frame in flight; an NVENC never told so pipelines two.
+    enc.set_input_ring_depth(1);
     Ok((enc, framed))
 }
 
@@ -613,8 +682,11 @@ fn attach_pipeline(
         bit_depth,
         enc_of,
         plan,
+        pyrowave_max_kbps,
+        ref encoder,
         client_hdr,
         wire_seq_base,
+        screen,
     } = *req;
     #[cfg(target_os = "linux")]
     let reused_gen = vout.reused_gen;
@@ -625,28 +697,17 @@ fn attach_pipeline(
     #[cfg(not(target_os = "linux"))]
     let pool_gen = None;
     let node_id = vout.node_id;
-    #[cfg(target_os = "linux")]
-    let cursor_seat = vout.seat.clone();
     let achieved_hz = vout
         .preferred_mode
         .map(|(_, _, hz)| hz)
         .filter(|&hz| hz > 0)
         .unwrap_or(display_mode.refresh_hz);
-    if achieved_hz < mode.refresh_hz {
-        tracing::warn!(
-            requested = display_mode.refresh_hz,
-            achieved = achieved_hz,
-            session = mode.refresh_hz,
-            "compositor did not honor the requested refresh — encoding at the achieved rate"
-        );
-    } else if achieved_hz < display_mode.refresh_hz {
-        tracing::info!(
-            requested = display_mode.refresh_hz,
-            achieved = achieved_hz,
-            session = mode.refresh_hz,
-            "compositor did not honor the multiplied display refresh — the session rate is unaffected"
-        );
-    }
+    report_achieved_hz(
+        vout.ownership,
+        display_mode.refresh_hz,
+        achieved_hz,
+        mode.refresh_hz,
+    );
     let effective_hz = pacing_hz(mode.refresh_hz, achieved_hz);
     // A mirrored KWin head is still KWin's stream: its id 0 hides the pointer.
     let cursor_id0_hides = vd.producer() == pf_vdisplay::Compositor::Kwin.id();
@@ -654,29 +715,28 @@ fn attach_pipeline(
     let mut capturer = crate::capture::capture_virtual_output(
         vout,
         crate::capture::VirtualCaptureRequest {
-            output: plan.output_format(),
+            output: plan.output_format(encoder),
             codec: Some(plan.codec),
+            encoder: encoder.clone(),
             capture: plan.capture,
             kwin: cursor_id0_hides,
             gamescope: producer_is_gamescope,
             stream_hz: effective_hz,
+            screen,
+            gamescope_cursor: plan.gamescope_cursor,
         },
     )
     .context("capture virtual output")?;
-    #[cfg(target_os = "linux")]
-    if plan.gamescope_cursor {
-        capturer.attach_gamescope_cursor(std::sync::Arc::new(move || {
-            pf_vdisplay::gamescope_xwayland_cursor_targets(cursor_seat.as_deref())
-        }));
-    }
     if let Some(t) = trace {
         t.mark("capture_attached");
     }
-    capturer.set_active(true);
-    let first = match first_frame_budget {
-        Some(budget) => capturer.next_frame_within_provisional(budget),
-        None => capturer.next_frame(),
-    };
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(true);
+    }
+    let first = capturer.next_frame(first_frame_budget.map_or(
+        pf_capture::FirstFrame::Default,
+        pf_capture::FirstFrame::Provisional,
+    ));
     let frame = match first.context("first frame") {
         Ok(f) => f,
         Err(e) => {
@@ -703,7 +763,7 @@ fn attach_pipeline(
             bitrate_kbps
         } else if plan.codec == crate::encode::Codec::PyroWave {
             let running = bitrate_auto.then_some(bitrate_kbps);
-            pyrowave_mode_kbps(running, &encoded, &plan)
+            pyrowave_mode_kbps(running, &encoded, &plan, pyrowave_max_kbps)
         } else if bitrate_auto {
             resolve_bitrate_kbps_for(
                 plan.codec,
@@ -712,12 +772,14 @@ fn attach_pipeline(
                 plan.chroma,
                 bit_depth,
                 plan.pyrowave_bpp,
+                pyrowave_max_kbps,
             )
         } else {
             bitrate_kbps
         }
     };
     let (enc, reframe) = open_session_encoder(
+        encoder,
         &plan,
         &*capturer,
         &frame,
@@ -811,22 +873,34 @@ mod tests {
             sdr10_native: false,
             slices,
             reframe_to: None,
+            rgb_full_range: true,
+            studio_asked: crate::session_plan::StudioAsk::default(),
         }
     }
 
     /// Native opens a 4:4:4 HDR session at its own depth and a rate per encoded size;
     /// GameStream a 4:2:0 one at the client's slice count, the frame's depth and one rate.
+    /// Over a source gone SDR the HDR session opens 8-bit SDR.
     #[test]
     fn both_loops_open_the_encoder_their_plan_names() {
-        let mut cap = crate::capture::SyntheticCapturer::new(64, 32, 60);
-        let frame = cap.next_frame().expect("a synthetic frame");
-        let want =
-            |plan: &crate::session_plan::SessionPlan, hz, bitrate_bps, bit_depth| VideoOpen {
+        let frame = crate::capture::SyntheticCapturer::new(64, 32, 60)
+            .next_frame(pf_capture::FirstFrame::Default)
+            .expect("a synthetic frame");
+        // A source lit HDR.
+        let cap = pf_capture::FakeCapturer {
+            colour: pf_capture::ColourFacts {
+                hdr_meta: Some(pf_frame::hdr::generic_hdr10()),
+                sdr_fp16: false,
+            },
+            ..Default::default()
+        };
+        let want = |plan: &crate::session_plan::SessionPlan, hz, bitrate_bps, bit_depth| {
+            crate::encode::OpenParams {
                 codec: plan.codec,
                 format: frame.format,
                 width: 64,
                 height: 32,
-                hz,
+                fps: hz,
                 bitrate_bps,
                 cuda: false,
                 bit_depth,
@@ -834,13 +908,17 @@ mod tests {
                 chroma: plan.chroma,
                 cursor_blend: true,
                 slices: plan.slices,
-            };
+                full_range: plan.full_range(plan.hdr, bit_depth),
+            }
+        };
+        let encoder = crate::encode::resolve();
         let open = |plan: &crate::session_plan::SessionPlan,
                     hz,
                     bitrate_bps: fn(u32, u32) -> u64,
                     bit_depth| {
             let mut asked = Vec::new();
             let (_, reframe) = open_session_encoder_with(
+                &encoder,
                 plan,
                 &cap,
                 &frame,
@@ -850,7 +928,7 @@ mod tests {
                 bit_depth,
                 None,
                 1,
-                |v| {
+                |_, v| {
                     asked.push(v);
                     Ok(Box::new(NullEnc))
                 },
@@ -869,6 +947,25 @@ mod tests {
         let gamestream = plan(crate::encode::ChromaFormat::Yuv420, false, 4);
         let asked = open(&gamestream, 60, |_, _| 16_287_878, 8);
         assert_eq!(asked, [want(&gamestream, 60, 16_287_878, 8)]);
+
+        let sdr = crate::capture::SyntheticCapturer::new(64, 32, 60);
+        let (_, _) = open_session_encoder_with(
+            &encoder,
+            &native,
+            &sdr,
+            &frame,
+            (64, 32),
+            120,
+            |w, h| u64::from(w * h),
+            10,
+            None,
+            1,
+            |_, v| {
+                assert_eq!((v.hdr, v.bit_depth), (false, 8), "an SDR source");
+                Ok(Box::new(NullEnc))
+            },
+        )
+        .expect("an encoder");
     }
 
     #[test]
@@ -921,6 +1018,14 @@ mod tests {
             "spawn gamescope (is it installed? `apt install gamescope`)"
         ));
         assert!(is_permanent_build_error("virtual displays require Linux"));
+        assert!(is_permanent_build_error(
+            "open capture: direct capture refused and the backend has no PipeWire node: no \
+             ext_image_copy_capture_manager_v1"
+        ));
+        assert!(is_permanent_build_error(
+            "create virtual output: umbriel has no output-destroy: it predates virtual outputs \
+             (2026-09-28); update it"
+        ));
         assert!(!is_permanent_build_error(
             "create virtual output: KWin created the virtual output disabled and refused to \
              stream it (stream_virtual_output failed: Não foi possível encontrar saída); enabled \
@@ -939,6 +1044,10 @@ mod tests {
         ));
         assert!(is_permanent_build_error(
             "create virtual output: no monitor named \"HDMI-A-3\" — this host has: HDMI-A-1"
+        ));
+        assert!(is_permanent_build_error(
+            "create virtual output: umbriel parses neither request shape this host sends: update \
+             the host"
         ));
         assert!(!is_permanent_build_error("open NVENC: device busy"));
     }

@@ -137,7 +137,9 @@ let
       openFirewall = true;
       gamescopeHdr = false;
       settings.RUST_LOG = "info";
+      settings.PUNKTFUNK_MGMT_BIND = "0.0.0.0:47991";
     };
+    services.punktfunk.web.bind = "127.0.0.1";
     services.punktfunk.seats.enable = true;
   };
   seatsWithoutHost = evalWith { services.punktfunk.seats.enable = true; };
@@ -397,6 +399,18 @@ let
       ok = hasSys seats "punktfunk-seat@.service" "X-RestartIfChanged=false";
     }
     {
+      # The owner's row runs its host from seat-session, so it takes the module's settings and
+      # the gamestream flag from a file only the owner's branch reads, and every seat encodes
+      # through the capped worker.
+      name = "seats hand the owner's row the module's settings and every seat the capped worker";
+      ok =
+        let
+          env = seats.systemd.services."punktfunk-seat@".environment;
+        in
+        lib.hasSuffix "-punktfunk-owner.env" env.PUNKTFUNK_OWNER_ENV
+        && lib.hasSuffix "/punktfunk-encode-worker" env.PUNKTFUNK_ENCODE_WORKER;
+    }
+    {
       name = "seats refuses a box with no host";
       ok = lib.any (lib.hasInfix "seats needs services.punktfunk.host.enable") (
         failedAssertions seatsWithoutHost
@@ -430,7 +444,7 @@ let
           "ExecStart=\nExecStart=/pf-stub/punktfunk-web/bin/punktfunk-web-server";
     }
     {
-      # The helper calls useradd, runuser, flock and awk by name.
+      # The helpers and the door's ExecStartPre call useradd, runuser, flock and awk by name.
       name = "the door's helpers have a PATH with the account tools";
       ok =
         let
@@ -440,7 +454,45 @@ let
             && hasSys seats name "-util-linux-"
             && hasSys seats name "-gawk-";
         in
-        onPath "punktfunk-door-on@.service" && onPath "punktfunk-door-off@.service";
+        onPath "punktfunk-door-on@.service"
+        && onPath "punktfunk-door-off@.service"
+        && onPath "punktfunk-door.service";
+    }
+    {
+      name = "the door takes the port keys from settings and no other knob";
+      ok =
+        let
+          env = seats.systemd.services.punktfunk-door.environment;
+        in
+        env.PUNKTFUNK_MGMT_BIND or null == "0.0.0.0:47991" && !(env ? RUST_LOG);
+    }
+    {
+      # The helper's `systemctl enable` has nowhere to write on NixOS, so the units are wired
+      # here. They start at boot only while the owner record exists: the door is off without it.
+      name = "the door's units start at boot once the owner record exists";
+      ok =
+        let
+          wired =
+            name: unit:
+            seats.systemd.services.${name}.wantedBy == [ "multi-user.target" ]
+            && lib.hasInfix "\nConditionPathExists=/var/lib/punktfunk-seats/owner\n" (
+              builtins.readFile unit
+            );
+        in
+        wired "punktfunk-door" ../linux/punktfunk-door.service
+        && wired "punktfunk-web-door" ../linux/punktfunk-web-door.service;
+    }
+    {
+      # A console limited to this machine stays so when the door takes over. host.env, which
+      # carries the bind on other distros, is not read: the option is the source.
+      name = "the door's console binds where web.bind says, never host.env";
+      ok =
+        let
+          files = seats.systemd.services.punktfunk-web-door.serviceConfig.EnvironmentFile;
+        in
+        hasSys seats "punktfunk-web-door.service" "PUNKTFUNK_UI_BIND=127.0.0.1"
+        && lib.head files == ""
+        && lib.tail files == shippedEnvFiles ../linux/punktfunk-web-door.service;
     }
     {
       # polkit reads /etc/polkit-1/rules.d; the rule is the package's file, not a copy.
@@ -456,10 +508,21 @@ let
       ok = seats.users.groups ? punktfunk-update;
     }
     {
+      # The door's user has a group of its own. `punktfunk` owns the usbip attach nodes and
+      # passes pf-dm-helper, which the door has no use for.
+      name = "the door's units run in a group the module declares";
+      ok =
+        seats.users.groups ? punktfunk-door
+        && lib.all (f: lib.hasInfix "\nGroup=punktfunk-door\n" (builtins.readFile f)) [
+          ../linux/punktfunk-door.service
+          ../linux/punktfunk-web-door.service
+        ];
+    }
+    {
       name = "seats open the seat ports with the host's";
       ok = lib.elem {
         from = 9779;
-        to = 9782;
+        to = 9786;
       } seats.networking.firewall.allowedUDPPortRanges;
     }
     {
@@ -482,7 +545,8 @@ let
       ok =
         appliance.networking.firewall.allowedUDPPortRanges == [ ]
         && !(desktop.systemd.services ? punktfunk-door)
-        && !(desktop.users.groups ? punktfunk-update);
+        && !(desktop.users.groups ? punktfunk-update)
+        && !(desktop.users.groups ? punktfunk-door);
     }
 
     # --- the client half must not drag the host's system wiring in -----------------------------

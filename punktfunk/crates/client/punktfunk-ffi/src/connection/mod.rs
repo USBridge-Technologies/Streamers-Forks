@@ -10,6 +10,8 @@ mod pad;
 
 mod video;
 
+mod screens;
+
 mod input;
 
 mod host;
@@ -18,6 +20,11 @@ mod clipboard;
 
 mod control;
 
+mod au_memory;
+
+mod mgmt;
+
+pub use au_memory::*;
 pub use clipboard::*;
 pub use connect::*;
 pub use control::*;
@@ -25,21 +32,28 @@ pub use control::*;
 pub use host::*;
 #[cfg(feature = "quic")]
 pub use input::*;
+#[cfg(feature = "quic")]
+pub use mgmt::*;
 pub use pad::*;
 #[cfg(feature = "quic")]
 pub use planes::*;
+#[cfg(feature = "quic")]
+pub use screens::*;
 pub use video::*;
 
 #[cfg(feature = "quic")]
 use crate::*;
 
-/// Live `punktfunk/1` connection (QUIC control + UDP data, pumped on internal threads).
+/// Live `punktfunk/2` connection (one QUIC connection and its media, pumped on internal threads).
 /// One puller thread per plane; never two threads on the same plane.
 #[cfg(feature = "quic")]
 pub struct PunktfunkConnection {
     inner: punktfunk_core::client::NativeClient,
     /// Last `next_au` payload. Pointer valid until the next video pull.
     last: std::sync::Mutex<Option<punktfunk_core::session::Frame>>,
+    /// Last `next_screen_au` payload of screens 1 to 3. Each pointer valid until that screen's
+    /// next pull.
+    last_screens: std::sync::Mutex<[Option<punktfunk_core::session::Frame>; 3]>,
     /// Last `next_audio` payload. Independent of the video slot.
     last_audio: std::sync::Mutex<Option<punktfunk_core::client::AudioPacket>>,
     /// In-core PCM decode. Returned pointer valid until the next PCM call.
@@ -441,6 +455,8 @@ pub const PUNKTFUNK_COMPOSITOR_HYPRLAND: u32 = 5;
 pub const PUNKTFUNK_COMPOSITOR_WINDOWS: u32 = 6;
 /// niri (the biri fork, which adds virtual outputs).
 pub const PUNKTFUNK_COMPOSITOR_NIRI: u32 = 7;
+/// Umbriel, Noctalia's wlroots compositor, which creates virtual outputs.
+pub const PUNKTFUNK_COMPOSITOR_UMBRIEL: u32 = 8;
 
 /// Gamepad-backend preference for [`punktfunk_connect_ex2`]: which virtual pad
 /// the host creates. Precedence: client choice > `PUNKTFUNK_GAMEPAD` env > X-Box 360.
@@ -501,7 +517,7 @@ pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE3: u32 = 0x0004_0000;
 pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE4: u32 = 0x0008_0000;
 pub const PUNKTFUNK_GAMEPAD_BTN_MISC1: u32 = 0x0020_0000;
 
-/// Connect to a `punktfunk/1` host at `width`x`height`@`refresh_hz`. Blocks up to
+/// Connect to a `punktfunk/2` host at `width`x`height`@`refresh_hz`. Blocks up to
 /// `timeout_ms`. NULL on failure. Same as [`punktfunk_connect_ex`] with
 /// `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
 ///

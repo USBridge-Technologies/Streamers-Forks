@@ -2,9 +2,9 @@
 //
 // Threading contract (mirrors the C header): each plane has one puller thread. Video pulls
 // nextAU() and nextHdrMeta(); audio pulls nextAudioPcm()/audioPlc(); feedback pulls
-// nextRumbleCommand() and nextHidOutput() in turn, under the lock nextHdrMeta() shares; cursor
-// pulls nextCursorShape()/nextCursorState(); nextClipboard() and nextHostTiming() each have
-// their own. The core keeps per-plane borrow
+// nextRumbleCommand() and nextHidOutput() in turn; cursor
+// pulls nextCursorShape()/nextCursorState(); nextClipboard(), nextHostTiming() and nextHdrMeta()
+// each have their own. The core keeps per-plane borrow
 // slots, so the planes never alias. send() is enqueue-only and safe alongside all of them.
 // A borrowed pointer is valid only until the next call of the same kind, so every puller
 // copies into an owned value.
@@ -20,6 +20,7 @@
 // close, the pull methods throw `.closed` and the threads unwind on their own.
 
 import Foundation
+import Network
 import PunktfunkCore
 import PunktfunkShared
 
@@ -31,8 +32,26 @@ private let statusNoFrame: Int32 = PUNKTFUNK_STATUS_NO_FRAME.rawValue
 private let statusClosed: Int32 = PUNKTFUNK_STATUS_CLOSED.rawValue
 
 /// One reassembled, FEC-recovered, decrypted access unit (Annex-B HEVC from the host).
+/// The screens a connect asks the host for, screen 0 first; none for one picture.
+public struct ScreenAsk: Sendable {
+    let records: [PunktfunkScreen]
+    public static let none = ScreenAsk(records: [])
+}
+
 public struct AccessUnit: Sendable {
+    /// The AU's bytes: a copy, or with `inPlace` a view of the lender's slot that holds until
+    /// the next pull.
     public let data: Data
+    /// Where the AU lies in memory the embedder lent (`setAccessUnitMemory`): the lender's
+    /// token for the slot and the byte offset from the lender's base. The decoder reads it
+    /// there until the lender frees the slot.
+    public struct InPlace: Sendable {
+        public let token: UInt64
+        public let offset: Int
+        public let count: Int
+    }
+    public let inPlace: InPlace?
+    public var byteCount: Int { inPlace?.count ?? data.count }
     public let ptsNs: UInt64
     public let frameIndex: UInt32
     public let flags: UInt32
@@ -48,13 +67,18 @@ public struct AccessUnit: Sendable {
     /// so a client-side standing backlog can never masquerade as network latency again.
     public let pulledNs: Int64
 
+    /// The stream's format changed at this AU: rebuild the decoder for the connection's codec,
+    /// colour, depth and chroma, which already read the new one, before decoding it.
+    public var newFormat: Bool { flags & UInt32(PUNKTFUNK_FRAME_NEW_FORMAT) != 0 }
+
     /// `pulledNs` defaults to `receivedNs` (zero queue wait) for callers with no pull instant —
     /// the synthetic probe AUs and decode tests, where the split is meaningless.
     public init(
         data: Data, ptsNs: UInt64, frameIndex: UInt32, flags: UInt32,
-        receivedNs: Int64, pulledNs: Int64? = nil
+        receivedNs: Int64, pulledNs: Int64? = nil, inPlace: InPlace? = nil
     ) {
         self.data = data
+        self.inPlace = inPlace
         self.ptsNs = ptsNs
         self.frameIndex = frameIndex
         self.flags = flags
@@ -68,6 +92,43 @@ public struct AccessUnit: Sendable {
             data: data, ptsNs: ptsNs, frameIndex: frameIndex, flags: flags,
             receivedNs: receivedNs, pulledNs: pulledNs)
     }
+}
+
+/// Memory the core assembles access units in, one slot per AU, so a decoder reads each AU
+/// where it was written. `take` and `release` run on core threads and must return at once;
+/// `locate` runs on the pump thread.
+public protocol AccessUnitMemory: AnyObject {
+    /// A writable buffer of at least `count` bytes and its token, or nil for the heap.
+    func take(_ count: Int) -> (base: UnsafeMutableRawPointer, count: Int, token: UInt64)?
+    /// The core is done with the buffer `token` names.
+    func release(_ token: UInt64)
+    /// The slot `pointer` lies in and its byte offset from the lender's base, or nil for
+    /// memory that is not the lender's.
+    func locate(_ pointer: UnsafeRawPointer) -> (token: UInt64, offset: Int)?
+}
+
+/// The lender behind the C callbacks' `userdata`.
+private final class AccessUnitMemoryBox {
+    let memory: AccessUnitMemory
+    init(_ memory: AccessUnitMemory) { self.memory = memory }
+}
+
+private let accessUnitTake:
+    @convention(c) (UnsafeMutableRawPointer?, UInt, UnsafeMutablePointer<PunktfunkAuStore>?) -> Bool = {
+        userdata, count, out in
+        guard let userdata, let out else { return false }
+        let memory = Unmanaged<AccessUnitMemoryBox>.fromOpaque(userdata).takeUnretainedValue().memory
+        guard let slot = memory.take(Int(count)) else { return false }
+        out.pointee = PunktfunkAuStore(
+            data: slot.base.assumingMemoryBound(to: UInt8.self), len: UInt(slot.count),
+            token: slot.token)
+        return true
+    }
+
+private let accessUnitRelease: @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Void = {
+    userdata, token in
+    guard let userdata else { return }
+    Unmanaged<AccessUnitMemoryBox>.fromOpaque(userdata).takeUnretainedValue().memory.release(token)
 }
 
 /// One Opus audio packet (48 kHz stereo, 5 ms frames) — decode with AVAudioConverter
@@ -90,8 +151,9 @@ public enum PunktfunkClientError: Error {
     case status(Int32)
     /// The host deliberately turned the attempt away and said why (its typed QUIC
     /// application close) — distinct from `.connectFailed` (unreachable/timeout) so the UI
-    /// can show the stated reason instead of blaming the network.
-    case rejected(HostRejection)
+    /// can show the stated reason instead of blaming the network. `said` is the host's own
+    /// sentence when it sent one, which outranks the typed reason's wording.
+    case rejected(HostRejection, said: String? = nil)
 }
 
 /// Why a host turned a connect/pair attempt away — decoded from the
@@ -152,6 +214,29 @@ public enum HostRejection: Sendable {
         }
     }
 
+    /// The status this rejection decodes from: the inverse of `init(status:)`.
+    var status: Int32 {
+        switch self {
+        case .pairingNotArmed: return PUNKTFUNK_STATUS_REJECTED_NOT_ARMED.rawValue
+        case .pairingBoundToOtherDevice: return PUNKTFUNK_STATUS_REJECTED_BOUND_OTHER.rawValue
+        case .pairingRateLimited: return PUNKTFUNK_STATUS_REJECTED_RATE_LIMITED.rawValue
+        case .identityRequired: return PUNKTFUNK_STATUS_REJECTED_IDENTITY_REQUIRED.rawValue
+        case .denied: return PUNKTFUNK_STATUS_REJECTED_DENIED.rawValue
+        case .approvalTimeout: return PUNKTFUNK_STATUS_REJECTED_APPROVAL_TIMEOUT.rawValue
+        case .superseded: return PUNKTFUNK_STATUS_REJECTED_SUPERSEDED.rawValue
+        case .wireVersionMismatch: return PUNKTFUNK_STATUS_REJECTED_WIRE_VERSION.rawValue
+        case .busy: return PUNKTFUNK_STATUS_REJECTED_BUSY.rawValue
+        case .accessExpired: return PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED.rawValue
+        case .launchNotPermitted: return PUNKTFUNK_STATUS_REJECTED_LAUNCH_NOT_PERMITTED.rawValue
+        case .hostPower: return PUNKTFUNK_STATUS_REJECTED_HOST_POWER.rawValue
+        case .setupFailed: return PUNKTFUNK_STATUS_REJECTED_SETUP_FAILED.rawValue
+        case .profileUnknown: return PUNKTFUNK_STATUS_REJECTED_PROFILE_UNKNOWN.rawValue
+        case .noSeat: return PUNKTFUNK_STATUS_REJECTED_NO_SEAT.rawValue
+        case .seatOccupied: return PUNKTFUNK_STATUS_REJECTED_SEAT_OCCUPIED.rawValue
+        case .seatUnavailable: return PUNKTFUNK_STATUS_REJECTED_SEAT_UNAVAILABLE.rawValue
+        }
+    }
+
     /// User-facing sentence — wording shared with the desktop clients.
     public var userMessage: String {
         switch self {
@@ -205,6 +290,12 @@ public enum HostRejection: Sendable {
 func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
     guard let s else { return body(nil) }
     return s.withCString { body($0) }
+}
+
+/// A connect's `onPending`, carried through the C callback's context pointer.
+private final class PendingCallback {
+    let call: @Sendable () -> Void
+    init(_ call: @escaping @Sendable () -> Void) { self.call = call }
 }
 
 public extension PunktfunkConnection {
@@ -293,11 +384,20 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Held across the blocking next_au call; close() takes it (same plane-lock → abiLock
     /// order as the pullers) so it can never free the handle under an in-flight poll.
     private let pumpLock = NSLock()
+    /// The device's network path, watched from the end of init until close(): see `pathChanged()`.
+    private let pathMonitor = NWPathMonitor()
+    /// The lender `setAccessUnitMemory` installed, for `nextAU` to place pulls. Under `pumpLock`.
+    private var accessUnitMemory: AccessUnitMemory?
+    /// Every lender ever installed, retained until `close()` ends the core's calls into them.
+    private var accessUnitMemoryBoxes: [Unmanaged<AccessUnitMemoryBox>] = []
     /// Same role for the audio drain thread (its own plane in the core).
     private let audioLock = NSLock()
     /// Same role for the feedback drain thread (rumble + HID-output — two core planes,
     /// drained sequentially by one thread).
     private let feedbackLock = NSLock()
+    /// Same role for the HDR metadata pull, which the video pump drains every frame with a
+    /// zero timeout: on its own lock a blocking feedback pull never starves it.
+    private let hdrLock = NSLock()
     /// Same role for the host-timing (0xCF) puller — its own plane in the core, drained
     /// non-blockingly by the app's 1 s stats tick (never contends with the blocking pullers).
     private let statsLock = NSLock()
@@ -307,10 +407,15 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Serializes the (single) cursor pull thread against close() — both cursor planes are
     /// drained by ONE thread, so one lock covers them.
     private let cursorLock = NSLock()
+    /// Same role for each further screen's pump, screens 1 to 3: one screen's poll never waits on
+    /// another's.
+    private let screenLocks = [NSLock(), NSLock(), NSLock()]
 
     /// What this session resolved at connect: the kit-side readers (presenter, input, the
     /// match-window follower) read these, never the globals, so two windows keep their own.
     public let settings: EffectiveSettings
+    /// The caller opens a window per screen: the session may show more than one picture.
+    public let showsScreens: Bool
 
     /// Negotiated session mode (host-confirmed).
     public private(set) var width: UInt32 = 0
@@ -335,6 +440,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         /// A Windows host's only backend. The host reports it; a client never requests it.
         case windows = 6
         case niri = 7
+        case umbriel = 8
 
         /// Loose name parsing for env/dev hooks: the same names as the host's
         /// `CompositorPref::from_name`.
@@ -348,6 +454,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
             case "hyprland": self = .hyprland
             case "windows": self = .windows
             case "niri", "biri": self = .niri
+            case "umbriel": self = .umbriel
             default: return nil
             }
         }
@@ -363,6 +470,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
             case .hyprland: return "hyprland"
             case .windows: return "windows"
             case .niri: return "niri"
+            case .umbriel: return "umbriel"
             }
         }
     }
@@ -608,21 +716,52 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// (20 000) when 0 was requested. `0` = an older host that didn't report it.
     public private(set) var resolvedBitrateKbps: UInt32 = 0
 
-    /// The colour signalling the host actually encodes with (CICP code points): `colorPrimaries`
+    /// What the stream decodes as: the codec, CICP colour, depth and chroma of the newest AU
+    /// `nextAU` handed out. The connect-time format until an AU with `newFormat` moves it, read
+    /// live from the core; the last connect-time value once the session closed.
+    public struct StreamFormat: Sendable, Equatable {
+        public var primaries: UInt8 = 1
+        public var transfer: UInt8 = 1
+        public var matrix: UInt8 = 1
+        public var fullRange = false
+        public var bitDepth: UInt8 = 8
+        public var chromaFormat: UInt8 = 1
+    }
+
+    /// The format the session opened with, for the getters below once the handle is gone.
+    private var openedFormat = StreamFormat()
+    private var openedCodec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
+
+    /// The live format (see `StreamFormat`).
+    public var streamFormat: StreamFormat {
+        withLiveHandle(or: openedFormat) { Self.readFormat($0) }
+    }
+
+    private static func readFormat(_ h: OpaquePointer) -> StreamFormat {
+        var prim: UInt8 = 1, trc: UInt8 = 1, mtx: UInt8 = 1, fullRange: UInt8 = 0, depth: UInt8 = 8
+        _ = punktfunk_connection_color_info(h, &prim, &trc, &mtx, &fullRange, &depth)
+        var chroma: UInt8 = 1
+        _ = punktfunk_connection_chroma_format(h, &chroma)
+        return StreamFormat(
+            primaries: prim, transfer: trc, matrix: mtx, fullRange: fullRange != 0,
+            bitDepth: depth, chromaFormat: chroma)
+    }
+
+    /// The colour signalling the host encodes with now (CICP code points): `colorPrimaries`
     /// (1=BT.709, 9=BT.2020), `colorTransfer` (1=BT.709, 16=PQ, 18=HLG), `colorMatrix`
     /// (1=BT.709, 9=BT.2020-NCL), `colorFullRange`. BT.709 limited SDR for an older host. Configure
     /// the decoder/presenter from these; mastering metadata arrives via `nextHdrMeta`.
-    public private(set) var colorPrimaries: UInt8 = 1
-    public private(set) var colorTransfer: UInt8 = 1
-    public private(set) var colorMatrix: UInt8 = 1
-    public private(set) var colorFullRange: Bool = false
+    public var colorPrimaries: UInt8 { streamFormat.primaries }
+    public var colorTransfer: UInt8 { streamFormat.transfer }
+    public var colorMatrix: UInt8 { streamFormat.matrix }
+    public var colorFullRange: Bool { streamFormat.fullRange }
     /// Encoded bit depth (8 or 10).
-    public private(set) var bitDepth: UInt8 = 8
-    /// The chroma subsampling the host resolved for this session, as the HEVC `chroma_format_idc`:
-    /// `1` = 4:2:0 (every pre-4:4:4 host, and the back-compat default) or `3` = full-chroma 4:4:4
-    /// (only when this client advertised `videoCap444` *and* the host could open a real 4:4:4
-    /// encoder). Drive the decoder's requested pixel format from this. See `isChroma444`.
-    public private(set) var chromaFormat: UInt8 = 1
+    public var bitDepth: UInt8 { streamFormat.bitDepth }
+    /// The chroma subsampling the host encodes now, as the HEVC `chroma_format_idc`: `1` = 4:2:0
+    /// (every pre-4:4:4 host, and the back-compat default) or `3` = full-chroma 4:4:4 (only when
+    /// this client advertised `videoCap444` *and* the host could open a real 4:4:4 encoder).
+    /// Drive the decoder's requested pixel format from this. See `isChroma444`.
+    public var chromaFormat: UInt8 { streamFormat.chromaFormat }
     /// Convenience: the resolved stream is full-chroma 4:4:4 (`chroma_format_idc == 3`).
     public var isChroma444: Bool { chromaFormat == 3 }
     /// True when the negotiated stream is HDR (PQ or HLG transfer) — drive an HDR present path and
@@ -678,6 +817,30 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// so `frameCount` answers "how many samples did I get", not "how long is one frame".
     public private(set) var resolvedAudioFrameUs: UInt16 = UInt16(PUNKTFUNK_AUDIO_FRAME_MS * 1000)
 
+    /// What the audio `nextAudioPcm` hands back is in now: the `resolvedAudio*` values until it
+    /// throws `PUNKTFUNK_STATUS_AUDIO_FORMAT`, which says the host moved the format at the next
+    /// frame. Read live from the core; the connect-time values once the session closed.
+    public struct AudioFormat: Sendable, Equatable {
+        public var channels: UInt8
+        public var rateHz: UInt32
+        public var frameUs: UInt16
+    }
+
+    public var audioFormat: AudioFormat {
+        let opened = AudioFormat(
+            channels: resolvedAudioChannels, rateHz: resolvedAudioRateHz,
+            frameUs: resolvedAudioFrameUs)
+        return withLiveHandle(or: opened) { h in
+            var channels = opened.channels, rate = opened.rateHz, frameUs = opened.frameUs
+            _ = punktfunk_connection_audio_channels(h, &channels)
+            _ = punktfunk_connection_audio_sample_rate(h, &rate)
+            _ = punktfunk_connection_audio_frame_us(h, &frameUs)
+            return AudioFormat(
+                channels: channels, rateHz: rate,
+                frameUs: frameUs == 0 ? opened.frameUs : frameUs)
+        }
+    }
+
     /// True when this session resolved the LOSSLESS `0xD3` plane (`HOST_CAP_AUDIO_HIRES`) rather
     /// than Opus — the one honest answer to "is this bit-exact?", which the rate and depth alone
     /// cannot give (48 kHz/16-bit is a legal resolution on both planes).
@@ -685,11 +848,17 @@ public final class PunktfunkConnection: @unchecked Sendable {
         hostCaps & UInt8(PUNKTFUNK_HOST_CAP_AUDIO_HIRES) != 0
     }
 
-    /// The video codec the host resolved for this session (`Welcome.codec`, `PUNKTFUNK_CODEC_*`):
-    /// `2` = HEVC (default / older host), `1` = H.264, `4` = AV1, `8` = PyroWave (only when this
-    /// client opted in). Build the decoder from THIS. The resolved value honors the client's
-    /// `preferredCodec` when the host could emit it.
-    public private(set) var resolvedCodec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
+    /// The video codec the host encodes now (`PUNKTFUNK_CODEC_*`): `2` = HEVC (default / older
+    /// host), `1` = H.264, `4` = AV1, `8` = PyroWave (only when this client opted in). Build the
+    /// decoder from THIS. It honours the client's `preferredCodec` when the host could emit it,
+    /// and moves with `streamFormat`.
+    public var resolvedCodec: UInt8 {
+        withLiveHandle(or: openedCodec) { h in
+            var codec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
+            _ = punktfunk_connection_codec(h, &codec)
+            return codec
+        }
+    }
 
     /// The session's negotiated wire shard payload (`Welcome.shard_payload`, bytes) — the
     /// parse-window size for `USER_FLAG_CHUNK_ALIGNED` PyroWave AUs (plan §4.4). Other codecs
@@ -1024,9 +1193,17 @@ public final class PunktfunkConnection: @unchecked Sendable {
         timeoutMs: UInt32 = 10_000,
         // `deliveryProbeOnly` dials a network check's probes-only session; 0 streams.
         deliveryFlags: UInt8 = 0,
-        settings: EffectiveSettings = EffectiveSettings(defaults: .standard)
+        settings: EffectiveSettings = EffectiveSettings(defaults: .standard),
+        // Every display the stream shows, screen 0 first at this mode; none for one. With
+        // `showsScreens` a later `requestScreens` may ask for them though none is asked here.
+        screens: ScreenAsk = .none,
+        showsScreens: Bool = false,
+        // Called once, on this thread, when the host answers that its operator is deciding about
+        // this device; the connect then waits for that verdict instead of `timeoutMs`.
+        onPending: (@Sendable () -> Void)? = nil
     ) throws {
         self.settings = settings
+        self.showsScreens = showsScreens
         _ = Self.abiVersionGate // version-equality guard — fail loudly before the first C call
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
         var observed = [UInt8](repeating: 0, count: 32)
@@ -1060,17 +1237,31 @@ public final class PunktfunkConnection: @unchecked Sendable {
         opts.gamepad = gamepad.rawValue
         opts.bitrate_kbps = bitrateKbps
         opts.pyrowave_bpp_x100 = settings.pyrowaveBppX100
+        // The stage-2 pump rebuilds its decoder on an AU flagged `newFormat`.
+        opts.reformat = UInt8(PUNKTFUNK_REFORMAT_VIDEO)
         opts.video_caps = videoCaps
         opts.audio_channels = audioChannels
         opts.delivery_flags = deliveryFlags
         opts.audio_rate_hz = wantsHiRes ? audioRateHz : 0
         opts.audio_bits = wantsHiRes ? audioBits : 0
+        // The drain reopens playback when `nextAudioPcm` reports a new audio format.
+        opts.reformat |= UInt8(PUNKTFUNK_REFORMAT_AUDIO)
         opts.video_codecs = videoCodecs
         opts.preferred_codec = preferredCodec
         opts.client_caps = clientCaps
         opts.video_fit = videoFit
+        opts.shows_screens = showsScreens ? 1 : 0
         opts.timeout_ms = timeoutMs
-        let dialed = host.withCString { cs in
+        // The callback runs inside the connect call below, so the box only has to outlive it.
+        let pending = onPending.map(PendingCallback.init)
+        if let pending {
+            opts.on_pending = { ctx in
+                guard let ctx else { return }
+                Unmanaged<PendingCallback>.fromOpaque(ctx).takeUnretainedValue().call()
+            }
+            opts.on_pending_ctx = Unmanaged.passUnretained(pending).toOpaque()
+        }
+        let dialed = withExtendedLifetime(pending) { host.withCString { cs in
             withOptionalCString(identity?.certPEM) { cert in
                 withOptionalCString(identity?.keyPEM) { key in
                     withOptionalCString(launchID) { launch in
@@ -1089,8 +1280,13 @@ public final class PunktfunkConnection: @unchecked Sendable {
                                         opts.preset_name = presetName
                                         func dial(_ pin: UnsafePointer<UInt8>?) -> OpaquePointer? {
                                             opts.pin_sha256 = pin
-                                            return punktfunk_connect_opts(
-                                                &opts, &observed, &connectStatus)
+                                            // Read during the call only.
+                                            return screens.records.withUnsafeBufferPointer { list in
+                                                opts.screens = list.baseAddress
+                                                opts.screen_count = UInt8(clamping: list.count)
+                                                return punktfunk_connect_opts(
+                                                    &opts, &observed, &connectStatus)
+                                            }
                                         }
                                         if let pin = pinSHA256 {
                                             return pin.withUnsafeBytes { p in
@@ -1105,10 +1301,14 @@ public final class PunktfunkConnection: @unchecked Sendable {
                     }
                 }
             }
-        }
+        } }
         guard let opened = dialed else {
             if let rejection = HostRejection(status: connectStatus) {
-                throw PunktfunkClientError.rejected(rejection)
+                // The host's own sentence, read on this thread right after the refusal.
+                var said = [CChar](repeating: 0, count: 512)
+                let ok = punktfunk_connect_refusal(&said, UInt(said.count)) == statusOK
+                let text = ok ? String(cString: said) : ""
+                throw PunktfunkClientError.rejected(rejection, said: text.isEmpty ? nil : text)
             }
             throw PunktfunkClientError.connectFailed
         }
@@ -1135,16 +1335,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         var br: UInt32 = 0
         _ = punktfunk_connection_bitrate(opened, &br)
         resolvedBitrateKbps = br
-        var prim: UInt8 = 1, trc: UInt8 = 1, mtx: UInt8 = 1, fullRange: UInt8 = 0, depth: UInt8 = 8
-        _ = punktfunk_connection_color_info(opened, &prim, &trc, &mtx, &fullRange, &depth)
-        colorPrimaries = prim
-        colorTransfer = trc
-        colorMatrix = mtx
-        colorFullRange = fullRange != 0
-        bitDepth = depth
-        var cf: UInt8 = 1
-        _ = punktfunk_connection_chroma_format(opened, &cf)
-        chromaFormat = cf
+        openedFormat = Self.readFormat(opened)
         var ac: UInt8 = 2
         _ = punktfunk_connection_audio_channels(opened, &ac)
         resolvedAudioChannels = ac
@@ -1166,9 +1357,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         resolvedAudioFrameUs = frameUs == 0
             ? UInt16(PUNKTFUNK_AUDIO_FRAME_MS * 1000)
             : frameUs
-        var codec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
-        _ = punktfunk_connection_codec(opened, &codec)
-        resolvedCodec = codec
+        _ = punktfunk_connection_codec(opened, &openedCodec)
         var shard: UInt32 = 1408
         _ = punktfunk_connection_shard_payload(opened, &shard)
         shardPayload = shard
@@ -1184,6 +1373,20 @@ public final class PunktfunkConnection: @unchecked Sendable {
         var mgmt: UInt16 = 0
         _ = punktfunk_connection_mgmt_port(opened, &mgmt)
         hostMgmtPort = mgmt
+        // Every update with a route nudges the core, the first included: a nudge is one datagram.
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            if path.status == .satisfied { self?.pathChanged() }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "punktfunk.path", qos: .userInitiated))
+    }
+
+    /// The device's network path changed. The core re-picks the socket's source address and
+    /// shows the host where this device now is, so a roam heals within a round trip instead of
+    /// a keep-alive. Silently dropped after close.
+    public func pathChanged() {
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_path_changed(h)
+        }
     }
 
     /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.
@@ -1541,7 +1744,16 @@ public final class PunktfunkConnection: @unchecked Sendable {
             punktfunk_connection_next_au(h, &frame, timeoutMs)
         } decode: {
             guard let base = frame.data, frame.len > 0 else { return nil }
-            let data = Data(bytes: base, count: Int(frame.len)) // copy: ptr valid only until next call
+            let count = Int(frame.len)
+            // In lent memory the AU stays where it is and `data` views it: the view holds until
+            // the next pull, and a sample made over the slot holds the slot past that. Anything
+            // else is copied out, as the pointer is only valid until the next call.
+            let inPlace = accessUnitMemory?.locate(UnsafeRawPointer(base)).map {
+                AccessUnit.InPlace(token: $0.token, offset: $0.offset, count: count)
+            }
+            let data = inPlace == nil
+                ? Data(bytes: base, count: count)
+                : Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base), count: count, deallocator: .none)
             let pulledNs = realtimeNowNs()
             // Receipt = the core's reassembly-completion stamp (ABI v9); the pull instant is
             // kept separately so the client-queue wait is its own measured term. 0 would mean a
@@ -1550,6 +1762,56 @@ public final class PunktfunkConnection: @unchecked Sendable {
             let receivedNs = frame.received_ns > 0 ? Int64(frame.received_ns) : pulledNs
             return AccessUnit(
                 data: data, ptsNs: frame.pts_ns,
+                frameIndex: frame.frame_index, flags: frame.flags,
+                receivedNs: receivedNs, pulledNs: pulledNs, inPlace: inPlace)
+        }
+    }
+
+    /// The screens the host built, screen 0 first, and a generation that moves with each change;
+    /// `0` before the host said. A screen it could not build is absent.
+    public func screenLayout() -> (generation: UInt32, screens: [PunktfunkScreen]) {
+        withLiveHandle(or: (0, [])) { h in
+            var out = [PunktfunkScreen](repeating: PunktfunkScreen(), count: Int(PUNKTFUNK_SCREENS_MAX))
+            var count: UInt = 0
+            var generation: UInt32 = 0
+            let rc = out.withUnsafeMutableBufferPointer {
+                punktfunk_connection_screen_layout(h, $0.baseAddress, UInt($0.count), &count, &generation)
+            }
+            guard rc == statusOK else { return (0, []) }
+            return (generation, Array(out.prefix(Int(count))))
+        }
+    }
+
+    /// Show these screens from now on, screen 0 first: the host adds, drops and resizes the others
+    /// and answers with a new `screenLayout()`. A host without screens ignores it.
+    public func requestScreens(_ screens: [PunktfunkScreen]) {
+        withLiveHandle(or: ()) { h in
+            _ = screens.withUnsafeBufferPointer {
+                punktfunk_connection_request_screens(h, $0.baseAddress, UInt($0.count))
+            }
+        }
+    }
+
+    /// Screen `screen`'s decoder cannot go on: its access units wait for a keyframe, which the
+    /// core asks the host for.
+    public func requestScreenKeyframe(_ screen: UInt8) {
+        withLiveHandle(or: ()) { h in _ = punktfunk_connection_request_screen_keyframe(h, screen) }
+    }
+
+    /// Pull screen `screen`'s (1 to 3) next whole access unit; nil on timeout and before the host
+    /// opened it, throws `.closed` once the session ended or the host dropped it. One pump thread
+    /// per screen. The bytes are copied out: a further screen never lands in lent memory.
+    public func nextScreenAU(screen: UInt8, timeoutMs: UInt32 = 100) throws -> AccessUnit? {
+        guard (1...screenLocks.count).contains(Int(screen)) else { return nil }
+        var frame = PunktfunkFrame()
+        return try poll(screenLocks[Int(screen) - 1]) { h in
+            punktfunk_connection_next_screen_au(h, screen, &frame, timeoutMs)
+        } decode: {
+            guard let base = frame.data, frame.len > 0 else { return nil }
+            let pulledNs = realtimeNowNs()
+            let receivedNs = frame.received_ns > 0 ? Int64(frame.received_ns) : pulledNs
+            return AccessUnit(
+                data: Data(bytes: base, count: Int(frame.len)), ptsNs: frame.pts_ns,
                 frameIndex: frame.frame_index, flags: frame.flags,
                 receivedNs: receivedNs, pulledNs: pulledNs)
         }
@@ -1837,12 +2099,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     }
 
     /// Pull the next static HDR metadata update; nil on timeout, throws `.closed` once the session
-    /// ended. The video pump drains it with timeout 0: it shares the feedback thread's lock with
-    /// `nextRumbleCommand`/`nextHidOutput`, and a blocking poll there starves the other side.
+    /// ended. The video pump drains it with timeout 0 every frame, on its own lock.
     /// Only an HDR stream sends it, and a game can enter HDR mid-session.
     public func nextHdrMeta(timeoutMs: UInt32 = 0) throws -> HdrMeta? {
         var out = PunktfunkHdrMeta()
-        return try poll(feedbackLock) { h in
+        return try poll(hdrLock) { h in
             punktfunk_connection_next_hdr_meta(h, &out, timeoutMs)
         } decode: {
             // The fixed C `uint16_t[3]` arrays import as tuples — copy them out.
@@ -1922,28 +2183,60 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Close the connection and free the handle. Safe from any thread, idempotent; waits
     /// for in-flight pulls (≤ their timeouts) before tearing down.
     public func close() {
+        pathMonitor.cancel()
         abiLock.lock()
         closeRequested = true
         abiLock.unlock()
         pumpLock.lock() // pullers exit at their next poll boundary, releasing these
         audioLock.lock()
         feedbackLock.lock()
+        hdrLock.lock()
         statsLock.lock()
         clipboardLock.lock()
         cursorLock.lock()
+        screenLocks.forEach { $0.lock() }
         abiLock.lock()
         let h = handle
         handle = nil
         abiLock.unlock()
+        screenLocks.reversed().forEach { $0.unlock() }
         cursorLock.unlock()
         clipboardLock.unlock()
         statsLock.unlock()
+        hdrLock.unlock()
         feedbackLock.unlock()
         audioLock.unlock()
         pumpLock.unlock()
         if let h {
             punktfunk_connection_close(h) // joins the connection's internal Rust threads
         }
+        // Joined: no core thread can call a lender any more.
+        pumpLock.lock()
+        accessUnitMemory = nil
+        accessUnitMemoryBoxes.forEach { $0.release() }
+        accessUnitMemoryBoxes.removeAll()
+        pumpLock.unlock()
+    }
+
+    /// Assemble access units in `memory` from the next frame on (nil: the heap). The core
+    /// writes into its slots on its own threads, and `nextAU` then names the slot instead of
+    /// copying. From the pump thread, between pulls.
+    public func setAccessUnitMemory(_ memory: AccessUnitMemory?) {
+        pumpLock.lock()
+        defer { pumpLock.unlock() }
+        let installed = withLiveHandle(or: false) { h -> Bool in
+            guard let memory else { return punktfunk_connection_set_au_memory(h, nil) == statusOK }
+            let box = Unmanaged.passRetained(AccessUnitMemoryBox(memory))
+            var callbacks = PunktfunkAuMemory(
+                take: accessUnitTake, release: accessUnitRelease, userdata: box.toOpaque())
+            guard punktfunk_connection_set_au_memory(h, &callbacks) == statusOK else {
+                box.release()
+                return false
+            }
+            accessUnitMemoryBoxes.append(box)
+            return true
+        }
+        accessUnitMemory = installed ? memory : nil
     }
 
     /// Send one Opus mic frame (48 kHz) to the host, where it feeds a virtual
@@ -2314,6 +2607,13 @@ public final class PunktfunkConnection: @unchecked Sendable {
         /// Is this an ordinary outcome rather than something to alarm the user about? `.none`
         /// counts as normal: no evidence of trouble is not evidence of it.
         public var isNormal: Bool { self != .hostError && self != .lost }
+
+        /// How long to wait before redial `attempt` (0-based) of a session that ended this way,
+        /// on the schedule every client shares; nil means stay ended. Only `.lost` redials.
+        public func redialDelay(attempt: UInt32) -> Duration? {
+            let ms = punktfunk_redial_delay_ms(rawValue, attempt)
+            return ms < 0 ? nil : .milliseconds(ms)
+        }
     }
 
     /// Why this session ended. Only meaningful once it HAS ended (a plane threw `.closed`, or
@@ -2362,6 +2662,35 @@ public final class PunktfunkConnection: @unchecked Sendable {
             return said.isEmpty ? nil : said
         }
     }
+
+    /// How long to wait before dialing again a host whose connect failed with `error`,
+    /// `sinceFirst` after its first such refusal (nil: this is the first); nil means show the
+    /// failure. A host that just woke answers before it can stream: the rule every client shares.
+    public static func wakeRedialDelay(
+        after error: Error, autoWake: Bool, sinceFirst: Duration?
+    ) -> Duration? {
+        guard case .rejected(let rejection, _)? = error as? PunktfunkClientError else { return nil }
+        return redialDelay(
+            ms: punktfunk_wake_redial_delay_ms(autoWake, rejection.status, ms(sinceFirst)))
+    }
+
+    /// The same for how this session ended: its typed close counts only before any frame. Same
+    /// read discipline as `endRejection`.
+    public func wakeRedialDelay(autoWake: Bool, sinceFirst: Duration?) -> Duration? {
+        return withLiveHandle(or: nil) { h in
+            var out: Int64 = -1
+            guard punktfunk_connection_wake_redial_delay_ms(h, autoWake, Self.ms(sinceFirst), &out)
+                    == statusOK else { return nil }
+            return Self.redialDelay(ms: out)
+        }
+    }
+
+    private static func ms(_ d: Duration?) -> Int64 {
+        d.map { $0.components.seconds * 1000 + $0.components.attoseconds / 1_000_000_000_000_000 }
+            ?? -1
+    }
+
+    private static func redialDelay(ms: Int64) -> Duration? { ms < 0 ? nil : .milliseconds(ms) }
 
     /// The host's sentence when this session's launch did not give the player their game:
     /// refused, died on the spot, or picked up without the host seeing it. `nil` otherwise,

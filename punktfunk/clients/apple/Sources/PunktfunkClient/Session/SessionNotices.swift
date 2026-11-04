@@ -42,8 +42,13 @@ struct SessionNotices {
     /// The "Steam Controller passing through" badge, the SC2 capture's only UI surface. A
     /// release drops it at once: it must never outlive the passthrough it announces.
     var sc2Captured = Flash<Bool>()
+    /// macOS refused the Steam Controller's open: it plays as a plain pad and types beside it.
+    var sc2Refused = Flash<Bool>()
     /// How to leave, from stream start, unless the player turned it off.
     var exitHint = Flash<Bool>()
+    /// macOS 26 on an adaptive-sync panel. Stays until the player answers it or the session
+    /// ends: the fix is a system setting they have to go and change.
+    var vrrWarning = false
     /// The player just muted the microphone (`true`) or opened it again. Said after the switch
     /// and then gone: a standing badge over the game is the host's language, not the player's.
     var micMute = Flash<Bool>()
@@ -72,6 +77,7 @@ struct SessionNotices {
     mutating func cancelTimers() {
         motionUnreachable.clear()
         sc2Captured.clear()
+        sc2Refused.clear()
         exitHint.clear()
         micMute.clear()
         touchFallback.clear()

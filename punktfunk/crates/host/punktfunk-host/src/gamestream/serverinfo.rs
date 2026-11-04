@@ -93,21 +93,41 @@ fn host_mac(reached: Option<std::net::IpAddr>) -> Option<String> {
 
 /// `<ServerCodecModeSupport>`: SDR baseline ([`base_codec_mode_support`]) plus each
 /// codec's 10-bit bit the host can actually deliver ([`apply_hdr`] /
-/// [`crate::gamestream::host_hdr_capable`]). Moonlight offers its HDR toggle only
-/// when a 10-bit bit is set.
+/// [`crate::gamestream::host_hdr_capable`]), plus PyroWave's profiles where its encoder
+/// exists ([`pyrowave_modes`]). Moonlight offers its HDR toggle only when a 10-bit bit is set.
 pub(super) fn codec_mode_support() -> u32 {
     use crate::encode::Codec;
-    let hdr = crate::gamestream::host_hdr_capable();
-    let mask = apply_hdr(
-        base_codec_mode_support(),
-        hdr && crate::encode::can_encode_10bit(Codec::H265),
-        hdr && crate::encode::can_encode_10bit(Codec::Av1),
-    );
-    if super::rtsp::pyrowave_offered() {
-        mask | super::SCM_USBRIDGE_PYROWAVE
-    } else {
-        mask
+    let encoder = crate::encode::resolve();
+    let hdr = crate::gamestream::host_hdr_capable(&encoder);
+    apply_hdr(
+        base_codec_mode_support(&encoder),
+        hdr && encoder.can_encode_10bit(Codec::H265),
+        hdr && encoder.can_encode_10bit(Codec::Av1),
+    ) | pyrowave_modes(
+        // The native plane's PyroWave bit: built in and not on the software backend.
+        encoder.wire_caps() & punktfunk_core::quic::CODEC_PYROWAVE != 0,
+        pf_host_config::config().four_four_four,
+        hdr && encoder.can_encode_10bit(Codec::PyroWave),
+    )
+}
+
+/// Pure so tests can pin the PyroWave bits without a GPU. `chroma_444` is the host's 4:4:4
+/// policy row.
+fn pyrowave_modes(available: bool, chroma_444: bool, ten_bit: bool) -> u32 {
+    if !available {
+        return 0;
     }
+    let mut m = super::SCM_PYROWAVE;
+    if chroma_444 {
+        m |= super::SCM_PYROWAVE_444;
+    }
+    if ten_bit {
+        m |= super::SCM_PYROWAVE_HDR10;
+        if chroma_444 {
+            m |= super::SCM_PYROWAVE_HDR10_444;
+        }
+    }
+    m
 }
 
 /// Pure so tests can pin HDR layering without a GPU.
@@ -125,29 +145,19 @@ fn apply_hdr(base: u32, hevc_10bit: bool, av1_10bit: bool) -> u32 {
 /// SDR baseline. Probe when the backend can, so Moonlight never negotiates a
 /// codec the encoder cannot open; fail open to [`SERVER_CODEC_MODE_SUPPORT`].
 /// HDR bits are layered by [`codec_mode_support`].
-fn base_codec_mode_support() -> u32 {
-    // Software encodes H.264 only. A local config read, not `host_wire_caps()`:
-    // that re-runs DXGI enumeration per `/serverinfo` poll.
+fn base_codec_mode_support(encoder: &crate::encode::Resolved) -> u32 {
+    // Software encodes H.264 only, before any probe.
     if matches!(
         pf_host_config::config().encoder_pref.as_str(),
         "software" | "sw" | "openh264"
     ) {
         return super::SCM_H264;
     }
-    // The same narrowed probe `host_wire_caps` advertises, so Moonlight is never
-    // offered a codec the native path withholds. Fail-open: `probed_mask` is
-    // None → the static superset below.
-    #[cfg(target_os = "linux")]
-    if let Some(m) = probed_mask(crate::encode::linux_advertised_codec_support()) {
+    // The probe the native plane advertises, so Moonlight is never offered a codec it
+    // withholds. Unprobed (a Windows backend this build has no probe for) or empty → the
+    // static superset below.
+    if let Some(m) = encoder.advertised().and_then(probed_mask) {
         return m;
-    }
-    // AMF probes with no extra feature; QSV needs the `qsv` build and NVENC the
-    // `nvenc` one. Unprobed → superset, same fail-open as the Linux arms.
-    #[cfg(target_os = "windows")]
-    if crate::encode::windows_backend_is_probed() {
-        if let Some(m) = probed_mask(crate::encode::windows_codec_support()) {
-            return m;
-        }
     }
     SERVER_CODEC_MODE_SUPPORT
 }
@@ -155,7 +165,6 @@ fn base_codec_mode_support() -> u32 {
 /// Map a probe to a `ServerCodecModeSupport` mask. `None` means the GPU was
 /// unusable at probe time, not that it encodes nothing — the caller then
 /// advertises the static superset rather than claiming zero codecs.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn probed_mask(caps: crate::encode::CodecSupport) -> Option<u32> {
     use super::{SCM_AV1_MAIN8, SCM_H264, SCM_HEVC};
     let mut m = 0;
@@ -209,6 +218,29 @@ mod tests {
         assert_eq!(
             apply_hdr(SCM_H264 | SCM_HEVC, true, true),
             SCM_H264 | SCM_HEVC | SCM_HEVC_MAIN10
+        );
+    }
+
+    /// HDR10 needs 10-bit capability, 4:4:4 the host's policy; 8-bit 4:2:0 rides on
+    /// availability alone.
+    #[test]
+    fn pyrowave_modes_layer_hdr10_on_availability() {
+        use crate::gamestream::{
+            SCM_PYROWAVE, SCM_PYROWAVE_444, SCM_PYROWAVE_HDR10, SCM_PYROWAVE_HDR10_444,
+        };
+        assert_eq!(pyrowave_modes(false, true, true), 0);
+        assert_eq!(pyrowave_modes(true, false, false), SCM_PYROWAVE);
+        assert_eq!(
+            pyrowave_modes(true, true, false),
+            SCM_PYROWAVE | SCM_PYROWAVE_444
+        );
+        assert_eq!(
+            pyrowave_modes(true, false, true),
+            SCM_PYROWAVE | SCM_PYROWAVE_HDR10
+        );
+        assert_eq!(
+            pyrowave_modes(true, true, true),
+            SCM_PYROWAVE | SCM_PYROWAVE_444 | SCM_PYROWAVE_HDR10 | SCM_PYROWAVE_HDR10_444
         );
     }
 

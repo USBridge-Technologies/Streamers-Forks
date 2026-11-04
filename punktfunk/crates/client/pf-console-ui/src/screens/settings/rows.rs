@@ -24,6 +24,11 @@ pub enum RowId {
     RenderScale,
     /// `trust::Settings::video_fit`: bars, crop or stretch when the stream's shape differs.
     VideoFit,
+    /// `trust::Settings::screens`: this monitor, or a host screen on each monitor.
+    Screens,
+    /// How a Vision Pro bends the picture: flat, or a curved monitor's radius.
+    /// Device-local, under [`device_keys::SCREEN`].
+    Screen,
     Bitrate,
     /// `trust::Settings::pyrowave_bpp`, shown as the rate it needs. In Bitrate's place while
     /// the codec is PyroWave.
@@ -46,6 +51,9 @@ pub enum RowId {
     KeepHostAudio,
     Mic,
     EchoCancel,
+    /// Off, a Vision Pro plays the game's mix straight to the ears instead of from the
+    /// window. Device-local, under [`device_keys::SPATIAL_AUDIO`].
+    SpatialAudio,
     PadForward,
     Pad,
     PadType,
@@ -148,9 +156,7 @@ pub fn advanced(id: RowId) -> bool {
     matches!(
         id,
         RowId::SmoothBuffer
-            | RowId::PyroWaveQuality
             | RowId::RenderScale
-            | RowId::Codec
             | RowId::Chroma444
             | RowId::TenBitSdr
             | RowId::Vsync
@@ -193,6 +199,9 @@ pub(super) mod device_keys {
     /// With `width`/`height` 0: Native narrowed to clear the cutout. Kotlin's `-2`
     /// sentinel, which an unsigned size cannot carry.
     pub const SAFE_AREA_MODE: &str = "android.safe_area_mode";
+    /// The Vision Pro's own rows, under the prefix that client writes.
+    pub const SPATIAL_AUDIO: &str = "visionos.spatial_audio";
+    pub const SCREEN: &str = "visionos.screen";
 }
 
 /// The `Settings::extra` keys the webOS rows share with that client (`services::store::shared`),
@@ -213,6 +222,17 @@ const WEBOS_AUDIO_ROUTES: [(&str, &str); 2] =
 pub(super) const GAMEPAD_UI_KEY: &str = "gamepad_ui_enabled";
 pub(super) const GAMEPAD_UI_MODE_KEY: &str = "gamepad_ui_mode";
 
+/// The Vision Pro's `visionos.screen` values, as its own Settings names them.
+const SCREENS: [(&str, &str); 8] = [
+    ("flat", "Flat"),
+    ("4000r", "4000R"),
+    ("3000r", "3000R"),
+    ("2300r", "2300R"),
+    ("1800r", "1800R"),
+    ("1500r", "1500R"),
+    ("1000r", "1000R"),
+    ("800r", "800R"),
+];
 /// Stored [`GAMEPAD_UI_MODE_KEY`] values (`GamepadUi.kt`).
 const GAMEPAD_UI_MODES: [(&str, &str); 2] =
     [("connected", "With a controller"), ("always", "Always")];
@@ -381,6 +401,7 @@ impl RowId {
             RowId::PhoneGyro => Extra::Bool(device_keys::PHONE_GYRO, false),
             RowId::Sc2Passthrough => Extra::Bool(device_keys::SC2, true),
             RowId::DsCapture => Extra::Bool(device_keys::DS_CAPTURE, true),
+            RowId::SpatialAudio => Extra::Bool(device_keys::SPATIAL_AUDIO, true),
             RowId::CursorGestures => Extra::Bool(webos_keys::CURSOR_GESTURES, false),
             RowId::GamepadUi => Extra::Bool(GAMEPAD_UI_KEY, true),
             RowId::BackgroundKeepAlive => Extra::Bool(BACKGROUND_KEEP_ALIVE_KEY, false),
@@ -388,6 +409,7 @@ impl RowId {
                 Extra::Choice(webos_keys::AUDIO_ROUTE, "software", &WEBOS_AUDIO_ROUTES)
             }
             RowId::HostSort => Extra::Choice(home::HOST_SORT_KEY, "added", &home::HOST_SORTS),
+            RowId::Screen => Extra::Choice(device_keys::SCREEN, "flat", &SCREENS),
             RowId::GamepadUiMode => {
                 Extra::Choice(GAMEPAD_UI_MODE_KEY, "connected", &GAMEPAD_UI_MODES)
             }
@@ -472,15 +494,17 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
             RowId::Aspect,
             RowId::Resolution,
             RowId::Refresh,
+            RowId::Codec,
             RowId::Bitrate,
             RowId::PyroWaveQuality,
             RowId::VideoFit,
+            RowId::Screens,
+            RowId::Screen,
             RowId::SecondScreen,
             RowId::Hdr,
             RowId::PresentPriority,
             RowId::SmoothBuffer,
             RowId::RenderScale,
-            RowId::Codec,
             RowId::Chroma444,
             RowId::TenBitSdr,
             RowId::Vsync,
@@ -496,6 +520,7 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
         &[
             RowId::Audio,
             RowId::Mic,
+            RowId::SpatialAudio,
             RowId::AudioFormat,
             RowId::KeepHostAudio,
             RowId::EchoCancel,
@@ -689,12 +714,13 @@ fn bitrate_rungs(platform: crate::platform::Platform) -> usize {
         .position(|b| *b > ceiling)
         .unwrap_or(BITRATES.len())
 }
-const COMPOSITORS: [(&str, &str); 7] = [
+const COMPOSITORS: [(&str, &str); 8] = [
     ("auto", "Automatic"),
     ("kwin", "KWin"),
     ("mutter", "Mutter"),
     ("hyprland", "Hyprland"),
     ("niri", "niri"),
+    ("umbriel", "Umbriel"),
     ("wlroots", "wlroots"),
     ("gamescope", "gamescope"),
 ];
@@ -710,14 +736,15 @@ const CODECS: [(&str, &str); 5] = [
 /// The PS5's: Videodec2 decodes H.264 and HEVC, the GPU PyroWave, and nothing decodes AV1.
 const CODECS_PS5: [(&str, &str); 4] = [CODECS[0], CODECS[1], CODECS[2], CODECS[4]];
 
-/// The codecs this platform decodes. The TV's NDL pipeline takes H.264 and HEVC only:
-/// no AV1 (never presented a picture) and no PyroWave (no Vulkan presentation). A Samsung set
-/// is the same pair: its WebCodecs says yes to AV1 without ever having been measured on one.
+/// The codecs this platform decodes. The TV's NDL pipeline takes H.264, HEVC and AV1, but no
+/// PyroWave (no Vulkan presentation). A Samsung set takes H.264 and HEVC: its WebCodecs says
+/// yes to AV1 without ever having been measured on one.
 pub(super) fn codecs(
     platform: crate::platform::Platform,
 ) -> &'static [(&'static str, &'static str)] {
     match platform {
-        crate::platform::Platform::WebOS | crate::platform::Platform::Tizen => &CODECS[..3],
+        crate::platform::Platform::WebOS => &CODECS[..4],
+        crate::platform::Platform::Tizen => &CODECS[..3],
         crate::platform::Platform::Ps5 => &CODECS_PS5,
         _ => &CODECS,
     }
@@ -746,6 +773,8 @@ const VIDEO_FITS: [(&str, &str); 3] = [
     ("crop", "Crop to fill"),
     ("stretch", "Stretch to fill"),
 ];
+/// Shared `screens` key; anything but `all` reads as this monitor.
+const MONITORS: [(&str, &str); 2] = [("this", "This monitor"), ("all", "All monitors")];
 const PRESENT_PRIORITIES: [(&str, &str); 2] =
     [("latency", "Lowest latency"), ("smooth", "Smoothness")];
 /// Depth in frames. `0` = Automatic, which resolves to 2.
@@ -803,6 +832,8 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         // Apple asks before it captures a Steam Controller 2 (`sc2Capture`); Android captures
         // one whenever it is present.
         RowId::Sc2Passthrough => &[Apple],
+        // A room to place the sound and the picture in: the Vision Pro alone (`row_applies`).
+        RowId::SpatialAudio | RowId::Screen => &[Apple],
         // The weak-GPU row. On Android it also shrinks the surface; webOS's compositor
         // already hands a 1080p buffer, so there it is the cheaper backdrop alone.
         RowId::ReduceUiResolution => &[Android, WebOS],
@@ -814,8 +845,10 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::SecondScreen => &[Android],
         // The clients whose presenters place the picture through `video_fit`.
         RowId::VideoFit => &[Desktop, Android, Apple],
+        // The clients that open a window per monitor; Apple's is the Mac (`row_applies`).
+        RowId::Screens => &[Desktop, Apple],
         // The clients whose dial sends `pyrowave_bpp`.
-        RowId::PyroWaveQuality => &[Desktop, Android, Apple],
+        RowId::PyroWaveQuality => &[Desktop, Android, Apple, Ps5],
         // Offered wherever there is a second UI to fall back to: Android's touch home,
         // webOS's cursor shell. `row_applies` still needs `fallback_ui` from the host.
         RowId::GamepadUi | RowId::GamepadUiMode => &[Android, WebOS, Apple],
@@ -870,15 +903,6 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         // Main10 at BT.709 asks nothing of the panel, and MediaCodec and NDL both decode it from
         // the SPS.
         RowId::TenBitSdr => &[Desktop, Android, WebOS, Apple, Ps5],
-        // The PS5's swapchain offers SDR only until a WSI change adds PQ (its plan §9).
-        RowId::Hdr => &[
-            Desktop,
-            Android,
-            WebOS,
-            Platform::Web,
-            Apple,
-            Platform::Tizen,
-        ],
         // The PS5 title reads no mouse.
         RowId::Mouse | RowId::InvertScroll => &[
             Desktop,
@@ -905,7 +929,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
 
 /// The codec setting is PyroWave on a device that decodes it and dials its quality: the
 /// session's rate is the quality's, not Bitrate's.
-fn pyrowave_rate(ctx: &Ctx) -> bool {
+pub(super) fn pyrowave_rate(ctx: &Ctx) -> bool {
     ctx.settings.codec == "pyrowave"
         && ctx.device.pyrowave_ok
         && row_on(RowId::PyroWaveQuality, ctx.device.platform)
@@ -916,13 +940,13 @@ fn pyrowave_rate(ctx: &Ctx) -> bool {
 /// Echo cancel and pad rows dim under a parent switch so the relationship stays
 /// visible. Smoothness buffer is a knob on one of two intents — under Lowest
 /// latency the quantity does not exist, so the row is dropped. It sits directly
-/// below the intent row so the cursor is never on a row that vanishes. Bitrate and
-/// PyroWave quality trade places with the codec.
+/// below the intent row so the cursor is never on a row that vanishes. PyroWave quality
+/// comes and goes with the codec; Bitrate stays, as Automatic or Fixed under PyroWave.
 pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     let apple = ctx.device.platform == crate::platform::Platform::Apple;
     match id {
         // The Apple app reads these on the Mac alone, as its own settings offer them.
-        RowId::Vsync | RowId::Shortcuts | RowId::Mouse if apple => is_mac(ctx),
+        RowId::Vsync | RowId::Shortcuts | RowId::Mouse | RowId::Screens if apple => is_mac(ctx),
         // An Apple TV has no touchscreen, microphone, scroll wheel or variable refresh.
         RowId::Touch | RowId::Mic | RowId::EchoCancel | RowId::InvertScroll | RowId::AllowVrr
             if apple =>
@@ -930,8 +954,6 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
             !ctx.device.tv
         }
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
-        // PyroWave sets its own rate, so its quality stands where Bitrate stood.
-        RowId::Bitrate => !pyrowave_rate(ctx),
         RowId::PyroWaveQuality => pyrowave_rate(ctx),
         // Needs `fallback_ui`; otherwise off strands the user with no UI.
         RowId::GamepadUi => ctx.device.fallback_ui,
@@ -947,6 +969,7 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
         }
         // A Mac window has no background session; Android and the other Apple devices do.
         RowId::BackgroundKeepAlive => !is_mac(ctx),
+        RowId::SpatialAudio | RowId::Screen => ctx.device.spatial,
         RowId::BackgroundTimeout => {
             !is_mac(ctx) && RowId::BackgroundKeepAlive.extra_on(ctx.settings)
         }
@@ -1021,11 +1044,12 @@ pub(super) fn changed_advanced(tab: usize, ctx: &Ctx) -> Vec<RowId> {
     changed(&offered, ctx)
 }
 
-/// Apple with no handheld screen and no TV.
+/// Apple with no handheld screen, no TV and no room around it.
 pub(super) fn is_mac(ctx: &Ctx) -> bool {
     ctx.device.platform == crate::platform::Platform::Apple
         && ctx.device.screen.is_none()
         && !ctx.device.tv
+        && !ctx.device.spatial
 }
 
 /// Where a launch will actually land, named. Not the stored value: with no default host
@@ -1093,7 +1117,11 @@ pub(super) fn row_icon(id: RowId) -> &'static str {
         RowId::PresentPriority | RowId::SmoothBuffer | RowId::LowLatency => "clock",
         RowId::Decoder | RowId::AudioRoute => "cpu",
         RowId::Chroma444 | RowId::TenBitSdr => "eye",
-        RowId::Audio | RowId::AudioFormat | RowId::KeepHostAudio | RowId::PadSpeaker => "volume-2",
+        RowId::Audio
+        | RowId::AudioFormat
+        | RowId::KeepHostAudio
+        | RowId::PadSpeaker
+        | RowId::SpatialAudio => "volume-2",
         RowId::Mic => "mic",
         RowId::EchoCancel => "mic-off",
         RowId::PadForward
@@ -1104,7 +1132,7 @@ pub(super) fn row_icon(id: RowId) -> &'static str {
         | RowId::Controllers => "gamepad-2",
         RowId::SystemButtons | RowId::GuideGesture => "house",
         RowId::PhoneGyro => "rotate-cw",
-        RowId::SecondScreen => "monitor",
+        RowId::SecondScreen | RowId::Screen | RowId::Screens => "monitor",
         RowId::Touch | RowId::CursorGestures => "pointer",
         RowId::Mouse => "mouse",
         RowId::QuickActions => "ellipsis",
@@ -1163,6 +1191,7 @@ pub(crate) fn preset_field(id: RowId) -> Option<&'static str> {
         RowId::Refresh => "refresh_hz",
         RowId::RenderScale => "render_scale",
         RowId::VideoFit => "video_fit",
+        RowId::Screens => "screens",
         RowId::Bitrate => "bitrate_kbps",
         RowId::PyroWaveQuality => "pyrowave_bpp",
         RowId::Compositor => "compositor",
@@ -1341,11 +1370,18 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Picture fit",
             label_for(&VIDEO_FITS, VideoFit::from_name(&s.video_fit).name()).into(),
         ),
+        RowId::Screens => (
+            None,
+            "Screens",
+            MONITORS[usize::from(s.all_screens())].1.into(),
+        ),
         RowId::Bitrate => (
             None,
             "Bitrate",
             if s.bitrate_kbps == 0 {
                 "Automatic".into()
+            } else if pyrowave_rate(ctx) {
+                "Fixed".into()
             } else {
                 bitrate_label(s.bitrate_kbps)
             },
@@ -1412,6 +1448,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::KeepHostAudio => (None, "Keep host audio playing", extra()),
         RowId::Mic => (None, "Stream microphone", extra()),
         RowId::EchoCancel => (None, "Echo cancellation", extra()),
+        RowId::SpatialAudio => (None, "Spatial audio", extra()),
         RowId::PadForward => (None, "Forward controllers", extra()),
         RowId::Pad => (
             None,
@@ -1489,6 +1526,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::ExitHint => (None, "Exit hint", extra()),
         RowId::HostSort => (None, "Host order", extra()),
+        RowId::Screen => (None, "Screen", extra()),
         RowId::HostGrouping => (
             None,
             "Group hosts by",
@@ -1599,10 +1637,16 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "When the stream's shape differs from this window. Fit shows the whole picture \
              with black bars, Crop to fill cuts the edges off, Stretch to fill distorts it."
         }
-        RowId::PyroWaveQuality => {
-            "Higher is sharper and needs a faster wired link. On a weak network the stream \
-             sends less on its own."
+        RowId::Screens if platform == Platform::Apple => {
+            "All monitors shows one host screen on each of this Mac's monitors, laid out as \
+             they sit. The extra monitors stay covered until the session ends."
         }
+        RowId::Screens => {
+            "All monitors opens a window on each of this computer's monitors, one host screen \
+             each, laid out as they sit. Close a window to give its monitor back."
+        }
+        RowId::PyroWaveQuality => "Higher is sharper and needs a faster wired link.",
+        RowId::Bitrate if pyrowave_rate(ctx) => pf_client_core::settings::PYROWAVE_BITRATE_HINT,
         RowId::Bitrate => {
             "Automatic adapts to the network as you play. Press to type a fixed rate, up to \
              2 Gbps."
@@ -1668,6 +1712,11 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         RowId::EchoCancel => {
             "Stops the host's audio, playing from this device's speakers, being picked up \
              and sent back. Turn it off if your microphone already runs its own processing."
+        }
+        RowId::Screen => "Where the picture shows: this window, or a curved screen.",
+        RowId::SpatialAudio => {
+            "On, the sound comes from the window. Off plays the game's own mix straight to \
+             your ears."
         }
         RowId::PadForward => {
             "Send controllers connected to this device to the host. Turn it off when your \
@@ -1959,6 +2008,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
     let platform = ctx.device.platform;
     let fams = families(ctx.device.screen);
     let window = has_window(ctx.device);
+    let pyrowave = pyrowave_rate(ctx);
     let s = &mut *ctx.settings;
     match id {
         RowId::Resolution => {
@@ -2021,6 +2071,17 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 .position(|(v, _)| *v == VideoFit::from_name(&s.video_fit).name());
             step_option(cur, VIDEO_FITS.len(), delta, wrap)
                 .map(|i| s.video_fit = VIDEO_FITS[i].0.to_string())
+        }
+        RowId::Screens => {
+            let cur = Some(usize::from(s.all_screens()));
+            step_option(cur, MONITORS.len(), delta, wrap)
+                .map(|i| s.screens = MONITORS[i].0.to_string())
+        }
+        // Automatic or Fixed: the quality row stands in for the rate.
+        RowId::Bitrate if pyrowave => {
+            let rates = [0, pf_client_core::settings::PYROWAVE_FIXED_KBPS];
+            step_option(Some(usize::from(s.bitrate_kbps != 0)), 2, delta, wrap)
+                .map(|i| s.bitrate_kbps = rates[i])
         }
         RowId::Bitrate => {
             // Off-ladder must not snap to Automatic (index 0). Step to the neighbour
@@ -2153,6 +2214,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         | RowId::KeepHostAudio
         | RowId::Mic
         | RowId::EchoCancel
+        | RowId::SpatialAudio
         | RowId::PadForward
         | RowId::PadRumble
         | RowId::PadHaptics
@@ -2175,6 +2237,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         | RowId::GamepadUi
         | RowId::BackgroundKeepAlive
         | RowId::HostSort
+        | RowId::Screen
         | RowId::GamepadUiMode => id.extra().and_then(|e| e.step(s, delta, wrap)),
         RowId::StatsPosition => {
             let at = HudCorner::ALL

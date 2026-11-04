@@ -257,6 +257,22 @@ const WINDOWS: &[&str] = &["windows"];
 const LINUX_WINDOWS: &[&str] = &["linux", "windows"];
 /// Row `pyrowave_bpp`'s default: Themaister's clean point for 4:2:0, 200 Mbps at 1080p60.
 pub const PYROWAVE_BPP: f64 = 1.6;
+/// Row `vdisplay_resolutions`' default: common 16:9, 16:10 and 21:9 sizes, largest first.
+pub const VDISPLAY_RESOLUTIONS: &[&str] = &[
+    "3840x2160",
+    "3440x1440",
+    "2560x1600",
+    "2560x1440",
+    "2560x1080",
+    "1920x1200",
+    "1920x1080",
+    "1680x1050",
+    "1600x900",
+    "1440x900",
+    "1366x768",
+    "1280x800",
+    "1280x720",
+];
 pub(crate) const TRI: Kind = Kind::Enum(&["auto", "on", "off"]);
 const TRI_SPELLINGS: &[(&str, &str)] = &[
     ("1", "on"),
@@ -470,13 +486,14 @@ pub static SETTINGS: &[Setting] = &[
     row("max_fps", "PUNKTFUNK_MAX_FPS", Kind::Int { min: 0, max: 240, unit: "fps" }, D::Int(0), Video, NextSession, "Game frame limit", "gamescope").only(LINUX),
     // 0 is the host's pick per compositor (`HostConfig::vdisplay_hz_mult_for`); 1 is off.
     row("vdisplay_hz_mult", "PUNKTFUNK_VDISPLAY_HZ_MULT", Kind::Int { min: 0, max: 4, unit: "×" }, D::Int(0), Video, NextSession, "Display refresh multiple", "configuration").advanced().only(LINUX_WINDOWS),
+    // `WIDTHxHEIGHT` sizes the virtual display offers beside the stream's own. The driver skips
+    // any larger than the stream; ADD carries the first 16.
+    row("vdisplay_resolutions", "PUNKTFUNK_VDISPLAY_RESOLUTIONS", Kind::List, D::List(VDISPLAY_RESOLUTIONS), Video, NextSession, "Extra resolutions", "configuration").advanced().only(WINDOWS),
     row("portal_cursor_mode", "PUNKTFUNK_PORTAL_CURSOR_MODE", Kind::Enum(&["auto", "embedded", "metadata", "hidden"]), D::Str("auto"), Video, NextSession, "Cursor capture", "configuration")
         .advanced()
         .only(LINUX)
         .spellings(&[("composited", "embedded"), ("meta", "metadata"), ("none", "hidden")]),
-    // usbridge: off by default. Vulkan Video HEVC on AMD/Intel streamed smeared,
-    // flickering colours where VAAPI on the same box is clean; opt in per host.
-    row("vulkan_encode", "PUNKTFUNK_VULKAN_ENCODE", Kind::Bool, D::Bool(false), Video, NextSession, "Vulkan encoding", "configuration").advanced().only(LINUX),
+    row("vulkan_encode", "PUNKTFUNK_VULKAN_ENCODE", Kind::Bool, D::Bool(true), Video, NextSession, "Vulkan encoding", "configuration").advanced().only(LINUX),
     row("direct_capture", "PUNKTFUNK_DIRECT_CAPTURE", Kind::Bool, D::Bool(true), Video, NextSession, "Direct capture", "configuration").advanced().only(LINUX),
     row("lazy_capture", "PUNKTFUNK_LAZY_CAPTURE", Kind::Bool, D::Bool(true), Video, NextSession, "On-demand capture", "configuration").advanced().only(LINUX),
     row("kwin_paced", "PUNKTFUNK_KWIN_PACED", Kind::Bool, D::Bool(false), Video, NextSession, "KWin capture pacing", "kde").advanced().only(LINUX),
@@ -522,7 +539,6 @@ pub static SETTINGS: &[Setting] = &[
         .spellings(TRI_SPELLINGS),
     row("dualsense_usbip", "PUNKTFUNK_DUALSENSE_USBIP", Kind::Bool, D::Bool(false), Input, NextSession, "DualSense over USB/IP", "controller-audio").advanced().only(LINUX),
     // --- Game Mode
-    row("gamescope_attach", "PUNKTFUNK_GAMESCOPE_ATTACH", Kind::Bool, D::Bool(false), GameMode, NextSession, "Attach mode", "gamescope").only(LINUX),
     row("gamescope_hdr", "PUNKTFUNK_GAMESCOPE_HDR", Kind::Bool, D::Bool(true), GameMode, NextSession, "Game Mode HDR", "gamescope").only(LINUX),
     row("gamescope_managed", "PUNKTFUNK_GAMESCOPE_MANAGED", Kind::Bool, D::Bool(false), GameMode, NextSession, "Force managed mode", "gamescope").advanced().only(LINUX),
     row("gamescope_vrr", "PUNKTFUNK_GAMESCOPE_VRR", Kind::Bool, D::Bool(true), GameMode, NextSession, "Adaptive sync", "gamescope").advanced().only(LINUX),
@@ -552,6 +568,11 @@ pub static SETTINGS: &[Setting] = &[
     // Off mounts the owner's Steam libraries read-only in a seat: it plays what is installed and
     // can't update or install there. The supervisor reads it at each seat start.
     row("seat_library_writable", "PUNKTFUNK_SEAT_LIBRARY_WRITABLE", Kind::Bool, D::Bool(true), Seats, NextSession, "Seats update games", "profiles").only(LINUX),
+    // GameInput has one focus for the whole PC: a window appearing in any session takes the pad
+    // from a GameInput game in every other. Each app a seat or, while seats exist, the desk
+    // starts gets the background-input quirk, so a desk game and a seat game each keep theirs.
+    // The quirk is per exe name, for the whole PC. Off = the GameInput default fight.
+    row("seat_background_input", "PUNKTFUNK_SEAT_BACKGROUND_INPUT", Kind::Bool, D::Bool(true), Seats, Now, "Players keep controllers", "windows-seats").only(WINDOWS),
     // --- System
     row("update_check", "PUNKTFUNK_UPDATE_CHECK", Kind::Bool, D::Bool(true), System, Now, "Check for updates", "updating"),
     row("update_apply", "PUNKTFUNK_UPDATE_APPLY", Kind::Bool, D::Bool(true), System, Now, "Console updates", "updating").advanced(),

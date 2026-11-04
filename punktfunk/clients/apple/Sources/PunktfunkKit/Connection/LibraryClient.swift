@@ -575,8 +575,9 @@ public enum LibraryClient {
         return games
     }
 
-    /// The host's catalog, walked by `GET /api/v1/library/page`. A host older than the paged
-    /// route refuses it on this lane, so `GET /api/v1/library` answers whole instead.
+    /// The host's catalog, walked by `GET /api/v1/library/page` over ``send(_:to:method:body:)``'s
+    /// lanes. A host older than the paged route refuses it, so `GET /api/v1/library` answers
+    /// whole instead.
     public static func fetch(_ target: MgmtTarget) async throws -> [GameEntry] {
         guard let base = URL(
             string: "\(baseURL(address: target.address, port: target.port))/api/v1/library")
@@ -612,6 +613,17 @@ public enum LibraryClient {
         } catch {
             throw LibraryError.unreachable("bad JSON")
         }
+    }
+
+    /// A row's `avatar` as a URL on this host. nil for anything but a path: the art loader
+    /// presents this device's certificate to the origin it is handed.
+    public static func pictureURL(_ path: String?, on target: MgmtTarget) -> URL? {
+        pictureURL(path, base: baseURL(address: target.address, port: target.port))
+    }
+
+    static func pictureURL(_ path: String?, base: String) -> URL? {
+        guard let path, path.hasPrefix("/") else { return nil }
+        return URL(string: base + path)
     }
 
     /// Start profile `id`'s stopped seat: `POST /api/v1/profiles/{id}/wake`. The host answers the
@@ -796,11 +808,28 @@ public enum LibraryClient {
         return (json?["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 
-    /// One request against `target`, with transport failures mapped onto `LibraryError`.
+    /// One request against `target`: over the stream port when it is known, which needs no TCP
+    /// 47990, then over HTTPS, with transport failures mapped onto `LibraryError`. The stream
+    /// port's answer stands, except 401 and 403: a host that predates stamping the client
+    /// certificate on its tunnel refuses the paired lane there. That refusal stands only when
+    /// HTTPS can't be reached either.
     static func send(
         _ path: String, to target: MgmtTarget, method: String = "GET",
         body: (data: Data, contentType: String)? = nil
     ) async throws -> HTTPResponse {
+        var refused: HTTPResponse?
+        if target.streamPort > 0 {
+            do {
+                let response = try await MgmtTransport.tunnel(
+                    method, path, body: body?.data, contentType: body?.contentType, to: target)
+                guard response.status == 401 || response.status == 403 else { return response }
+                refused = response
+            } catch MgmtTransportError.pinMismatch {
+                throw LibraryError.pinMismatch
+            } catch {
+                // The stream port carried nothing; HTTPS may.
+            }
+        }
         do {
             return try await MgmtTransport.request(
                 host: target.address, port: target.port, method: method, path: path,
@@ -808,11 +837,12 @@ public enum LibraryClient {
                 identity: target.identity, pin: target.pin)
         } catch MgmtTransportError.pinMismatch {
             throw LibraryError.pinMismatch
-        } catch MgmtTransportError.timedOut {
-            throw LibraryError.unreachable("timed out")
-        } catch let error as MgmtTransportError {
-            throw LibraryError.unreachable(String(describing: error))
         } catch {
+            if let refused { return refused }
+            if case MgmtTransportError.timedOut = error { throw LibraryError.unreachable("timed out") }
+            if let error = error as? MgmtTransportError {
+                throw LibraryError.unreachable(String(describing: error))
+            }
             throw LibraryError.unreachable(error.localizedDescription)
         }
     }

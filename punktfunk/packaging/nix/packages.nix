@@ -48,6 +48,8 @@
   # gbm lives in `libgbm` on recent nixpkgs, `mesa` on older ones.
   libgbm ? null,
   mesa,
+  # door-helper's interpreter: NixOS has no /bin/bash.
+  bash,
   # client-only libs
   sdl3,
   gtk4,
@@ -85,8 +87,8 @@ let
     cargoVendorDir = craneLib.vendorCargoDeps {
       inherit src;
       outputHashes = {
-        "git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc#acb5a1a7441033d9312b16842af02eb0c2b403dc" =
-          "sha256-i92qO/7YO4XB9LQ2w9etTAwGebM/SdwSi8hJaGoGq/Y=";
+        "git+https://github.com/microsoft/windows-rs?rev=58217a690#58217a690d6256ee229044a174de67d72d28bc35" =
+          "sha256-zarqTTlHYV0NYyBbVhe8UNHYpn8RFcfl8uBQF1T5Nqc=";
         "git+https://github.com/unom-io/usbfs-iso?rev=ff5468ac68cea3de64ecc4a1e16b4dbdba2f8b39#ff5468ac68cea3de64ecc4a1e16b4dbdba2f8b39" =
           "sha256-4y84oeUPEXC3c/45X/sBIYjJwxID6XvZU283/dLgNKk=";
       };
@@ -194,15 +196,15 @@ in
         install -Dm0644 scripts/60-punktfunk-dualsense.conf "$out/share/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf"
 
         # KWin Desktop-mode authorization (zkde_screencast + fake_input). Point Exec at the store binary.
-        install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
-          "$out/share/applications/io.unom.Punktfunk.Host.desktop"
-        substituteInPlace "$out/share/applications/io.unom.Punktfunk.Host.desktop" \
+        install -Dm0644 packaging/linux/io.unom.punktfunk.host.desktop \
+          "$out/share/applications/io.unom.punktfunk.host.desktop"
+        substituteInPlace "$out/share/applications/io.unom.punktfunk.host.desktop" \
           --replace-fail "/usr/bin/punktfunk-host" "$out/bin/punktfunk-host"
 
         # The tray's launcher + hicolor status icons. The host writes its per-user autostart entry.
-        install -Dm0644 packaging/linux/io.unom.Punktfunk.StartHost.desktop \
-          "$out/share/applications/io.unom.Punktfunk.StartHost.desktop"
-        substituteInPlace "$out/share/applications/io.unom.Punktfunk.StartHost.desktop" \
+        install -Dm0644 packaging/linux/io.unom.punktfunk.starthost.desktop \
+          "$out/share/applications/io.unom.punktfunk.starthost.desktop"
+        substituteInPlace "$out/share/applications/io.unom.punktfunk.starthost.desktop" \
           --replace-fail "/usr/bin/punktfunk-tray" "$out/bin/punktfunk-tray"
         for sz in 22x22 48x48; do
           for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
@@ -248,7 +250,7 @@ in
       '';
 
       meta = meta // {
-        description = "Low-latency desktop/game streaming host (Moonlight-compatible + native punktfunk/1)";
+        description = "Low-latency desktop/game streaming host (Moonlight-compatible + native punktfunk/2)";
         mainProgram = "punktfunk-host";
       };
     }
@@ -265,8 +267,10 @@ in
       pname = "punktfunk-seats";
       cargoExtraArgs = "--locked -p punktfunk-seats --bin punktfunk-seats";
 
+      # bash is a host input so the fixup rewrites the helpers' shebangs to it.
       buildInputs = [
         libxkbcommon # pf-inject's keymap
+        bash
       ];
 
       postInstall = ''
@@ -289,14 +293,13 @@ in
         install -Dm0755 packaging/linux/door-helper "$out/libexec/punktfunk/door-helper"
         substituteInPlace "$out/libexec/punktfunk/door-helper" \
           --replace-fail /usr/libexec/punktfunk "$out/libexec/punktfunk"
-        for f in punktfunk-door-on@.service punktfunk-door-off@.service; do
+        for f in punktfunk-door.service punktfunk-door-on@.service punktfunk-door-off@.service; do
           install -Dm0644 "packaging/linux/$f" "$out/lib/systemd/system/$f"
           substituteInPlace "$out/lib/systemd/system/$f" \
             --replace-fail /usr/libexec/punktfunk "$out/libexec/punktfunk"
         done
-        for f in punktfunk-door.service punktfunk-web-door.service; do
-          install -Dm0644 "packaging/linux/$f" "$out/lib/systemd/system/$f"
-        done
+        install -Dm0644 packaging/linux/punktfunk-web-door.service \
+          "$out/lib/systemd/system/punktfunk-web-door.service"
         install -Dm0644 packaging/linux/49-punktfunk-door.rules \
           "$out/share/polkit-1/rules.d/49-punktfunk-door.rules"
         # seat-session seeds the portal grant and the virtual speaker from these two files. They
@@ -356,13 +359,15 @@ in
         install -Dm0644 scripts/70-punktfunk-client.rules "$out/lib/udev/rules.d/70-punktfunk-client.rules"
 
         # The app icon the desktop entry (and the About dialog) name.
-        install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg \
-          "$out/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg"
+        install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg \
+          "$out/share/icons/hicolor/scalable/apps/io.unom.punktfunk.svg"
+        # The CamelCase icon name, which desktop entries users already have still name.
+        ln -s io.unom.punktfunk.svg "$out/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg"
 
         # Desktop launcher — point Exec at the store binary (wrapped below).
-        install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
-          "$out/share/applications/io.unom.Punktfunk.desktop"
-        substituteInPlace "$out/share/applications/io.unom.Punktfunk.desktop" \
+        install -Dm0644 packaging/linux/io.unom.punktfunk.desktop \
+          "$out/share/applications/io.unom.punktfunk.desktop"
+        substituteInPlace "$out/share/applications/io.unom.punktfunk.desktop" \
           --replace-fail "Exec=punktfunk-client" "Exec=$out/bin/punktfunk-client"
       '';
 
@@ -387,7 +392,7 @@ in
       '';
 
       meta = meta // {
-        description = "Native Linux punktfunk/1 streaming client (GTK4 shell + Vulkan session)";
+        description = "Native Linux punktfunk/2 streaming client (GTK4 shell + Vulkan session)";
         mainProgram = "punktfunk-client";
       };
     }
@@ -426,6 +431,18 @@ in
     bunDeps = bun2nix.fetchBunDeps { bunNix = src + "/web/bun.nix"; };
     # `src` is the whole repo; the console (and its lockfile) live in web/.
     bunRoot = "web";
+    # bun 1.4.4 keys a registry with a path as `@@<host>__<hash of its URL>@@@1`. bun2nix 2.1.2
+    # still writes `@@<host>@@@1`, so the offline install would miss the @unom scope. The hash is
+    # bun's for the web/.npmrc URL: moving that URL, bun or bun2nix means checking it again.
+    postBunSetInstallCacheDirPhase = ''
+      grep -qx '@unom:registry=https://git.unom.io/api/packages/unom/npm/' web/.npmrc \
+        || { echo "web/.npmrc registry moved: recheck the @unom cache name" >&2; exit 1; }
+      # The hook's copy keeps the store's read-only modes.
+      chmod u+w "$BUN_INSTALL_CACHE_DIR/@unom"
+      for d in "$BUN_INSTALL_CACHE_DIR"/@unom/*@@git.unom.io@@@1; do
+        if [ -e "$d" ]; then mv "$d" "''${d%@@git.unom.io@@@1}@@git.unom.io__4edaa278c5298c3a@@@1"; fi
+      done
+    '';
     # The install-time `prepare` codegen is run explicitly in buildPhase instead (below), matching
     # the deb/rpm builders — and the dependency lifecycle scripts stay off, as they were under the
     # old `--ignore-scripts` FOD (playwright's would try to download browsers).

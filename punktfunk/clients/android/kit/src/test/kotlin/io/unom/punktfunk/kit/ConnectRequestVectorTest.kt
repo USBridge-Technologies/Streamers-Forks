@@ -46,6 +46,7 @@ class ConnectRequestVectorTest {
         deviceName = text("deviceName"),
         padAudioOk = getBoolean("padAudioOk"),
         keepHostAudio = getBoolean("keepHostAudio"),
+        clientCursor = getBoolean("clientCursor"),
         videoFit = getString("videoFit"),
         dialer = getString("dialer"),
         presetId = text("presetId"),
@@ -53,6 +54,7 @@ class ConnectRequestVectorTest {
         deliveryFlags = getInt("deliveryFlags"),
         profile = text("profile"),
         pyrowaveBppX100 = getInt("pyrowaveBppX100"),
+        studioRange = getBoolean("studioRange"),
     )
 
     /** One JSON value, whatever the key order or number spelling. */

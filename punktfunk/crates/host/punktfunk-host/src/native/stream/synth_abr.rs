@@ -266,6 +266,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                         ramp_open,
                         resend,
                         link_kbps,
+                        refuted,
                         ..
                     },
                 bitrate_kbps,
@@ -283,6 +284,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                 hdr,
                 bit_depth,
                 chroma,
+                color: _,
             },
         content,
         recovery,
@@ -313,7 +315,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     while !life.stopping() && std::time::Instant::now() < build_until {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let (session, probe_rx) = ramp.finish();
+    let (session, probe_rx) = ramp.finish()?;
     tracing::info!(
         bringup_ms = bringup_delay.as_millis() as u64,
         "synthetic-abr bring-up done — the ramp window is closed"
@@ -340,6 +342,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         link_kbps,
         ports,
         link_paced: false,
+        refuted: refuted.clone(),
         shape,
         bringup: bringup.clone(),
         wire_sock,
@@ -424,7 +427,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     // An IDR at start, then whenever one comes due. `None` = none owed.
     let mut idr_due: Option<std::time::Instant> = Some(started);
     // `recovery.rs`'s gate, so a burst of asks costs what it costs a real host.
-    let (mut kf_gate, mut last_idr) = (KeyframeGate::default(), None);
+    let (mut kf_gate, mut last_idr) = (KeyframeGate::new(refuted), None);
     while !life.stopping() {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             break;
@@ -494,6 +497,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                 meta: AuMeta {
                     capture_ns: now_ns(),
                     epoch: 0,
+                    stream: 0,
                     flags,
                     frame_index: au_seq,
                     // A plausible encode: half a frame budget, which is what a GPU that is not

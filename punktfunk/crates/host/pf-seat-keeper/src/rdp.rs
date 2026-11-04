@@ -22,7 +22,7 @@ use pf_seats::windows::keeper::{self, RdpBootstrap};
 use pf_seats::BackendError;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use x509_cert::der::Decode as _;
 use zeroize::Zeroize as _;
 
@@ -61,11 +61,15 @@ pub(crate) fn observe_pin() -> WinResult<[u8; 32]> {
     })
 }
 
-/// Reattach attempts before the keeper gives the seat back to the supervisor. Ten at the delay
-/// below covers a graphics-subsystem reset without letting a seat that cannot hold a session spin.
+/// Consecutive reattach attempts before the keeper gives the seat back to the supervisor. Ten at
+/// the delay below covers a graphics-subsystem reset without letting a seat that cannot hold a
+/// session spin.
 const REATTACH_ATTEMPTS: u32 = 10;
 /// Long enough for the server's graphics subsystem to finish resetting before the next connect.
 const REATTACH_DELAY: Duration = Duration::from_secs(3);
+/// A connection that lasted this long held, so its drop starts a new count. It also covers a seat
+/// host's own drop whose mark the keeper missed.
+const HELD: Duration = Duration::from_secs(30);
 
 /// Hold the seat's session open, reattaching whenever the connection drops but the session does
 /// not. A neighbouring seat logging off knocks this connection over — the server reports its
@@ -73,32 +77,46 @@ const REATTACH_DELAY: Duration = Duration::from_secs(3);
 /// there would strand a seat that only needed reconnecting.
 ///
 /// The session's existence is the test, not the disconnect reason: a logoff removes it, anything
-/// recoverable leaves it. That needs no match on the server's English description.
+/// recoverable leaves it. That needs no match on the server's English description. A drop the
+/// seat host marked as its own ([`keeper::host_disconnected`]) spends no attempt.
 pub(crate) fn keep_from_stdin() -> WinResult<()> {
     let mut input = std::io::stdin().lock();
     let mut bootstrap = RdpBootstrap::read_from(&mut input)
         .map_err(|error| io_error("keeper_bootstrap", "read RDP keeper bootstrap", error))?;
     let domain = Some(keeper::computer_name()?);
     let account = bootstrap.account.clone();
-    let mut outcome = keep_session(&bootstrap, domain.clone(), &account);
-    for attempt in 1..=REATTACH_ATTEMPTS {
-        let Err(error) = outcome else { return Ok(()) };
+    let mut attempt = 0;
+    let error = loop {
+        let connected = Instant::now();
+        let since = SystemTime::now();
+        let Err(error) = keep_session(&bootstrap, domain.clone(), &account) else {
+            return Ok(());
+        };
         // No session left means the seat is gone (logged off, or it never came up): hand the
         // error back so the supervisor restarts the seat rather than reconnecting to nothing.
-        match keeper::session_of(&account) {
-            Ok(Some(session)) => eprintln!(
-                "seat keeper: reattaching to session {session} after {error} (attempt {attempt}/{REATTACH_ATTEMPTS})"
-            ),
-            _ => {
-                bootstrap.password.zeroize();
-                return Err(error);
+        let Ok(Some(session)) = keeper::session_of(&account) else {
+            break error;
+        };
+        if connected.elapsed() >= HELD {
+            attempt = 0;
+        }
+        if keeper::host_disconnected(&bootstrap.host_root, since) {
+            eprintln!(
+                "seat keeper: reattaching to session {session}, which its host disconnected (attempt {attempt}/{REATTACH_ATTEMPTS} kept)"
+            );
+        } else {
+            attempt += 1;
+            if attempt > REATTACH_ATTEMPTS {
+                break error;
             }
+            eprintln!(
+                "seat keeper: reattaching to session {session} after {error} (attempt {attempt}/{REATTACH_ATTEMPTS})"
+            );
         }
         std::thread::sleep(REATTACH_DELAY);
-        outcome = keep_session(&bootstrap, domain.clone(), &account);
-    }
+    };
     bootstrap.password.zeroize();
-    outcome
+    Err(error)
 }
 
 /// One connect-and-hold. The password is rebuilt per attempt because the connector consumes it.

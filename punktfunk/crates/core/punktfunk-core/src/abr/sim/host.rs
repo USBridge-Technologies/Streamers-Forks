@@ -177,6 +177,9 @@ pub(super) struct HostCfg {
     /// the lever, and a notch that keeps it shows up in the next window.
     pub encode_knee_kbps: u32,
     pub encode_us_per_mbps: u32,
+    /// `(from_ms, until_ms, µs)`: frames made inside the range carry this encode time,
+    /// as the first AUs after a source stall carry the stall. The encoder keeps its pace.
+    pub encode_stamp: (u64, u64, u32),
     /// A keyframe is this many times an ordinary frame.
     pub idr_pct: u32,
     /// How long after a keyframe ask a decodable recovery point reaches the
@@ -190,7 +193,7 @@ pub(super) struct HostCfg {
     /// (`HOST_CAP2_RAMP`). An older host answers the first one and rejects
     /// every step behind it.
     pub ramp: bool,
-    /// Display, capture and encoder bring-up: the gap between the punch and
+    /// Display, capture and encoder bring-up: the gap between the bound data plane and
     /// the first video frame, which is what the ramp measures the link in.
     pub bringup_ms: u64,
     /// `false` = a host that advertises the ramp and then answers no step.
@@ -224,6 +227,7 @@ impl Default for HostCfg {
             encode_swing_ms: 1_500,
             encode_knee_kbps: u32::MAX,
             encode_us_per_mbps: 0,
+            encode_stamp: (u64::MAX, u64::MAX, 0),
             idr_pct: 400,
             recovery_ms: 0,
             content: vec![ContentPhase::default()],
@@ -264,10 +268,13 @@ pub(super) struct ProbeDone {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Frame {
     pub id: u32,
-    pub capture_ms: u64,
+    /// Capture time, µs, which is what the wire pts carries: `encode_us` before the send.
+    pub capture_us: u64,
     pub wire_bytes: u64,
     pub shape: FrameShape,
     pub encode_us: u32,
+    /// The pacer's spread, µs: first byte out to last, cut short by the next frame.
+    pub pace_us: u32,
     pub repeat: bool,
     pub idr: bool,
 }
@@ -602,8 +609,9 @@ impl Host {
 
     /// Produce this millisecond's frame, if the frame clock fired. A loaded
     /// encoder caps the rate at one frame per `encode_us`, which is what turns
-    /// GPU contention into a short window. Nothing leaves before the pipeline
-    /// exists. A recovery frame that answers an ask counts as a wave.
+    /// GPU contention into a short window, and the frame was captured
+    /// `encode_us` before it leaves over `pace_us`. Nothing leaves before the
+    /// pipeline exists. A recovery frame that answers an ask counts as a wave.
     pub(super) fn tick(&mut self, now_ms: u64) -> Option<Frame> {
         if now_ms < self.cfg.bringup_ms {
             self.next_frame_us = self.cfg.bringup_ms * 1_000;
@@ -698,12 +706,20 @@ impl Host {
             0
         };
         self.pace_until_ms = now_ms + spread_ms;
+        let next_ms = self.next_frame_us.div_ceil(1_000);
+        let (from_ms, until_ms, stamp_us) = self.cfg.encode_stamp;
+        let encode_us = if (from_ms..until_ms).contains(&now_ms) {
+            stamp_us
+        } else {
+            encode_us
+        };
         Some(Frame {
             id,
-            capture_ms: now_ms,
+            capture_us: (now_ms * 1_000).saturating_sub(u64::from(encode_us)),
             wire_bytes,
             shape,
             encode_us,
+            pace_us: (spread_ms.min(next_ms.saturating_sub(now_ms)) * 1_000) as u32,
             repeat: phase.idle,
             idr,
         })
@@ -770,8 +786,8 @@ mod tests {
         assert_eq!(adapt_fec(10_000), 5, "1 % loss is still inside the floor");
         assert_eq!(adapt_fec(50_000), 8, "5 % → ceil(7) + 1");
         assert_eq!(adapt_fec(400_000), 50);
-        // A run of unrecovered frames adds the step for four windows, then
-        // lets it go; decay is one point per window.
+        // A run of unrecovered frames adds the step for four windows and holds
+        // it while the run lasts; decay is one point per window after.
         let frame = FrameBudget {
             budget_kbps: 12_500,
             audio_kbps: 256,
@@ -780,7 +796,7 @@ mod tests {
         };
         let mut h = LossHorizon::default();
         assert_eq!(fec_target(0, 5, 1, frame, &mut h), 8);
-        assert_eq!(fec_target(0, 8, 5, frame, &mut h), 7, "past the run, decay");
+        assert_eq!(fec_target(0, 8, 5, frame, &mut h), 8, "past the step, held");
         assert_eq!(fec_target(0, 8, 0, frame, &mut h), 7);
     }
 

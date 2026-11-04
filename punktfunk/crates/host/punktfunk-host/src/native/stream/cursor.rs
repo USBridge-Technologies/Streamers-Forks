@@ -98,6 +98,15 @@ pub(super) struct CompositeLog {
 #[cfg(target_os = "linux")]
 const PARK_ATTEMPTS_MAX: u32 = 10;
 
+/// Whether a due park fires. While the composite is `starved` the capture has never seen the
+/// pointer on the output, so the player's moves land on another monitor and a park brings it
+/// back. Otherwise only the first `unconditional` attempts, and none once the player
+/// `steered`: that park is a yank back to centre.
+#[cfg(target_os = "linux")]
+fn park_due(attempts: u32, unconditional: u32, starved: bool, steered: bool) -> bool {
+    starved || (attempts < unconditional && !steered)
+}
+
 impl StreamState {
     /// Re-derive the cursor plan for compositor `c` on `route` before the next pipeline is built
     /// from it: blend, gamescope reader, both composite flags. Returns whether the display asks
@@ -116,23 +125,28 @@ impl StreamState {
             self.plan.bit_depth,
             self.plan.hdr,
             route,
+            &self.facts.encoder,
         );
         self.plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(gamescope, route);
         self.plan.sdr10_native = crate::session_plan::sdr10_native_for(&self.plan, c, route);
-        (self.gamescope_composite, self.metadata_composite) =
-            composite_plan(&self.plan, self.cursor_fwd.is_some(), gamescope);
-        self.plan.cursor_forward || self.metadata_composite
+        (
+            self.display.gamescope_composite,
+            self.display.metadata_composite,
+        ) = composite_plan(&self.plan, self.display.cursor_fwd.is_some(), gamescope);
+        self.plan.cursor_forward || self.display.metadata_composite
     }
 
     /// Route this tick's cursor: forward it when the client draws, else put the live overlay on
     /// the frame for the encoder blend. Either way the capturer hears the host places it, so it
     /// bakes no second copy. An invisible cursor never reaches the encoder.
     pub(super) fn tick_cursor(&mut self) {
-        if let Some(fwd) = self.cursor_fwd.as_mut() {
-            let client_draws = self.cursor_client_draws.load(Ordering::Relaxed);
-            self.capturer.set_cursor_forward(client_draws);
-            if client_draws != self.cursor_client_drew {
-                self.cursor_client_drew = client_draws;
+        if let Some(fwd) = self.display.cursor_fwd.as_mut() {
+            let client_draws = self.shared.cursor_client_draws.load(Ordering::Relaxed);
+            if let Some(c) = self.live.capturer.cursor() {
+                c.set_forward(client_draws);
+            }
+            if client_draws != self.display.cursor_client_drew {
+                self.display.cursor_client_drew = client_draws;
                 tracing::info!(
                     client_draws,
                     "cursor render mode flipped ({})",
@@ -144,20 +158,24 @@ impl StreamState {
                 );
                 #[cfg(target_os = "linux")]
                 if !client_draws {
-                    self.park_attempts = 0;
-                    self.next_park_at = std::time::Instant::now();
+                    self.display.park_attempts = 0;
+                    self.display.next_park_at = std::time::Instant::now();
                 }
             }
             if client_draws {
-                let live = self.capturer.cursor();
-                let reframe = *self.frame_map.lock().unwrap_or_else(|e| e.into_inner());
+                let live = self.live.capturer.cursor().and_then(|c| c.overlay());
+                let reframe = *self
+                    .shared
+                    .frame_map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 fwd.tick(
-                    live.as_ref().or(self.frame.cursor.as_ref()),
+                    live.as_ref().or(self.live.frame.cursor.as_ref()),
                     &reframe,
-                    &self.conn,
-                    &self.cursor_shape_tx,
+                    &self.facts.conn,
+                    &self.ends.cursor_shape_tx,
                 );
-                self.frame.cursor = None;
+                self.live.frame.cursor = None;
             } else {
                 #[cfg(not(target_os = "windows"))]
                 self.composite_live_cursor(
@@ -166,28 +184,30 @@ impl StreamState {
                      pointer, if any, is the compositor's own",
                 );
             }
-        } else if self.gamescope_composite || self.metadata_composite {
+        } else if self.display.gamescope_composite || self.display.metadata_composite {
             #[cfg(not(target_os = "windows"))]
             {
-                self.capturer.set_cursor_forward(false);
+                if let Some(c) = self.live.capturer.cursor() {
+                    c.set_forward(false);
+                }
                 self.composite_live_cursor(
                     "host-composite active but the capture has no live cursor overlay yet (no \
                      SPA_META_Cursor bitmap) — the stream is cursorless until one arrives",
                 );
             }
         }
-        if self.frame.cursor.as_ref().is_some_and(|c| !c.visible) {
-            self.frame.cursor = None;
+        if self.live.frame.cursor.as_ref().is_some_and(|c| !c.visible) {
+            self.live.frame.cursor = None;
         }
     }
 
     /// Hand the capture's live overlay to the encoder blend. Each of the two outcomes is logged once.
     #[cfg(not(target_os = "windows"))]
     fn composite_live_cursor(&mut self, none_msg: &'static str) {
-        match self.capturer.cursor() {
+        match self.live.capturer.cursor().and_then(|c| c.overlay()) {
             Some(live) => {
-                if !self.composite_log.saw_overlay {
-                    self.composite_log.saw_overlay = true;
+                if !self.diag.composite_log.saw_overlay {
+                    self.diag.composite_log.saw_overlay = true;
                     tracing::info!(
                         x = live.x,
                         y = live.y,
@@ -197,41 +217,58 @@ impl StreamState {
                         "host-composite: first live cursor overlay handed to the encoder blend"
                     );
                 }
-                self.frame.cursor = Some(live);
+                self.live.frame.cursor = Some(live);
             }
             None => {
-                if !self.composite_log.saw_none {
-                    self.composite_log.saw_none = true;
+                if !self.diag.composite_log.saw_none {
+                    self.diag.composite_log.saw_none = true;
                     tracing::info!("{none_msg}");
                 }
             }
         }
     }
 
-    /// The park schedule (see [`park_pointer`]): per (re)built display, re-armed by the
-    /// capture-model flip. Unconditional parks first, then only while the composite is starved
-    /// and "no overlay" means the pointer is off the output.
+    /// The park schedule (see [`park_pointer`] and [`park_due`]): per (re)built display,
+    /// re-armed by the capture-model flip. A move the client sent since the display's first
+    /// frame means the player steers; the flip does not reset that.
     #[cfg(target_os = "linux")]
     pub(super) fn park_seat_pointer(&mut self) {
-        if self.compositor == pf_vdisplay::Compositor::Gamescope
-            || self.park_attempts >= PARK_ATTEMPTS_MAX
-            || std::time::Instant::now() < self.next_park_at
+        if self.display.compositor == pf_vdisplay::Compositor::Gamescope
+            || self.display.park_attempts >= PARK_ATTEMPTS_MAX
+            || std::time::Instant::now() < self.display.next_park_at
         {
             return;
         }
-        let client_steers =
-            self.cursor_fwd.is_some() && self.cursor_client_draws.load(Ordering::Relaxed);
+        let client_steers = self.display.cursor_fwd.is_some()
+            && self.shared.cursor_client_draws.load(Ordering::Relaxed);
         let unconditional = if client_steers { 1 } else { 2 };
-        let composite_starved = ((self.cursor_fwd.is_some() && !client_steers)
-            || self.metadata_composite)
-            && self.capturer.cursor().is_none()
-            && self.no_overlay_means_off_output;
-        if self.park_attempts < unconditional || composite_starved {
-            park_pointer(&self.input_tx, self.frame.width, self.frame.height);
-            self.park_attempts += 1;
-            self.next_park_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let composite_starved = ((self.display.cursor_fwd.is_some() && !client_steers)
+            || self.display.metadata_composite)
+            && self
+                .live
+                .capturer
+                .cursor()
+                .and_then(|c| c.overlay())
+                .is_none()
+            && self.display.no_overlay_means_off_output;
+        let steered =
+            self.facts.counters.pointer_moves.load(Ordering::Relaxed) != self.display.moves_at_arm;
+        if park_due(
+            self.display.park_attempts,
+            unconditional,
+            composite_starved,
+            steered,
+        ) {
+            park_pointer(
+                &self.ends.input_tx,
+                self.live.frame.width,
+                self.live.frame.height,
+            );
+            self.display.park_attempts += 1;
+            self.display.next_park_at =
+                std::time::Instant::now() + std::time::Duration::from_secs(1);
         } else {
-            self.park_attempts = PARK_ATTEMPTS_MAX;
+            self.display.park_attempts = PARK_ATTEMPTS_MAX;
         }
     }
 }
@@ -240,6 +277,26 @@ impl StreamState {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_players_own_move_ends_the_unconditional_parks() {
+        assert!(park_due(0, 2, false, false), "a display's first park");
+        assert!(park_due(1, 2, false, false), "the retry for a cold EIS");
+        assert!(
+            !park_due(1, 2, false, true),
+            "the retry would yank a steered pointer"
+        );
+        assert!(
+            !park_due(0, 2, false, true),
+            "a mode flip after the player steered"
+        );
+        assert!(
+            park_due(1, 2, true, true),
+            "the capture never saw the pointer: the moves land off the stream"
+        );
+        assert!(!park_due(2, 2, false, false));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -83,16 +83,18 @@ fn managed_infra_usable(
     installed && !(target_restart && desktop_active && !steamos)
 }
 
-/// Operator gamescope knobs, sampled once at first use and never written back.
+/// The env-only gamescope knobs (`_ATTACH`, `_NODE`, `_SESSION`), sampled once at first use.
 ///
 /// `node_env` sits above `dedicated_launch` in [`pick_gamescope_mode`]. A live
 /// re-read of a published `_NODE=auto` would latch Attach for the host's life
 /// and override `game_session=dedicated`. Sampling once means "the operator
-/// set this before we ran".
+/// set this before we ran". The console's Force managed switch is not latched:
+/// nothing in the host writes it, and its row promises the next session.
 ///
 /// Pin: `operator_overrides_do_not_see_our_own_writes`.
 #[cfg(target_os = "linux")]
-static OPERATOR_GAMESCOPE: std::sync::OnceLock<OperatorGamescope> = std::sync::OnceLock::new();
+static OPERATOR_ENV: std::sync::OnceLock<(bool, Option<String>, Option<String>)> =
+    std::sync::OnceLock::new();
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
@@ -105,37 +107,54 @@ struct OperatorGamescope {
     session: Option<String>,
 }
 
+/// The operator's gamescope knobs as they stand for this connect: the console's Force managed
+/// switch read live, the env-only knobs from the one-time sample ([`OPERATOR_ENV`]).
 #[cfg(target_os = "linux")]
-fn operator_gamescope() -> &'static OperatorGamescope {
-    OPERATOR_GAMESCOPE.get_or_init(|| {
-        // Presence is not the grammar: `PUNKTFUNK_GAMESCOPE_ATTACH=0` must be off, as the
-        // console shows it. This rung outranks dedicated spawn, so a silent inversion costs
-        // the client its own display.
-        let ov = with_env_lock(|| OperatorGamescope {
-            managed: pf_host_config::row_bool("PUNKTFUNK_GAMESCOPE_MANAGED"),
-            attach: pf_host_config::row_bool("PUNKTFUNK_GAMESCOPE_ATTACH"),
-            node: std::env::var("PUNKTFUNK_GAMESCOPE_NODE")
-                .ok()
-                .filter(|v| !v.is_empty()),
-            session: std::env::var("PUNKTFUNK_GAMESCOPE_SESSION")
-                .ok()
-                .filter(|v| !v.is_empty()),
+fn operator_gamescope() -> OperatorGamescope {
+    operator_gamescope_from(|k| std::env::var(k).ok())
+}
+
+/// [`operator_gamescope`] with `get` as the environment. `get` runs under the env lock for the
+/// one-time sample only; once [`OPERATOR_ENV`] holds it, no call consults `get` again.
+#[cfg(target_os = "linux")]
+fn operator_gamescope_from(get: impl Fn(&str) -> Option<String>) -> OperatorGamescope {
+    let (attach, node, session) = OPERATOR_ENV.get_or_init(|| {
+        let env = with_env_lock(|| {
+            let v = |k: &str| get(k).filter(|v| !v.is_empty());
+            // Presence is not the grammar: `PUNKTFUNK_GAMESCOPE_ATTACH=0` is off. This rung
+            // outranks dedicated spawn, so a silent inversion costs the client its own display.
+            let off = |s: String| {
+                pf_host_config::registry::parse_bool(&s.trim().to_ascii_lowercase()) == Some(false)
+            };
+            (
+                v("PUNKTFUNK_GAMESCOPE_ATTACH").is_some_and(|s| !off(s)),
+                v("PUNKTFUNK_GAMESCOPE_NODE"),
+                v("PUNKTFUNK_GAMESCOPE_SESSION"),
+            )
         });
-        if ov.managed || ov.attach || ov.node.is_some() || ov.session.is_some() {
+        if env.0 || env.1.is_some() || env.2.is_some() {
             tracing::info!(
-                ?ov,
+                attach = env.0,
+                node = ?env.1,
+                session = ?env.2,
                 "gamescope: operator sub-mode overrides sampled from the environment"
             );
         }
-        ov
-    })
+        env
+    });
+    OperatorGamescope {
+        managed: pf_host_config::row_bool("PUNKTFUNK_GAMESCOPE_MANAGED"),
+        attach: *attach,
+        node: node.clone(),
+        session: session.clone(),
+    }
 }
 
 /// Injector id that matches this video backend — the one place the pair is
 /// chosen, so they cannot diverge. Caller publishes it via
 /// `pf_inject::set_backend_id` next to [`resolve_gamescope_route`].
 ///
-/// `&'static str` because this crate must not depend on pf-inject; the four
+/// `&'static str` because this crate must not depend on pf-inject; the five
 /// Linux ids are the injector's `PUNKTFUNK_INPUT_BACKEND` vocabulary.
 ///
 /// A return value, not a `setenv`: `pf_inject::default_backend` `getenv`s on
@@ -156,6 +175,9 @@ pub fn input_backend_id(chosen: Compositor) -> &'static str {
         // — same wlr injector as sway/river.
         // niri serves both too, on stock builds and biri alike.
         Compositor::Wlroots | Compositor::Hyprland | Compositor::Niri => "wlr",
+        // Same protocols, but Umbriel maps absolute motion over the whole layout and ignores
+        // the pointer's output: the injector aims in layout space.
+        Compositor::Umbriel => "wlr-layout",
         // pf-inject ignores the id off Linux; Windows has one injector.
         Compositor::Windows => "windows",
     }
@@ -170,6 +192,8 @@ pub fn input_backend_id(chosen: Compositor) -> &'static str {
 /// The operator-pinned (`PUNKTFUNK_COMPOSITOR`) path calls this alone — it
 /// leaves input routing to the operator's knob, but `create` still needs a
 /// route or it falls through to a bare spawn on a box pinned to managed.
+/// A managed override without gamescope-session-plus on the box is dropped:
+/// its launch cannot start, and it would outrank a dedicated spawn that can.
 /// A seat's own session ([`pf_paths::seat::HostRole::runs_seat_session`]) always spawns,
 /// whatever the box runs or the operator set.
 #[cfg(target_os = "linux")]
@@ -205,12 +229,21 @@ pub fn resolve_gamescope_route(
                  it — not taking over"
             );
         }
+        // Managed needs session-plus. Forced without it, every launch dies in `launch_session`,
+        // and the override sits above the dedicated spawn that would have worked.
+        let managed_override = ov.managed || ov.session.is_some();
+        if managed_override && !installed {
+            tracing::warn!(
+                "gamescope: PUNKTFUNK_GAMESCOPE_MANAGED / PUNKTFUNK_GAMESCOPE_SESSION ignored — \
+                 gamescope-session-plus is not installed on this box"
+            );
+        }
         let mode = pick_gamescope_mode(
             dedicated_launch,
-            ov.managed,
+            ov.managed && installed,
             ov.attach,
             ov.node.is_some(),
-            ov.session.is_some(),
+            ov.session.is_some() && installed,
             managed_infra,
             gamescope::foreign_gamescope_running(),
         );
@@ -321,6 +354,10 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
             niri::focus_output(name);
             true
         }
+        Compositor::Umbriel if hyprland::is_managed_output(name) => {
+            umbriel::focus_output(name);
+            true
+        }
         // No `_` arm: a new backend must decide here. Silent "no focus" only
         // shows up as a game on the wrong screen.
         Compositor::Hyprland
@@ -329,6 +366,7 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
         | Compositor::Mutter
         | Compositor::Gamescope
         | Compositor::Niri
+        | Compositor::Umbriel
         | Compositor::Windows => false,
     }
 }
@@ -342,6 +380,8 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceClaim {
     compositor: Compositor,
+    /// The streamed head: Umbriel numbers workspaces per output.
+    output: String,
     /// Workspace the launch opens on.
     id: i64,
     /// What the head showed before the claim. Equal to `id` when the head was
@@ -367,6 +407,7 @@ impl WorkspaceClaim {
             Compositor::Hyprland => hyprland::focus_workspace(self.restore),
             Compositor::Wlroots => wlroots::focus_workspace(self.restore),
             Compositor::Niri => niri::desktop::focus_workspace(self.restore),
+            Compositor::Umbriel => umbriel::desktop::focus_workspace(&self.output, self.restore),
             // No `_` arm: only a backend that claims can release.
             Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
                 return
@@ -420,7 +461,14 @@ pub(crate) fn pick_workspace(slots: &[WsSlot], active: i64) -> i64 {
         .unwrap_or(1)
 }
 
-/// Give a launch its own empty workspace on streamed head `name`, or re-focus
+/// Another head holds workspace `id`. Switching to it would switch that head,
+/// so a claim moves it onto the streamed head first.
+#[cfg(target_os = "linux")]
+pub(crate) fn held_elsewhere(slots: &[WsSlot], id: i64) -> bool {
+    slots.iter().any(|w| w.id == id && !w.on_head)
+}
+
+/// Give a launch its own empty workspace on streamed head `name`, or bring back
 /// `want` — the workspace an earlier session already claimed for this launch.
 ///
 /// Only the backends whose new windows map on the focused workspace act.
@@ -443,6 +491,9 @@ pub fn claim_workspace(
         Compositor::Niri if hyprland::is_managed_output(name) => {
             niri::desktop::claim_workspace(name, want)
         }
+        Compositor::Umbriel if hyprland::is_managed_output(name) => {
+            umbriel::desktop::claim_workspace(name, want)
+        }
         // No `_` arm: a new backend must decide here. KWin is a later step (its
         // workspaces are a D-Bus script away); Mutter/GNOME has no per-output
         // workspace to aim at; gamescope already gives the game the whole
@@ -453,6 +504,7 @@ pub fn claim_workspace(
         | Compositor::Mutter
         | Compositor::Gamescope
         | Compositor::Niri
+        | Compositor::Umbriel
         | Compositor::Windows => {
             tracing::info!(
                 compositor = compositor.id(), output = %name,
@@ -469,6 +521,7 @@ pub fn claim_workspace(
     );
     Some(WorkspaceClaim {
         compositor,
+        output: name.to_string(),
         id,
         restore,
     })
@@ -561,14 +614,17 @@ pub fn managed_session_available() -> bool {
 /// Schedule a debounced TV restore after a managed takeover session ends.
 /// A reconnect inside the window reuses the warm session (no per-connect
 /// gamescope stop/relaunch). No-op when nothing was taken. Needs
-/// [`start_restore_worker`] running to fire.
+/// [`start_restore_worker`] running to fire. A box already on its desktop gets
+/// back what our session held at once, whatever the keep-alive. `quit` says the
+/// last session was stopped on purpose, `slept` how long the box slept under it.
 #[cfg(target_os = "linux")]
-pub fn restore_managed_session() {
-    gamescope::schedule_restore_tv_session();
+pub fn restore_managed_session(quit: bool, slept: std::time::Duration) {
+    gamescope::release_autologin_mask(crate::detect_active_session().kind);
+    gamescope::schedule_restore_tv_session(quit, slept);
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn restore_managed_session() {}
+pub fn restore_managed_session(_quit: bool, _slept: std::time::Duration) {}
 
 /// The takeover the host still holds, for the console's display list. `None` = nothing held.
 #[cfg(target_os = "linux")]
@@ -607,12 +663,14 @@ pub fn restore_takeover_on_startup() {
 #[cfg(not(target_os = "linux"))]
 pub fn restore_takeover_on_startup() {}
 
-/// Take back the desk changes a dead host journaled ([`crate::topology_journal`]). Call at
-/// `serve` startup before [`restore_takeover_on_startup`], and when a compositor instance
-/// appears. No-op with nothing journaled.
+/// Take back what a dead host left: the desk changes it journaled ([`crate::topology_journal`])
+/// and the xdph picker shim its config still names. Call at `serve` startup before
+/// [`restore_takeover_on_startup`], and when a compositor instance appears. With nothing left,
+/// a directory listing and one config read.
 #[cfg(target_os = "linux")]
 pub fn reclaim_topology_journal() {
     crate::topology_journal::reclaim(&crate::backend_by_id);
+    hyprland::reconcile_picker_shim();
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -706,11 +764,10 @@ pub fn restore_takeover_now() {}
 
 /// Mid-stream switch: drop the autologin-unit mask if it no longer applies.
 ///
-/// Takeover masks the box's autologin gaming unit so the supervisor cannot
-/// restart it under us. That is only sound while our managed session holds
-/// the box. After a switch to desktop the mask bars "Return to Gaming Mode"
-/// until reboot. Call from the session watcher on every confirmed switch;
-/// no-op when nothing was masked or the switch does not end the mask window.
+/// The box left our managed session for its desktop: hand back what the
+/// takeover holds of it, our Steam included, so "Return to Gaming Mode" gets
+/// the box's own. Call on every confirmed switch, and from a connect or a
+/// stream end that finds a desktop. A no-op for any other session kind.
 #[cfg(target_os = "linux")]
 pub fn release_autologin_mask(switched_to: crate::ActiveKind) {
     gamescope::release_autologin_mask(switched_to);
@@ -776,7 +833,7 @@ mod tests {
 
     /// Injector id is a return value, never a `PUNKTFUNK_INPUT_BACKEND` `set_var`
     /// (that raced `pf_inject::default_backend`'s `getenv` on the injector
-    /// thread). Whole table: this crate cannot depend on pf-inject; the four
+    /// thread). Whole table: this crate cannot depend on pf-inject; the five
     /// ids are one half of the contract (`every_id_the_video_side_emits_maps_to_a_backend`
     /// is the other).
     #[test]
@@ -788,6 +845,7 @@ mod tests {
         assert_eq!(input_backend_id(Compositor::Wlroots), "wlr");
         assert_eq!(input_backend_id(Compositor::Hyprland), "wlr");
         assert_eq!(input_backend_id(Compositor::Niri), "wlr");
+        assert_eq!(input_backend_id(Compositor::Umbriel), "wlr-layout");
         assert_eq!(input_backend_id(Compositor::Windows), "windows");
     }
 
@@ -819,6 +877,17 @@ mod tests {
         assert_eq!(pick_workspace(&slots, 1), 3);
     }
 
+    /// A reconnect's head is new, so the game's workspace sits on another one:
+    /// it is moved, not switched to. One on the head, or one nobody has, is switched to.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_workspace_on_another_head_is_brought_over() {
+        let slots = [slot(2, false, false), slot(3, true, true)];
+        assert!(held_elsewhere(&slots, 2));
+        assert!(!held_elsewhere(&slots, 3));
+        assert!(!held_elsewhere(&slots, 9));
+    }
+
     /// Special workspaces sit at negative ids; the free-id scan starts at 1.
     #[test]
     #[cfg(target_os = "linux")]
@@ -834,6 +903,7 @@ mod tests {
     fn releasing_a_claim_that_switched_nothing_restores_nothing() {
         let stay = WorkspaceClaim {
             compositor: Compositor::Hyprland,
+            output: "PF-1".into(),
             id: 2,
             restore: 2,
         };
@@ -842,6 +912,7 @@ mod tests {
         stay.release();
         let switched = WorkspaceClaim {
             compositor: Compositor::Hyprland,
+            output: "PF-1".into(),
             id: 4,
             restore: 1,
         };
@@ -854,27 +925,58 @@ mod tests {
     fn a_physical_connector_is_never_focused_or_claimed_on_niri() {
         assert!(!focus_streamed_output(Compositor::Niri, "DP-1"));
         assert!(claim_workspace(Compositor::Niri, "DP-1", None).is_none());
+        assert!(!focus_streamed_output(Compositor::Umbriel, "DP-1"));
+        assert!(claim_workspace(Compositor::Umbriel, "DP-1", None).is_none());
     }
 
-    /// Sample must not move when `PUNKTFUNK_GAMESCOPE_NODE` is written afterwards.
+    /// The console's Force managed switch is a next-session row: a toggle reaches the next
+    /// connect, not the next host restart.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_console_managed_switch_applies_to_the_next_session() {
+        crate::fake::in_child(
+            module_path!(),
+            "the_console_managed_switch_applies_to_the_next_session",
+            &[],
+            || {
+                use super::operator_gamescope;
+                assert!(!operator_gamescope().managed);
+                let mut patch = serde_json::Map::new();
+                patch.insert("gamescope_managed".into(), serde_json::Value::Bool(true));
+                pf_host_config::save(&patch).expect("save the console switch");
+                assert!(
+                    operator_gamescope().managed,
+                    "the next read sees the switch"
+                );
+                patch.insert("gamescope_managed".into(), serde_json::Value::Bool(false));
+                pf_host_config::save(&patch).expect("clear it");
+                assert!(!operator_gamescope().managed);
+            },
+        );
+    }
+
+    /// `PUNKTFUNK_GAMESCOPE_ATTACH=0` in host.env is off, not "set".
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_explicit_off_attach_reads_as_off() {
+        crate::fake::in_child(
+            module_path!(),
+            "an_explicit_off_attach_reads_as_off",
+            &[("PUNKTFUNK_GAMESCOPE_ATTACH", "0")],
+            || assert!(!super::operator_gamescope().attach),
+        );
+    }
+
+    /// Sample must not move when `PUNKTFUNK_GAMESCOPE_NODE` reads differently afterwards.
     /// `node_env` outranks `dedicated_launch`; a live re-read of a published
     /// `=auto` would latch Attach for the host's life.
     #[test]
     #[cfg(target_os = "linux")]
     fn operator_overrides_do_not_see_our_own_writes() {
-        use super::operator_gamescope;
+        use super::{operator_gamescope, operator_gamescope_from};
         let first = operator_gamescope();
-        let restore = crate::with_env_lock(|| std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE"));
-        // SAFETY: both mutations run under `with_env_lock` — the crate's env-writer
-        // serialization (ENV_LOCK, lib.rs); the readers under test sample once at startup.
-        crate::with_env_lock(|| unsafe { std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto") });
-        let second = operator_gamescope();
-        crate::with_env_lock(|| match &restore {
-            // SAFETY: as above — the restore also runs under the same env-writer lock.
-            Some(v) => unsafe { std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", v) },
-            // SAFETY: as above.
-            None => unsafe { std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE") },
-        });
+        let published = |k: &str| (k == "PUNKTFUNK_GAMESCOPE_NODE").then(|| "auto".to_string());
+        let second = operator_gamescope_from(published);
         assert_eq!(
             second.node, first.node,
             "writing the key we publish must not turn into an operator override"

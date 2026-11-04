@@ -6,10 +6,14 @@
 //! in [`crate::stream_output`] and rebound by [`WlrootsInjector::retarget`].
 //! A miss binds no output (whole-layout mapping). First-advertised is the
 //! operator's physical display, never the session head.
+//!
+//! A layout-mapped compositor (Umbriel) ignores that output and maps absolute
+//! motion over the bounding box of its whole layout. There the pointer binds
+//! nothing and each sample is placed in layout space from `zxdg_output_v1`.
 
 use super::{InputEvent, InputInjector};
 use crate::head_pick::{self, HeadFacts, StreamTarget};
-use crate::plan::{Op, Plan};
+use crate::plan::{Abs, Op, Plan};
 use crate::scroll::{AxisSource, ScrollBackend, ScrollMapper, ScrollOp};
 use anyhow::{bail, Context, Result};
 use punktfunk_core::input::InputKind;
@@ -22,6 +26,10 @@ use wayland_client::protocol::{
     wl_seat::WlSeat,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1,
+    zxdg_output_v1::{self, ZxdgOutputV1},
+};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
@@ -41,6 +49,41 @@ struct Output {
     proxy: WlOutput,
     /// `wl_output.name` (v4). Same string every client sees; `None` below v4.
     name: Option<String>,
+    /// Layout mode only: the `zxdg_output_v1` reporting where the output sits.
+    xdg: Option<ZxdgOutputV1>,
+    /// `(x, y, w, h)` in layout coordinates; `w == 0` until reported.
+    logical: (i32, i32, i32, i32),
+}
+
+impl Output {
+    fn logical(&self) -> Option<Rect> {
+        let (_, _, w, h) = self.logical;
+        (w > 0 && h > 0).then_some(self.logical)
+    }
+}
+
+/// `(x, y, w, h)` of one output in layout coordinates.
+type Rect = (i32, i32, i32, i32);
+
+/// Units per logical pixel in layout-space motion: integer units stay finer than a pixel at
+/// fractional scales.
+const LAYOUT_STEP: f64 = 16.0;
+
+/// `(x, y, x_extent, y_extent)` that put fraction `norm` of `head` at its place in the bounding
+/// box of `heads`, which a layout-mapped compositor stretches absolute motion over.
+fn layout_point(heads: &[Rect], head: Rect, (fx, fy): (f64, f64)) -> (u32, u32, u32, u32) {
+    let all = || heads.iter().chain(std::iter::once(&head));
+    let x0 = all().map(|r| r.0).min().unwrap_or(head.0);
+    let y0 = all().map(|r| r.1).min().unwrap_or(head.1);
+    let x1 = all().map(|r| r.0 + r.2).max().unwrap_or(head.0 + head.2);
+    let y1 = all().map(|r| r.1 + r.3).max().unwrap_or(head.1 + head.3);
+    let units = |logical: f64| (logical * LAYOUT_STEP) as u32;
+    (
+        units(f64::from(head.0 - x0) + fx * f64::from(head.2)),
+        units(f64::from(head.1 - y0) + fy * f64::from(head.3)),
+        units(f64::from(x1 - x0)),
+        units(f64::from(y1 - y0)),
+    )
 }
 
 #[derive(Default)]
@@ -51,6 +94,10 @@ struct Globals {
     /// Every advertised head, advertisement order. The first is the operator's
     /// physical display; the streamed head is added later and is never first.
     outputs: Vec<Output>,
+    /// Absolute motion spans the whole layout ([`Backend::WlrLayout`](crate::Backend)).
+    layout: bool,
+    /// Layout mode only.
+    xdg_mgr: Option<ZxdgOutputManagerV1>,
 }
 
 impl Globals {
@@ -64,6 +111,28 @@ impl Globals {
             })
             .collect();
         head_pick::pick(&heads, target, None).map(|i| &self.outputs[i])
+    }
+
+    /// The output a pointer binds to: none in layout mode, where the compositor ignores it.
+    fn bind_target(&self, target: &StreamTarget) -> Option<&Output> {
+        if self.layout {
+            return None;
+        }
+        self.resolve(target)
+    }
+
+    /// `motion_absolute` arguments for `abs` aimed at `target`: in layout space in layout mode
+    /// once the head's geometry is known, else on the sample's own extent.
+    fn motion(&self, target: impl FnOnce() -> StreamTarget, abs: &Abs) -> (u32, u32, u32, u32) {
+        let placed = self.layout.then(|| {
+            let head = self.resolve(&target())?.logical()?;
+            let heads: Vec<Rect> = self.outputs.iter().filter_map(Output::logical).collect();
+            Some(layout_point(&heads, head, abs.normalized()))
+        });
+        placed.flatten().unwrap_or_else(|| {
+            let (x, y) = abs.in_extent();
+            (x, y, abs.w, abs.h)
+        })
     }
 
     /// True when `target` names a head this registry has not shown yet.
@@ -98,12 +167,22 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Globals {
                 }
                 "wl_output" => {
                     // User data is the registry global name so later events hit this entry.
-                    let proxy = registry.bind(name, version.min(WL_OUTPUT_MAX), qh, name);
+                    let proxy: WlOutput = registry.bind(name, version.min(WL_OUTPUT_MAX), qh, name);
+                    let xdg = (state.xdg_mgr.as_ref()).map(|m| m.get_xdg_output(&proxy, qh, name));
                     state.outputs.push(Output {
                         global: name,
                         proxy,
                         name: None,
+                        xdg,
+                        logical: (0, 0, 0, 0),
                     });
+                }
+                "zxdg_output_manager_v1" if state.layout => {
+                    let mgr: ZxdgOutputManagerV1 = registry.bind(name, version.min(3), qh, ());
+                    for o in state.outputs.iter_mut().filter(|o| o.xdg.is_none()) {
+                        o.xdg = Some(mgr.get_xdg_output(&o.proxy, qh, o.global));
+                    }
+                    state.xdg_mgr = Some(mgr);
                 }
                 _ => {}
             },
@@ -113,6 +192,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Globals {
                 state.outputs.retain(|o| {
                     if o.global != name {
                         return true;
+                    }
+                    if let Some(x) = &o.xdg {
+                        x.destroy();
                     }
                     if o.proxy.version() >= 3 {
                         o.proxy.release();
@@ -142,6 +224,28 @@ impl Dispatch<WlOutput, u32> for Globals {
     }
 }
 
+impl Dispatch<ZxdgOutputV1, u32> for Globals {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        global: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(o) = state.outputs.iter_mut().find(|o| o.global == *global) else {
+            return;
+        };
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => (o.logical.0, o.logical.1) = (x, y),
+            zxdg_output_v1::Event::LogicalSize { width, height } => {
+                (o.logical.2, o.logical.3) = (width, height)
+            }
+            _ => {}
+        }
+    }
+}
+
 // These proxies emit no events we handle; Dispatch is still required to bind them.
 macro_rules! ignore_events {
     ($($t:ty),* $(,)?) => {$(
@@ -156,6 +260,7 @@ ignore_events!(
     ZwlrVirtualPointerV1,
     ZwpVirtualKeyboardManagerV1,
     ZwpVirtualKeyboardV1,
+    ZxdgOutputManagerV1,
 );
 
 pub struct WlrootsInjector {
@@ -168,6 +273,13 @@ pub struct WlrootsInjector {
     bound_output: Option<u32>,
     /// Aim generation [`Self::retarget`] last read the socket for an unbound name.
     lookup_gen: u64,
+    /// A pointer per further screen that saw absolute input, bound to that screen's output:
+    /// the protocol has no re-aim, and re-making one pointer per move would drop a held button
+    /// mid-drag between screens.
+    screens: Vec<ScreenPointer>,
+    /// The screen whose pointer moved last, `0` the first: buttons, scroll and relative motion
+    /// go there.
+    active: u8,
     /// What `pointer` and `keyboard` hold. Released before either goes; the compositor will not.
     plan: Plan,
     keyboard: ZwpVirtualKeyboardV1,
@@ -178,6 +290,16 @@ pub struct WlrootsInjector {
     text: Option<TextKeyboard>,
     /// Scroll lowering, legacy and normalized; holds the sub-detent residue.
     scroll: ScrollMapper,
+}
+
+/// One further screen's pointer ([`WlrootsInjector::screens`]).
+struct ScreenPointer {
+    screen: u8,
+    pointer: ZwlrVirtualPointerV1,
+    /// Registry global of its output; `None` maps over the whole layout.
+    bound: Option<u32>,
+    /// Screens generation it last read the socket for an unbound name.
+    lookup_gen: u64,
 }
 
 /// Distinct chars before the text keymap restarts. Keycodes start at 9; xkb max is 255.
@@ -193,7 +315,9 @@ struct TextKeyboard {
 }
 
 impl WlrootsInjector {
-    pub fn open() -> Result<Self> {
+    /// `layout`: the compositor maps absolute motion over its whole layout
+    /// ([`Backend::WlrLayout`](crate::Backend)).
+    pub fn open(layout: bool) -> Result<Self> {
         let conn = match pf_host_config::session::wayland_stream() {
             Some(Ok(stream)) => Connection::from_socket(stream),
             Some(Err(_)) => Err(wayland_client::ConnectError::NoCompositor),
@@ -203,7 +327,10 @@ impl WlrootsInjector {
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());
-        let mut globals = Globals::default();
+        let mut globals = Globals {
+            layout,
+            ..Globals::default()
+        };
         queue
             .roundtrip(&mut globals)
             .context("Wayland registry roundtrip")?;
@@ -227,7 +354,7 @@ impl WlrootsInjector {
             .context("Wayland output-name roundtrip")?;
 
         let aim = crate::aim();
-        let bound = globals.resolve(&aim.target);
+        let bound = globals.bind_target(&aim.target);
         let pointer = pointer_mgr.create_virtual_pointer_with_output(
             Some(&seat),
             bound.map(|o| &o.proxy),
@@ -280,6 +407,7 @@ impl WlrootsInjector {
             outputs = globals.outputs.len(),
             want = ?aim.target.name,
             bound = ?bound_name,
+            layout,
             "wlroots virtual input ready (pointer + keyboard)"
         );
         Ok(Self {
@@ -289,6 +417,8 @@ impl WlrootsInjector {
             pointer,
             bound_output,
             lookup_gen: aim.generation,
+            screens: Vec::new(),
+            active: 0,
             plan: Plan::default(),
             keyboard,
             xkb_state,
@@ -307,7 +437,7 @@ impl WlrootsInjector {
     /// letterboxed content rect, not the streamed mode. A head created since the
     /// last read takes two roundtrips, one to bind it and one for its name; they
     /// run once per aim generation, not per motion. The head and its generation
-    /// come from one read of the aim.
+    /// come from one read of the aim. In layout mode only the read runs.
     fn retarget(&mut self) {
         let aim = crate::aim();
         if self.globals.lacks(&aim.target) && self.lookup_gen != aim.generation {
@@ -318,7 +448,7 @@ impl WlrootsInjector {
                 }
             }
         }
-        let target = self.globals.resolve(&aim.target);
+        let target = self.globals.bind_target(&aim.target);
         let to = target.map(|o| o.global);
         if to == self.bound_output {
             return;
@@ -349,6 +479,68 @@ impl WlrootsInjector {
         self.bound_output = to;
     }
 
+    /// The pointer of further screen `screen`, bound to its output and made on first use;
+    /// `None` without the pointer manager or seat.
+    fn screen_pointer(&mut self, screen: u8) -> Option<&ZwlrVirtualPointerV1> {
+        let generation = crate::aim().screens_generation;
+        let target = crate::stream_target_for(screen);
+        let at = self.screens.iter().position(|p| p.screen == screen);
+        if self.globals.lacks(&target) && at.map(|i| self.screens[i].lookup_gen) != Some(generation)
+        {
+            for _ in 0..2 {
+                if self.queue.roundtrip(&mut self.globals).is_err() {
+                    break;
+                }
+            }
+            if let Some(i) = at {
+                self.screens[i].lookup_gen = generation;
+            }
+        }
+        let output = self.globals.bind_target(&target);
+        let bound = output.map(|o| o.global);
+        if let Some(i) = at.filter(|&i| self.screens[i].bound == bound) {
+            return Some(&self.screens[i].pointer);
+        }
+        let output = output.map(|o| o.proxy.clone());
+        let (mgr, seat) = (
+            self.globals.pointer_mgr.clone()?,
+            self.globals.seat.clone()?,
+        );
+        let pointer = mgr.create_virtual_pointer_with_output(
+            Some(&seat),
+            output.as_ref(),
+            &self.queue.handle(),
+            (),
+        );
+        tracing::info!(screen, output = ?target.name, "wlroots virtual pointer made for a further screen");
+        let made = ScreenPointer {
+            screen,
+            pointer,
+            bound,
+            lookup_gen: generation,
+        };
+        let i = match at {
+            Some(i) => {
+                std::mem::replace(&mut self.screens[i], made)
+                    .pointer
+                    .destroy();
+                i
+            }
+            None => {
+                self.screens.push(made);
+                self.screens.len() - 1
+            }
+        };
+        Some(&self.screens[i].pointer)
+    }
+
+    /// The pointer that moved last ([`Self::active`]).
+    fn current(&self) -> &ZwlrVirtualPointerV1 {
+        (self.screens.iter())
+            .find(|p| p.screen == self.active)
+            .map_or(&self.pointer, |p| &p.pointer)
+    }
+
     /// Read the socket, dispatch, flush. `dispatch_pending` does not read, so
     /// without `read()` a `wl_output` created after `open` is never seen and
     /// protocol errors sit unread. `WouldBlock` is the idle case, not an error.
@@ -377,12 +569,12 @@ impl WlrootsInjector {
         (crate::monotonic_us() / 1_000) as u32
     }
 
-    /// Release every button `pointer` holds, unframed. `true` when there was one.
+    /// Release every button the current pointer holds, unframed. `true` when there was one.
     fn release_buttons(&mut self, t: u32) -> bool {
         let mut any = false;
         for op in self.plan.lift(false, true) {
             if let Op::Button { evdev, .. } = op {
-                self.pointer
+                self.current()
                     .button(t, evdev, wl_pointer::ButtonState::Released);
                 any = true;
             }
@@ -394,14 +586,25 @@ impl WlrootsInjector {
     fn emit(&mut self, t: u32, op: Op) -> Result<()> {
         match op {
             Op::Motion { dx, dy } => {
-                self.pointer.motion(t, dx.into(), dy.into());
-                self.pointer.frame();
+                self.current().motion(t, dx.into(), dy.into());
+                self.current().frame();
+            }
+            // A screen past the session's lands on the first, as on KWin and libei.
+            Op::Absolute(abs) if (1..=crate::EXTRA_SCREENS).contains(&usize::from(abs.screen)) => {
+                if let Some(p) = self.screen_pointer(abs.screen).cloned() {
+                    let (x, y, w, h) =
+                        (self.globals).motion(|| crate::stream_target_for(abs.screen), &abs);
+                    p.motion_absolute(t, x, y, w, h);
+                    p.frame();
+                    self.active = abs.screen;
+                }
             }
             Op::Absolute(abs) => {
+                self.active = 0;
                 self.retarget();
                 let t = self.now_ms(); // `retarget` may have consumed time releasing buttons
-                let (x, y) = abs.in_extent();
-                self.pointer.motion_absolute(t, x, y, abs.w, abs.h);
+                let (x, y, w, h) = self.globals.motion(|| crate::aim().target, &abs);
+                self.pointer.motion_absolute(t, x, y, w, h);
                 self.pointer.frame();
             }
             Op::Button { evdev, down } => {
@@ -410,8 +613,8 @@ impl WlrootsInjector {
                 } else {
                     wl_pointer::ButtonState::Released
                 };
-                self.pointer.button(t, evdev, st);
-                self.pointer.frame();
+                self.current().button(t, evdev, st);
+                self.current().frame();
             }
             Op::Key { evdev, down } => {
                 self.keyboard.key(t, evdev.into(), down.into());
@@ -495,29 +698,29 @@ impl WlrootsInjector {
                 wl_pointer::Axis::VerticalScroll
             }
         };
+        let pointer = self.current();
         for op in ops {
             match op {
                 ScrollOp::AxisSource(src) => {
-                    self.pointer.axis_source(match src {
+                    pointer.axis_source(match src {
                         AxisSource::Wheel => wl_pointer::AxisSource::Wheel,
                         AxisSource::Finger => wl_pointer::AxisSource::Finger,
                     });
                 }
                 ScrollOp::Continuous { horizontal, value } => {
-                    self.pointer.axis(t, axis(horizontal), value);
+                    pointer.axis(t, axis(horizontal), value);
                 }
                 ScrollOp::DiscreteDetents {
                     horizontal,
                     value,
                     detents,
                 } => {
-                    self.pointer
-                        .axis_discrete(t, axis(horizontal), value, detents);
+                    pointer.axis_discrete(t, axis(horizontal), value, detents);
                 }
                 ScrollOp::Stop { horizontal, .. } => {
-                    self.pointer.axis_stop(t, axis(horizontal));
+                    pointer.axis_stop(t, axis(horizontal));
                 }
-                ScrollOp::Frame => self.pointer.frame(),
+                ScrollOp::Frame => pointer.frame(),
                 // ei/Win32 vocabulary; a wlr plan never emits it.
                 ScrollOp::Discrete120 { .. } => {}
             }
@@ -542,7 +745,10 @@ impl Drop for WlrootsInjector {
         self.release_buttons(t);
         let ops = self.scroll.cancel_all();
         self.emit_scroll_ops(t, ops);
-        self.pointer.frame();
+        self.current().frame();
+        for p in self.screens.drain(..) {
+            p.pointer.destroy();
+        }
         let _ = self.conn.flush();
     }
 }
@@ -637,6 +843,34 @@ fn memfd_with(s: &str) -> Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The compositor reads `x / x_extent` over the layout box: the extent is the box and `x`
+    /// the head's offset in it, in 1/16 logical pixels.
+    #[test]
+    fn layout_motion_lands_on_the_streamed_head() {
+        let desk = (0, 0, 1920, 1080);
+        let ours = (1920, 0, 2560, 1600);
+        assert_eq!(
+            layout_point(&[desk, ours], ours, (0.5, 0.5)),
+            (3200 * 16, 800 * 16, 4480 * 16, 1600 * 16)
+        );
+        // A head left of the origin moves the box's origin, not the head.
+        let left = (-1920, 200, 1920, 1080);
+        assert_eq!(
+            layout_point(&[left, ours], ours, (0.0, 0.0)),
+            (3840 * 16, 0, 6400 * 16, 1600 * 16)
+        );
+        // The far edge stays on the head, never on its neighbour.
+        let edge = f64::from(crate::plan::ABS_EDGE);
+        let right = (4480, 0, 1920, 1080);
+        let (x, y, _, _) = layout_point(&[ours, right], ours, (edge, edge));
+        assert!(x < 2560 * 16 && y < 1600 * 16, "{x} {y}");
+        // A sole head maps onto itself.
+        assert_eq!(
+            layout_point(&[ours], ours, (0.25, 0.75)),
+            (640 * 16, 1200 * 16, 2560 * 16, 1600 * 16)
+        );
+    }
 
     const VK_LWIN: u32 = 0x5B;
     const VK_SHIFT: u32 = 0x10;

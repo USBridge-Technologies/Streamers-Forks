@@ -140,10 +140,11 @@ fn tails(head: u32, mid: u32, tail: u32) -> bool {
 /// Loss at the frames' heads, well past the rest, with the socket dropping nothing: a
 /// receiver whose adapter wakes late. The wake shape answers it, not the rate.
 pub(crate) fn head_signature(w: &WindowSample) -> bool {
-    heads(w.head, w.mid, w.tail, w.sock_drops)
+    shows_head_loss(w.head, w.mid, w.tail, w.sock_drops)
 }
 
-fn heads(head: u32, mid: u32, tail: u32, sock_drops: u32) -> bool {
+/// [`head_signature`] on a report's counts, for a host reading the same window.
+pub fn shows_head_loss(head: u32, mid: u32, tail: u32, sock_drops: u32) -> bool {
     head >= HEAD_MIN
         && head >= HEAD_RATIO.saturating_mul(mid.saturating_add(tail))
         && sock_drops == 0
@@ -153,7 +154,7 @@ fn heads(head: u32, mid: u32, tail: u32, sock_drops: u32) -> bool {
 /// a filling queue. A host that sees one keeps its encoder on the frames the client
 /// confirmed.
 pub fn shows_loss_shape(head: u32, mid: u32, tail: u32, sock_drops: u32) -> bool {
-    heads(head, mid, tail, sock_drops) || tails(head, mid, tail)
+    shows_head_loss(head, mid, tail, sock_drops) || tails(head, mid, tail)
 }
 
 /// Rolling-min baselines for the three relative signals.
@@ -208,6 +209,13 @@ impl Baselines {
         self.owd.clear();
         self.decode.clear();
         self.encode.clear();
+    }
+
+    /// The clock stepped: the delay floor moves with every reading it was taken from.
+    pub(crate) fn shift_owd(&mut self, step_us: i64) {
+        for mean in &mut self.owd {
+            *mean = mean.saturating_add(step_us);
+        }
     }
 
     /// Our own decrease changes the encode-time regime. Judging the new
@@ -495,6 +503,27 @@ mod tests {
         );
     }
 
+    /// The delay floor moves with the clock's step: the level it learned is no rise in the
+    /// new frame, and a rise in it still is.
+    #[test]
+    fn the_delay_floor_moves_with_the_clock() {
+        let mut b = Baselines::new();
+        let owd_bad = |b: &mut Baselines, us: i64| {
+            let w = WindowSample {
+                owd_mean_us: Some(us),
+                ..WindowSample::at(Instant::now())
+            };
+            b.score(&w, 0, None, false, false, 0, false, false, false, false)
+                .owd_bad
+        };
+        for _ in 0..BASELINE_MIN_WINDOWS {
+            assert!(!owd_bad(&mut b, 20_000));
+        }
+        b.shift_owd(40_000);
+        assert!(!owd_bad(&mut b, 60_000), "the floor in the new frame");
+        assert!(owd_bad(&mut b, 60_000 + OWD_RISE_US + 1), "a rise over it");
+    }
+
     /// A lone dead frame on a flat link is a blip while the minute's dead frames stay
     /// under [`LONE_DEAD_PER_MIN_PCT`] of the refresh. Two windows running, a frame dying at
     /// its tail, or the budget spent is damage the rate answers; frames dying at their
@@ -672,6 +701,28 @@ mod tests {
             }),
             Some(14_000)
         );
+    }
+
+    /// A starved decoder's asks are no signal: six a window with nothing lost and no decode
+    /// sample leave the rate and name nothing, where six recovery asks cut it at once.
+    #[test]
+    fn starved_decoder_asks_are_not_keyframe_asks() {
+        let start = Instant::now();
+        let asks = |recovery_kf, starved_kf, i| WindowSample {
+            owd_mean_us: Some(10_000),
+            actual_kbps: 1_000_000,
+            recovery_kf,
+            starved_kf,
+            ..WindowSample::at(ticks(start, i))
+        };
+        let mut c = BitrateController::new(20_000, None);
+        for i in 0..4 {
+            assert_eq!(c.on_window(&asks(0, 6, i)), None);
+            assert_eq!(c.last_reason(), Reason::Clean);
+        }
+        let mut c = BitrateController::new(20_000, None);
+        assert_eq!(c.on_window(&asks(6, 0, 0)), Some(14_000));
+        assert_eq!(c.last_reason(), Reason::KeyframeAsks);
     }
 
     /// A clean run at the rate is what makes one lost frame isolated: without

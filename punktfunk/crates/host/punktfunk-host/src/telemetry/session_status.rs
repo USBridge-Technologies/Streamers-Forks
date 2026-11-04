@@ -94,7 +94,8 @@ struct LiveSession {
     started: std::time::Instant,
     /// Host wall clock at registration; [`started`](Self::started) cannot give one.
     started_unix: i64,
-    /// 8 or 10, and the encoder's chroma. Fixed for the session.
+    /// 8 or 10, and the encoder's chroma. A codec change moves them with `codec` and `hdr`
+    /// ([`set_format`]).
     bit_depth: u8,
     chroma: ChromaFormat,
     /// What the video loop counted, stored once at its tail ([`record_tally`]).
@@ -270,6 +271,8 @@ pub struct SessionCounters {
     pub input_mic: AtomicU64,
     pub input_rich: AtomicU64,
     pub input_dropped: AtomicU64,
+    /// Pointer motion among `input_events`. The seat-pointer park reads it: the player steers.
+    pub pointer_moves: AtomicU64,
     /// `RichInput::Motion` arrivals, and the gaps ≥ 500 ms among them.
     motion_samples: AtomicU64,
     motion_stalls: AtomicU64,
@@ -682,6 +685,28 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
     LiveSessionGuard {
         id,
         _sleep: crate::sleep_inhibit::hold(),
+    }
+}
+
+/// Follow session `id`'s client to `peer`, its address now. Path sharing and the rate
+/// governor's groups read the registry, so a roamed session stops splitting the path it left.
+pub fn refresh_peer(id: u64, peer: std::net::IpAddr) {
+    let peer = peer.to_canonical();
+    let mut reg = registry();
+    let Some(s) = reg.iter_mut().find(|s| s.id == id) else {
+        return;
+    };
+    if s.peer != Some(peer) {
+        tracing::info!(session = id, from = ?s.peer, to = %peer, "client moved to a new address");
+        s.peer = Some(peer);
+    }
+}
+
+/// A codec change rebuilt session `id`'s pipeline: `/status` and its summary name what it
+/// encodes now.
+pub fn set_format(id: u64, codec: Codec, hdr: bool, bit_depth: u8, chroma: ChromaFormat) {
+    if let Some(s) = registry().iter_mut().find(|s| s.id == id) {
+        (s.codec, s.hdr, s.bit_depth, s.chroma) = (codec, hdr, bit_depth, chroma);
     }
 }
 
@@ -1116,6 +1141,29 @@ pub(crate) mod tests {
             .unwrap()
             .shared_path_with
             .is_empty());
+    }
+
+    /// A session whose client roamed groups with whoever is at its new address, and leaves
+    /// the one it was at.
+    #[test]
+    fn a_roamed_session_regroups() {
+        let _registry = registry_lock();
+        let home: std::net::IpAddr = "203.0.113.77".parse().unwrap();
+        let away: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        let (a, _) = fake_at("phone", false, Some(home));
+        let (b, _) = fake_at("pc", false, Some(home));
+        let (c, _) = fake_at("tv", false, Some(away));
+        refresh_peer(a.id, "::ffff:198.51.100.9".parse().unwrap());
+        let rows = snapshot();
+        let with = |id| {
+            rows.iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .shared_path_with
+                .clone()
+        };
+        assert_eq!(with(a.id), vec![c.id]);
+        assert!(with(b.id).is_empty());
     }
 
     /// The owner of a live display may switch its monitor; a joiner watching it, a device with

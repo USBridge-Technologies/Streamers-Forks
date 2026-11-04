@@ -179,8 +179,9 @@ v2_message!(AuthResponse = reg::MSG_AUTH_RESPONSE, { 1 => device_key, 2 => signa
 v2_message!(Refused = reg::MSG_REFUSED, { 1 => code, 2 => reason },
     check |m| m.reason.len() <= REFUSED_REASON_MAX);
 
-v2_message!(Reconfigure = reg::MSG_RECONFIGURE, { 1 => mode });
-v2_message!(Reconfigured = reg::MSG_RECONFIGURED, { 1 => accepted, 2 => mode });
+v2_message!(Reconfigure = reg::MSG_RECONFIGURE, { 1 => mode, 2 => exclude_codecs });
+v2_message!(Reconfigured = reg::MSG_RECONFIGURED,
+    { 1 => accepted, 2 => mode, 3 => exclude_codecs });
 v2_message!(SetBitrate = reg::MSG_SET_BITRATE, { 1 => bitrate_kbps });
 v2_message!(PipelineGap = reg::MSG_PIPELINE_GAP, { 1 => gap_ms });
 v2_message!(ProbeShaped = reg::MSG_PROBE_REQUEST,
@@ -244,7 +245,9 @@ pub const REDIRECT_PIN_LEN: usize = 64;
 /// address it dialed. `pin` is that host's certificate fingerprint, which the box vouches for
 /// over the connection the client already pinned; empty keeps the pin it dialed with.
 /// `profile` is the id the host resolved, `seat_no` and `seat_name` the seat, and `occupant`
-/// the device already there when this one joins a live session. `punktfunk/2` only.
+/// the device already there when this one joins a live session. To a browser, `port` is the
+/// seat's browser plane and `cert_hash` its certificate's SHA-256, the hash the browser pins and
+/// binds its credential to; empty to a native client. `punktfunk/2` only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Redirect {
     pub addr: String,
@@ -254,16 +257,21 @@ pub struct Redirect {
     pub seat_name: String,
     pub occupant: String,
     pub pin: String,
+    pub cert_hash: String,
+}
+
+/// An empty value, or one SHA-256 in hex: [`Redirect::pin`] and [`Redirect::cert_hash`].
+fn hex_or_empty(v: &str) -> bool {
+    v.is_empty() || (v.len() == REDIRECT_PIN_LEN && v.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 v2_message!(Redirect = reg::MSG_REDIRECT,
     { 1 => addr, 2 => port, 3 => profile, 4 => seat_no, 5 => seat_name, 6 => occupant,
-      7 => pin },
+      7 => pin, 8 => cert_hash },
     check |m| m.port != 0 && m.addr.len() <= REDIRECT_ADDR_MAX
         && m.profile.len() <= PROFILE_ID_MAX && m.seat_name.len() <= HELLO_NAME_MAX
         && m.occupant.len() <= HELLO_NAME_MAX
-        && (m.pin.is_empty()
-            || (m.pin.len() == REDIRECT_PIN_LEN && m.pin.bytes().all(|b| b.is_ascii_hexdigit()))));
+        && hex_or_empty(&m.pin) && hex_or_empty(&m.cert_hash));
 
 v2_message!(ClipControl = reg::MSG_CLIP_CONTROL, { 1 => enabled, 2 => flags });
 v2_message!(ClipState = reg::MSG_CLIP_STATE, { 1 => enabled, 2 => policy, 3 => reason });
@@ -351,6 +359,9 @@ impl V2Message for ClipOffer {
 /// say.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StreamConfig {
+    /// The video stream this config is for: 0 the first screen, then the one each further
+    /// screen rides ([`ScreenLayout`]). Epochs count per stream.
+    pub stream: u8,
     pub epoch: u8,
     pub mode: Mode,
     /// One `CODEC_*` bit.
@@ -371,7 +382,110 @@ pub struct StreamConfig {
 
 v2_message!(StreamConfig = reg::MSG_STREAM_CONFIG,
     { 1 => epoch, 2 => mode, 3 => codec, 4 => bit_depth, 5 => color, 6 => chroma_format,
-      7 => host_iface_kind, 8 => host_link_mbps, 9 => host_sndbuf_kb, 10 => host_forced_shape });
+      7 => host_iface_kind, 8 => host_link_mbps, 9 => host_sndbuf_kb, 10 => host_forced_shape,
+      11 => stream });
+
+/// Screens one session carries at most, the first included.
+pub const SCREENS_MAX: usize = 4;
+/// Bytes of one [`Screen`] on the wire.
+const SCREEN_LEN: usize = 20;
+
+/// One screen of a session. In a `ClientHello` or [`Screens`] it is a monitor the client shows,
+/// placed in the client's pixels beside screen 0; in a [`ScreenLayout`], a display the host
+/// built, placed on the host's desktop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Screen {
+    /// 0 is the screen `Hello.mode` describes.
+    pub index: u8,
+    /// The video stream it rides ([`crate::packet::screen_stream`]); 0 in an ask.
+    pub stream: u8,
+    pub mode: Mode,
+    /// Top-left of the screen.
+    pub x: i32,
+    pub y: i32,
+    /// The client's primary monitor.
+    pub primary: bool,
+}
+
+/// `index u8 ‖ stream u8 ‖ flags u8 ‖ 0 ‖ width u16 ‖ height u16 ‖ refresh u16 ‖ 0 u16 ‖ x i32 ‖
+/// y i32` per screen, at most [`SCREENS_MAX`], as one value.
+impl FieldValue for Vec<Screen> {
+    fn put(&self, f: Fields, tag: u64) -> Fields {
+        let mut b = Vec::with_capacity(self.len() * SCREEN_LEN);
+        for s in self.iter().take(SCREENS_MAX) {
+            let dim = |v: u32| (v.min(u32::from(u16::MAX)) as u16).to_le_bytes();
+            b.extend_from_slice(&[s.index, s.stream, u8::from(s.primary), 0]);
+            b.extend_from_slice(&dim(s.mode.width));
+            b.extend_from_slice(&dim(s.mode.height));
+            b.extend_from_slice(&dim(s.mode.refresh_hz));
+            b.extend_from_slice(&[0, 0]);
+            b.extend_from_slice(&s.x.to_le_bytes());
+            b.extend_from_slice(&s.y.to_le_bytes());
+        }
+        f.bytes(tag, &b)
+    }
+    fn get(v: &[u8]) -> Result<Self> {
+        if v.len() % SCREEN_LEN != 0 || v.len() / SCREEN_LEN > SCREENS_MAX {
+            return Err(PunktfunkError::InvalidArg("bad screen list"));
+        }
+        Ok(v.chunks_exact(SCREEN_LEN)
+            .map(|r| {
+                let u16_at = |o: usize| u32::from(u16::from_le_bytes([r[o], r[o + 1]]));
+                let i32_at = |o: usize| i32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
+                Screen {
+                    index: r[0],
+                    stream: r[1],
+                    primary: r[2] & 1 != 0,
+                    mode: Mode {
+                        width: u16_at(4),
+                        height: u16_at(6),
+                        refresh_hz: u16_at(8),
+                    },
+                    x: i32_at(12),
+                    y: i32_at(16),
+                }
+            })
+            .collect())
+    }
+}
+
+/// `host → client`, before the first packet of any stream past the first and after every
+/// change: each screen the host built, screen 0 included. A screen the host could not build
+/// is absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScreenLayout {
+    pub screens: Vec<Screen>,
+}
+
+v2_message!(ScreenLayout = reg::MSG_SCREEN_LAYOUT, { 1 => screens });
+
+/// `client → host`: every screen the client shows now, screen 0 first. Screen 0's mode still
+/// moves by `Reconfigure`; this adds, drops and resizes the others.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Screens {
+    pub screens: Vec<Screen>,
+}
+
+v2_message!(Screens = reg::MSG_SCREENS, { 1 => screens });
+
+impl StreamConfig {
+    /// What a decoder for this epoch is built for.
+    pub fn format(&self) -> VideoFormat {
+        VideoFormat {
+            codec: self.codec,
+            bit_depth: self.bit_depth,
+            color: ColorInfo::from_cicp(self.color),
+            chroma_format: self.chroma_format,
+        }
+    }
+
+    pub fn set_format(&mut self, f: VideoFormat) {
+        self.codec = f.codec;
+        self.bit_depth = f.bit_depth;
+        self.color = f.color.cicp();
+        self.chroma_format = f.chroma_format;
+    }
+}
 
 /// `host → client`, before the first datagram of epoch `epoch` on audio stream `stream`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -387,11 +501,13 @@ pub struct AudioConfig {
     pub frame_us: u16,
     /// Each datagram carries the previous frame too.
     pub redundant: bool,
+    /// The first audio `seq` under this config. The datagram carries no epoch, so this anchors it.
+    pub first_seq: u32,
 }
 
 v2_message!(AudioConfig = reg::MSG_AUDIO_CONFIG,
     { 1 => stream, 2 => epoch, 3 => codec, 4 => rate_hz, 5 => bits, 6 => channels, 7 => layout,
-      8 => frame_us, 9 => redundant });
+      8 => frame_us, 9 => redundant, 10 => first_seq });
 
 impl FieldValue for [u8; 4] {
     fn put(&self, f: Fields, tag: u64) -> Fields {
@@ -496,11 +612,25 @@ mod tests {
             seat_name: "Seat 1".into(),
             occupant: "Ben's Apple TV".into(),
             pin: "ab".repeat(32),
+            cert_hash: "cd".repeat(32),
         });
-        round_trip(Reconfigure { mode });
+        round_trip(Reconfigure {
+            mode,
+            exclude_codecs: 0,
+        });
+        round_trip(Reconfigure {
+            mode,
+            exclude_codecs: CODEC_HEVC | CODEC_AV1,
+        });
         round_trip(Reconfigured {
             accepted: true,
             mode,
+            exclude_codecs: 0,
+        });
+        round_trip(Reconfigured {
+            accepted: false,
+            mode,
+            exclude_codecs: CODEC_HEVC,
         });
         round_trip(SetBitrate {
             bitrate_kbps: 80_000,
@@ -577,6 +707,7 @@ mod tests {
             total_size: 1 << 40,
         });
         round_trip(StreamConfig {
+            stream: 0,
             epoch: 4,
             mode,
             codec: CODEC_AV1,
@@ -588,6 +719,38 @@ mod tests {
             host_sndbuf_kb: 4_096,
             host_forced_shape: 2,
         });
+        round_trip(StreamConfig {
+            stream: 2,
+            epoch: 1,
+            mode,
+            ..Default::default()
+        });
+        let screens = vec![
+            Screen {
+                index: 0,
+                stream: 0,
+                mode,
+                x: 0,
+                y: 0,
+                primary: true,
+            },
+            Screen {
+                index: 1,
+                stream: 2,
+                mode: Mode {
+                    width: 2560,
+                    height: 1440,
+                    refresh_hz: 60,
+                },
+                x: -2560,
+                y: -300,
+                primary: false,
+            },
+        ];
+        round_trip(ScreenLayout {
+            screens: screens.clone(),
+        });
+        round_trip(Screens { screens });
         round_trip(AudioConfig {
             stream: 0,
             epoch: 1,
@@ -598,6 +761,7 @@ mod tests {
             layout: 0,
             frame_us: 2000,
             redundant: false,
+            first_seq: 7_000,
         });
     }
 
@@ -632,13 +796,45 @@ mod tests {
                 seat_name: String::new(),
                 occupant: String::new(),
                 pin: String::new(),
+                cert_hash: String::new(),
             }
             .encode_v2(),
             [
-                0x05, 0x13, 0x01, 0x00, 0x02, 0x02, 0x32, 0x26, 0x03, 0x02, 0x61, 0x62, 0x04, 0x01,
-                0x02, 0x05, 0x00, 0x06, 0x00, 0x07, 0x00
+                0x05, 0x15, 0x01, 0x00, 0x02, 0x02, 0x32, 0x26, 0x03, 0x02, 0x61, 0x62, 0x04, 0x01,
+                0x02, 0x05, 0x00, 0x06, 0x00, 0x07, 0x00, 0x08, 0x00
             ]
         );
+        assert_eq!(
+            ScreenLayout {
+                screens: vec![Screen {
+                    index: 1,
+                    stream: 2,
+                    mode: Mode {
+                        width: 1920,
+                        height: 1080,
+                        refresh_hz: 60,
+                    },
+                    x: 1920,
+                    y: 0,
+                    primary: false,
+                }],
+            }
+            .encode_v2(),
+            [
+                0x28, 0x16, 0x01, 0x14, 0x01, 0x02, 0x00, 0x00, 0x80, 0x07, 0x38, 0x04, 0x3C, 0x00,
+                0x00, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            ]
+        );
+    }
+
+    /// A screen list past [`SCREENS_MAX`] or with a torn record does not decode.
+    #[test]
+    fn a_bad_screen_list_does_not_decode() {
+        let list = |n: usize| Fields::new().bytes(1, &vec![0u8; n]).into_body();
+        let at_bound = Screens::from_body(&list(SCREEN_LEN * SCREENS_MAX)).unwrap();
+        assert_eq!(at_bound.screens.len(), SCREENS_MAX);
+        assert!(Screens::from_body(&list(SCREEN_LEN * (SCREENS_MAX + 1))).is_err());
+        assert!(Screens::from_body(&list(SCREEN_LEN - 1)).is_err());
     }
 
     #[test]
@@ -675,10 +871,16 @@ mod tests {
         for pin in ["ab".repeat(31), "zz".repeat(32), "ab".repeat(33)] {
             let unpinnable = Redirect {
                 port: 9778,
-                pin,
+                pin: pin.clone(),
                 ..Redirect::default()
             };
             assert!(Redirect::from_body(&unpinnable.fields().into_body()).is_err());
+            let unhashable = Redirect {
+                port: 9778,
+                cert_hash: pin,
+                ..Redirect::default()
+            };
+            assert!(Redirect::from_body(&unhashable.fields().into_body()).is_err());
         }
         let bad_cursor = CursorShape {
             serial: 1,

@@ -1,4 +1,8 @@
-use super::{build_h265_rps_s0, intra_refresh_caps, parse_rgb_request, VulkanVideoEncoder};
+use super::{
+    build_h265_rps_s0, intra_refresh_caps, PhaseStats, VulkanVideoEncoder, PHASE_IMPORT,
+    PHASE_REPORT_EVERY, PHASE_SPIKE, PHASE_SPIKE_EVERY, PHASE_WAIT,
+};
+use crate::env_knobs::Knobs;
 use crate::test_frames::{cpu_frame, cpu_frame_24};
 use crate::{Codec, Encoder};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
@@ -21,6 +25,24 @@ fn rc_plan_prefers_offered_vbr_and_clamps_to_the_driver() {
         rc_plan(both, None, 60, 900_000_000, 400_000_000).2,
         400_000_000
     );
+}
+
+/// The largest CTB and transform the driver offers, the transform never above the CTB.
+#[test]
+fn h265_blocks_follow_the_driver_caps() {
+    use super::h265_block_log2;
+    use ash::vk::VideoEncodeH265CtbSizeFlagsKHR as Ctb;
+    use ash::vk::VideoEncodeH265TransformBlockSizeFlagsKHR as Tb;
+    let all_tb = Tb::TYPE_4 | Tb::TYPE_8 | Tb::TYPE_16 | Tb::TYPE_32;
+    assert_eq!(h265_block_log2(Ctb::TYPE_64, all_tb), (6, 5)); // VCN
+    assert_eq!(h265_block_log2(Ctb::TYPE_32, all_tb), (5, 5)); // NVIDIA
+    assert_eq!(h265_block_log2(Ctb::TYPE_16 | Ctb::TYPE_32, all_tb), (5, 5));
+    assert_eq!(h265_block_log2(Ctb::TYPE_16, all_tb), (4, 4));
+    assert_eq!(
+        h265_block_log2(Ctb::TYPE_64, Tb::TYPE_4 | Tb::TYPE_16),
+        (6, 4)
+    );
+    assert_eq!(h265_block_log2(Ctb::empty(), Tb::empty()), (6, 5));
 }
 
 /// The profile chain's structure types, head first.
@@ -66,6 +88,26 @@ fn native_planar_format_matches_only_the_depth_pair() {
     assert!(native_planar_format_matches(PixelFormat::P010, true));
     assert!(!native_planar_format_matches(PixelFormat::Nv12, true));
     assert!(!native_planar_format_matches(PixelFormat::P010, false));
+}
+
+/// A studio session clears the shaders' `FULL_RANGE` constant, which Vulkan drops silently if a
+/// rebuilt blob no longer declares it: the pixels would stay full under a studio VUI.
+#[test]
+fn the_csc_blobs_declare_the_range_constant() {
+    use super::{CSC10_709_SPV, CSC10_SPV, CSC_FULL_RANGE_SPEC_ID, CSC_SPV};
+    // `OpDecorate %target SpecId <id>`: word count 4, opcode 71, decoration 1.
+    let declares = |spv: &[u8]| {
+        let words: Vec<u32> = spv
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        words
+            .windows(4)
+            .any(|w| w[0] == (4 << 16 | 71) && w[2] == 1 && w[3] == CSC_FULL_RANGE_SPEC_ID)
+    };
+    assert!(declares(CSC_SPV), "rgb2yuv.spv");
+    assert!(declares(CSC10_709_SPV), "rgb2yuv10_709.spv");
+    assert!(declares(CSC10_SPV), "rgb2yuv10.spv");
 }
 
 /// Imported EXCLUSIVE images are re-acquired from the producer family on every use —
@@ -665,6 +707,8 @@ fn vulkan_encode_cursor_switch_follows_the_cursor() {
         true,
         8,
         false,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open");
     assert!(
@@ -912,6 +956,139 @@ fn vulkan_reframe_crops_and_scales() {
     );
 }
 
+/// 1080 rows sit off VCN4's 64×16 AV1 grid. A stream whose header disagrees with the coded
+/// size desyncs in the bottom superblock row, so that row must match the source as well as
+/// the top one does, on the CSC and on EFC.
+#[test]
+#[ignore = "needs a real VK_KHR_video_encode_av1 device and ffmpeg"]
+fn vulkan_av1_1080_bottom_row_decodes_clean() {
+    let (w, h, frames) = (1920u32, 1080u32, 12u32);
+    for rgb in [false, true] {
+        let mut enc =
+            VulkanVideoEncoder::open_opts(Codec::Av1, w, h, 60, 20_000_000, rgb).expect("open");
+        if rgb && enc.rgb.is_none() {
+            eprintln!("RGB-direct unavailable on this driver — CSC only");
+            continue;
+        }
+        let mut stream = Vec::new();
+        for i in 0..frames {
+            let frame = cpu_frame_scroll(w, h, u64::from(i) * 16_666_667, i);
+            enc.submit_indexed(&frame, i).expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                stream.extend_from_slice(&au.data);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("poll") {
+            stream.extend_from_slice(&au.data);
+        }
+        let path = std::env::temp_dir().join("vkenc-1080.obu");
+        std::fs::write(&path, &stream).expect("write the stream");
+        let Ok(out) = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "obu", "-i"])
+            .arg(&path)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+        else {
+            eprintln!("no ffmpeg — skipping the picture check");
+            return;
+        };
+        // ffmpeg keeps the coded rows (render_size becomes the aspect ratio).
+        let rows = out.stdout.len() / (frames * w * 3) as usize;
+        assert!(
+            rows >= h as usize,
+            "decoded {} bytes: {}",
+            out.stdout.len(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let last = &out.stdout[(frames - 1) as usize * rows * w as usize * 3..];
+        let src = crate::smoke_pattern::scroll_pattern(w as usize, h as usize, frames as usize - 1);
+        let mae = |y0: u32, y1: u32| {
+            let mut sum = 0u64;
+            for y in y0..y1 {
+                for x in 0..w {
+                    let (d, s) = (((y * w + x) * 3) as usize, ((y * w + x) * 4) as usize);
+                    for (c, k) in [(0, 2), (1, 1), (2, 0)] {
+                        sum += u64::from(last[d + c].abs_diff(src[s + k]));
+                    }
+                }
+            }
+            sum as f64 / f64::from((y1 - y0) * w * 3)
+        };
+        let (top, bottom) = (mae(0, 64), mae(h - 56, h));
+        eprintln!("rgb={rgb}: rows={rows} top MAE {top:.1}, bottom MAE {bottom:.1}");
+        assert!(
+            bottom <= 2.0 * top + 8.0,
+            "rgb={rgb}: the bottom superblock row decodes as garbage \
+             (MAE {bottom:.1} vs {top:.1} at the top)"
+        );
+    }
+}
+
+/// White decodes to the session's range on both converters: Y' 255 full, 235 studio. A blend
+/// session takes the CSC; the other takes EFC where the probe passes.
+#[test]
+#[ignore = "needs a real VK_KHR_video_encode_h265 device and ffmpeg"]
+fn vulkan_white_lands_at_the_session_range() {
+    let (w, h) = (256u32, 256u32);
+    for (full_range, blend) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut enc = VulkanVideoEncoder::open(
+            Codec::H265,
+            PixelFormat::Bgrx,
+            w,
+            h,
+            60,
+            10_000_000,
+            blend,
+            8,
+            false,
+            full_range,
+            &Knobs::from_env(),
+        )
+        .expect("open");
+        let efc = enc.rgb.is_some();
+        let mut stream = Vec::new();
+        for i in 0..2u32 {
+            let frame = cpu_frame(w, h, u64::from(i) * 16_666_667, [255, 255, 255, 255]);
+            enc.submit_indexed(&frame, i).expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                stream.extend_from_slice(&au.data);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("poll") {
+            stream.extend_from_slice(&au.data);
+        }
+        let path = std::env::temp_dir().join("vkenc-range.h265");
+        std::fs::write(&path, &stream).expect("write the stream");
+        // Same pixel format out as in: ffmpeg copies the codes, no range conversion.
+        let Ok(out) = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args([
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-",
+            ])
+            .output()
+        else {
+            eprintln!("no ffmpeg — skipping the picture check");
+            return;
+        };
+        assert_eq!(out.stdout.len(), (w * h * 3 / 2) as usize);
+        let y = out.stdout[(h / 2 * w + w / 2) as usize];
+        let want = if full_range { 255 } else { 235 };
+        assert!(
+            y.abs_diff(want) <= 3,
+            "full={full_range} efc={efc}: white Y' {y}, want {want}"
+        );
+    }
+}
+
 /// Mid-stream [`Encoder::reset`] must not change what `vkCmdBeginVideoCodingKHR` declares.
 /// `reset()` re-arms `first_frame` without rebuilding the session, so CBR is still current
 /// — declaration keys on `rc_installed`. Also stages `reconfigure_bitrate` before the reset
@@ -947,26 +1124,39 @@ fn vulkan_reset_keeps_the_declared_rate_control_state() {
     eprintln!("done — under validation layers this run must report ZERO VUID errors");
 }
 
-/// `PUNKTFUNK_VULKAN_RGB_DIRECT` accepts the same spellings as every sibling knob, trimmed,
-/// in any case.
+/// A stall warns once a second; the window reports its maxima, then starts over.
 #[test]
-fn rgb_direct_knob_accepts_the_house_spellings() {
-    for on in ["1", "true", "yes", "on", " 1", "1 ", "\ton\n", "TRUE", "On"] {
-        assert_eq!(parse_rgb_request(Some(on)), Some(true), "{on:?}");
-    }
-    for off in [
-        "0", "false", "no", "off", " 0", "0 ", "\toff\n", "FALSE", "Off",
-    ] {
-        assert_eq!(parse_rgb_request(Some(off)), Some(false), "{off:?}");
-    }
-}
-
-/// Unset, empty, and unrecognised values mean default — never a force-on. Anything-but-`"0"`
-/// as force-on made a trailing space on `=0` enable the path the operator was disabling.
-#[test]
-fn rgb_direct_knob_never_force_enables_on_an_unrecognised_value() {
-    assert_eq!(parse_rgb_request(None), None);
-    for junk in ["", "   ", "2", "maybe", "0x0", "enabled"] {
-        assert_eq!(parse_rgb_request(Some(junk)), None, "{junk:?}");
-    }
+fn phase_stats_warn_once_a_second_then_report_the_window() {
+    use std::time::{Duration, Instant};
+    let mut p = PhaseStats::default();
+    let t = Instant::now();
+    assert!(
+        !p.note(PHASE_WAIT, Duration::from_millis(8), t),
+        "a healthy phase never warns"
+    );
+    assert!(p.note(PHASE_WAIT, PHASE_SPIKE, t), "the first stall warns");
+    assert!(
+        !p.note(
+            PHASE_IMPORT,
+            Duration::from_millis(400),
+            t + Duration::from_millis(500)
+        ),
+        "a stall inside the same second is folded in silently"
+    );
+    assert!(
+        p.note(PHASE_WAIT, PHASE_SPIKE, t + PHASE_SPIKE_EVERY),
+        "the next second warns again"
+    );
+    assert!(
+        p.report(t + Duration::from_secs(1)).is_none(),
+        "no report before the window ends"
+    );
+    let w = p
+        .report(t + PHASE_REPORT_EVERY)
+        .expect("the window reports");
+    assert_eq!(
+        (w.max_us[PHASE_WAIT], w.max_us[PHASE_IMPORT]),
+        (100_000, 400_000)
+    );
+    assert_eq!(p.max_us, [0; 4], "the next window starts empty");
 }

@@ -29,6 +29,9 @@ const val CONNECT_TIMEOUT_MS = 10_000
  */
 const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
 
+/** How often a dial in flight checks whether the host parked it for its operator. */
+const val PENDING_POLL_MS = 250L
+
 /** The session [HostServices.dial] hands every shell once a dial lands. */
 object SessionFactory {
     /**
@@ -45,6 +48,7 @@ object SessionFactory {
         preset: StreamPreset?,
         store: KnownHostStore,
         mgmtPort: Int,
+        redial: DialSpec? = null,
     ): ActiveSession {
         if (record != null) store.learnMgmtPort(record, mgmtPort)
         return ActiveSession(
@@ -53,6 +57,7 @@ object SessionFactory {
             clipboardSync = record?.clipboardSync ?: false,
             presetName = preset?.name,
             hostId = record?.id,
+            redial = redial,
         )
     }
 
@@ -179,6 +184,7 @@ suspend fun connectToHost(context: Context, spec: DialSpec): Long {
         // sockets) — must be applied before connect, since sockets are tagged at creation.
         NativeBridge.nativeSetLowLatencyMode(settings.lowLatencyMode)
         val multiSlice = VideoDecoders.multiSliceTolerant()
+        val studioRange = VideoDecoders.showsFullRangeAsStudio()
         val partialFrame = VideoDecoders.partialFrameCapable()
         // Slice-progressive delivery: decoder truth AND the low-latency toggle — parts are part of
         // the fast pipeline, and the toggle's "off" is the conservative configuration throughout.
@@ -193,25 +199,24 @@ suspend fun connectToHost(context: Context, spec: DialSpec): Long {
         // still resolves HEVC. An explicit user choice always wins unchanged.
         val preferredCodec = settings.preferredCodec().takeIf { it != 0 }
             ?: if (codecBits and 4 != 0 && !partialFrame) 4 else 0
-        // PyroWave takes its rate from the player's quality. Asking Automatic (0) is what lets
-        // the host fit that rate to the link before the first frame; a stored fixed rate is
-        // kept for the other codecs.
-        val pyrowave = preferredCodec == 8 && codecBits and 8 != 0
         // The connect-time capability readout (`adb logcat -s pf.caps`): the P2 slice pipeline
         // is client-inert unless BOTH probes pass — this line says which decoder failed one.
         Log.i(
             "pf.caps",
             VideoDecoders.capsReport() +
-                " → multiSlice=$multiSlice parts=$frameParts prefer=$preferredCodec" +
+                " → multiSlice=$multiSlice parts=$frameParts studioRange=$studioRange" +
+                " prefer=$preferredCodec" +
                 " (lowLatency=${settings.lowLatencyMode})",
         )
         val request = ConnectRequest(
             host = spec.host, port = spec.port, width = w, height = h, refreshHz = hz,
             certPem = spec.identity.certPem, keyPem = spec.identity.privateKeyPem, pinHex = spec.pinHex,
-            bitrateKbps = if (pyrowave) 0 else settings.bitrateKbps, compositorPref = settings.compositor,
+            // Zero is Automatic. Under PyroWave any other value is Fixed: the host ignores the
+            // number and pins the player's quality.
+            bitrateKbps = settings.bitrateKbps, compositorPref = settings.compositor,
             pyrowaveBppX100 = settings.pyrowaveBppX100(), gamepadPref = gamepadPref,
             hdrEnabled = hdrEnabled, tenBitSdr = tenBitSdr, multiSliceOk = multiSlice,
-            framePartsOk = frameParts,
+            framePartsOk = frameParts, studioRange = studioRange,
             audioChannels = settings.audioChannels,
             // The audio format this session asks for. Only ever a request: the host's own gate
             // may resolve it back to Opus, and the native side downgrades it first if AAudio on
@@ -232,6 +237,9 @@ suspend fun connectToHost(context: Context, spec: DialSpec): Long {
             // "Keep host audio playing": the host taps its own default output rather than
             // silencing it for the session. Free to ask for — an older host just ignores it.
             keepHostAudio = settings.keepHostAudio,
+            // Only a mouse wears the host's pointer; without one the channel costs a Linux host
+            // an encoder blend for nothing.
+            clientCursor = settings.mouseMode == MouseMode.DESKTOP && hasPhysicalMouse(),
             videoFit = settings.videoFit,
             // Which build, and which shell and path, opened this session — the host's
             // `handshake complete` `client=` field.

@@ -14,7 +14,11 @@ use crate::seam::{BasePaths, CommandRunner, Env};
 pub const DOCS: &str = "https://docs.punktfunk.unom.io/docs";
 
 /// User-scope client id when the family has no native package.
-pub const FLATPAK_APP: &str = "io.unom.Punktfunk";
+pub const FLATPAK_APP: &str = "io.unom.punktfunk";
+
+/// The id the client shipped under before the lowercase rename. The remote marks it
+/// end-of-life, so its next `flatpak update` rebases it onto [`FLATPAK_APP`].
+pub const LEGACY_FLATPAK_APP: &str = "io.unom.Punktfunk";
 
 /// The three binaries the installer asks about separately. "Is the host there?" is the
 /// wrong question: a box with the host but no console never grows one, however often
@@ -208,6 +212,9 @@ pub struct Facts {
     pub floor: Option<Floor>,
     /// Flatpak client already on the box; uninstall has a leg to sweep.
     pub has_flatpak_client: bool,
+    /// The client under [`LEGACY_FLATPAK_APP`]. It counts as installed: an update moves it.
+    #[serde(default)]
+    pub legacy_flatpak_client: bool,
     pub couch_box: bool,
     pub graphical_seat: bool,
     /// A session file under `/usr/share/{wayland-sessions,xsessions}`: a desktop can be
@@ -280,6 +287,9 @@ impl Facts {
             floor,
             has_flatpak_client: run
                 .probe("flatpak", &["info", FLATPAK_APP])
+                .is_some_and(|o| o.ok()),
+            legacy_flatpak_client: run
+                .probe("flatpak", &["info", LEGACY_FLATPAK_APP])
                 .is_some_and(|o| o.ok()),
             couch_box: os.like("bazzite") || os.like("nobara"),
             graphical_seat: graphical_seat(env),
@@ -404,6 +414,7 @@ pub fn floors(os: &OsRelease, family: Family) -> (Option<String>, Option<Floor>)
         return (None, floor);
     }
     match os.major() {
+        45 => (Some("fedora-45".into()), floor),
         44 => (Some("fedora-44".into()), floor),
         // Fedora 43 ships the same RPM as Bazzite, so the group name is `bazzite`.
         43 => (Some("bazzite".into()), floor),
@@ -658,7 +669,11 @@ mod tests {
     }
 
     #[test]
-    fn the_fedora_group_map_covers_44_and_43_and_dies_otherwise() {
+    fn the_fedora_group_map_covers_43_to_45_and_dies_otherwise() {
+        assert_eq!(
+            floors(&os("fedora", "", "45"), Family::Dnf).0.unwrap(),
+            "fedora-45"
+        );
         assert_eq!(
             floors(&os("fedora", "", "44"), Family::Dnf).0.unwrap(),
             "fedora-44"
@@ -667,7 +682,7 @@ mod tests {
             floors(&os("fedora", "", "43"), Family::Dnf).0.unwrap(),
             "bazzite"
         );
-        let (group, floor) = floors(&os("fedora", "", "45"), Family::Dnf);
+        let (group, floor) = floors(&os("fedora", "", "46"), Family::Dnf);
         assert!(group.is_none());
         assert!(matches!(floor, Some(Floor::Die(_))));
     }

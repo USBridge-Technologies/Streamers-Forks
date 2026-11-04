@@ -8,6 +8,8 @@
 //! the others.
 
 use anyhow::Result;
+use punktfunk_core::au::{AuBuf, AuMemory};
+use std::sync::Arc;
 
 use crate::video::DecodedImage;
 use crate::video_caps::NativeRung;
@@ -30,6 +32,22 @@ pub(crate) trait Rung {
         user_flags: u32,
         complete: bool,
     ) -> Result<Option<DecodedImage>>;
+
+    /// [`Self::decode`] with the AU's own buffer, for a rung that reads it where it lies.
+    fn decode_au(
+        &mut self,
+        au: AuBuf,
+        user_flags: u32,
+        complete: bool,
+    ) -> Result<Option<DecodedImage>> {
+        self.decode(&au, user_flags, complete)
+    }
+
+    /// Memory this rung reads AUs from in place, for the session to lend; `None` = the
+    /// heap. A resize can replace it.
+    fn au_memory(&self) -> Option<Arc<dyn AuMemory>> {
+        None
+    }
 
     /// Drain the re-anchor ask the last `decode` raised by concealing damage.
     fn take_recovery_request(&mut self) -> bool {
@@ -59,6 +77,10 @@ pub(crate) trait Rung {
     fn boosted(&self) -> bool {
         false
     }
+
+    /// Run `wake` once each shipped decode completes, off the pump's thread. A rung that
+    /// returns with the pixels done has nothing to wake for.
+    fn set_decode_wake(&mut self, _wake: std::sync::Arc<dyn Fn() + Send + Sync>) {}
 
     /// Newest planned decode-order ordinal. 0 on a rung that stamps none.
     fn decode_order(&self) -> u64 {
@@ -101,6 +123,10 @@ impl Rung for NativeVulkanDecoder {
 
     fn boosted(&self) -> bool {
         Self::boosted(self)
+    }
+
+    fn set_decode_wake(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        Self::set_decode_wake(self, wake);
     }
 
     fn decode_order(&self) -> u64 {
@@ -216,6 +242,24 @@ impl Rung for crate::video_pyrowave::PyroWaveDecoder {
             self.wait_ready(f)?;
         }
         Ok(frame.map(DecodedImage::PyroWave))
+    }
+
+    fn decode_au(
+        &mut self,
+        au: AuBuf,
+        user_flags: u32,
+        complete: bool,
+    ) -> Result<Option<DecodedImage>> {
+        let aligned = user_flags & punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED != 0;
+        let frame = Self::decode_au(self, au, aligned, complete)?;
+        if let Some(f) = &frame {
+            self.wait_ready(f)?;
+        }
+        Ok(frame.map(DecodedImage::PyroWave))
+    }
+
+    fn au_memory(&self) -> Option<Arc<dyn AuMemory>> {
+        Self::au_memory(self)
     }
 }
 

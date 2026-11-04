@@ -139,13 +139,13 @@ sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#/usr/share/punktfunk
 # host bind KWin's restricted zkde_screencast (virtual output) + fake_input globals on an
 # interactive Plasma session. Must ship with the host — KWin caches the per-exe grant on first
 # connect, so it has to be present before the host ever connects. See the file's header comment.
-install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
-    "$STAGE/usr/share/applications/io.unom.Punktfunk.Host.desktop"
+install -Dm0644 packaging/linux/io.unom.punktfunk.host.desktop \
+    "$STAGE/usr/share/applications/io.unom.punktfunk.host.desktop"
 # Status tray: the per-user SNI icon + the hicolor status icons it names. Its autostart entry is
 # per user, written by the host from the tray_autostart setting.
 install -Dm0755 "$TRAY_BIN"                        "$STAGE/usr/bin/punktfunk-tray"
-install -Dm0644 packaging/linux/io.unom.Punktfunk.StartHost.desktop \
-    "$STAGE/usr/share/applications/io.unom.Punktfunk.StartHost.desktop"
+install -Dm0644 packaging/linux/io.unom.punktfunk.starthost.desktop \
+    "$STAGE/usr/share/applications/io.unom.punktfunk.starthost.desktop"
 for sz in 22x22 48x48; do
   for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
     install -Dm0644 "$png" "$STAGE/usr/share/icons/hicolor/$sz/apps/$(basename "$png")"
@@ -264,10 +264,10 @@ Homepage: https://git.unom.io/unom/punktfunk
 Depends: $DEPENDS
 Recommends: $RECOMMENDS
 Suggests: $SUGGESTS
-Description: Low-latency desktop/game streaming host (Moonlight + punktfunk/1)
+Description: Low-latency desktop/game streaming host (Moonlight + punktfunk/2)
  punktfunk is a Linux-first, low-latency desktop and game streaming host. It speaks
  the Moonlight/GameStream protocol (pair a stock Moonlight client) and its own native
- punktfunk/1 protocol (GF(2^16) Leopard FEC + AES-GCM, mid-stream mode renegotiation,
+ punktfunk/2 protocol (GF(2^16) Leopard FEC + AES-GCM, mid-stream mode renegotiation,
  client microphone passthrough). Each session gets a virtual output at the client's
  exact resolution and refresh via a per-compositor backend (KWin, gamescope, Mutter,
  Sway/wlroots), captured zero-copy (dmabuf -> CUDA -> NVENC). Input (mouse, keyboard,

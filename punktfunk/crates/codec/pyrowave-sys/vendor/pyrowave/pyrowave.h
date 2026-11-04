@@ -218,6 +218,18 @@ pyrowave_device_set_queue_type(pyrowave_device device, VkQueueFlagBits queue_fla
 PYROWAVE_PUBLIC_API bool
 pyrowave_device_confirm_interop_support(pyrowave_device device);
 
+// PUNKTFUNK LOCAL EXTENSION (patches/0013-confirm-one-import.patch), not upstream.
+// Confirm the one import a caller makes (a 2D optimal image, a semaphore), where the check
+// above wants every handle type and STORAGE usage. The semaphore is asked without a
+// VkSemaphoreTypeCreateInfo, as upstream asks a D3D12 fence.
+PYROWAVE_PUBLIC_API bool
+pyrowave_device_confirm_image_import_support(pyrowave_device device,
+		VkExternalMemoryHandleTypeFlagBits handle_type, VkFormat format, VkImageUsageFlags usage);
+
+PYROWAVE_PUBLIC_API bool
+pyrowave_device_confirm_semaphore_import_support(pyrowave_device device,
+		VkExternalSemaphoreHandleTypeFlagBits handle_type);
+
 // All encoders and decoders must have been destroyed before destroying the device.
 PYROWAVE_PUBLIC_API void pyrowave_device_destroy(pyrowave_device device);
 ////
@@ -623,6 +635,31 @@ PYROWAVE_PUBLIC_API void pyrowave_decoder_clear(pyrowave_decoder decoder);
 // Packets are pushed into the decoder until decode_is_ready says it's ready.
 PYROWAVE_PUBLIC_API pyrowave_result
 pyrowave_decoder_push_packet(pyrowave_decoder decoder, const void *data, size_t size);
+
+// PUNKTFUNK (patch 0011): payload memory the caller owns and writes, so a decode copies nothing.
+typedef struct pyrowave_payload_memory
+{
+	// STORAGE | UNIFORM_TEXEL | TRANSFER_DST usage, `size` bytes of host-coherent memory.
+	VkBuffer buffer;
+	VkDeviceSize size;
+	// Leading bytes pyrowave_decoder_push_packet still copies into.
+	VkDeviceSize copy_reserve;
+	// The buffer's memory, mapped.
+	void *host;
+	// R8, R16 and R32_UINT linear images of `rows` 4096-byte rows aliasing the buffer from
+	// offset 0, in GENERAL layout: all three or none. Mobile GPUs read them faster than texel
+	// buffers.
+	VkImage linear[3];
+	uint32_t rows;
+} pyrowave_payload_memory;
+
+// Every handle must outlive the decoder. pyrowave_decoder_push_packet_in_place then takes packets
+// that already lie in `host` past `copy_reserve`, 4-byte aligned; a frame may mix both pushes.
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_decoder_set_payload_memory(pyrowave_decoder decoder, const pyrowave_payload_memory *memory);
+
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_decoder_push_packet_in_place(pyrowave_decoder decoder, const void *data, size_t size);
 
 // For error correction purposes, it may be okay to decode a frame which dropped some packets.
 PYROWAVE_PUBLIC_API bool

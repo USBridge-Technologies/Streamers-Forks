@@ -50,6 +50,34 @@ impl WindowsSlotPlan {
         }
     }
 
+    /// The `resolved` slot as a joiner's own, which a join skips. `None` when other clients
+    /// share it: a seat's one slot, and slot 0 for every client without an identity slot.
+    pub(crate) fn own_slot(self, resolved: u32) -> Option<u32> {
+        (self.seat_slot().is_none() && resolved != 0).then_some(resolved)
+    }
+
+    /// The connector a console client drives once it resolved to `resolved`. Slot 0 takes one
+    /// device at a time: a device on a live connector keeps it, and while another holds slot 0
+    /// this one takes `device_slot`, its own. `held` is each live slot and its device.
+    pub(crate) fn connector(
+        self,
+        resolved: u32,
+        fp: Option<[u8; 32]>,
+        held: &[(u32, Option<[u8; 32]>)],
+        device_slot: impl FnOnce() -> Option<u32>,
+    ) -> u32 {
+        if resolved != 0 || fp.is_none() || self.seat_slot().is_some() {
+            return resolved;
+        }
+        if let Some(&(slot, _)) = held.iter().find(|(_, device)| *device == fp) {
+            return slot;
+        }
+        if held.iter().any(|&(slot, _)| slot == 0) {
+            return device_slot().unwrap_or(0);
+        }
+        0
+    }
+
     /// Applies the role to a normal host's resolved slot. Seat assignment
     /// replaces that slot; console roles validate their allowed connector set.
     pub(crate) fn resolve(self, ordinary_slot: u32) -> Result<u32, WindowsSlotError> {
@@ -160,21 +188,34 @@ struct Entry {
 pub(crate) struct DisplayIdentityMap {
     path: PathBuf,
     store: Store,
+    /// False when the map exists but could not be read: this run remembers nothing and
+    /// writes nothing, so the file is still there for the next start.
+    persists: bool,
 }
 
 impl DisplayIdentityMap {
-    /// Empty on first run or parse failure (ids re-derive once). Falls back to `pf-vdisplay-identity.json`.
     pub(crate) fn load() -> Self {
-        let dir = pf_paths::config_dir();
+        Self::load_in(&pf_paths::config_dir())
+    }
+
+    /// Empty on first run or parse failure (ids re-derive once). A missing map falls back to
+    /// `pf-vdisplay-identity.json`; a map the OS refused is left alone (`persists` false).
+    fn load_in(dir: &std::path::Path) -> Self {
         let path = dir.join(FILE);
-        let (from, bytes) = match std::fs::read(&path) {
-            Ok(b) => (path.clone(), Some(b)),
-            Err(_) => {
+        let (from, bytes, persists) = match std::fs::read(&path) {
+            Ok(b) => (path.clone(), Some(b), true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let legacy = dir.join(LEGACY_FILE);
                 match std::fs::read(&legacy) {
-                    Ok(b) => (legacy, Some(b)),
-                    Err(_) => (path.clone(), None),
+                    Ok(b) => (legacy, Some(b), true),
+                    Err(_) => (path.clone(), None, true),
                 }
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e,
+                    "display-identity map exists but could not be read — ids are not remembered \
+                     this run and the file is left as it is");
+                (path.clone(), None, false)
             }
         };
         let mut store = match bytes {
@@ -203,7 +244,11 @@ impl DisplayIdentityMap {
         store.entries.retain(|e| {
             (1..=MAX_ID).contains(&e.id) && seen_key.insert(e.key.clone()) && seen_id.insert(e.id)
         });
-        Self { path, store }
+        Self {
+            path,
+            store,
+            persists,
+        }
     }
 
     /// Returns the remembered id, or the lowest free / LRU-idle id in
@@ -270,16 +315,27 @@ impl DisplayIdentityMap {
         self.resolve_bounded(key, live, MAX_ID)
     }
 
-    /// Best-effort [`pf_paths::replace_file`]. Parent is `config_dir()` (host key, allow-list,
-    /// mgmt token) so use `create_private_dir` (0700), not `create_dir_all`.
+    /// Best-effort ([`write_private`]); nothing while `persists` is false.
     fn persist(&self) {
+        if !self.persists {
+            return;
+        }
         let Ok(bytes) = serde_json::to_vec_pretty(&self.store) else {
             return;
         };
-        if let Some(dir) = self.path.parent() {
-            let _ = pf_paths::create_private_dir(dir);
-        }
-        let _ = pf_paths::replace_file(&self.path, &bytes);
+        write_private(&self.path, &bytes, "the display-identity map");
+    }
+}
+
+/// Write one of this module's files under `config_dir()` (host key, allow-list, mgmt token):
+/// the parent is `create_private_dir` (0700), never `create_dir_all`. A write that fails is
+/// logged, not dropped: the next start re-derives what it should have found.
+fn write_private(path: &std::path::Path, bytes: &[u8], what: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = pf_paths::create_private_dir(dir);
+    }
+    if let Err(e) = pf_paths::replace_file(path, bytes) {
+        tracing::warn!(path = %path.display(), error = %e, "{what} was not written");
     }
 }
 
@@ -302,19 +358,23 @@ pub(crate) fn resolve_slot_bounded(
     use crate::policy::Identity;
     // Per device: "remember display settings" is a property of the device whose
     // settings are being remembered (§6.1).
-    let id_policy = crate::policy::prefs()
-        .configured()
-        .map(|p| {
-            p.effective_for(crate::policy::fp_hex(fp).as_deref())
-                .identity
-        })
-        .unwrap_or(default);
+    let id_policy = identity_policy_for(fp, default);
     let per_client_mode = match id_policy {
         Identity::Shared => return None,
         Identity::PerClient => false,
         Identity::PerClientMode => true,
     };
-    let fp = fp?;
+    device_slot_bounded(fp?, mode, per_client_mode, max_id)
+}
+
+/// `fp`'s own slot in the identity map, whatever its policy says. `None` when every
+/// candidate id is live.
+pub(crate) fn device_slot_bounded(
+    fp: [u8; 32],
+    mode: (u32, u32),
+    per_client_mode: bool,
+    max_id: u32,
+) -> Option<u32> {
     // Sample live ids before the map lock. Their sources take the manager/pool
     // lock, and this map is reached from backend `create`. Map lock stays a leaf.
     let live = live_slot_ids();
@@ -361,6 +421,35 @@ pub(crate) fn slot_owner(slot: Option<u32>) -> Option<String> {
         .cloned()
 }
 
+/// Whether device `fp` may take a kept display carrying `slot`. A display with a slot goes back
+/// to the device that owns it; one with none (shared, anonymous) to whoever asks first. Every
+/// pooled backend's `accepts_kept` answers through here. Takes only the leaf owner lock.
+pub(crate) fn may_reuse(slot: Option<u32>, fp: Option<[u8; 32]>) -> bool {
+    slot.is_none() || slot_owner(slot) == crate::policy::fp_hex(fp)
+}
+
+/// The slot [`resolve_slot_bounded`] answers for `fp` now, without allocating one or touching
+/// the LRU order. `None` for a shared or anonymous client, or one with no slot yet.
+pub(crate) fn peek_slot(
+    fp: Option<[u8; 32]>,
+    mode: (u32, u32),
+    default: crate::policy::Identity,
+) -> Option<u32> {
+    use crate::policy::Identity;
+    let per_client_mode = match identity_policy_for(fp, default) {
+        Identity::Shared => return None,
+        Identity::PerClient => false,
+        Identity::PerClientMode => true,
+    };
+    let key = identity_key(fp?, mode, per_client_mode);
+    let map = global().lock().unwrap();
+    map.store
+        .entries
+        .iter()
+        .find(|e| e.key == key)
+        .map(|e| e.id)
+}
+
 /// Resolves against the full identity range used by non-Windows backends.
 pub(crate) fn resolve_slot(
     fp: Option<[u8; 32]>,
@@ -393,18 +482,29 @@ fn live_slot_ids() -> BTreeSet<u32> {
 
 const SCALE_FILE: &str = "display-scale.json";
 
-/// Scale-map key: [`identity_key`], or `"shared"` for Shared/anonymous.
-/// `"shared"` cannot collide — identity keys are 64 hex chars.
+/// Scale-map key: [`identity_key`], or `"shared"` for Shared/anonymous, under the device's
+/// own identity policy. `"shared"` cannot collide — identity keys are 64 hex chars.
 pub(crate) fn scale_key(
     fp: Option<[u8; 32]>,
     mode: (u32, u32),
     default: crate::policy::Identity,
 ) -> String {
-    let id_policy = crate::policy::prefs()
-        .configured_effective()
-        .map(|e| e.identity)
-        .unwrap_or(default);
-    scale_key_for(id_policy, fp, mode)
+    scale_key_for(identity_policy_for(fp, default), fp, mode)
+}
+
+/// The identity axis for `fp`: the device's own overlay, else the host's, else `default`.
+/// The slot and the scale key both resolve through here, so they cannot disagree.
+fn identity_policy_for(
+    fp: Option<[u8; 32]>,
+    default: crate::policy::Identity,
+) -> crate::policy::Identity {
+    crate::policy::prefs()
+        .configured()
+        .map(|p| {
+            p.effective_for(crate::policy::fp_hex(fp).as_deref())
+                .identity
+        })
+        .unwrap_or(default)
 }
 
 /// [`scale_key`] with policy already resolved (no global prefs).
@@ -430,15 +530,35 @@ pub(crate) struct ScaleMap {
 }
 
 impl ScaleMap {
-    /// Empty on first run / unreadable. Drop non-finite and values outside 0.25..=8.0
-    /// (sane compositor scale range; a hand-edited file can store anything).
     fn load() -> Self {
-        let path = pf_paths::config_dir().join(SCALE_FILE);
-        let mut map: std::collections::BTreeMap<String, f64> = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        map.retain(|_, s| s.is_finite() && (0.25..=8.0).contains(s));
+        Self::load_from(pf_paths::config_dir().join(SCALE_FILE))
+    }
+
+    /// Empty on first run. One unreadable value loses only its entry; a non-finite scale or
+    /// one outside 0.25..=8.0 (a hand-edited file can store anything) is dropped too. A file
+    /// that is not a map, or that the OS refused, keeps nothing and says so.
+    fn load_from(path: PathBuf) -> Self {
+        let raw: std::collections::BTreeMap<String, serde_json::Value> = match std::fs::read(&path)
+        {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+                tracing::warn!(path = %path.display(), error = %e,
+                        "display-scale.json is not a map — every remembered scale is forgotten");
+                Default::default()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e,
+                        "display-scale.json could not be read — remembered scales do not apply");
+                Default::default()
+            }
+        };
+        let map = raw
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let s = v.as_f64()?;
+                (s.is_finite() && (0.25..=8.0).contains(&s)).then_some((k, s))
+            })
+            .collect();
         Self { path, map }
     }
 
@@ -454,11 +574,7 @@ impl ScaleMap {
         let Ok(bytes) = serde_json::to_vec_pretty(&self.map) else {
             return;
         };
-        if let Some(dir) = self.path.parent() {
-            // Parent is `config_dir()` (host key, allow-list, token). 0700, not `create_dir_all`.
-            let _ = pf_paths::create_private_dir(dir);
-        }
-        let _ = pf_paths::replace_file(&self.path, &bytes);
+        write_private(&self.path, &bytes, "the remembered scale");
     }
 }
 
@@ -484,7 +600,60 @@ mod tests {
         DisplayIdentityMap {
             path: dir.join(FILE),
             store: Store::default(),
+            persists: true,
         }
+    }
+
+    #[test]
+    fn an_unreadable_identity_map_is_neither_replaced_nor_resurrected() {
+        // A directory where the map should be: the read fails, but not with NotFound. The
+        // stale legacy map beside it must not come back, and nothing may overwrite the file.
+        let dir = std::env::temp_dir().join(format!("pf-id-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(FILE)).unwrap();
+        std::fs::write(
+            dir.join(LEGACY_FILE),
+            br#"{"tick":1,"entries":[{"fp":"old","id":3,"seen":1}]}"#,
+        )
+        .unwrap();
+        let map = DisplayIdentityMap::load_in(&dir);
+        assert!(
+            map.store.entries.is_empty(),
+            "the legacy map is not resurrected"
+        );
+        assert!(!map.persists, "nothing overwrites the file this run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peek answers what a resolve remembered and takes no slot itself.
+    #[test]
+    fn a_peek_reads_a_slot_without_allocating_one() {
+        let name = "a_peek_reads_a_slot_without_allocating_one";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            use crate::policy::Identity::{PerClient, Shared};
+            assert_eq!(peek_slot(Some(fp(1)), (1920, 1080), PerClient), None);
+            assert_eq!(resolve_slot(Some(fp(2)), (1920, 1080), PerClient), Some(1));
+            assert_eq!(peek_slot(Some(fp(2)), (1280, 720), PerClient), Some(1));
+            assert_eq!(peek_slot(Some(fp(2)), (1920, 1080), Shared), None);
+            assert_eq!(peek_slot(None, (1920, 1080), PerClient), None);
+        });
+    }
+
+    /// A slotted kept display is its owner's alone; a slotless one is anyone's.
+    #[test]
+    fn a_kept_display_is_its_owners_or_anyones() {
+        let name = "a_kept_display_is_its_owners_or_anyones";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            let slot = resolve_slot(
+                Some(fp(1)),
+                (1920, 1080),
+                crate::policy::Identity::PerClient,
+            );
+            assert!(slot.is_some());
+            let answers = [Some(fp(1)), Some(fp(2)), None].map(|fp| may_reuse(slot, fp));
+            assert_eq!(answers, [true, false, false]);
+            assert!(may_reuse(None, Some(fp(2))) && may_reuse(None, None));
+        });
     }
 
     fn nothing_live() -> BTreeSet<u32> {
@@ -526,6 +695,42 @@ mod tests {
                 Err(WindowsSlotError::OverrideOutOfRange(slot))
             );
         }
+    }
+
+    #[test]
+    fn a_shared_slot_is_no_joiners_own() {
+        for plan in [
+            WindowsSlotPlan::Unreserved,
+            WindowsSlotPlan::ReservedConsole,
+        ] {
+            assert_eq!(plan.own_slot(0), None);
+            assert_eq!(plan.own_slot(3), Some(3));
+        }
+        assert_eq!(WindowsSlotPlan::Seat(12).own_slot(12), None);
+    }
+
+    #[test]
+    fn slot_0_takes_one_device_at_a_time() {
+        let console = WindowsSlotPlan::Unreserved;
+        let (a, b) = (Some([1; 32]), Some([2; 32]));
+        let own = || Some(4);
+        let none = || None;
+        assert_eq!(console.connector(0, a, &[], own), 0);
+        // A device's rebuild stays where it is, before and after the other one leaves.
+        assert_eq!(console.connector(0, a, &[(0, a), (4, b)], none), 0);
+        assert_eq!(console.connector(0, b, &[(4, b)], none), 4);
+        // Another device, or a Moonlight session, holds slot 0.
+        assert_eq!(console.connector(0, b, &[(0, a)], own), 4);
+        assert_eq!(console.connector(0, b, &[(0, None)], own), 4);
+        // No free identity slot leaves it where it was.
+        assert_eq!(console.connector(0, b, &[(0, a)], none), 0);
+        // No fingerprint, a seat, or an identity slot of its own: untouched.
+        assert_eq!(console.connector(0, None, &[(0, a)], own), 0);
+        assert_eq!(
+            WindowsSlotPlan::Seat(12).connector(12, b, &[(12, a)], own),
+            12
+        );
+        assert_eq!(console.connector(3, b, &[(0, a)], own), 3);
     }
 
     #[test]
@@ -712,10 +917,50 @@ mod tests {
         assert!(pcm.ends_with("@1920x1080"));
     }
 
+    /// A tablet whose overlay says per-client remembers its own scale on a shared-identity
+    /// host: the key follows the same per-device identity the slot does.
+    #[test]
+    fn scale_key_follows_the_devices_own_identity_overlay() {
+        crate::fake::in_child(
+            module_path!(),
+            "scale_key_follows_the_devices_own_identity_overlay",
+            &[],
+            || {
+                let fp = fp(7);
+                let hex = crate::policy::fp_hex(Some(fp)).unwrap();
+                let doc = format!(
+                    r#"{{"identity":"shared","clients":{{"{hex}":{{"identity":"per-client"}}}}}}"#
+                );
+                std::fs::write(pf_paths::config_dir().join("display-settings.json"), doc).unwrap();
+                let key = scale_key(Some(fp), (1920, 1080), crate::policy::Identity::Shared);
+                assert_eq!(
+                    key,
+                    scale_key_for(crate::policy::Identity::PerClient, Some(fp), (1920, 1080))
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn one_bad_scale_entry_costs_only_itself() {
+        // A hand-edited or half-written value loses its own entry, not every client's scale.
+        let dir = std::env::temp_dir().join(format!("pf-scale-bad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("scale.json");
+        std::fs::write(&path, br#"{"a": 1.5, "b": "1.5", "c": 100.0}"#).unwrap();
+        let m = ScaleMap::load_from(path);
+        assert_eq!(m.get("a"), Some(1.5));
+        assert_eq!(m.get("b"), None);
+        assert_eq!(m.get("c"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn scale_map_roundtrips_and_rejects_junk() {
-        let path = std::env::temp_dir().join(format!("pf-scale-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        // Its own dir: `set` hardens the parent, which must not be the shared temp root.
+        let dir = std::env::temp_dir().join(format!("pf-scale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("scale.json");
         let mut m = ScaleMap {
             path: path.clone(),
             map: Default::default(),
@@ -731,6 +976,6 @@ mod tests {
         let reread: std::collections::BTreeMap<String, f64> =
             serde_json::from_slice(&bytes).unwrap();
         assert_eq!(reread.get("k"), Some(&1.5));
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

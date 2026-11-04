@@ -1,11 +1,12 @@
 //! Video pacing: frame intake, the latch clock, the glass gate, and the 1 Hz window.
 
+use super::pace_step::{PaceAction, PaceFacts};
 use super::*;
 
 impl Shell {
-    /// This pass's video: HDR metadata, the glass fold, intake, the pick behind the glass
-    /// gate, the present, and the 1 Hz window. `true` when a frame reached the swapchain,
-    /// carrying the overlay with it.
+    /// This pass's video: HDR metadata, the glass fold, intake, the pace step and its
+    /// action, and the 1 Hz window. `true` when a frame reached the swapchain, carrying
+    /// the overlay with it.
     pub(super) fn video_tick(&mut self, st: &mut StreamState) -> Result<bool> {
         // Mastering metadata (0xCE) → the presentation engine, ahead of the frame
         // that needs it.
@@ -19,7 +20,11 @@ impl Shell {
         // Without a glass clock too: the compositor queues a feedback answer per present.
         let samples = self.presenter.take_presented_samples();
         if !samples.is_empty() {
-            st.fold_glass(&samples, self.presenter.vblank_locked());
+            st.fold_glass(
+                &samples,
+                self.presenter.vblank_locked(),
+                self.presenter.glass_estimated(),
+            );
         }
         st.intake();
         self.presenter.begin_present_turn(st.newest_turn);
@@ -33,73 +38,32 @@ impl Shell {
             st.note_engine_refresh(cycle_ns, interval_ns);
         }
         let now_ns = session::now_ns();
-        // An estimated stamp never builds the latch grid: on a VRR panel the vblanks it
-        // reads follow our own presents, and a grid built on them chases itself.
-        let estimated = self.presenter.glass_estimated();
-        let grid_known = self.presenter.present_timing_active() && !estimated;
-        let mut to_present = st.pick(now_ns, grid_known);
-        // FIFO glass budget: one undisplayed present in flight, so the swapchain's
-        // own FIFO can never become a standing queue. Only FIFO modes queue. The
-        // estimate counts only while the panel runs at its mode rate, where that queue
-        // stands two deep; under variable refresh nothing queues.
-        if self.pacing_active
-            && self.presenter.needs_glass_gate()
-            && self.presenter.present_timing_active()
-            && (!estimated || st.cadence.verdict() == Cadence::Fixed)
-            && st.cadence.verdict() != Cadence::Variable
-        {
-            if let Some(f) = to_present.take() {
-                if st.gate.open(self.presenter.presents_outstanding(), now_ns) {
-                    to_present = Some(f);
-                } else {
-                    // Parked: a newest-wins store replaces it if a fresher frame
-                    // lands; the waiter's wake (or the 100 ms stale force-open) retries.
-                    st.store.put_back(f);
-                }
+        let facts = st.pace_facts(&self.presenter, self.pacing_active, now_ns);
+        let slot_after = |t: u64| st.clock.next_slot_after(t);
+        // Newest-wins at a latch slot keeps one frame of backlog; everywhere else the
+        // store's own rule.
+        let due = move |p: &Paced| p.due_ns <= now_ns as i64;
+        let take = || {
+            if facts.on_grid() && !facts.smoothing {
+                st.store.take_due_bounded(due)
+            } else {
+                st.store.take(due)
             }
-        }
-        st.busy_retry = false;
-        let mut presented = false;
-        if let Some(paced) = to_present {
-            let (pts_ns, decoded_ns) = (paced.frame.pts_ns, paced.frame.decoded_ns);
-            tracing::trace!(
-                pts_ns,
-                // Present pass against the due time (0 = none); against arrival otherwise.
-                slip_us = (now_ns as i64 - paced.due_ns) / 1000 * i64::from(paced.due_ns != 0),
-                waited_us = now_ns.saturating_sub(decoded_ns) / 1000,
-                "frame out"
-            );
-            // Resize end: a frame at the steered target size means the new-mode
-            // picture is here.
-            let (fw, fh) = paced.frame.image.dimensions();
-            st.resize_overlay.decoded(fw, fh);
-            st.last_video = Some((fw, fh));
-            if st.present(
-                &mut self.presenter,
-                &self.window,
-                self.overlay_frame.as_ref(),
-                paced,
-            )? {
-                presented = true;
-                self.overlay_damage.video_presented(Instant::now());
-                st.win.push(&self.presenter);
-                if self.opts.json_status && !st.ready_announced {
-                    st.ready_announced = true;
-                    emit(SessionLine::Ready);
-                }
-                if self.presenter.present_timing_active() {
-                    // Hand the frame's stamps to the present-wait waiter — e2e/display
-                    // samples arrive via `take_presented_samples` with a true on-glass stamp.
-                    self.presenter.note_presented(pts_ns, decoded_ns);
-                    st.gate.note_present(now_ns);
-                    st.win.out_max = st.win.out_max.max(self.presenter.presents_outstanding());
-                } else {
-                    st.note_submitted(pts_ns, decoded_ns);
-                }
+        };
+        let action = st
+            .pace
+            .step(&mut st.slots, &mut st.gate, &facts, slot_after, take);
+        let presented = match action {
+            PaceAction::Vend { frame, aim_ns } => self.present_vended(st, frame, aim_ns, now_ns)?,
+            PaceAction::Park(frame) => {
+                st.store.put_back(frame);
+                false
             }
-        }
+            // The loop's sleep is `wake_timeout`: the same rule over the store as it stands.
+            PaceAction::Wait => false,
+        };
         // Nothing taken in is waiting on this pass any more, unless the presenter was busy.
-        if !st.busy_retry {
+        if !st.pace.is_busy() {
             self.presenter.end_present_turn(st.newest_turn);
         }
         // Close the overlay window once per second.
@@ -107,6 +71,55 @@ impl Shell {
             self.close_present_window(st);
         }
         Ok(presented)
+    }
+
+    /// Present the frame the pace step vended at `aim_ns`, then book it: the HUD window,
+    /// the ready line, and under a glass clock the gate and the aim its stamp is checked
+    /// against. `true` when it reached the swapchain.
+    fn present_vended(
+        &mut self,
+        st: &mut StreamState,
+        paced: Paced,
+        aim_ns: u64,
+        now_ns: u64,
+    ) -> Result<bool> {
+        let (pts_ns, decoded_ns) = (paced.frame.pts_ns, paced.frame.decoded_ns);
+        tracing::trace!(
+            pts_ns,
+            // Present pass against the due time (0 = none); against arrival otherwise.
+            slip_us = (now_ns as i64 - paced.due_ns) / 1000 * i64::from(paced.due_ns != 0),
+            waited_us = now_ns.saturating_sub(decoded_ns) / 1000,
+            "frame out"
+        );
+        // Resize end: a frame at the steered target size means the new-mode
+        // picture is here.
+        let (fw, fh) = paced.frame.image.dimensions();
+        st.resize_overlay.decoded(fw, fh);
+        st.last_video = Some((fw, fh));
+        let overlay = self.overlay_frame.as_ref();
+        if !st.present(&mut self.presenter, &self.window, overlay, paced)? {
+            return Ok(false);
+        }
+        self.overlay_damage.video_presented(Instant::now());
+        st.win.push(&self.presenter);
+        if self.opts.json_status && !st.ready_announced {
+            st.ready_announced = true;
+            emit(SessionLine::Ready);
+        }
+        if self.presenter.present_timing_active() {
+            // Hand the frame's stamps to the present-wait waiter — e2e/display
+            // samples arrive via `take_presented_samples` with a true on-glass stamp.
+            self.presenter.note_presented(pts_ns, decoded_ns);
+            st.gate.note_present(now_ns);
+            st.win.out_max = st.win.out_max.max(self.presenter.presents_outstanding());
+            st.aimed.push_back((pts_ns, aim_ns));
+            while st.aimed.len() > 16 {
+                st.aimed.pop_front();
+            }
+        } else {
+            st.note_submitted(pts_ns, decoded_ns);
+        }
+        Ok(true)
     }
 
     /// The 1 Hz close: the HUD window, the adaptive slot margin, and the presenter line.
@@ -152,12 +165,34 @@ impl Shell {
             replaced,
             self.stats_verbosity,
         );
+        // Submit → our GPU done (latch) and GPU done → glass (floor), p50 and the window's
+        // worst: a hold after the present call lands in one of the two.
+        let ms = |us: u32| us as f32 / 1000.0;
+        let (latch_max_ms, floor_ms, floor_max_ms) =
+            st.last_snap.as_ref().map_or((0.0, 0.0, 0.0), |s| {
+                (
+                    ms(s.latch.max_us),
+                    ms(s.os_floor.p50_us),
+                    ms(s.os_floor.max_us),
+                )
+            });
         st.win.start = Instant::now();
-        if st.store.is_smoothing() && st.slots.widen(st.win.misses) {
+        // Under MAILBOX a missed latch leaves no stamp: the successor replaces the frame and
+        // the engine reports it unshown. Both feed the margin, for either intent on a grid.
+        let on_grid =
+            (st.store.is_smoothing() || st.pacer.paces_latency()) && !st.pacer.free_running();
+        // From a settled window only: a stream still ramping, or arrival jitter past an
+        // eighth of a period, misses latches for reasons of its own and would widen the
+        // margin to its cap in the first seconds of every session.
+        let shown: u64 = st.win.steps.iter().map(|&n| u64::from(n)).sum();
+        let settled = shown.saturating_mul(st.source_interval_ns.max(0) as u64) >= 800_000_000
+            && st.pacer.health().jitter_ns < st.clock.period_ns() as i64 / 8;
+        if on_grid && settled && st.slots.note_window(st.win.misses + unshown, st.win.early) {
             tracing::info!(
                 margin_us = st.slots.margin_ns() / 1000,
                 misses = st.win.misses,
-                "smoothness slot margin widened (measured latch misses)"
+                unshown,
+                "slot margin widened (missed or replaced latches)"
             );
         }
         // The 1 Hz presenter line, always: the field bundle's only record of where a
@@ -174,7 +209,7 @@ impl Shell {
             };
             tracing::info!(
                 smoothing = present.smoothing,
-                // The latency intent held for its due time: a measured VRR panel.
+                // The latency intent held for its due time or its slot: a measured panel.
                 paced = st.pacer.paces_latency(),
                 mode = present.mode,
                 // Where the display stamps came from; `none` means the glass fields
@@ -202,12 +237,17 @@ impl Shell {
                 gated,
                 forced,
                 misses = st.win.misses,
+                // Frames shown before the latch they were aimed at: the lead is long.
+                early = st.win.early,
                 out_max = st.win.out_max,
                 steps = ?st.win.steps,
                 busy = ?st.win.busy,
                 judder,
                 pace_ms,
                 latch_ms,
+                latch_max_ms,
+                floor_ms,
+                floor_max_ms,
                 import_us = import.p50_us,
                 submit_us = submit.p50_us,
                 submit_max_us = submit.max_us,
@@ -220,11 +260,14 @@ impl Shell {
                 // The output's own vblank spacing where a waiter measures it; 0 elsewhere.
                 refresh_us = self.presenter.measured_refresh_ns().unwrap_or(0) / 1000,
                 margin_us = st.slots.margin_ns() / 1000,
+                // Submit lead ahead of the aimed latch (smoothing on a grid).
+                lead_us = st.slots.lead_ns(st.clock.period_ns()) / 1000,
                 // Cadence loop's current hold and the jitter it is sized from,
                 // plus frames whose due time had already passed when they arrived.
                 // Cumulative/instantaneous, not window sums like the counters above.
                 cushion_us = cadence_health.cushion_ns / 1000,
                 jitter_us = cadence_health.jitter_ns / 1000,
+                tail_us = cadence_health.tail_ns / 1000,
                 late = cadence_health.late,
                 "presenter window"
             );
@@ -236,11 +279,13 @@ impl Shell {
 impl StreamState {
     /// Fold present-wait completions into the latch clock, the VRR probe, and this window's
     /// misses and steps. `vblank_locked`: the present mode waits for vblank, which the VRR
-    /// probe needs.
+    /// probe needs. `estimated`: the stamps are the vblank waiter's estimate, which never
+    /// trains the latch clock — on a variable panel those vblanks follow our own presents.
     pub(super) fn fold_glass(
         &mut self,
         samples: &[crate::vk::PresentedSample],
         vblank_locked: bool,
+        estimated: bool,
     ) {
         let clock_offset_ns = self.clock_offset_ns();
         let period = self.clock.period_ns();
@@ -266,14 +311,34 @@ impl StreamState {
                     s.displayed_ns,
                 );
             }
-            // Latch miss: glass later than one panel period past submit plus
-            // the lead we already applied. Store evictions happen whenever
-            // the stream out-runs the panel and say nothing about the latch.
-            if self.store.is_smoothing()
-                && s.displayed_ns.saturating_sub(s.submitted_ns) > period + self.slots.margin_ns()
-            {
-                self.win.misses += 1;
+            // Latch miss: the frame landed past the slot it was aimed at (half a period
+            // of stamp slack). Smoothing without an aim: past one period plus the lead from
+            // submit. Store evictions happen whenever the stream out-runs the panel and say
+            // nothing about the latch.
+            let target_ns = self
+                .aimed
+                .iter()
+                .position(|&(pts, _)| pts == s.pts_ns)
+                .and_then(|i| self.aimed.remove(i))
+                .map_or(0, |(_, t)| t);
+            if target_ns > 0 || self.store.is_smoothing() {
+                let missed = if target_ns > 0 {
+                    s.displayed_ns > target_ns + period / 2
+                } else {
+                    s.displayed_ns.saturating_sub(s.submitted_ns) > period + self.slots.margin_ns()
+                };
+                self.win.misses += u32::from(missed);
+                // A slot before its aim: the lead reaches past the previous latch.
+                self.win.early +=
+                    u32::from(target_ns > 0 && s.displayed_ns + period / 2 < target_ns);
             }
+            tracing::trace!(
+                pts_ns = s.pts_ns,
+                displayed_ns = s.displayed_ns,
+                target_ns,
+                submitted_ns = s.submitted_ns,
+                "frame glass"
+            );
             if self.last_displayed_ns != 0 && period > 0 {
                 let steps =
                     (s.displayed_ns.saturating_sub(self.last_displayed_ns) + period / 2) / period;
@@ -298,7 +363,9 @@ impl StreamState {
                 glass.push((s.displayed_ns, s.pts_ns));
             }
         }
-        self.clock.note_batch(&stamps, self.store.is_smoothing());
+        if !estimated {
+            self.clock.note_batch(&stamps, self.store.is_smoothing());
+        }
         // VRR probe: healthy-window stamps only, against the display mode's period (the
         // learned one adopts a slow stream's cadence as "the grid").
         let healthy = self.last_forced == 0;
@@ -351,33 +418,36 @@ impl StreamState {
         }
     }
 
-    /// One frame out: latency takes the newest whenever the glass gate allows;
-    /// smoothness serves the frame whose due time has come. `grid_known`: on-glass
-    /// stamps feed the latch clock; without them the due time itself is the target.
-    pub(super) fn pick(&mut self, now_ns: u64, grid_known: bool) -> Option<Paced> {
-        self.pacer.follow(
-            self.cadence.verdict(),
-            grid_known,
-            self.store.is_smoothing(),
-        );
+    /// This pass's facts for the pace step. The pacer follows the measured refresh first,
+    /// so the step reads this pass's intents. An estimated stamp never builds the latch
+    /// grid: on a VRR panel the vblanks it reads follow our own presents.
+    fn pace_facts(&mut self, presenter: &Presenter, pacing: bool, now_ns: u64) -> PaceFacts {
+        let glass = presenter.present_timing_active();
+        let estimated = presenter.glass_estimated();
+        let verdict = self.cadence.verdict();
+        let smoothing = self.store.is_smoothing();
+        self.pacer.follow(verdict, glass && !estimated, smoothing);
         self.store.set_paced(self.pacer.paces_latency());
-        if self.store.is_smoothing() {
-            if self.pacer.free_running() {
-                // Variable refresh, measured: the panel refreshes when we present, so
-                // there is no grid to aim at and the due time is the target.
-                self.store.take(|p| p.due_ns <= now_ns as i64)
-            } else {
-                let (clock, store) = (&self.clock, &mut self.store);
-                self.slots.pick(
-                    now_ns,
-                    |after| clock.next_slot_after(after),
-                    |slot| store.take(|p| p.due_ns < slot as i64),
-                )
-            }
-        } else {
-            // Arrival-driven; a paced store (measured VRR) holds the newest for its due time.
-            self.store.take(|p| p.due_ns <= now_ns as i64)
+        PaceFacts {
+            now_ns,
+            period_ns: self.clock.period_ns(),
+            front_due_ns: self.front_due_ns(),
+            outstanding: presenter.presents_outstanding(),
+            pacing,
+            fifo: presenter.needs_glass_gate(),
+            glass,
+            estimated,
+            anchored: self.clock.anchored(),
+            verdict,
+            smoothing,
+            paces_latency: self.pacer.paces_latency(),
+            free_running: self.pacer.free_running(),
         }
+    }
+
+    /// When the store's front frame is due; a negative due time is due now.
+    fn front_due_ns(&self) -> Option<u64> {
+        self.store.front().map(|p| p.due_ns.max(0) as u64)
     }
 
     /// Present one paced frame through its lane. `Ok(true)`: it reached the swapchain.
@@ -438,7 +508,7 @@ impl StreamState {
             // streak demotion are the same contract as the other hardware arms.
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(d)
-                if presenter.supports_dmabuf() && !self.health.demoted =>
+                if presenter.supports_dmabuf() && !self.health.demoted(Lane::Import) =>
             {
                 self.hdr = d.color.is_pq();
                 self.hdr_untonemapped = false;
@@ -450,16 +520,14 @@ impl StreamState {
                         presenter.present(window, FrameInput::Dmabuf(d), overlay)
                     }
                 };
-                (Rung::Hardware("hardware"), res.map(Shown::of))
+                (Rung::Hardware(Lane::Import), res.map(Shown::of))
             }
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(_) => {
-                // No import extensions (or already demoted) — the pump rebuilds
-                // the decoder as software.
-                if self.health.demote() {
+                // No import extensions (or already demoted) — the pump demotes the decoder.
+                if self.health.demote(Lane::Import) {
                     tracing::warn!(
-                        "no dmabuf import support on this device — demoting the \
-                         decoder to software"
+                        "no dmabuf import support on this device — demoting the decoder"
                     );
                     self.force_software.store(true, Ordering::Relaxed);
                 }
@@ -468,20 +536,20 @@ impl StreamState {
             // D3D11VA: shared-texture import, same gate + failure-streak demotion
             // as dmabuf.
             #[cfg(windows)]
-            DecodedImage::D3d11(d) if presenter.supports_d3d11() && !self.health.demoted => {
-                self.hdr = d.color.is_pq();
+            DecodedImage::D3d11(d)
+                if presenter.supports_d3d11() && !self.health.demoted(Lane::Import) =>
+            {
+                self.hdr = d.color().is_pq();
                 self.hdr_untonemapped = false;
                 let res = presenter.present(window, FrameInput::D3d11(d), overlay);
-                (Rung::Hardware("hardware"), res.map(Shown::of))
+                (Rung::Hardware(Lane::Import), res.map(Shown::of))
             }
             #[cfg(windows)]
             DecodedImage::D3d11(_) => {
-                // No import extensions (or already demoted) — the pump rebuilds
-                // the decoder as software.
-                if self.health.demote() {
+                // No import extensions (or already demoted) — the pump demotes the decoder.
+                if self.health.demote(Lane::Import) {
                     tracing::warn!(
-                        "no win32 external-memory import on this device — demoting \
-                         the decoder to software"
+                        "no win32 external-memory import on this device — demoting the decoder"
                     );
                     self.force_software.store(true, Ordering::Relaxed);
                 }
@@ -491,7 +559,7 @@ impl StreamState {
             // present is views + CSC, no import step. Same failure-streak demotion.
             // A drained/demoted frame drops through the arm below — its guard
             // still returns the decoder's slot.
-            DecodedImage::NativeVk(v) if !self.health.demoted => {
+            DecodedImage::NativeVk(v) if !self.health.demoted(Lane::Vulkan) => {
                 self.hdr = v.color.is_pq();
                 self.hdr_untonemapped = false;
                 // The native lane first: a copy of the picture as the window's buffer.
@@ -502,7 +570,7 @@ impl StreamState {
                         presenter.present(window, FrameInput::NativeVk(v), overlay)
                     }
                 };
-                (Rung::Hardware("native vulkan"), res.map(Shown::of))
+                (Rung::Hardware(Lane::Vulkan), res.map(Shown::of))
             }
             DecodedImage::NativeVk(_) => return Ok(false), // demoted — drain until rebuild
         };
@@ -521,7 +589,7 @@ impl StreamState {
             Err(e) if device_lost(&e) => Err(e).context("GPU device lost"),
             Err(e) => {
                 if self.health.failed(rung, &e) {
-                    tracing::warn!("demoting the decoder to software");
+                    tracing::warn!("demoting the decoder");
                     self.force_software.store(true, Ordering::Relaxed);
                 }
                 Ok(false)
@@ -576,6 +644,8 @@ pub(super) struct PresentWindow {
     /// This window's latch misses (glass later than one panel period past submit plus
     /// the applied lead). Adaptive margin's error signal.
     misses: u32,
+    /// This window's frames shown before the latch they were aimed at.
+    early: u32,
     out_max: usize,
     /// Consecutive on-glass spacings this window, in whole panel periods: `[0, 1, 2, 3, 4, 5+]`.
     /// The mode is the expected step; everything else is judder.
@@ -605,6 +675,7 @@ impl PresentWindow {
             present_us: Vec::with_capacity(256),
             start: Instant::now(),
             misses: 0,
+            early: 0,
             out_max: 0,
             steps: [0; 6],
             busy: [0; 2],
@@ -645,6 +716,7 @@ impl PresentWindow {
 
     fn reset_counts(&mut self) {
         self.misses = 0;
+        self.early = 0;
         self.out_max = 0;
         self.steps = [0; 6];
         self.busy = [0; 2];
@@ -664,12 +736,30 @@ fn e2e_ns(clock_offset_ns: i64, displayed_ns: u64, pts_ns: u64) -> Option<u64> {
 /// Which failure policy a lane's present runs under.
 #[derive(Clone, Copy)]
 enum Rung {
-    /// A hardware lane, named for the log. A failure streak demotes the decoder.
-    Hardware(&'static str),
+    /// A hardware lane. A failure streak demotes the decoder.
+    Hardware(Lane),
     /// The last rungs: nothing left to demote to.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave,
     Software,
+}
+
+/// Where a hardware lane's pictures come from. Each lane demotes the decoder once.
+#[derive(Clone, Copy, PartialEq)]
+enum Lane {
+    /// Imported from the decoder's API: a VAAPI or V4L2 dma-buf, a D3D11 texture.
+    Import,
+    /// Decoded on the presenter's own device by Vulkan Video.
+    Vulkan,
+}
+
+impl Lane {
+    fn name(self) -> &'static str {
+        match self {
+            Lane::Import => "hardware",
+            Lane::Vulkan => "native vulkan",
+        }
+    }
 }
 
 /// What a present did with its frame, whatever the lane.
@@ -691,15 +781,15 @@ impl Shown {
     }
 }
 
-/// Present-failure streaks. A hardware streak of three demotes the decoder to software,
-/// once per session; the last rungs warn on the first failure of a streak and stay quiet
-/// until a present succeeds.
+/// Present-failure streaks. A hardware streak of three demotes the decoder, once per lane
+/// per session; the last rungs warn on the first failure of a streak and stay quiet until a
+/// present succeeds.
 #[derive(Default)]
 pub(super) struct PresentHealth {
     hw_fails: u32,
-    /// The decoder was told to go software (a failure streak, or no import support).
-    /// The hardware lanes drain until the pump rebuilds it.
-    pub(super) demoted: bool,
+    /// Lanes the decoder was told to leave (a failure streak, or no import support). Such a
+    /// lane drains until the pump rebuilds; the lane it demotes onto still presents.
+    demoted: Vec<Lane>,
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     pyro_warned: bool,
     cpu_warned: bool,
@@ -717,14 +807,19 @@ impl PresentHealth {
         }
     }
 
-    /// A present failed short of device loss. `true` when the decoder demotes now.
+    /// A present failed short of device loss. `true` when the decoder demotes now. A
+    /// window-system error, or one on a lane already demoted, says nothing about the
+    /// decoder: it never counts toward the streak.
     fn failed(&mut self, rung: Rung, e: &anyhow::Error) -> bool {
         match rung {
-            Rung::Hardware(what) => {
-                self.hw_fails += 1;
+            Rung::Hardware(lane) => {
+                let counts = !crate::vk::PresentError::is_window(e) && !self.demoted(lane);
+                if counts {
+                    self.hw_fails += 1;
+                }
                 tracing::warn!(error = %format!("{e:#}"), fails = self.hw_fails,
-                    "{what} present failed");
-                self.hw_fails >= 3 && self.demote()
+                    "{} present failed", lane.name());
+                counts && self.hw_fails >= 3 && self.demote(lane)
             }
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Rung::PyroWave => {
@@ -748,15 +843,27 @@ impl PresentHealth {
         }
     }
 
-    /// Demote once per session: `true` on the call that does.
-    fn demote(&mut self) -> bool {
-        !std::mem::replace(&mut self.demoted, true)
+    /// `lane`'s pictures drain until the pump rebuilds the decoder.
+    fn demoted(&self, lane: Lane) -> bool {
+        self.demoted.contains(&lane)
+    }
+
+    /// Demote `lane` once per session: `true` on the call that does. The next lane's
+    /// streak starts over.
+    fn demote(&mut self, lane: Lane) -> bool {
+        if self.demoted(lane) {
+            return false;
+        }
+        self.demoted.push(lane);
+        self.hw_fails = 0;
+        true
     }
 }
 
 impl StreamState {
-    /// The presenter found `on` busy for `image`: keep it for the next pass and wake
-    /// soon. Newest-wins drops it if a fresher frame has landed meanwhile.
+    /// The presenter found `on` busy for `image`: it goes back for the next pass and the
+    /// pace step's busy row holds the loop's wake. Newest-wins drops it if a fresher frame
+    /// lands meanwhile.
     pub(super) fn hold_busy(
         &mut self,
         on: crate::vk::BusyOn,
@@ -765,6 +872,7 @@ impl StreamState {
         decoded_ns: u64,
         due_ns: i64,
     ) {
+        let returned = image.is_some();
         if let Some(image) = image {
             self.store.put_back(Paced {
                 frame: DecodedFrame {
@@ -777,47 +885,15 @@ impl StreamState {
                 due_ns,
             });
         }
+        self.pace.note_busy(&mut self.slots, on, returned);
         self.win.busy[on as usize] += 1;
-        self.busy_on = on;
-        self.busy_retry = true;
     }
 
-    /// A paced store with a frame in hand sleeps only to the pass that can still serve
-    /// it; everything else uses a 15 ms housekeeping tick. Must stay the present
-    /// decision's mirror — a rule changed on one side oversleeps a frame past its due time.
+    /// The run loop's sleep: the pace step's wait over the store as it stands.
     pub(super) fn wake_timeout(&self) -> Duration {
-        const TICK: Duration = Duration::from_millis(15);
-        if self.busy_retry {
-            // The fence wait inside the presenter is the pace; only a full swapchain
-            // needs a refresh to pass.
-            return match self.busy_on {
-                crate::vk::BusyOn::Fence => Duration::ZERO,
-                crate::vk::BusyOn::Acquire => Duration::from_millis(1),
-            };
-        }
-        if !self.store.is_smoothing() && !self.pacer.paces_latency() {
-            return TICK;
-        }
-        let Some(p) = self.store.front() else {
-            return TICK;
-        };
-        // Free-running presents at the due time. Snapping presents once the aimed slot
-        // is the next one still reachable (one period minus submit lead). Before the
-        // first on-glass stamp there is no grid; `next_slot_after` answers "one period
-        // from now" — mirror that or opening frames wait a refresh they never owed.
-        let lead_ns = self.clock.period_ns() as i64 + self.slots.margin_ns() as i64;
-        let wake_ns = if self.pacer.free_running() {
-            p.due_ns
-        } else if self.clock.anchor_ns() == 0 {
-            p.due_ns - lead_ns
-        } else {
-            self.clock.next_slot_after(p.due_ns.max(0) as u64) as i64 - lead_ns
-        };
-        // Short waits sleep in slices ([`wait_event`](super::wait_event)), so the floor is
-        // what a due time may slip by.
-        const FLOOR: Duration = Duration::from_micros(200);
-        Duration::from_nanos(wake_ns.saturating_sub(session::now_ns() as i64).max(0) as u64)
-            .clamp(FLOOR, TICK)
+        let paced = self.store.is_smoothing() || self.pacer.paces_latency();
+        self.pace
+            .wait(session::now_ns(), self.front_due_ns(), paced)
     }
 }
 
@@ -980,7 +1056,6 @@ pub(super) fn close_window(
     let mut snap = c.hud_snapshot();
     snap.decoder = st.facts.decoder.to_string();
     snap.hdr = hdr_shown(st.hdr, presenter.hdr_active(), st.hdr_untonemapped);
-    snap.asked_444 = st.params.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
     snap.preset = st.preset.clone();
     snap.on_glass = presenter.present_timing_active();
     let prev = std::mem::replace(&mut st.health_seen, st.facts.health);
@@ -1120,20 +1195,29 @@ pub(super) fn desktop_extras(
 mod tests {
     use super::*;
 
-    /// Three hardware failures in a row demote the decoder, once; a shown frame ends
-    /// the streak.
+    /// Three hardware failures in a row demote the decoder, once per lane; a shown frame
+    /// ends the streak. The lane it demotes onto still presents, on a streak of its own.
     #[test]
-    fn a_hardware_failure_streak_demotes_the_decoder_once() {
+    fn a_hardware_failure_streak_demotes_each_lane_once() {
         let e = anyhow::anyhow!("import");
-        let hw = Rung::Hardware("hardware");
+        let hw = Rung::Hardware(Lane::Import);
         let mut h = PresentHealth::default();
         assert!(!h.failed(hw, &e) && !h.failed(hw, &e));
         h.presented(hw, true);
         assert!(!h.failed(hw, &e) && !h.failed(hw, &e));
         assert!(h.failed(hw, &e), "the third in a row demotes");
-        assert!(h.demoted);
-        assert!(!h.failed(hw, &e), "a demoted decoder is told once");
-        assert!(!h.demote());
+        assert!(h.demoted(Lane::Import));
+        assert!(!h.failed(hw, &e), "a demoted lane is told once");
+        assert!(!h.demote(Lane::Import));
+
+        let vk = Rung::Hardware(Lane::Vulkan);
+        assert!(!h.demoted(Lane::Vulkan), "the lane below still presents");
+        assert!(
+            !h.failed(vk, &e) && !h.failed(vk, &e),
+            "its streak starts over"
+        );
+        assert!(h.failed(vk, &e));
+        assert!(!h.demote(Lane::Vulkan));
     }
 
     /// A stale swapchain drops the frame: it is not the recovery that re-arms a last

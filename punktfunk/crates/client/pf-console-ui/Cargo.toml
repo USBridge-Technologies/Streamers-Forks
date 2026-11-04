@@ -58,7 +58,7 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 # 🛑 Check the log for `DOWNLOAD AND INSTALL SUCCEEDED` on every bump: the fallback is a
 # from-source Skia build that turns a 2-minute CI leg into hours.
 #
-# 🛑 Half the bump is by hand: packaging/flatpak/io.unom.Punktfunk.yml pins the archives by
+# 🛑 Half the bump is by hand: packaging/flatpak/io.unom.punktfunk.yml pins the archives by
 # URL + sha256 (the sandbox is offline) and nothing derives them from this line. A stale pin
 # unpacks the old bindings.rs under the new crate and fails to compile (that is how #193 shipped).
 skia-safe = { version = "0.153", features = ["textlayout"] }
@@ -95,12 +95,12 @@ skia-safe = { version = "0.153", features = ["textlayout"] }
 pf-client-core = { path = "../pf-client-core", default-features = false }
 
 # The PS5 homebrew title: CPU raster here; the title adds Skia's Vulkan backend itself.
-[target.'cfg(all(target_os = "freebsd", target_vendor = "sie"))'.dependencies]
+[target.'cfg(any(all(target_os = "freebsd", target_vendor = "sie"), target_os = "horizon"))'.dependencies]
 skia-safe = { version = "0.153", features = ["textlayout"] }
 pf-client-core = { path = "../pf-client-core", default-features = false }
 
 # Everything the shell itself needs, on every platform it runs on.
-[target.'cfg(any(target_os = "linux", windows, target_os = "android", target_vendor = "apple", target_family = "wasm", all(target_os = "freebsd", target_vendor = "sie")))'.dependencies]
+[target.'cfg(any(target_os = "linux", windows, target_os = "android", target_vendor = "apple", target_family = "wasm", all(target_os = "freebsd", target_vendor = "sie"), target_os = "horizon"))'.dependencies]
 anyhow = "1"
 tracing = "0.1"
 # The host-facing model types (`HostRow`, `ConsoleCmd`, `LibraryGame`, …) derive serde so a host

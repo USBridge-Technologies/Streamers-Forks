@@ -5,11 +5,12 @@
 //! producer renders behind whatever else fills the GPU queue, so several arrivals can be out
 //! at once with none of them readable yet; a one-deep slot would lose all but the last.
 
-use crate::linux::sync_timeline::SyncDevice;
+use crate::linux::sync_timeline::Syncobj;
 use crate::CapturedFrame;
 use pf_dmabuf::fence::WaitOutcome;
 use std::collections::VecDeque;
-use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,26 +26,18 @@ pub(in crate::linux) enum RenderFence {
     /// Implicit sync: the dmabuf's pending writes at arrival.
     SyncFile(OwnedFd),
     /// Explicit sync: the producer's acquire point on the buffer's timeline.
-    Acquire {
-        dev: Arc<SyncDevice>,
-        timeline: OwnedFd,
-        point: u64,
-    },
+    Acquire { timeline: Arc<Syncobj>, point: u64 },
 }
 
 impl RenderFence {
     /// Block until the render finished or `timeout` passed.
-    pub(super) fn wait(&self, timeout: Duration) -> std::io::Result<WaitOutcome> {
+    pub(in crate::linux) fn wait(&self, timeout: Duration) -> std::io::Result<WaitOutcome> {
         match self {
             RenderFence::SyncFile(fd) => {
                 let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
                 pf_dmabuf::fence::wait_sync_file(fd.as_fd(), ms)
             }
-            RenderFence::Acquire {
-                dev,
-                timeline,
-                point,
-            } => dev.wait(timeline.as_raw_fd(), *point, timeout),
+            RenderFence::Acquire { timeline, point } => timeline.wait(*point, timeout),
         }
     }
 
@@ -157,15 +150,19 @@ impl Arrivals {
     }
 }
 
-/// Block until [`Arrivals::take_ready`] has a frame, `deadline` passes, or the loop thread
-/// is gone: `false` for the last. Never consumes.
+/// Block until [`Arrivals::take_ready`] has a frame, `deadline` passes, a poke lands
+/// (`poked`, taken here), or the loop thread is gone: `false` for the last. Never consumes.
 pub(in crate::linux) fn wait_ready(
     queue: &FrameQueue,
     wake: &Receiver<()>,
+    poked: &AtomicBool,
     deadline: Instant,
 ) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
     loop {
+        if poked.swap(false, Ordering::Relaxed) {
+            return true;
+        }
         let now = Instant::now();
         let Ok(wait) = queue.lock().map(|q| q.wait(now)) else {
             return true;
@@ -198,6 +195,8 @@ mod tests {
     use crate::{CapturedFrame, FramePayload, PixelFormat};
     use pf_dmabuf::fence::WaitOutcome;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn frame(n: u64) -> CapturedFrame {
@@ -340,7 +339,13 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
                 signal(&w);
             });
-            assert!(super::wait_ready(&queue, &rx, t0 + Duration::from_secs(2)));
+            let poked = AtomicBool::new(false);
+            assert!(super::wait_ready(
+                &queue,
+                &rx,
+                &poked,
+                t0 + Duration::from_secs(2)
+            ));
         });
         assert!(t0.elapsed() < Duration::from_secs(1), "woke on the fence");
         assert!(queue.lock().unwrap().take_ready(Instant::now()).is_some());
@@ -351,10 +356,37 @@ mod tests {
         let queue = super::FrameQueue::default();
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         drop(tx);
+        let poked = AtomicBool::new(false);
         assert!(!super::wait_ready(
             &queue,
             &rx,
+            &poked,
             Instant::now() + Duration::from_secs(2)
         ));
+    }
+
+    /// A poke ends the wait with no frame and is consumed, so the loop ticks on what it
+    /// has once and then waits as before.
+    #[test]
+    fn a_poke_ends_the_wait_before_any_frame() {
+        let queue = super::FrameQueue::default();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let poked = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                poked.store(true, Ordering::Relaxed);
+                let _ = tx.try_send(());
+            });
+            assert!(super::wait_ready(
+                &queue,
+                &rx,
+                &poked,
+                t0 + Duration::from_secs(2)
+            ));
+        });
+        assert!(t0.elapsed() < Duration::from_secs(1), "woke on the poke");
+        assert!(!poked.load(Ordering::Relaxed), "the poke is consumed");
     }
 }

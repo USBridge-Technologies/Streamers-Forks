@@ -63,16 +63,18 @@ DOCDIR="$STAGE/usr/share/doc/$PKG"
 install -Dm0755 "$BIN"                                   "$STAGE/usr/bin/$PKG"
 install -Dm0755 "$SESSION_BIN"                           "$STAGE/usr/bin/punktfunk-session"
 install -Dm0755 "$CLI_BIN"                               "$STAGE/usr/bin/punktfunk"
-install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
-                "$STAGE/usr/share/applications/io.unom.Punktfunk.desktop"
+install -Dm0644 packaging/linux/io.unom.punktfunk.desktop \
+                "$STAGE/usr/share/applications/io.unom.punktfunk.desktop"
 # Second launcher, straight into the gamepad console (`--browse`): the couch entry point a
 # TV/HTPC user picks from the app grid, and what gets added to Steam as a non-Steam game.
-install -Dm0644 packaging/linux/io.unom.Punktfunk.Console.desktop \
-                "$STAGE/usr/share/applications/io.unom.Punktfunk.Console.desktop"
+install -Dm0644 packaging/linux/io.unom.punktfunk.console.desktop \
+                "$STAGE/usr/share/applications/io.unom.punktfunk.console.desktop"
 # The app icon the desktop entry (and the About dialog) name. Without it the launcher falls
 # back to a generic monitor glyph, which is what shipped until now.
-install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg \
-                "$STAGE/usr/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg"
+install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg \
+                "$STAGE/usr/share/icons/hicolor/scalable/apps/io.unom.punktfunk.svg"
+# The CamelCase icon name, which desktop entries users already have still name.
+ln -s io.unom.punktfunk.svg "$STAGE/usr/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg"
 # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).
 install -Dm0644 scripts/70-punktfunk-client.rules \
                 "$STAGE/usr/lib/udev/rules.d/70-punktfunk-client.rules"
@@ -180,7 +182,7 @@ Priority: optional
 Homepage: https://git.unom.io/unom/punktfunk
 Depends: $SHDEPS
 Recommends: $RECOMMENDS
-Description: Low-latency desktop/game streaming client (punktfunk/1, GTK4)
+Description: Low-latency desktop/game streaming client (punktfunk/2, GTK4)
  The native Linux client for punktfunk, a Linux-first low-latency desktop and
  game streaming stack. Discovers hosts on the LAN (mDNS), trusts them via
  certificate pinning with a SPAKE2 PIN pairing ceremony, and streams HEVC video

@@ -84,70 +84,65 @@ pub fn render(header: &str) -> String {
     out
 }
 
-/// POST the ring to the paired host; returns the stored bundle id. Same TLS
-/// client auth and pin as the library fetch. Errors reuse that classification
-/// (`NotPaired`, `PinMismatch`) so existing shell strings apply.
+/// POST the ring to the paired host; returns the stored bundle id. Same lanes,
+/// client auth and pin as the library fetch ([`crate::library::HostApi`]). Errors reuse
+/// that classification (`NotPaired`, `PinMismatch`) so existing shell strings apply.
 #[cfg(desktop)]
 pub fn send_to_host(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
     header: &str,
 ) -> Result<String, crate::library::LibraryError> {
-    use crate::library::LibraryError;
+    use crate::library::HostApi;
     let body = render(header);
-    let agent = crate::library::agent(identity, pin)?;
-    let url = format!(
-        "{}/api/v1/client-logs",
-        crate::library::base_url(addr, mgmt_port)
-    );
-    match agent
-        .post(&url)
-        .header("Content-Type", "text/plain; charset=utf-8")
-        .send(body.as_bytes())
-    {
-        Ok(mut resp) => {
-            let text = resp
-                .body_mut()
-                .read_to_string()
-                .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?;
-            let id = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|v| v.get("id")?.as_str().map(str::to_string))
-                .unwrap_or_default();
-            Ok(id)
-        }
-        Err(e) => Err(crate::library::classify(e)),
-    }
+    let https = crate::library::agent(identity, pin)?;
+    let api = HostApi::new(addr, mgmt_port, stream_port, identity, pin);
+    let text = Some(("text/plain; charset=utf-8", body.as_bytes()));
+    let reply = api
+        .call(&https, "POST", "/api/v1/client-logs", text)?
+        .ok()?;
+    Ok(serde_json::from_slice::<serde_json::Value>(&reply)
+        .ok()
+        .and_then(|v| v.get("id")?.as_str().map(str::to_string))
+        .unwrap_or_default())
 }
 
-/// [`send_to_host`] with the bundle header and outcome every shell uses. `app` names the
-/// binary in the header; the result is the sentence the shell shows the user.
+/// [`send_to_host`] on (mgmt port, stream port) with the bundle header and outcome every
+/// shell uses. `app` names the binary in the header; `Ok` or `Err` holds the sentence the
+/// shell shows the user.
 #[cfg(desktop)]
 pub fn send_bundle(
     app: &str,
     host_name: &str,
     addr: &str,
-    mgmt_port: u16,
+    (mgmt_port, stream_port): (u16, u16),
     identity: &(String, String),
     fp_hex: &str,
-) -> String {
+) -> Result<String, String> {
+    // The package version where the build stamped one (every packager sets
+    // PUNKTFUNK_BUILD_VERSION), else the crate's: a bundle names the build it came from.
+    let version = option_env!("PUNKTFUNK_BUILD_VERSION")
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
     let header = format!(
-        "{app} {} ({} {}) — client log bundle",
-        env!("CARGO_PKG_VERSION"),
+        "{app} {version} ({} {}) — client log bundle",
         std::env::consts::OS,
         std::env::consts::ARCH,
     );
     let pin = crate::trust::parse_hex32(fp_hex);
-    match send_to_host(addr, mgmt_port, identity, pin, &header) {
+    match send_to_host(addr, mgmt_port, stream_port, identity, pin, &header) {
         Ok(id) => {
             tracing::info!(host = %host_name, id, "client logs uploaded");
-            format!("Logs sent to {host_name} — download them from its web console's Logs page")
+            Ok(format!(
+                "Logs sent to {host_name} — download them from its web console's Logs page"
+            ))
         }
         Err(e) => {
             tracing::warn!(host = %host_name, error = %e, "client log upload failed");
-            format!("Couldn't send logs — {e}")
+            Err(format!("Couldn't send logs — {e}"))
         }
     }
 }
@@ -185,11 +180,12 @@ where
 #[cfg(desktop)]
 pub struct RingLayer;
 
-/// DEBUG/TRACE from these module-path prefixes is chatter, not diagnostics.
-/// Prefix-matched on `::` boundaries so `cros_codecs::…` is gated and
+/// DEBUG/TRACE from these module-path prefixes is chatter, not diagnostics: the H.265
+/// parser's per-frame DPB bookkeeping, mDNS cache churn, TLS records, WASAPI buffer
+/// chatter. Prefix-matched on `::` boundaries so `cros_codecs::…` is gated and
 /// `cros_codecs_probe` is not. Same shape as the host's `NOISY_DEBUG_TARGETS`.
 #[cfg(desktop)]
-const NOISY_DEBUG_TARGETS: &[&str] = &["cros_codecs"];
+const NOISY_DEBUG_TARGETS: &[&str] = &["cros_codecs", "mdns_sd", "rustls", "wasapi"];
 
 #[cfg(desktop)]
 fn is_noisy_debug(target: &str) -> bool {
@@ -334,6 +330,11 @@ mod tests {
         assert!(!is_noisy_debug("cros_codecs_probe"));
         assert!(!is_noisy_debug("pf_bitstream::h265"));
         assert!(!is_noisy_debug("pf_client_core::audio"));
+        // 60 % of a field bundle's ring, evicting the session it exists to keep.
+        assert!(is_noisy_debug("mdns_sd::service_daemon"));
+        assert!(is_noisy_debug("rustls::client::hs"));
+        assert!(is_noisy_debug("wasapi"));
+        assert!(!is_noisy_debug("pf_audio::wasapi"));
     }
 
     /// Markers, not ring size: the ring is process-global.

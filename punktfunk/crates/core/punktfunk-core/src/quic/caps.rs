@@ -122,10 +122,6 @@ pub const CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
 /// host-global wiring, so any live session that asked wins until it ends.
 pub const CLIENT_CAP_KEEP_HOST_AUDIO: u8 = 0x20;
 
-/// [`Hello::client_caps`]: every client sets it; it gates nothing on `punktfunk/2`.
-/// `0x80` is the last free `client_caps` bit.
-pub const CLIENT_CAP_EXT: u8 = 0x40;
-
 /// [`Welcome::host_caps`]: the session is on the lossless audio plane
 /// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). A wire statement, not
 /// an offer: the client must open from
@@ -161,7 +157,7 @@ pub const HOST_CAP2_EXT: u8 = 0x04;
 pub const HOST_CAP2_SCROLL: u8 = 0x08;
 
 /// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
-/// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is punched,
+/// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is bound,
 /// before its pipeline exists and without the one-per-10 s spacing, until the first video
 /// frame leaves. That window is what the client's bring-up ramp measures the link in; a
 /// client that does not see the bit bursts beside live video as before.
@@ -173,9 +169,9 @@ pub const HOST_CAP2_DELIVERY: u8 = 0x20;
 
 /// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads
 /// [`InputEdge`](super::control::InputEdge) off the control stream. Toward this bit the
-/// client sends every key press and release there, where QUIC resends what the network
-/// drops; a lost `KeyUp` on the datagram plane otherwise holds the key until its next edge.
-/// Motion, scroll and pads stay datagrams. Without the bit every event is a datagram, as before.
+/// client sends every key and mouse-button press and release there, where QUIC resends what
+/// the network drops; a lost release on the datagram plane otherwise holds it until its next
+/// edge. Motion, scroll and pads stay datagrams. Without the bit every event is a datagram.
 pub const HOST_CAP2_INPUT_EDGES: u8 = 0x40;
 
 /// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
@@ -187,8 +183,8 @@ pub const CODEC_HEVC: u8 = 0x02;
 pub const CODEC_AV1: u8 = 0x04;
 /// [`Hello::video_codecs`]: PyroWave (opt-in wired-LAN intra-only wavelet,
 /// `design/pyrowave-codec-plan.md`). Deliberately absent from [`resolve_codec`]'s ladder:
-/// selected only when the client also names it [`Hello::preferred_codec`] (or the operator
-/// forces the mask). The bit means the bitstream of the vendored pin
+/// selected only as the preference — the client's [`Hello::preferred_codec`], or the host's
+/// Encoder pin for a client that names none. The bit means the bitstream of the vendored pin
 /// (`crates/codec/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`); upstream has no version
 /// field, so a bitstream-changing vendor bump bumps the punktfunk protocol instead.
 pub const CODEC_PYROWAVE: u8 = 0x08;
@@ -258,6 +254,25 @@ pub fn codec_preference_miss(
     )
 }
 
+/// The rate a session runs at, `0` = Automatic. Under PyroWave the stored rate only says
+/// Fixed, so a client that offered PyroWave as its preference sends it whatever the codec;
+/// if the host negotiates another codec the number would become that codec's fixed rate.
+/// That session is Automatic instead. Host and client both apply this to the Hello's rate,
+/// so neither reads a Fixed the other does not.
+pub fn session_bitrate_kbps(
+    asked_kbps: u32,
+    preferred: u8,
+    client_codecs: u8,
+    negotiated: u8,
+) -> u32 {
+    let offered = preferred == CODEC_PYROWAVE && client_codecs & CODEC_PYROWAVE != 0;
+    if offered && negotiated != CODEC_PYROWAVE {
+        0
+    } else {
+        asked_kbps
+    }
+}
+
 /// HEVC `chroma_format_idc` 4:2:0. Default when a peer omits [`Welcome::chroma_format`].
 pub const CHROMA_IDC_420: u8 = 1;
 /// HEVC `chroma_format_idc` 4:4:4 (Range Extensions).
@@ -265,7 +280,7 @@ pub const CHROMA_IDC_444: u8 = 3;
 
 /// Per-session CICP (ITU-T H.273) the host resolved, on [`Welcome`]. Configure the
 /// decoder/presenter from these; do not infer from bitstream VUI. An older host omits the
-/// bytes → [`ColorInfo::SDR_BT709`]. ST.2086 + CLL can change mid-stream, so they ride
+/// bytes → [`ColorInfo::SDR_BT709_STUDIO`]. ST.2086 + CLL can change mid-stream, so they ride
 /// [`HDR_META_MAGIC`] rather than this fixed struct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColorInfo {
@@ -289,30 +304,93 @@ impl ColorInfo {
     /// CICP matrix 9: BT.2020 NCL. Never emit 10 (constant-luminance) — no client decodes it.
     pub const MC_BT2020_NCL: u8 = 9;
 
-    /// Default when a peer omits the colour bytes.
+    /// SDR: full range, so a desktop's 0 and 255 survive the trip and every code level is used.
     pub const SDR_BT709: ColorInfo = ColorInfo {
+        primaries: Self::CP_BT709,
+        transfer: Self::TRC_BT709,
+        matrix: Self::MC_BT709,
+        full_range: 1,
+    };
+
+    /// Studio-range SDR: the default when a peer omits the colour bytes (every host before full
+    /// range).
+    pub const SDR_BT709_STUDIO: ColorInfo = ColorInfo {
         primaries: Self::CP_BT709,
         transfer: Self::TRC_BT709,
         matrix: Self::MC_BT709,
         full_range: 0,
     };
 
+    /// HDR10: full range, like SDR.
     pub const HDR10_BT2020_PQ: ColorInfo = ColorInfo {
         primaries: Self::CP_BT2020,
         transfer: Self::TRC_PQ,
         matrix: Self::MC_BT2020_NCL,
-        full_range: 0,
+        full_range: 1,
     };
+
+    /// The colour a session encodes: HDR by the HDR verdict, not the depth (10-bit SDR is
+    /// Main10 under BT.709), at the range the encoder writes.
+    pub const fn for_session(hdr: bool, full_range: bool) -> ColorInfo {
+        let base = if hdr {
+            Self::HDR10_BT2020_PQ
+        } else {
+            Self::SDR_BT709
+        };
+        ColorInfo {
+            full_range: full_range as u8,
+            ..base
+        }
+    }
 
     /// PQ also needs a [`HdrMeta`] datagram; HLG does not.
     pub fn is_hdr(&self) -> bool {
         self.transfer == Self::TRC_PQ || self.transfer == Self::TRC_HLG
     }
+
+    /// `[primaries, transfer, matrix, full_range]`, the order a `StreamConfig` carries.
+    pub fn cicp(&self) -> [u8; 4] {
+        [self.primaries, self.transfer, self.matrix, self.full_range]
+    }
+
+    pub fn from_cicp([primaries, transfer, matrix, full_range]: [u8; 4]) -> ColorInfo {
+        ColorInfo {
+            primaries,
+            transfer,
+            matrix,
+            full_range,
+        }
+    }
 }
 
 impl Default for ColorInfo {
     fn default() -> Self {
-        Self::SDR_BT709
+        Self::SDR_BT709_STUDIO
+    }
+}
+
+/// What a video decoder is built for. It moves only at an epoch whose `StreamConfig` says so,
+/// and only toward a client in [`FEATURE_FORMAT_EPOCH`](super::v2::registry::FEATURE_FORMAT_EPOCH).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoFormat {
+    /// One `CODEC_*` bit.
+    pub codec: u8,
+    /// `8`, or `10` for Main10 and 10-bit AV1.
+    pub bit_depth: u8,
+    pub color: ColorInfo,
+    /// HEVC `chroma_format_idc`: [`CHROMA_IDC_420`] or [`CHROMA_IDC_444`].
+    pub chroma_format: u8,
+}
+
+impl VideoFormat {
+    /// The format the session opened with.
+    pub fn of_welcome(w: &super::Welcome) -> VideoFormat {
+        VideoFormat {
+            codec: w.codec,
+            bit_depth: w.bit_depth,
+            color: w.color,
+            chroma_format: w.chroma_format,
+        }
     }
 }
 
@@ -352,7 +430,8 @@ mod tests {
                 ("CLIENT_CAP_PAD_AUDIO", CLIENT_CAP_PAD_AUDIO),
                 ("CLIENT_CAP_AUDIO_HIRES", CLIENT_CAP_AUDIO_HIRES),
                 ("CLIENT_CAP_KEEP_HOST_AUDIO", CLIENT_CAP_KEEP_HOST_AUDIO),
-                ("CLIENT_CAP_EXT", CLIENT_CAP_EXT),
+                // Retired: older clients still set it, so the bit stays spent. 0x80 is free.
+                ("retired CLIENT_CAP_EXT", 0x40),
             ],
         ),
         (
@@ -542,5 +621,46 @@ mod tests {
         .unwrap();
         assert_eq!(got.count_ones(), 1);
         assert_ne!(got & (CODEC_AV1 | CODEC_HEVC), 0);
+    }
+
+    /// A rate stored for PyroWave is Automatic once the host lands on another codec; every
+    /// other pairing keeps what the player asked.
+    #[test]
+    fn a_pyrowave_offer_that_lands_elsewhere_is_automatic() {
+        let both = CODEC_HEVC | CODEC_PYROWAVE;
+        let rate = |asked, preferred, codecs, negotiated| {
+            session_bitrate_kbps(asked, preferred, codecs, negotiated)
+        };
+        for landed in [CODEC_H264, CODEC_HEVC, CODEC_AV1] {
+            assert_eq!(rate(20_000, CODEC_PYROWAVE, both, landed), 0);
+        }
+        assert_eq!(rate(20_000, CODEC_PYROWAVE, both, CODEC_PYROWAVE), 20_000);
+        assert_eq!(rate(0, CODEC_PYROWAVE, both, CODEC_PYROWAVE), 0);
+        // PyroWave preferred but never advertised: the client kept the player's rate for the
+        // H.26x it falls back to.
+        assert_eq!(rate(80_000, CODEC_PYROWAVE, CODEC_HEVC, CODEC_HEVC), 80_000);
+        // Another preference, or none: nothing was stored for PyroWave.
+        assert_eq!(rate(80_000, CODEC_AV1, both, CODEC_HEVC), 80_000);
+        assert_eq!(rate(80_000, 0, both, CODEC_HEVC), 80_000);
+    }
+
+    /// The session's colour keeps the HDR verdict's code points and takes the encoder's range.
+    #[test]
+    fn session_colour_takes_the_encoders_range() {
+        assert_eq!(ColorInfo::for_session(false, true), ColorInfo::SDR_BT709);
+        assert_eq!(
+            ColorInfo::for_session(false, false),
+            ColorInfo::SDR_BT709_STUDIO
+        );
+        assert_eq!(
+            ColorInfo::for_session(true, true),
+            ColorInfo::HDR10_BT2020_PQ
+        );
+        let studio_hdr = ColorInfo::for_session(true, false);
+        assert_eq!(studio_hdr.full_range, 0);
+        assert_eq!(
+            studio_hdr.cicp()[..3],
+            ColorInfo::HDR10_BT2020_PQ.cicp()[..3]
+        );
     }
 }

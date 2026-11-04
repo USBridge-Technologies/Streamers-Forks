@@ -1,6 +1,8 @@
 # The paths every Linux format ships for a package: <package> <path>. scripts/ci/assert-payload-parity.sh
 # checks each built .deb, .rpm and .pkg.tar.zst against it. A package is the artifact that ships
-# usr/bin/punktfunk-<package>. On Arch, usr/libexec/punktfunk/ reads usr/lib/punktfunk/.
+# its first row. On Arch, usr/libexec/punktfunk/ reads usr/lib/punktfunk/, except for seats, whose
+# units and doctor name /usr/libexec. check-packaging-policy.py finds each seats file in the Nix
+# and Steam Deck recipes too.
 # Format-specific paths stay out: the deb's data dir is /usr/share/punktfunk-host, rpm ships no ufw
 # profile, the deb no gamescope-session drop-in, and Arch puts the client icon in punktfunk-icons.
 host usr/bin/punktfunk-host
@@ -29,8 +31,8 @@ host usr/share/alsa/ucm2/USB-Audio/conf.d/054c-0ce6.conf
 host usr/share/alsa/ucm2/USB-Audio/conf.d/054c-0df2.conf
 host usr/share/alsa/ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic.conf
 host usr/share/alsa/ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic-HiFi.conf
-host usr/share/applications/io.unom.Punktfunk.Host.desktop
-host usr/share/applications/io.unom.Punktfunk.StartHost.desktop
+host usr/share/applications/io.unom.punktfunk.host.desktop
+host usr/share/applications/io.unom.punktfunk.starthost.desktop
 host usr/share/icons/hicolor/22x22/apps/punktfunk-tray.png
 host usr/share/icons/hicolor/22x22/apps/punktfunk-tray-degraded.png
 host usr/share/icons/hicolor/22x22/apps/punktfunk-tray-error.png
@@ -51,6 +53,20 @@ client usr/lib/udev/rules.d/70-punktfunk-client.rules
 client usr/lib/sysctl.d/99-punktfunk-client-net.conf
 client usr/lib/systemd/system/punktfunk-client-update.service
 client usr/share/polkit-1/rules.d/49-punktfunk-client-update.rules
-client usr/share/applications/io.unom.Punktfunk.desktop
-client usr/share/applications/io.unom.Punktfunk.Console.desktop
+client usr/share/applications/io.unom.punktfunk.desktop
+client usr/share/applications/io.unom.punktfunk.console.desktop
 client usr/share/punktfunk-client/install-kind
+seats usr/libexec/punktfunk/punktfunk-seats
+seats usr/libexec/punktfunk/seat-session
+seats usr/libexec/punktfunk/seat-reap
+seats usr/libexec/punktfunk/door-helper
+seats usr/lib/systemd/system/punktfunk-seats.service
+seats usr/lib/systemd/system/punktfunk-seat@.service
+seats usr/lib/systemd/system/punktfunk-door.service
+seats usr/lib/systemd/system/punktfunk-web-door.service
+seats usr/lib/systemd/system/punktfunk-door-on@.service
+seats usr/lib/systemd/system/punktfunk-door-off@.service
+seats usr/lib/systemd/system/user@.service.d/50-punktfunk-seats.conf
+seats usr/lib/tmpfiles.d/punktfunk-seats.conf
+seats usr/lib/udev/rules.d/65-punktfunk-seats.rules
+seats usr/share/polkit-1/rules.d/49-punktfunk-door.rules

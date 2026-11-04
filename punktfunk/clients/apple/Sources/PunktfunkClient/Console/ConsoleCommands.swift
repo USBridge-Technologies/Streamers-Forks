@@ -87,6 +87,10 @@ extension ConsoleModel {
             fetchProfiles(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "")
+        case .fetchAvatar:
+            fetchAvatar(
+                addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
+                fp: a["fp_hex"] as? String ?? "", url: a["url"] as? String ?? "")
         case .wakeProfile:
             wakeProfile(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
@@ -99,6 +103,7 @@ extension ConsoleModel {
                     (pick?["id"] as? String).map {
                         ProfilePick(
                             id: $0, displayName: pick?["display_name"] as? String ?? "",
+                            avatar: pick?["avatar"] as? String,
                             remember: pick?["remember"] as? Bool ?? false)
                     })
             }
@@ -392,6 +397,19 @@ extension ConsoleModel {
         }
     }
 
+    /// A profile's picture for the faces the shell draws. A read that fails leaves the initials.
+    private func fetchAvatar(addr: String, mgmt: UInt16, fp: String, url: String) {
+        guard let host = host(fp: fp, addr: addr, port: 0),
+              case .success(let target) = MgmtTarget.make(host: host, port: mgmt),
+              let resolved = LibraryClient.pictureURL(url, on: target)
+        else { return }
+        let loader = LibraryArtLoader(target)
+        Task { [weak self] in
+            guard let bytes = try? await loader.data(for: resolved) else { return }
+            self?.bridge.avatar(url: url, bytes: bytes)
+        }
+    }
+
     /// Starts a profile's stopped seat. The shell polls `FetchProfiles` for `ready` itself.
     private func wakeProfile(addr: String, mgmt: UInt16, fp: String, id: String) {
         guard let host = host(fp: fp, addr: addr, port: 0) else { return }
@@ -508,18 +526,29 @@ extension ConsoleModel {
         }
     }
 
-    /// Pin the saved host at `addr:port` to `cert` and tell the Pair screen that sent `req`.
+    /// Pin `cert` and tell the Pair screen that sent `req`. The record is the one pinned to
+    /// `cert`, else the unpinned one at `addr:port`, else the advert there, saved as a tap on it
+    /// would. A record pinned to another fingerprint is the other OS of a dual-boot box.
     private func paired(addr: String, port: UInt16, cert: Data, req: Any) {
-        guard var host = host(fp: "", addr: addr, port: port) else {
-            bridge.push(.pair, ConsoleJSON.pairFailed(req, "That host is no longer saved."))
-            return
-        }
-        host.pinnedSHA256 = cert
-        store.update(host)
-        actions.paired(host, cert)
         let fp = cert.map { String(format: "%02x", $0) }.joined()
+        let host = store.hosts.first { $0.pinnedSHA256 == cert }
+            ?? store.hosts.first { $0.pinnedSHA256 == nil && $0.address == addr && $0.port == port }
+            ?? saveAdvert(addr: addr, port: port, fp: fp)
+        store.pin(host.id, fingerprint: cert)
+        actions.paired(host, cert)
         bridge.push(.pair, ConsoleJSON.pairPaired(req, key: fp))
         pushHosts()
+    }
+
+    /// The advert at `addr:port` that answered as `fp`, or a bare record when it has gone quiet.
+    private func saveAdvert(addr: String, port: UInt16, fp: String) -> StoredHost {
+        let advert = discovery.hosts.first {
+            $0.host == addr && $0.port == port && $0.matches(pin: fp, address: addr, port: port)
+        }
+        let host = advert.map(StoredHost.init(advert:))
+            ?? StoredHost(name: "", address: addr, port: port)
+        store.add(host)
+        return host
     }
 
     private func sendLogs(fp: String, addr: String) {

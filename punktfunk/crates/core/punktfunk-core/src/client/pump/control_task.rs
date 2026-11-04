@@ -74,12 +74,28 @@ impl ControlTask {
             CLOCK_RESYNC_INTERVAL,
         );
         resync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Between applied batches the offset moves at the measured skew. A 1 s tick
+        // publishes it: embedders read `clock_offset` directly, never through a getter.
+        let mut skew = SkewModel::new(
+            clock_offset.load(Ordering::Relaxed),
+            std::time::Instant::now(),
+        );
+        let mut skew_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tokio::select! {
                 req = ctrl_rx.recv() => {
                     let Some(req) = req else { break }; // client dropped
                     let frame = match req {
-                        CtrlRequest::Mode(m) => Reconfigure { mode: m }.encode_v2(),
+                        CtrlRequest::Mode(m) => Reconfigure {
+                            mode: m,
+                            exclude_codecs: 0,
+                        }
+                        .encode_v2(),
+                        CtrlRequest::Codec(exclude) => Reconfigure {
+                            mode: *mode_slot.lock().unwrap_or_else(|e| e.into_inner()),
+                            exclude_codecs: exclude,
+                        }
+                        .encode_v2(),
                         CtrlRequest::Probe(p) => crate::quic::ProbeShaped::from(p).encode_v2(),
                         CtrlRequest::ProbeShaped(p) => p.encode_v2(),
                         CtrlRequest::SetBitrate(k) => SetBitrate { bitrate_kbps: k }.encode_v2(),
@@ -95,6 +111,7 @@ impl ControlTask {
                         CtrlRequest::CursorRender(m) => m.encode_v2(),
                         CtrlRequest::InputEdge(ev) => v2msg::encode_input_event(&ev),
                         CtrlRequest::PadIdentity(id) => id.encode_v2(),
+                        CtrlRequest::Screens(screens) => v2msg::Screens { screens }.encode_v2(),
                     };
                     if v2io::write_frame(&mut ctrl_send, &frame).await.is_err() {
                         break;
@@ -107,6 +124,10 @@ impl ControlTask {
                         break;
                     }
                 }
+                _ = skew_tick.tick(), if clock_rtt_ns.is_some() => {
+                    let carried = skew.offset_at(std::time::Instant::now());
+                    clock_offset.store(carried, Ordering::Relaxed);
+                }
                 _ = async { tokio::time::sleep_until(staged_round.unwrap()).await },
                         if staged_round.is_some() => {
                     staged_round = None;
@@ -118,7 +139,18 @@ impl ControlTask {
                 }
                 frame = ctrl_recv.read_frame() => {
                     let Ok((ty, body)) = frame else { break }; // stream closed
-                    if let Ok(ack) = decode::<Reconfigured>(ty, &body) {
+                    if let Some(ack) = decode::<Reconfigured>(ty, &body)
+                        .ok()
+                        .filter(|a| a.exclude_codecs != 0)
+                    {
+                        // A codec answer: a yes arrives as the new epoch's config and frames.
+                        if ack.accepted {
+                            tracing::info!(excluded = ack.exclude_codecs, "host accepted codec change");
+                        } else {
+                            tracing::warn!(excluded = ack.exclude_codecs, "host refused codec change");
+                            shared.codec_refused.store(ack.exclude_codecs, Ordering::Relaxed);
+                        }
+                    } else if let Ok(ack) = decode::<Reconfigured>(ty, &body) {
                         // An anchored host says what it delivers in a `StreamConfig` instead.
                         if ack.accepted && !anchor.lock().unwrap_or_else(|e| e.into_inner()).on {
                             *mode_slot.lock().unwrap_or_else(|e| e.into_inner()) = ack.mode;
@@ -129,6 +161,25 @@ impl ControlTask {
                         } else {
                             tracing::warn!(active = ?ack.mode, "host rejected mode switch");
                         }
+                    } else if let Some(cfg) = decode::<v2msg::AudioConfig>(ty, &body)
+                        .ok()
+                        .filter(|c| c.stream == 0)
+                    {
+                        tracing::info!(
+                            codec = cfg.codec,
+                            rate_hz = cfg.rate_hz,
+                            first_seq = cfg.first_seq,
+                            "the host changes the audio format"
+                        );
+                        shared.audio_anchor.lock().unwrap_or_else(|e| e.into_inner()).config(&cfg);
+                    } else if let Some(cfg) = decode::<v2msg::StreamConfig>(ty, &body)
+                        .ok()
+                        .filter(|c| c.stream != crate::packet::V2_STREAM_VIDEO)
+                    {
+                        shared.screens.config(cfg);
+                    } else if let Ok(layout) = decode::<v2msg::ScreenLayout>(ty, &body) {
+                        tracing::info!(screens = ?layout.screens, "host screen layout");
+                        shared.screens.set_layout(layout.screens);
                     } else if let Ok(cfg) = decode::<v2msg::StreamConfig>(ty, &body) {
                         let host = crate::quic::HostLink::of(&cfg);
                         if std::mem::replace(&mut *shared.host_link.lock().unwrap(), host) != host {
@@ -231,14 +282,22 @@ impl ControlTask {
                                             "clock re-sync batch rejected — RTT above the \
                                              session floor (congested window)"
                                         );
+                                        let _ = events.send(PumpEvent::ClockResyncRejected);
                                         (None, false)
                                     }
                                 };
                                 if let Some((offset_ns, rtt_ns)) = apply {
+                                    let now = std::time::Instant::now();
+                                    // How far the carried offset sat from this batch.
+                                    let miss_us =
+                                        offset_ns.saturating_sub(skew.offset_at(now)) / 1000;
+                                    skew.apply(offset_ns, now);
                                     tracing::info!(
                                         offset_ns,
                                         rtt_us = rtt_ns / 1000,
                                         best_of_streak,
+                                        miss_us,
+                                        skew_ppm = skew.skew_ppm(),
                                         "mid-stream clock re-sync applied"
                                     );
                                     clock_offset.store(offset_ns, Ordering::Relaxed);

@@ -22,6 +22,7 @@ import io.unom.punktfunk.HostRecords
 import io.unom.punktfunk.HostServices
 import io.unom.punktfunk.JniHostNative
 import io.unom.punktfunk.ProfilesAnswer
+import io.unom.punktfunk.PENDING_POLL_MS
 import io.unom.punktfunk.PresetStore
 import io.unom.punktfunk.REQUEST_ACCESS_TIMEOUT_MS
 import io.unom.punktfunk.Settings
@@ -257,11 +258,12 @@ object SkiaConsole {
     /** Held as one value so [resumeDiscovery] and [pauseDiscovery] name the same subscriber. */
     private val onDiscovered: (List<DiscoveredHost>) -> Unit = { list ->
         services.discovered = list
-        // Learn wake MACs / mgmt ports from live adverts, as the desktop service does.
+        // Learn names / wake MACs / mgmt ports from live adverts, as the desktop service does.
         ioPool.execute {
             var changed = false
             for (dh in list) {
                 val kh = services.store.all().firstOrNull { it.matches(dh) } ?: continue
+                if (services.store.learnName(kh, dh.name)) changed = true
                 if (dh.mac.isNotEmpty() && dh.mac.toSet() != kh.mac.toSet()) {
                     services.store.learnMac(kh, dh.mac); changed = true
                 }
@@ -591,18 +593,19 @@ object SkiaConsole {
             // is asleep, and this asks it a question only a live host can answer.
             if (h.id !in services.reachable) continue
             val (addr, mgmt, fp) = Triple(h.address, h.effectiveMgmtPort, h.fpHex)
+            val port = h.port
             // Stamp BEFORE the request, so a slow host cannot make every push spawn another.
             if (now - (services.nowPlayingAt[fp] ?: 0L) >= NOW_PLAYING_TTL_MS) {
                 services.nowPlayingAt[fp] = now
                 ioPool.execute {
-                    val up = LibraryClient.fetchRunning(addr, mgmt, id.certPem, id.privateKeyPem, fp)
+                    val up = LibraryClient.fetchRunning(addr, mgmt, id.certPem, id.privateKeyPem, fp, port)
                     state.launch { recordNowPlaying(fp, up) }
                 }
             }
             if (now - (services.hostActionsAt[fp] ?: 0L) < HOST_ACTIONS_TTL_MS) continue
             services.hostActionsAt[fp] = now
             ioPool.execute {
-                val found = HostActions.list(id, addr, mgmt, fp)
+                val found = HostActions.list(id, addr, mgmt, fp, port)
                 state.launch {
                     services.hostActions[fp] = found
                     pushHosts()
@@ -765,8 +768,14 @@ object SkiaConsole {
         )
         // A host the dial saves by what it presented is named by its advert, else its address.
         val name = services.discovered.firstOrNull { it.host == addr && it.port == port }?.name ?: addr
+        // A dial the host parks for its operator narrates the approval wait (phase 6).
+        val watch = state.launch {
+            while (!NativeBridge.nativeDialPending()) kotlinx.coroutines.delay(PENDING_POLL_MS)
+            NativeBridge.nativeConsoleSessionPhase(handle, 6, "")
+        }
         state.launch {
             val dialed = services.dial(spec, kh, name, requestAccess, ticket)
+            watch.cancel()
             if (dialed is HostServices.Cancelled) return@launch
             dial = null
             if (dialed is HostServices.Connected) {
@@ -801,7 +810,7 @@ object SkiaConsole {
                 // 5: the console forgets the pick and asks the box's list once more.
                 NativeBridge.nativeConsoleSessionPhase(
                     handle, if (token == "profile-unknown") 5 else 2,
-                    ConnectErrors.connectMessage(token, requestAccess),
+                    dialed.said.ifEmpty { ConnectErrors.connectMessage(token, requestAccess) },
                 )
                 resumeDiscovery()
             }
@@ -862,6 +871,7 @@ object SkiaConsole {
         "Wake" to ::wake,
         "SetPin" to ::setPin,
         "FetchProfiles" to ::fetchProfiles,
+        "FetchAvatar" to { c -> fetchAvatar(c) },
         "WakeProfile" to ::wakeProfile,
         "SetProfile" to ::setProfile,
         "BindPreset" to ::bindPreset,
@@ -872,6 +882,12 @@ object SkiaConsole {
 
     /** `ConsoleCmd`s this shell drops: it raises no prompt, so no `PromptAnswer` comes back. */
     internal val ignoredCommands = setOf("PromptAnswer")
+
+    /**
+     * The stream port of the saved host [fp] pins, where its management API answers without TCP.
+     * 0 with no such record: HTTPS alone. A command names the mgmt port, not this.
+     */
+    internal fun streamPort(fp: String): Int = services.store.getByFp(fp)?.port ?: 0
 
     private fun hostForKey(key: String): KnownHost? {
         val primary = ConsoleJson.hostKey(key)
@@ -965,7 +981,7 @@ object SkiaConsole {
             val answer = if (id == null) {
                 ProfilesAnswer.Failed(identities.blockedMessage())
             } else {
-                HostProfiles.fetch(id, addr, mgmt, fp)
+                HostProfiles.fetch(id, addr, mgmt, fp, streamPort(fp))
             }
             val json = ConsoleJson.profilesAnswer(answer)
             state.launch { if (handle != 0L) NativeBridge.nativeConsoleSetProfiles(handle, fp, json) }
@@ -977,7 +993,7 @@ object SkiaConsole {
         val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
         val profile = c.optString("id")
         val id = identity ?: return
-        ioPool.execute { HostProfiles.wake(id, addr, mgmt, fp, profile) }
+        ioPool.execute { HostProfiles.wake(id, addr, mgmt, fp, profile, streamPort(fp)) }
     }
 
     /** `ConsoleCmd::SetProfile`: save (or with no profile, clear) the pick on a host. */
@@ -1008,7 +1024,7 @@ object SkiaConsole {
         }
         val app = appContext ?: return
         ioPool.execute {
-            val message = io.unom.punktfunk.SendLogs.toHost(app, id, addr, mgmt, fp, hostName)
+            val message = io.unom.punktfunk.SendLogs.toHost(app, id, addr, mgmt, fp, hostName, streamPort(fp))
             state.launch { notice(message) }
         }
     }
@@ -1062,7 +1078,7 @@ object SkiaConsole {
             return
         }
         ioPool.execute {
-            val message = HostActions.invoke(id, addr, mgmt, fp, hostName, actionId, label)
+            val message = HostActions.invoke(id, addr, mgmt, fp, hostName, actionId, label, streamPort(fp))
             state.launch { notice(message) }
         }
     }

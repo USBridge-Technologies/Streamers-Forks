@@ -116,6 +116,7 @@ public enum ConsoleSettings {
         .double("pyrowave_bpp", DefaultsKey.pyrowaveBpp, SettingDefault.pyrowaveBpp),
         .double("render_scale", DefaultsKey.renderScale, SettingDefault.renderScale),
         .string("video_fit", DefaultsKey.videoFit, SettingDefault.videoFit),
+        .string("screens", DefaultsKey.screens, SettingDefault.screens),
         .string("codec", DefaultsKey.codec, SettingDefault.codec),
         .bool("hdr_enabled", DefaultsKey.hdrEnabled, SettingDefault.hdrEnabled),
         .bool("enable_444", DefaultsKey.enable444, SettingDefault.enable444),
@@ -183,6 +184,8 @@ public enum ConsoleSettings {
         .bool("android.rumble_on_phone", DefaultsKey.rumbleOnDevice, SettingDefault.rumbleOnDevice),
         .bool("android.gyro_on_phone", DefaultsKey.gyroFromDevice, SettingDefault.gyroFromDevice),
         .bool("android.sc2_capture", DefaultsKey.sc2Capture, SettingDefault.sc2Capture),
+        .bool("visionos.spatial_audio", DefaultsKey.spatialAudio, SettingDefault.spatialAudio),
+        .string("visionos.screen", DefaultsKey.screen, SettingDefault.screen),
     ]
 
     // MARK: - the two that differ
@@ -190,7 +193,7 @@ public enum ConsoleSettings {
     /// The compositors and pad kinds the console names. The stored value is the wire value, the
     /// console's word is the host's name; anything else reads as "auto".
     private static let compositors: [PunktfunkConnection.Compositor] = [
-        .auto, .kwin, .mutter, .hyprland, .niri, .wlroots, .gamescope,
+        .auto, .kwin, .mutter, .hyprland, .niri, .umbriel, .wlroots, .gamescope,
     ]
     private static let padTypes: [PunktfunkConnection.GamepadType] = [
         .auto, .xbox360, .xboxOne, .dualSense, .dualShock4, .steamDeck, .steamController2,

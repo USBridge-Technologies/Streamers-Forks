@@ -12,7 +12,9 @@
 // `super::*` is the point of the child-module shape. `vk_util` is a crate-root sibling, so
 // `crate::` — not the parent-relative `super::` the parent uses.
 use super::*;
-use crate::vk_util::{ext_advertised, find_mem, find_mem_preferring, make_plain_image, make_view};
+use crate::vk_util::{
+    ext_advertised, find_mem_preferring, find_readback_mem, make_plain_image, make_view,
+};
 use anyhow::{bail, Result};
 use ash::vk;
 use pf_zerocopy::vkdev::VkImageAlloc;
@@ -20,6 +22,16 @@ use std::ffi::c_void;
 
 pub(super) fn align_up(v: u64, a: u64) -> u64 {
     v.div_ceil(a) * a
+}
+
+/// The AV1 frame the driver codes for a `w`×`h` sequence header: padded up to
+/// `codedPictureAlignment`. VCN4 aligns to 64×16, so 1080 rows code as 1088.
+pub(super) fn av1_coded_frame(w: u32, h: u32, align: vk::Extent2D) -> vk::Extent2D {
+    let up = |v: u32, a: u32| align_up(v.into(), a.max(1).into()) as u32;
+    vk::Extent2D {
+        width: up(w, align.width),
+        height: up(h, align.height),
+    }
 }
 
 /// The session's rate control as `(mode, (vbv_window_ms, vbv_initial_ms), bitrate)`. VBR
@@ -78,10 +90,11 @@ pub(super) fn rc_plan(
 /// `Ok((x_offset, y_offset))` is the chroma-siting bits the session must be created with
 /// (preferred available bit per axis). `Err` is the first missing requirement.
 ///
-/// `ten_bit` (depth) + `hdr` (colour) + `src_fmt` describe the planned session: HDR wants the
-/// BT.2020 model, SDR the BT.709 one at either depth; the 10-bit packed-RGB `src_fmt` is HDR's
-/// encode source. An EFC that cannot serve the wanted model returns `Err` and the session takes
-/// the compute CSC.
+/// `ten_bit` (depth) + `hdr` (colour) + `full_range` + `src_fmt` describe the planned session:
+/// HDR wants the BT.2020 model, SDR the BT.709 one at either depth, each at the session's range
+/// ([`rgb_range_for`]), as the VUI and OBU signal; the 10-bit packed-RGB `src_fmt` is HDR's
+/// encode source. An EFC that cannot serve the wanted model and range returns `Err` and the
+/// session takes the compute CSC.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn probe_rgb_direct(
     instance: &ash::Instance,
@@ -91,6 +104,7 @@ pub(super) unsafe fn probe_rgb_direct(
     av1: bool,
     ten_bit: bool,
     hdr: bool,
+    full_range: bool,
     src_fmt: vk::Format,
 ) -> Result<(u32, u32), &'static str> {
     use crate::vk_av1_encode as av1b;
@@ -154,11 +168,13 @@ pub(super) unsafe fn probe_rgb_direct(
         vrgb::CHROMA_OFFSET_MIDPOINT,
     );
     let want_model = rgb_model_for(hdr);
-    if rgb_caps.rgb_models & want_model == 0 || rgb_caps.rgb_ranges & vrgb::RANGE_NARROW == 0 {
-        return Err(if hdr {
-            "no-2020-narrow"
-        } else {
-            "no-709-narrow"
+    if rgb_caps.rgb_models & want_model == 0 || rgb_caps.rgb_ranges & rgb_range_for(full_range) == 0
+    {
+        return Err(match (hdr, full_range) {
+            (true, true) => "no-2020-full",
+            (true, false) => "no-2020-narrow",
+            (false, true) => "no-709-full",
+            (false, false) => "no-709-narrow",
         });
     }
     let (Some(x_offset), Some(y_offset)) = (
@@ -225,8 +241,14 @@ unsafe fn make_usage_view(
     )?)
 }
 
+/// The direct-planes picture's whole usage: the encode reads it, the CSC writes its planes.
+/// Nothing copies into it. The probe asks the driver for exactly this.
+const DIRECT_PLANES_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw(),
+);
+
 /// Can the compute CSC write the encode source's planes directly? True when this profile
-/// lists `pic` for `ENCODE_SRC | STORAGE` with the create flags a plane view needs. A driver
+/// lists `pic` for [`DIRECT_PLANES_USAGE`] with the create flags a plane view needs. A driver
 /// that lists it and still misrenders is what `PUNKTFUNK_VULKAN_DIRECT_PLANES=0` is for.
 pub(super) unsafe fn probe_yuv_storage_planes(
     vq_inst: &ash::khr::video_queue::Instance,
@@ -236,8 +258,8 @@ pub(super) unsafe fn probe_yuv_storage_planes(
 ) -> bool {
     let profile_arr = [*profile];
     let plist = vk::VideoProfileListInfoKHR::default().profiles(&profile_arr);
-    let mut fmt_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
-        .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::STORAGE);
+    let mut fmt_info =
+        vk::PhysicalDeviceVideoFormatInfoKHR::default().image_usage(DIRECT_PLANES_USAGE);
     fmt_info.p_next = &plist as *const _ as *const c_void;
     let get_fmt = vq_inst.fp().get_physical_device_video_format_properties_khr;
     let mut count = 0u32;
@@ -307,6 +329,10 @@ mod direct_planes_tests {
             "other format"
         );
         assert!(!planes_writable(&[], NV12));
+        assert!(
+            planes_writable(&[listed(DIRECT_PLANES_USAGE, full)], NV12),
+            "the usage the direct picture is created with"
+        );
     }
 }
 
@@ -319,6 +345,17 @@ pub(super) fn rgb_model_for(hdr: bool) -> u32 {
         vrgb::MODEL_YCBCR_2020
     } else {
         vrgb::MODEL_YCBCR_709
+    }
+}
+
+/// EFC range for the session's range: narrow is studio, as the compute CSC writes it with
+/// `FULL_RANGE` clear.
+pub(super) fn rgb_range_for(full_range: bool) -> u32 {
+    use crate::vk_valve_rgb as vrgb;
+    if full_range {
+        vrgb::RANGE_FULL
+    } else {
+        vrgb::RANGE_NARROW
     }
 }
 
@@ -528,9 +565,7 @@ unsafe fn make_frame_csc(
             w,
             h,
             1,
-            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR
-                | vk::ImageUsageFlags::STORAGE
-                | vk::ImageUsageFlags::TRANSFER_DST,
+            DIRECT_PLANES_USAGE,
             vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
             profile_list,
             fams,
@@ -654,19 +689,17 @@ unsafe fn make_frame_common(
         None,
     )?;
     let bs_req = device.get_buffer_memory_requirements(f.bs.buffer);
+    let (bs_type, bs_coherent) = find_readback_mem(mem_props, bs_req.memory_type_bits)?;
+    f.bs_coherent = bs_coherent;
     f.bs.memory = device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(bs_req.size)
-            .memory_type_index(find_mem(
-                mem_props,
-                bs_req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?),
+            .memory_type_index(bs_type),
         None,
     )?;
     device.bind_buffer_memory(f.bs.buffer, f.bs.memory, 0)?;
-    // Map once for the slot's lifetime; `read_slot` copies AUs out of coherent memory.
-    // `vkFreeMemory` unmaps at teardown.
+    // Map once for the slot's lifetime; `read_slot` copies AUs out of it, invalidating first
+    // when the type is not coherent. `vkFreeMemory` unmaps at teardown.
     f.bs_ptr =
         BsPtr(
             device.map_memory(f.bs.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
@@ -706,6 +739,31 @@ unsafe fn make_frame_common(
     Ok(())
 }
 
+/// The HEVC CTB and largest transform block as log2 sizes: the largest each that the driver
+/// offers, the transform no larger than the CTB. VCN codes 64×64 CTBs, NVIDIA only 32×32. A
+/// driver that fills in neither mask gets 64 and 32.
+pub(super) fn h265_block_log2(
+    ctb: vk::VideoEncodeH265CtbSizeFlagsKHR,
+    tb: vk::VideoEncodeH265TransformBlockSizeFlagsKHR,
+) -> (u8, u8) {
+    use vk::VideoEncodeH265CtbSizeFlagsKHR as Ctb;
+    use vk::VideoEncodeH265TransformBlockSizeFlagsKHR as Tb;
+    let ctb_log2 = [(Ctb::TYPE_64, 6), (Ctb::TYPE_32, 5), (Ctb::TYPE_16, 4)]
+        .into_iter()
+        .find(|&(f, _)| ctb.contains(f))
+        .map_or(6, |(_, l)| l);
+    let tb_log2 = [
+        (Tb::TYPE_32, 5),
+        (Tb::TYPE_16, 4),
+        (Tb::TYPE_8, 3),
+        (Tb::TYPE_4, 2),
+    ]
+    .into_iter()
+    .find(|&(f, l)| l <= ctb_log2 && tb.contains(f))
+    .map_or(5.min(ctb_log2), |(_, l)| l);
+    (ctb_log2, tb_log2)
+}
+
 /// Author VPS/SPS/PPS (Main/Main10, low-latency, conformance-window crop) and return the
 /// session-parameters object plus the encoded header bytes for keyframes.
 pub(super) unsafe fn build_parameters_h265(
@@ -717,12 +775,16 @@ pub(super) unsafe fn build_parameters_h265(
     h: u32,
     rw: u32,
     rh: u32,
+    // `h265_block_log2` of the driver's caps.
+    (ctb_log2, tb_log2): (u8, u8),
     quality_level: u32,
     // Depth (Main vs Main10). Must match the profile the session was created with
     // (`open_inner`'s `ten_bit`); a Main SPS on a Main10 session mislabels the samples.
     ten_bit: bool,
     // Colour (BT.709 vs BT.2020 PQ), independent of depth: 10-bit SDR is Main10 under BT.709.
     hdr: bool,
+    // The range the CSC or EFC writes; `false` is studio.
+    full_range: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>)> {
     use ash::vk::native as hh;
     let mut ptl: hh::StdVideoH265ProfileTierLevel = std::mem::zeroed();
@@ -758,10 +820,11 @@ pub(super) unsafe fn build_parameters_h265(
         sps.bit_depth_luma_minus8 = 2;
         sps.bit_depth_chroma_minus8 = 2;
     }
-    sps.log2_diff_max_min_luma_coding_block_size = 3;
-    sps.log2_diff_max_min_luma_transform_block_size = 3;
-    sps.max_transform_hierarchy_depth_inter = 4;
-    sps.max_transform_hierarchy_depth_intra = 4;
+    // Minimum coding block 8×8, minimum transform 4×4; the hierarchy may split down to it.
+    sps.log2_diff_max_min_luma_coding_block_size = ctb_log2 - 3;
+    sps.log2_diff_max_min_luma_transform_block_size = tb_log2 - 2;
+    sps.max_transform_hierarchy_depth_inter = ctb_log2 - 2;
+    sps.max_transform_hierarchy_depth_intra = ctb_log2 - 2;
     sps.pProfileTierLevel = &ptl;
     sps.pDecPicBufMgr = &dpbm;
     if w != rw || h != rh {
@@ -770,19 +833,8 @@ pub(super) unsafe fn build_parameters_h265(
         sps.conf_win_bottom_offset = (h - rh) / 2; // 4:2:0 SubHeightC = 2
     }
 
-    // VUI names the CSC: 709 limited (SDR at either depth), or 2020-NCL + PQ (HDR; samples arrive
-    // PQ, the matrix does not touch transfer). Omit it and decoders guess colorimetry.
     // `vui` must outlive `create_video_session_parameters_khr` — `sps_arr` copies the pointer.
-    let mut vui: hh::StdVideoH265SequenceParameterSetVui = std::mem::zeroed();
-    vui.flags.set_video_signal_type_present_flag(1);
-    vui.flags.set_video_full_range_flag(0); // limited/studio swing
-    vui.flags.set_colour_description_present_flag(1);
-    vui.video_format = 5; // unspecified — the CICP triplet below is what matters
-                          // CICP: 1 = BT.709, 9 = BT.2020 primaries / 2020-NCL matrix, 16 = SMPTE 2084.
-    let (prim, trc, mat) = if hdr { (9, 16, 9) } else { (1, 1, 1) };
-    vui.colour_primaries = prim;
-    vui.transfer_characteristics = trc;
-    vui.matrix_coeffs = mat;
+    let vui = h265_vui(hdr, full_range);
     sps.flags.set_vui_parameters_present_flag(1);
     sps.pSequenceParameterSetVui = &vui;
 
@@ -923,9 +975,29 @@ fn leb128(mut v: u64) -> Vec<u8> {
     out
 }
 
+/// The VUI that names the CSC: 709 (SDR at either depth) or 2020-NCL + PQ (HDR; samples arrive
+/// PQ, the matrix does not touch transfer), at the range the CSC or EFC writes. Omit it and
+/// decoders guess colorimetry.
+fn h265_vui(hdr: bool, full_range: bool) -> ash::vk::native::StdVideoH265SequenceParameterSetVui {
+    // SAFETY: a plain C struct of integers and bitfields; all-zero is its empty value.
+    let mut vui: ash::vk::native::StdVideoH265SequenceParameterSetVui =
+        unsafe { std::mem::zeroed() };
+    vui.flags.set_video_signal_type_present_flag(1);
+    vui.flags.set_video_full_range_flag(u32::from(full_range));
+    vui.flags.set_colour_description_present_flag(1);
+    vui.video_format = 5; // unspecified — the CICP triplet below is what matters
+                          // CICP: 1 = BT.709, 9 = BT.2020 primaries / 2020-NCL matrix, 16 = SMPTE 2084.
+    let (prim, trc, mat) = if hdr { (9, 16, 9) } else { (1, 1, 1) };
+    vui.colour_primaries = prim;
+    vui.transfer_characteristics = trc;
+    vui.matrix_coeffs = mat;
+    vui
+}
+
 /// Bit-pack a `sequence_header_obu` (AV1 spec §5.5) into a size-delimited OBU. Field values
 /// MUST match the `StdVideoAV1SequenceHeader` in `build_parameters_av1` so driver-emitted
-/// frame OBUs parse against this header. Single operating point, 4:2:0 at 8 or 10 bits,
+/// frame OBUs parse against this header; the frame size is the driver's coded size
+/// ([`av1_coded_frame`]). Single operating point, 4:2:0 at 8 or 10 bits,
 /// order-hint on; CDEF, restoration, filter-intra, compound, warp, superres all off.
 #[allow(clippy::too_many_arguments)]
 fn av1_sequence_header_obu(
@@ -938,6 +1010,7 @@ fn av1_sequence_header_obu(
     seq_level_idx: u32,
     ten_bit: bool,
     hdr: bool,
+    full_range: bool,
 ) -> Vec<u8> {
     let mut w = Av1BitWriter::new();
     w.put(0, 3); // seq_profile = MAIN
@@ -983,7 +1056,7 @@ fn av1_sequence_header_obu(
     w.put(prim, 8); // color_primaries         (1 = BT.709, 9 = BT.2020)
     w.put(trc, 8); // transfer_characteristics (1 = BT.709, 16 = SMPTE 2084)
     w.put(mat, 8); // matrix_coefficients      (1 = BT.709, 9 = BT.2020 NCL)
-    w.bit(0); // color_range (studio/limited)
+    w.bit(u32::from(full_range)); // color_range (1 = full swing, 0 = studio)
     w.put(0, 2); // chroma_sample_position = CSP_UNKNOWN (subsampling_x==subsampling_y==1 for profile 0)
     w.bit(0); // separate_uv_delta_q
     w.bit(0); // film_grain_params_present
@@ -1001,6 +1074,7 @@ fn av1_sequence_header_obu(
 /// AV1 session parameters + header framing. Vulkan AV1 encode emits only the per-frame OBU, so
 /// the return is app-owned prefixes: a temporal-delimiter OBU every temporal unit
 /// (`frame_prefix`), and TD + the bit-packed sequence-header OBU for keyframes (`header`).
+/// The Std header states `w`×`h`, the source size; the OBU states `frame`, the coded size.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn build_parameters_av1(
     device: &ash::Device,
@@ -1008,8 +1082,7 @@ pub(super) unsafe fn build_parameters_av1(
     session: vk::VideoSessionKHR,
     w: u32,
     h: u32,
-    _rw: u32,
-    _rh: u32,
+    frame: vk::Extent2D,
     max_level: ash::vk::native::StdVideoAV1Level,
     sb128: bool,
     quality_level: u32,
@@ -1018,6 +1091,8 @@ pub(super) unsafe fn build_parameters_av1(
     ten_bit: bool,
     // Colour (BT.709 vs BT.2020 PQ), independent of depth: 10-bit SDR is AV1 10-bit under BT.709.
     hdr: bool,
+    // The range the CSC or EFC writes; `false` is studio. The Std header and the OBU both carry it.
+    full_range: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>, Vec<u8>)> {
     use crate::vk_av1_encode as av1;
     use ash::vk::native as hh;
@@ -1028,9 +1103,10 @@ pub(super) unsafe fn build_parameters_av1(
     let seq_level_idx = max_level; // StdVideoAV1Level's numeric value IS the AV1 seq_level_idx
 
     // Std sequence header must match the OBU packed below or driver frame OBUs parse
-    // against a header we did not write. `color_range` stays 0 (studio swing).
+    // against a header we did not write, `color_range` included.
     let mut cc_flags: hh::StdVideoAV1ColorConfigFlags = std::mem::zeroed();
     cc_flags.set_color_description_present_flag(1);
+    cc_flags.set_color_range(u32::from(full_range));
     let mut cc: hh::StdVideoAV1ColorConfig = std::mem::zeroed();
     cc.flags = cc_flags;
     // The Std struct carries the DEPTH; the driver derives the OBU's `high_bitdepth` from it.
@@ -1114,14 +1190,15 @@ pub(super) unsafe fn build_parameters_av1(
     let td = vec![0x12u8, 0x00]; // temporal_delimiter OBU (type=2, size=0)
     let seq_obu = av1_sequence_header_obu(
         sb128,
-        fwb,
-        fhb,
-        w - 1,
-        h - 1,
+        31 - frame.width.leading_zeros(),
+        31 - frame.height.leading_zeros(),
+        frame.width - 1,
+        frame.height - 1,
         order_hint_bits_minus_1,
         seq_level_idx,
         ten_bit,
         hdr,
+        full_range,
     );
     let mut keyframe_prefix = td.clone();
     keyframe_prefix.extend_from_slice(&seq_obu);
@@ -1218,15 +1295,31 @@ mod tests {
         (high_bitdepth, described, cp, tc, mc, range)
     }
 
-    /// Sequence header must signal BT.709 limited — the CSC `rgb2yuv.comp` performs.
+    /// VCN4 pads AV1 to 64×16 and VCN5 to 8×2: 1080p codes as 1088 rows on the first only.
+    /// A driver that reports no alignment pads nothing.
+    #[test]
+    fn av1_frame_is_the_size_the_driver_codes() {
+        let at = |w, h| vk::Extent2D {
+            width: w,
+            height: h,
+        };
+        assert_eq!(av1_coded_frame(1920, 1080, at(64, 16)), at(1920, 1088));
+        assert_eq!(av1_coded_frame(1366, 768, at(64, 16)), at(1408, 768));
+        assert_eq!(av1_coded_frame(1920, 1080, at(8, 2)), at(1920, 1080));
+        assert_eq!(av1_coded_frame(2560, 1440, at(64, 16)), at(2560, 1440));
+        assert_eq!(av1_coded_frame(1920, 1080, at(0, 0)), at(1920, 1080));
+    }
+
+    /// Sequence header must signal BT.709 at full range — the CSC `rgb2yuv.comp` performs.
     /// Values must equal `StdVideoAV1ColorConfig` in `build_parameters_av1`: the driver
     /// packs frame OBUs against that struct while clients parse this header.
     #[test]
-    fn av1_sequence_header_signals_bt709_limited() {
+    fn av1_sequence_header_signals_bt709_full() {
         // 1920×1080 → 10/10 frame-size bits. Level 8 exercises seq_tier; sb128 both ways
         // because it sits above color_config.
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
-            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, false, false);
+            let obu =
+                av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, false, false, true);
             let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
             assert_eq!(depth10, 0, "high_bitdepth (8-bit session)");
             assert_eq!(
@@ -1238,7 +1331,7 @@ mod tests {
                 (1, 1, 1),
                 "CICP BT.709 primaries/transfer/matrix"
             );
-            assert_eq!(range, 0, "color_range = studio/limited swing");
+            assert_eq!(range, 1, "color_range = full swing");
         }
     }
 
@@ -1247,7 +1340,8 @@ mod tests {
     #[test]
     fn av1_sequence_header_signals_bt2020_pq_at_10_bit() {
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
-            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, true);
+            let obu =
+                av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, true, true);
             let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
             assert_eq!(depth10, 1, "high_bitdepth (sb128={sb128})");
             assert_eq!(described, 1, "color_description_present_flag");
@@ -1256,7 +1350,7 @@ mod tests {
                 (9, 16, 9),
                 "CICP BT.2020 primaries / SMPTE 2084 transfer / BT.2020-NCL matrix"
             );
-            assert_eq!(range, 0, "color_range = studio/limited swing");
+            assert_eq!(range, 1, "color_range = full swing");
         }
     }
 
@@ -1265,7 +1359,8 @@ mod tests {
     #[test]
     fn av1_sequence_header_signals_bt709_at_10_bit() {
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
-            let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, false);
+            let obu =
+                av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, true, false, true);
             let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
             assert_eq!(depth10, 1, "high_bitdepth (sb128={sb128})");
             assert_eq!(described, 1, "color_description_present_flag");
@@ -1274,7 +1369,35 @@ mod tests {
                 (1, 1, 1),
                 "CICP BT.709 primaries/transfer/matrix at 10-bit"
             );
-            assert_eq!(range, 0, "color_range = studio/limited swing");
+            assert_eq!(range, 1, "color_range = full swing");
         }
+    }
+
+    /// A studio session says studio at either depth and in HDR, in the OBU and the H.265 VUI
+    /// alike.
+    #[test]
+    fn a_studio_session_signals_studio_range() {
+        for (ten_bit, hdr) in [(false, false), (true, false), (true, true)] {
+            let obu = av1_sequence_header_obu(false, 10, 10, 1919, 1079, 7, 8, ten_bit, hdr, false);
+            let (depth10, _, cp, tc, mc, range) = read_color_config(&obu, 10, 10, 8);
+            let cicp = if hdr { (9, 16, 9) } else { (1, 1, 1) };
+            assert_eq!(
+                (depth10, cp, tc, mc),
+                (u8::from(ten_bit), cicp.0, cicp.1, cicp.2)
+            );
+            assert_eq!(range, 0, "color_range = studio swing (hdr={hdr})");
+        }
+        assert_eq!(h265_vui(false, false).flags.video_full_range_flag(), 0);
+        assert_eq!(h265_vui(false, true).flags.video_full_range_flag(), 1);
+        assert_eq!(h265_vui(true, false).flags.video_full_range_flag(), 0);
+        assert_eq!(h265_vui(true, true).matrix_coeffs, 9);
+    }
+
+    /// The EFC is asked for the range the bitstream signals.
+    #[test]
+    fn the_efc_range_follows_the_session() {
+        use crate::vk_valve_rgb as vrgb;
+        assert_eq!(rgb_range_for(true), vrgb::RANGE_FULL);
+        assert_eq!(rgb_range_for(false), vrgb::RANGE_NARROW);
     }
 }

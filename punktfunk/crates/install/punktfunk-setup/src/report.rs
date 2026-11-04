@@ -106,7 +106,8 @@ fn bind_label(choices: &Choices) -> String {
 pub fn uninstall_outro(ui: &dyn Reporter) {
     ui.blank();
     ui.line("  Removed. Left on purpose: ~/.config/punktfunk (identity, pairings, host.env, plugins — a reinstall");
-    ui.line("  picks them up), the punktfunk / punktfunk-update groups, and any firewall rules you opened.");
+    ui.line("  picks them up), the punktfunk, punktfunk-door and punktfunk-update groups, and any firewall");
+    ui.line("  rules you opened.");
     ui.line(&format!(
         "  The one-command cleanups for each are on {DOCS}/uninstall#linux-hosts"
     ));
@@ -140,7 +141,7 @@ pub fn verify(
             .probe("ss", &["-lun"])
             .is_some_and(|o| o.ok() && o.stdout.contains(":9777 "));
         if listening {
-            ui.ok("listening on UDP 9777 (punktfunk/1)");
+            ui.ok("listening on UDP 9777 (punktfunk/2)");
         } else {
             ui.warn(
                 "nothing on UDP 9777 yet — give it a second, then: journalctl --user -u punktfunk-host -e",

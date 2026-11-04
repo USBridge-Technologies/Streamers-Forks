@@ -111,10 +111,9 @@ fun ConnectScreen(
 
     // The preset catalog as the cards draw it, re-read on entry: Settings may have changed it.
     var presets by remember { mutableStateOf(presetStore.all()) }
-    // Learn wake MAC(s) from live adverts for hosts we've saved (parity with the desktop clients),
-    // so we can Wake-on-LAN them once they sleep. Runs only when the discovered set changes; the
-    // prefs write is guarded (no-op when unchanged), and we refresh the saved list only if a MAC
-    // was actually newly learned.
+    // Learn name, wake MAC(s), OS and mgmt port from live adverts for saved hosts (parity with
+    // the desktop clients). Runs only when the discovered set changes; each prefs write is
+    // guarded (no-op when unchanged), and the saved list refreshes only if something was learned.
     LaunchedEffect(ctl.discovered) {
         val discovered = ctl.discovered
         val learned = withContext(Dispatchers.IO) {
@@ -124,6 +123,7 @@ fun ConnectScreen(
             val saved = knownHostStore.all()
             discovered.forEach { dh ->
                 val kh = saved.firstOrNull { it.matches(dh) } ?: return@forEach
+                if (knownHostStore.learnName(kh, dh.name)) any = true
                 if (dh.mac.isNotEmpty() && kh.mac != dh.mac) {
                     knownHostStore.learnMac(kh, dh.mac)
                     any = true
@@ -204,7 +204,7 @@ fun ConnectScreen(
                 // Stamp BEFORE the request, so a slow host cannot make every lap ask again.
                 hostActionsAt = hostActionsAt + (kh.fpHex to now)
                 val found = withContext(Dispatchers.IO) {
-                    HostActions.list(id, kh.address, kh.effectiveMgmtPort, kh.fpHex)
+                    HostActions.list(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.port)
                 }
                 hostActions = hostActions + (kh.fpHex to found)
             }
@@ -283,7 +283,7 @@ fun ConnectScreen(
         scope.launch {
             ctl.notice = withContext(Dispatchers.IO) {
                 HostActions.invoke(
-                    id, kh.address, kh.effectiveMgmtPort, kh.fpHex, name, a.id, a.label,
+                    id, kh.address, kh.effectiveMgmtPort, kh.fpHex, name, a.id, a.label, kh.port,
                 )
             }
         }
@@ -306,7 +306,7 @@ fun ConnectScreen(
         switching = kh to null
         scope.launch {
             val answer = withContext(Dispatchers.IO) {
-                HostProfiles.fetch(id, kh.address, kh.effectiveMgmtPort, kh.fpHex)
+                HostProfiles.fetch(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.port)
             }
             if (switching?.first?.id == kh.id) switching = kh to answer
         }
@@ -409,6 +409,7 @@ fun ConnectScreen(
             answer = ProfilesAnswer.Listed(ask.listed),
             saved = ask.host.asProfile,
             gone = ask.gone,
+            art = rememberProfileArt(ask.host),
             onPick = { ask.answer.complete(it) },
             onDismiss = { ask.answer.complete(null) },
         )
@@ -422,6 +423,7 @@ fun ConnectScreen(
             answer = answer,
             saved = kh.asProfile,
             gone = null,
+            art = rememberProfileArt(kh),
             onPick = { pick ->
                 HostRecords.savePick(knownHostStore, kh, pick)
                 ctl.refreshHosts()

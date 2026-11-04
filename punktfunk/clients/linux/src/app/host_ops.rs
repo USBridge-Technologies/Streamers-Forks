@@ -23,10 +23,11 @@ impl AppModel {
                     "punktfunk-client",
                     &req.host.name,
                     &req.host.addr,
-                    mgmt,
+                    (mgmt, req.host.port),
                     &identity,
                     req.host.fp_hex.as_deref().unwrap_or_default(),
-                );
+                )
+                .unwrap_or_else(|e| e);
                 let _ = out.send(AppMsg::Toast(msg));
             })
             .ok();
@@ -85,19 +86,22 @@ impl AppModel {
                     &req.host.name,
                     &req.host.addr,
                     mgmt,
+                    req.host.port,
                     &identity,
                     req.host.fp_hex.as_deref().unwrap_or_default(),
                     &action_id,
                     &label,
-                );
+                )
+                .unwrap_or_else(|e| e);
                 let _ = out.send(AppMsg::Toast(msg));
             })
             .ok();
     }
 
-    /// The speed-test page. The test is a connect, so it holds the slot until it ends.
+    /// The speed-test page. The test needs the link to itself, so it holds the whole shell
+    /// until it ends.
     pub(super) fn speed_test(&mut self, req: ConnectRequest, sender: &ComponentSender<AppModel>) {
-        if !self.flight.hold() {
+        if !self.flights.hold_alone() {
             return;
         }
         let sender = sender.clone();

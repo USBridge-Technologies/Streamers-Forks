@@ -11,21 +11,22 @@
 //! swapchain still leaves the next `Redraw` its frame.
 //!
 //! HDR follows the frame's PQ flag. No HDR10 surface → CSC shader mode 1
-//! tonemaps onto SDR. Pin peak with `PUNKTFUNK_TONEMAP_PEAK` (default 4.9 ≈
-//! 1000 nits / 203). Windows: `PUNKTFUNK_D3D11_NO_MUTEX=1` skips the keyed mutex.
+//! tonemaps onto SDR at the `tonemap_peak` knob. Windows: a fenced D3D11 slot waits the
+//! ring's `written` fence and signals its `read` fence instead of the keyed mutex;
+//! `d3d11_no_mutex` skips the mutex.
 //!
 //! Evidence: `csc_depth_packing` table tests; `design/pyrowave-444-hdr.md`.
 
 use super::gpu::*;
 use super::present_timing::SLICE_NS;
+use super::reconfig::{Applied, Input};
 use super::{
     BusyOn, DirectLast, DirectSrc, FrameInput, Held, Presented, Presenter, Retired, VideoImage,
 };
-use crate::csc::csc_rows;
+use crate::csc::{csc_rows, ycbcr_descriptors, CscPass, CscPipe};
 #[cfg(target_os = "linux")]
 use crate::dmabuf::{self, HwFrame};
 use crate::overlay::OverlayFrame;
-use crate::swapchain_state::Entry;
 use anyhow::{Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
@@ -34,24 +35,6 @@ use pf_client_core::video::SlotFormat;
 use pf_client_core::video::{CpuPlanarFrame, NativeVkFrame, NativeVkLayout, RawVkFormat};
 use punktfunk_core::video_fit::Placement;
 use std::ops::ControlFlow;
-
-/// `PUNKTFUNK_TONEMAP_PEAK`, read once: the environment lock and a string per frame is not
-/// a price the CSC record pays. Default 4.9 ≈ 1000 nits / 203-nit reference.
-fn tonemap_peak() -> f32 {
-    static PEAK: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *PEAK.get_or_init(|| {
-        std::env::var("PUNKTFUNK_TONEMAP_PEAK")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(4.9)
-    })
-}
-
-/// `PUNKTFUNK_DIRECT_PRESENT=0` keeps every lane on the video image: an A/B on one build.
-fn direct_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_client_core::env_on("PUNKTFUNK_DIRECT_PRESENT") != Some(false))
-}
 
 /// Where a CSC pass draws.
 #[derive(Clone, Copy)]
@@ -80,7 +63,7 @@ enum Lane<'a> {
     #[cfg(target_os = "linux")]
     Dmabuf(HwFrame),
     #[cfg(windows)]
-    D3d11(pf_client_core::video::D3d11Frame, crate::d3d11::Imported),
+    D3d11(pf_client_core::video::SharedSlot, crate::d3d11::Imported),
     Native(NativeVkFrame),
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     Pyro(pf_client_core::video_pyrowave::PyroWavePlanarFrame),
@@ -106,6 +89,27 @@ impl Lane<'_> {
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Lane::Pyro(f) => Some((f.width, f.height)),
         }
+    }
+}
+
+/// The class of a present error, a context marker in its `anyhow` chain. `Window`: the
+/// surface, the swapchain or the compositor failed, not the frame; it says nothing about
+/// the decoder. Untagged errors are the frame's lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentError {
+    Window,
+}
+
+impl std::fmt::Display for PresentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("present to the window")
+    }
+}
+
+impl PresentError {
+    /// `e` carries the `Window` marker anywhere in its chain.
+    pub(crate) fn is_window(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<PresentError>() == Some(&PresentError::Window)
     }
 }
 
@@ -148,24 +152,18 @@ fn video_target(v: &VideoImage) -> CscTarget {
 }
 
 impl DirectSrc {
-    /// The 3-plane CSC pipe (PyroWave, software I420) over the NV12 one.
-    fn planar(self) -> bool {
+    /// The CSC pipe these planes need.
+    fn pipe(self) -> CscPipe {
         match self {
-            DirectSrc::Native => false,
+            DirectSrc::Native => CscPipe::Nv12,
+            DirectSrc::NativeYcbcr => CscPipe::Ycbcr,
             #[cfg(target_os = "linux")]
-            DirectSrc::Dmabuf => false,
-            DirectSrc::Cpu => true,
+            DirectSrc::Dmabuf => CscPipe::Nv12,
+            DirectSrc::Cpu => CscPipe::Planar,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-            DirectSrc::Pyro => true,
+            DirectSrc::Pyro => CscPipe::Planar,
         }
     }
-}
-
-/// `PUNKTFUNK_D3D11_NO_MUTEX=1`, read once (debugging only: torn frames).
-#[cfg(windows)]
-fn keyed_mutex_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PUNKTFUNK_D3D11_NO_MUTEX").is_none())
 }
 
 impl Presenter {
@@ -185,7 +183,7 @@ impl Presenter {
         p: &punktfunk_core::video_fit::Placement,
         path: &'static str,
     ) {
-        let key = (self.extent, width, height, path);
+        let key = (self.targets.extent, width, height, path);
         if self.placement_logged == Some(key) {
             return;
         }
@@ -198,7 +196,7 @@ impl Presenter {
                 tracing::$level!(
                     fit = self.video_fit.name(),
                     path,
-                    view = ?(self.extent.width, self.extent.height),
+                    view = ?(self.targets.extent.width, self.targets.extent.height),
                     frame = ?(width, height),
                     dst = ?(p.dst_x, p.dst_y, p.dst_w, p.dst_h),
                     src = ?(p.src_x, p.src_y, p.src_w, p.src_h),
@@ -226,17 +224,18 @@ impl Presenter {
         input: FrameInput<'a>,
         overlay: Option<&OverlayFrame>,
     ) -> Result<Presented<'a>> {
-        if self.extent.width == 0 || self.extent.height == 0 {
-            return Ok(Presented::Shown); // minimized: not Stale (Stale recreates)
-        }
-        match self.state.enter(matches!(input, FrameInput::Redraw)) {
-            Entry::Draw => {}
-            Entry::Skip => return Ok(Presented::Shown),
-            // Only the Linux lane takes the window.
-            Entry::Resume => {
-                #[cfg(target_os = "linux")]
-                self.resume_swapchain(window)?;
-            }
+        // A redraw carrying an overlay the lane cannot show needs the swapchain, or the
+        // console never appears after a stream that ended on the lane.
+        let entry = match input {
+            FrameInput::Redraw => Input::Redraw {
+                overlay_blocked: overlay.is_some() && self.overlay_blocks_native,
+            },
+            _ => Input::RealFrame,
+        };
+        // Minimized, or a redraw the lane shows: not Stale (Stale recreates).
+        let entered = self.reconfigure(entry, window);
+        if entered.context(PresentError::Window)? == Applied::Dropped {
+            return Ok(Presented::Shown);
         }
         let input = match self.glass_gate(window, input)? {
             ControlFlow::Continue(input) => input,
@@ -256,7 +255,8 @@ impl Presenter {
             if let Lane::Dmabuf(f) = lane {
                 drop(f);
             }
-            self.recreate_swapchain(window)?;
+            self.reconfigure(Input::OutOfDate, window)
+                .context(PresentError::Window)?;
             return Ok(Presented::Stale);
         };
         self.retire(&lane);
@@ -307,7 +307,7 @@ impl Presenter {
         input: FrameInput<'a>,
     ) -> Result<ControlFlow<Presented<'a>, FrameInput<'a>>> {
         let nonblocking = self.needs_glass_gate()
-            && self.present_timer.is_none()
+            && !self.glass.has_waiter()
             && !matches!(input, FrameInput::Redraw);
         if !nonblocking {
             return Ok(ControlFlow::Continue(input));
@@ -326,10 +326,10 @@ impl Presenter {
             // The non-blocking probe runs only without a present waiter: no swapchain lock.
             // SAFETY: `swapchain`/`acquire_sem` are owned. No image is held, so every wait
             // on `acquire_sem` is complete: a present's by its fence (checked above), a
-            // discarded image's by `recreate_swapchain`'s queue drain.
+            // discarded image's by the rebuild's queue drain.
             match unsafe {
                 self.swap_d.acquire_next_image(
-                    self.swapchain,
+                    self.targets.swapchain,
                     0,
                     self.acquire_sem,
                     vk::Fence::null(),
@@ -341,17 +341,23 @@ impl Presenter {
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
                 | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                    self.recreate_swapchain(window)?;
+                    self.reconfigure(Input::OutOfDate, window)
+                        .context(PresentError::Window)?;
                     return Ok(ControlFlow::Break(Presented::Stale));
                 }
-                Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+                Err(e) => {
+                    return Err(e)
+                        .context("vkAcquireNextImageKHR")
+                        .context(PresentError::Window)
+                }
             }
         }
         Ok(ControlFlow::Continue(input))
     }
 
-    /// HDR follows this frame's PQ flag before any work. No HDR10 surface → PQ stays on
-    /// the SDR swapchain; CSC shader mode 1 tonemaps. A `Redraw` changes nothing.
+    /// HDR follows this frame's PQ flag before any work (the model's `Follow`). No HDR10
+    /// surface → PQ stays on the SDR swapchain; CSC shader mode 1 tonemaps. A `Redraw`
+    /// changes nothing. A failed flip is the window's error, not the frame's.
     fn follow_hdr(&mut self, window: &sdl3::video::Window, input: &FrameInput) -> Result<()> {
         let pq = match input {
             FrameInput::Redraw => return Ok(()),
@@ -359,7 +365,7 @@ impl Presenter {
             #[cfg(target_os = "linux")]
             FrameInput::Dmabuf(d) => d.color.is_pq(),
             #[cfg(windows)]
-            FrameInput::D3d11(d) => d.color.is_pq(),
+            FrameInput::D3d11(d) => d.color().is_pq(),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             FrameInput::PyroWave(f) => f.color.is_pq(),
             FrameInput::NativeVk(f) => f.color.is_pq(),
@@ -373,11 +379,9 @@ impl Presenter {
                  usually means the gamescope Vulkan WSI layer is not visible in the sandbox."
             );
         }
-        let want = pq && self.hdr10_format.is_some();
-        if want != self.hdr_active {
-            self.set_hdr_mode(window, want)?;
-        }
-        Ok(())
+        self.reconfigure(Input::Follow { pq }, window)
+            .context(PresentError::Window)
+            .map(drop)
     }
 
     /// One frame in flight: wait the last submit's fence, which covers the command buffer,
@@ -407,19 +411,20 @@ impl Presenter {
             Some(index) => Ok((index, false)),
             None => {
                 // With a present waiter, each call holds the swapchain for one bounded slice.
-                let timeout = match self.present_timer {
-                    Some(_) => SLICE_NS,
-                    None => u64::MAX,
+                let timeout = if self.glass.has_waiter() {
+                    SLICE_NS
+                } else {
+                    u64::MAX
                 };
                 loop {
-                    let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
+                    let _swapchain = self.glass.swapchain_guard();
                     // SAFETY: `swapchain` and `acquire_sem` are owned here; the guard above is
                     // the swapchain's host sync. No image is held, so every wait on
                     // `acquire_sem` is complete: a present's by the fence wait before this
                     // call, a discarded image's by `recreate_swapchain`'s queue drain.
                     let r = unsafe {
                         self.swap_d.acquire_next_image(
-                            self.swapchain,
+                            self.targets.swapchain,
                             timeout,
                             self.acquire_sem,
                             vk::Fence::null(),
@@ -435,7 +440,11 @@ impl Presenter {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => return Ok(None),
-            Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+            Err(e) => {
+                return Err(e)
+                    .context("vkAcquireNextImageKHR")
+                    .context(PresentError::Window)
+            }
         };
         self.state.acquired = Some(index);
         self.last_acquire_us = started.elapsed().as_micros() as u32;
@@ -515,11 +524,11 @@ impl Presenter {
         let source = self.video.as_ref().map(|v| (v.image, v.width, v.height));
         #[cfg(windows)]
         let source = slot.map(|(f, w, h)| (f.image, w, h)).or(source);
-        let view = (self.extent.width, self.extent.height);
+        let view = (self.targets.extent.width, self.targets.extent.height);
         let placement = source
             .map(|(_, w, h)| punktfunk_core::video_fit::place(self.video_fit, view, (w, h)))
             .filter(|p| !p.is_empty());
-        let targets_ready = self.overlay_pipe.framebuffers.len() == self.images.len();
+        let targets_ready = self.targets.overlay.framebuffers.len() == self.targets.images.len();
         let filtered = match (placement, &self.video) {
             (Some(p), Some(v)) if !from_slot && targets_ready && crate::scale::needs_filter(&p) => {
                 self.scale
@@ -530,8 +539,11 @@ impl Presenter {
         };
         let last = self.sampled_planes(lane);
         let direct = match (last, source, placement) {
-            (Some(_), Some((_, w, h)), Some(p))
-                if direct_enabled()
+            // The conversion pipe takes the video image and a blit: `DirectPass` has no
+            // pipeline for its layout.
+            (Some(l), Some((_, w, h)), Some(p))
+                if self.knobs.direct_present
+                    && l.src != DirectSrc::NativeYcbcr
                     && targets_ready
                     && !from_slot
                     && filtered.is_none()
@@ -542,11 +554,11 @@ impl Presenter {
             {
                 let covered = p.dst_x == 0
                     && p.dst_y == 0
-                    && p.dst_w == self.extent.width
-                    && p.dst_h == self.extent.height;
+                    && p.dst_w == self.targets.extent.width
+                    && p.dst_h == self.targets.extent.height;
                 Some(CscTarget::Direct {
-                    framebuffer: self.overlay_pipe.framebuffers[index as usize],
-                    surface: self.extent,
+                    framebuffer: self.targets.overlay.framebuffers[index as usize],
+                    surface: self.targets.extent,
                     rect: vk::Rect2D {
                         offset: vk::Offset2D {
                             x: p.dst_x as i32,
@@ -606,15 +618,21 @@ impl Presenter {
             // so a taller decode pool does not show.
             Lane::Native(f) => {
                 let (depth, msb_packed) = csc_depth_packing_or_8bit(f.vk_format);
+                let ycbcr = f.ycbcr_view != 0;
                 Some(DirectLast {
-                    src: DirectSrc::Native,
+                    src: if ycbcr {
+                        DirectSrc::NativeYcbcr
+                    } else {
+                        DirectSrc::Native
+                    },
                     uv_scale: [
                         f.width as f32 / f.coded_width as f32,
                         f.height as f32 / f.coded_height as f32,
                     ],
                     color: f.color,
                     depth,
-                    msb_packed,
+                    // A conversion reads a 10-bit code as code/1023, a plane view as UNORM16.
+                    msb_packed: msb_packed && !ycbcr,
                 })
             }
             // Always 8-bit, no MSB packing — R8 planes, whatever the stream signals. PQ
@@ -663,14 +681,11 @@ impl Presenter {
     ) -> Option<(vk::Semaphore, u64)> {
         // The VideoProcessor already delivered RGB matching the HDR mode: the
         // composite reads an RGB slot itself (this frame's, or the retained one on
-        // `Redraw`). Cross-API sync is the keyed mutex on submit, not these barriers.
+        // `Redraw`). Cross-API sync is the keyed mutex or the fences on submit.
         #[cfg(windows)]
         if let Some((f, _, _)) = plan.slot {
-            external_acquire_barrier(
-                &self.device,
-                self.cmd_buf,
-                f.image,
-                self.qfi,
+            self.slot_acquire_barrier(
+                &f,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::TRANSFER_READ,
@@ -719,17 +734,14 @@ impl Presenter {
     #[cfg(windows)]
     unsafe fn record_d3d11(
         &self,
-        d: &pf_client_core::video::D3d11Frame,
+        d: &pf_client_core::video::SharedSlot,
         f: &crate::d3d11::Imported,
     ) {
         let (Some(v), true) = (&self.video, f.planes.is_some()) else {
             return;
         };
-        external_acquire_barrier(
-            &self.device,
-            self.cmd_buf,
-            f.image,
-            self.qfi,
+        self.slot_acquire_barrier(
+            f,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::AccessFlags::SHADER_READ,
@@ -741,7 +753,7 @@ impl Presenter {
         // SAFETY: `cmd_buf` is recording and the set points at `f` (`# Safety` above).
         unsafe {
             self.record_csc(
-                false,
+                CscPipe::Nv12,
                 video_target(v),
                 [1.0, 1.0],
                 d.color,
@@ -751,6 +763,39 @@ impl Presenter {
         };
     }
 
+    /// [`external_acquire_barrier`] for a ring slot. A fenced slot's hop starts at `stage`,
+    /// inside the submit's `written` wait; a TOP_OF_PIPE hop would not wait for it.
+    #[cfg(windows)]
+    fn slot_acquire_barrier(
+        &self,
+        f: &crate::d3d11::Imported,
+        layout: vk::ImageLayout,
+        stage: vk::PipelineStageFlags,
+        access: vk::AccessFlags,
+    ) {
+        if f.fences.is_none() {
+            external_acquire_barrier(
+                &self.device,
+                self.cmd_buf,
+                f.image,
+                self.qfi,
+                layout,
+                stage,
+                access,
+            );
+            return;
+        }
+        Barrier {
+            image: f.image,
+            range: subresource_range(),
+            layouts: (vk::ImageLayout::UNDEFINED, layout),
+            stages: (stage, stage),
+            access: (vk::AccessFlags::empty(), access),
+            queues: (vk::QUEUE_FAMILY_EXTERNAL, self.qfi),
+        }
+        .record(&self.device, self.cmd_buf);
+    }
+
     /// A Vulkan Video picture, already on this device: its layer goes to
     /// SHADER_READ_ONLY_OPTIMAL for the CSC pass and back to its decode layout after. Pool
     /// images are CONCURRENT across graphics+decode, so these are layout transitions, not
@@ -758,7 +803,7 @@ impl Presenter {
     /// submit waits; a `Redraw` of `f` drops it, since the last real submit spent it.
     ///
     /// # Safety
-    /// `self.cmd_buf` is recording, and the NV12 CSC set points at `f`'s plane views.
+    /// `self.cmd_buf` is recording, and the set of `plan.last`'s pipe points at `f`'s views.
     unsafe fn record_native(
         &self,
         f: &NativeVkFrame,
@@ -888,7 +933,7 @@ impl Presenter {
         // above); `retired_hw` keeps the frame behind them alive.
         unsafe {
             match l.src {
-                DirectSrc::Native => {
+                DirectSrc::Native | DirectSrc::NativeYcbcr => {
                     if let Some(Held {
                         frame: Retired::NativeVk(f),
                         ..
@@ -916,7 +961,7 @@ impl Presenter {
         // SAFETY: the caller's contract is `record_csc`'s.
         unsafe {
             self.record_csc(
-                l.src.planar(),
+                l.src.pipe(),
                 target,
                 l.uv_scale,
                 l.color,
@@ -954,8 +999,8 @@ impl Presenter {
                     self.cmd_buf,
                     (v.width, v.height),
                     &p,
-                    self.overlay_pipe.framebuffers[plan.index as usize],
-                    self.extent,
+                    self.targets.overlay.framebuffers[plan.index as usize],
+                    self.targets.extent,
                 )
             };
             barrier(
@@ -967,7 +1012,7 @@ impl Presenter {
             );
             return vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         }
-        let swap_image = self.images[plan.index as usize];
+        let swap_image = self.targets.images[plan.index as usize];
         barrier(
             &self.device,
             self.cmd_buf,
@@ -982,8 +1027,8 @@ impl Presenter {
             (Some(_), Some(p))
                 if p.dst_x == 0
                     && p.dst_y == 0
-                    && p.dst_w == self.extent.width
-                    && p.dst_h == self.extent.height
+                    && p.dst_w == self.targets.extent.width
+                    && p.dst_h == self.targets.extent.height
         );
         if !covered {
             // SAFETY: `cmd_buf` is recording (`# Safety` above); the swapchain image was
@@ -1072,8 +1117,8 @@ impl Presenter {
         swap_layout: vk::ImageLayout,
     ) {
         let index = plan.index as usize;
-        let swap_image = self.images[index];
-        let Some(o) = overlay.filter(|_| index < self.overlay_pipe.framebuffers.len()) else {
+        let swap_image = self.targets.images[index];
+        let Some(o) = overlay.filter(|_| index < self.targets.overlay.framebuffers.len()) else {
             barrier(
                 &self.device,
                 self.cmd_buf,
@@ -1101,7 +1146,7 @@ impl Presenter {
         );
         let full = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: self.extent,
+            extent: self.targets.extent,
         };
         // SAFETY: `cmd_buf` is recording (`# Safety` above); the pipe, its framebuffer for
         // `index` and its set are owned here, and the set points at `overlay`.
@@ -1109,15 +1154,15 @@ impl Presenter {
             self.device.cmd_begin_render_pass(
                 self.cmd_buf,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.overlay_pipe.render_pass)
-                    .framebuffer(self.overlay_pipe.framebuffers[index])
+                    .render_pass(self.overlay_pipe.pass.render_pass)
+                    .framebuffer(self.targets.overlay.framebuffers[index])
                     .render_area(full),
                 vk::SubpassContents::INLINE,
             );
             self.device.cmd_bind_pipeline(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.overlay_pipe.pipeline,
+                self.overlay_pipe.pass.pipeline,
             );
             self.device.cmd_set_viewport(
                 self.cmd_buf,
@@ -1125,8 +1170,8 @@ impl Presenter {
                 &[vk::Viewport {
                     x: 0.0,
                     y: 0.0,
-                    width: self.extent.width as f32,
-                    height: self.extent.height as f32,
+                    width: self.targets.extent.width as f32,
+                    height: self.targets.extent.height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
@@ -1135,7 +1180,7 @@ impl Presenter {
             self.device.cmd_bind_descriptor_sets(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.overlay_pipe.pipeline_layout,
+                self.overlay_pipe.pass.pipeline_layout,
                 0,
                 &[self.overlay_pipe.desc_set],
                 &[],
@@ -1147,8 +1192,8 @@ impl Presenter {
 
     /// Submit the recording: wait the acquire, the native lane's decode timeline and the
     /// VAAPI decode's fences; signal the image's render semaphore, the native timeline's
-    /// next value and, with present timing, `done_sem`. On Windows the keyed mutex orders a
-    /// D3D11 slot read.
+    /// next value and, with present timing, `done_sem`. On Windows a D3D11 slot read is
+    /// ordered by its ring's fences, or else by its keyed mutex.
     ///
     /// # Safety
     /// `self.cmd_buf` holds this present's ended recording, `self.fence` is unsignaled,
@@ -1159,7 +1204,7 @@ impl Presenter {
         plan: &FramePlan,
         native_wait: Option<(vk::Semaphore, u64)>,
     ) -> Result<()> {
-        let render_sem = self.render_sems[plan.index as usize];
+        let render_sem = self.targets.render_sems[plan.index as usize];
         let cmd_bufs = [self.cmd_buf];
         let mut wait_sems = vec![self.acquire_sem];
         // The swapchain image is written by the blit (transfer) or by the direct,
@@ -1189,12 +1234,22 @@ impl Presenter {
                 wait_values.push(0);
             }
         }
+        // A fenced D3D11 slot, waited at the stages its `slot_acquire_barrier` starts in.
+        let ring_fence = self.ring_fence(lane, plan);
+        if let Some([(written, value), (read, next)]) = ring_fence {
+            wait_sems.push(written);
+            wait_stages
+                .push(vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER);
+            wait_values.push(value);
+            signal_sems.push(read);
+            signal_values.push(next);
+        }
         // With present timing the submit also signals `done_sem` with the id the
         // present below will carry: the waiter splits our GPU time from the compositor's.
-        let timed = self.glass_active() && self.done_sem != vk::Semaphore::null();
+        let timed = self.glass.follows() && self.done_sem != vk::Semaphore::null();
         if timed {
             signal_sems.push(self.done_sem);
-            signal_values.push(self.next_present_id + 1);
+            signal_values.push(self.glass.next_id());
         }
         let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(&wait_values)
@@ -1204,12 +1259,12 @@ impl Presenter {
             .wait_dst_stage_mask(&wait_stages)
             .command_buffers(&cmd_bufs)
             .signal_semaphores(&signal_sems);
-        if native_wait.is_some() || timed {
+        if native_wait.is_some() || timed || ring_fence.is_some() {
             submit = submit.push_next(&mut timeline);
         }
         // Keyed mutex, key 0 both ways (decode writes under acquire(0)/release(0)
-        // too), on every submit that reads a slot, `Redraw` included. Acquire orders
-        // the read after the decoder's Blt or copy; release unblocks the ring slot.
+        // too), on every submit that reads an unfenced slot, `Redraw` included. Acquire
+        // orders the read after the decoder's Blt or copy; release unblocks the ring slot.
         #[cfg(windows)]
         let keyed_mem;
         #[cfg(windows)]
@@ -1219,14 +1274,17 @@ impl Presenter {
         #[cfg(windows)]
         let mut keyed_info;
         #[cfg(windows)]
-        let lane_memory = match lane {
-            Lane::D3d11(_, f) => Some(f.memory),
+        let lane_import = match lane {
+            Lane::D3d11(_, f) => Some(*f),
             _ => None,
         };
         #[cfg(windows)]
-        if let Some(memory) = lane_memory.or(plan.slot.map(|(f, _, _)| f.memory)) {
-            if keyed_mutex_on() {
-                keyed_mem = [memory];
+        if let Some(f) = lane_import
+            .or(plan.slot.map(|(f, _, _)| f))
+            .filter(|f| f.fences.is_none())
+        {
+            if !self.knobs.d3d11_no_mutex {
+                keyed_mem = [f.memory];
                 keyed_info = vk::Win32KeyedMutexAcquireReleaseInfoKHR::default()
                     .acquire_syncs(&keyed_mem)
                     .acquire_keys(&keyed_keys)
@@ -1261,13 +1319,53 @@ impl Presenter {
         Ok(())
     }
 
+    /// A fenced D3D11 slot's `written` wait and `read` signal, as (semaphore, value), for a
+    /// new frame or a `Redraw` of the parked one ([`crate::d3d11::next_read`]). `None` for
+    /// any other frame.
+    fn ring_fence(&mut self, lane: &Lane, plan: &FramePlan) -> Option<[(vk::Semaphore, u64); 2]> {
+        #[cfg(windows)]
+        if let Some(hw) = self.hw_win.as_mut() {
+            let mut fresh;
+            let (pair, slot) = match (lane, plan.slot) {
+                (Lane::D3d11(d, f), _) => {
+                    let (Some(fence), Some(pair)) = (&d.fence, f.fences) else {
+                        return None;
+                    };
+                    fresh = crate::d3d11::SlotReads {
+                        written: fence.written,
+                        read: 0,
+                    };
+                    (pair, &mut fresh)
+                }
+                (Lane::Redraw, Some((f, _, _))) => {
+                    let (Some(pair), Some(parked)) = (f.fences, hw.parked.as_mut()) else {
+                        return None;
+                    };
+                    (pair, &mut parked.reads)
+                }
+                _ => return None,
+            };
+            let (written, read) = crate::d3d11::next_read(&mut hw.reads, slot);
+            return Some([(pair.written, written), (pair.read, read)]);
+        }
+        let _ = (lane, plan);
+        None
+    }
+
     /// Park the submitted hardware frame, with what the direct pass drew from it, until
     /// the fence proves its reads done (next present's wait, or Drop). A D3D11 slot stays
-    /// in the import cache. A `Redraw` keeps the parked frame: it read it again. Only
-    /// after a submit that succeeded.
+    /// in the import cache; a fenced one stays parked in `hw_win` for `Redraw` until a later
+    /// frame's submit. A `Redraw` keeps the parked frame: it read it again. Only after a
+    /// submit that succeeded.
     fn park(&mut self, lane: Lane, direct: Option<DirectLast>) {
         if matches!(lane, Lane::Redraw) {
             return;
+        }
+        // This submit waited the last one's fence before recording and does not read the
+        // parked slot (the ring never hands out a held one): it goes back now.
+        #[cfg(windows)]
+        if let Some(parked) = self.hw_win.as_mut().and_then(|hw| hw.parked.take()) {
+            parked.release();
         }
         let frame = match lane {
             #[cfg(target_os = "linux")]
@@ -1281,6 +1379,20 @@ impl Presenter {
             }
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Lane::Pyro(f) => Some(Retired::Pyro(f)),
+            // `ring_fence` stamped this submit's `read` as the latest of `reads`.
+            #[cfg(windows)]
+            Lane::D3d11(d, _) => {
+                if let (Some(fence), Some(hw)) = (d.fence, self.hw_win.as_mut()) {
+                    hw.parked = Some(crate::d3d11::Parked {
+                        guard: fence.guard,
+                        reads: crate::d3d11::SlotReads {
+                            written: fence.written,
+                            read: hw.reads,
+                        },
+                    });
+                }
+                None
+            }
             _ => None,
         };
         self.retired_hw = frame.map(|frame| Held { frame, direct });
@@ -1296,25 +1408,18 @@ impl Presenter {
         &mut self,
         window: &sdl3::video::Window,
         index: u32,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] redraw: bool,
+        redraw: bool,
     ) -> Result<Presented<'static>> {
-        let swapchains = [self.swapchain];
+        let swapchains = [self.targets.swapchain];
         let indices = [index];
-        let present_sems = [self.render_sems[index as usize]];
+        let present_sems = [self.targets.render_sems[index as usize]];
         // Monotonic present id for `PresentTimer`'s `vkWaitForPresentKHR`.
-        let ids = [self.next_present_id + 1];
+        let ids = [self.glass.next_id()];
         let mut pid_info = vk::PresentIdKHR::default().present_ids(&ids);
         let mut pid2_info = super::setup::present_wait2::PresentId2::new(&ids);
-        // A stamp only while the swapchain's result queue has room: asking into a
-        // full one fails the present.
-        let ask = self
-            .timing
-            .as_ref()
-            .filter(|t| self.state.timing_armed && t.may_ask());
-        let timing_info = ask.map_or_else(
-            || super::timing_ext::TimingInfo::stamps(0, 0),
-            |t| t.request(),
-        );
+        let ask = self.glass.ask();
+        let asked = ask.is_some();
+        let timing_info = ask.unwrap_or_else(|| super::timing_ext::TimingInfo::stamps(0, 0));
         let timings_info = super::timing_ext::TimingsInfo::new(&timing_info);
         let mut present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(&present_sems)
@@ -1322,31 +1427,22 @@ impl Presenter {
             .image_indices(&indices);
         // The id names the `done_sem` value either way; only present-wait carries it
         // to the driver, in the struct of the generation the waiter runs on.
-        let glass = self.glass_active();
-        if glass {
-            self.next_present_id += 1;
-        }
-        // The compositor stamps the commit this present makes. Only a waiter's sample
-        // can take it; without one the answers would pile up unread.
-        #[cfg(target_os = "linux")]
-        if let Some(fb) = self.feedback.as_mut().filter(|_| glass && !redraw) {
-            fb.request(self.next_present_id);
-        }
-        if self.present_id2 {
+        self.glass.take_id(redraw);
+        if self.glass.id2() {
             // Hand-rolled structs: the chain is empty here, so they are the whole chain.
-            if ask.is_some() {
+            if asked {
                 pid2_info.p_next = (&timings_info) as *const _ as *const std::ffi::c_void;
             }
             present_info.p_next = (&pid2_info) as *const _ as *const std::ffi::c_void;
-        } else if self.present_timer.is_some() {
+        } else if self.glass.has_waiter() {
             present_info = present_info.push_next(&mut pid_info);
         }
         let present_started = std::time::Instant::now();
         // Same queue external-sync as the submit. Scoped tightly: OUT_OF_DATE
-        // re-enters the lock via `recreate_swapchain`'s queue drain. The swapchain
+        // re-enters the lock via the rebuild's queue drain. The swapchain
         // guard comes first, so a waiter slice never holds off decode submits.
         let present_res = {
-            let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
+            let _swapchain = self.glass.swapchain_guard();
             let _q = self.queue_lock.guard();
             // SAFETY: the caller's contract has the submit signal the waited semaphore; the
             // chained structs are locals that outlive the call, and `queue` is held under
@@ -1354,34 +1450,31 @@ impl Presenter {
             unsafe { self.swap_d.queue_present(self.queue, &present_info) }
         };
         self.last_present_us = present_started.elapsed().as_micros() as u32;
-        let asked = ask.is_some();
         match present_res {
             Ok(_) => {
-                // A failed present's id may never signal — claim it only on Ok.
-                if self.glass_active() {
-                    self.last_presented = Some((self.swapchain, self.next_present_id));
-                }
-                self.state.timing_asked = asked;
-                if let Some(t) = self.timing.as_ref().filter(|_| asked) {
-                    t.note_asked();
-                }
+                self.glass.sent(self.targets.swapchain, asked);
                 Ok(Presented::Shown)
             }
             // The driver counted its result queue differently: stop asking, and take
             // a swapchain whose queue is empty.
             Err(super::timing_ext::QUEUE_FULL) => {
                 tracing::warn!("present stamp queue full; presenting without stamps");
-                self.timing = None;
-                self.state.timing_armed = false;
-                self.recreate_swapchain(window)?;
+                // The waiter polls while stamps are outstanding: forget them, or it asks a
+                // swapchain made without the timing flag.
+                self.glass.queue_full();
+                self.reconfigure(Input::QueueFull, window)
+                    .context(PresentError::Window)?;
                 Ok(Presented::Stale)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                self.recreate_swapchain(window)?;
+                self.reconfigure(Input::OutOfDate, window)
+                    .context(PresentError::Window)?;
                 Ok(Presented::Stale)
             }
-            Err(e) => Err(e).context("vkQueuePresentKHR"),
+            Err(e) => Err(e)
+                .context("vkQueuePresentKHR")
+                .context(PresentError::Window),
         }
     }
 
@@ -1406,6 +1499,7 @@ impl Presenter {
                     &mut hw.imports,
                     hw.sync.as_mut(),
                     d,
+                    self.knobs.hw_fault,
                 )?)
             }
             #[cfg(windows)]
@@ -1414,18 +1508,28 @@ impl Presenter {
                     .hw_win
                     .as_mut()
                     .context("D3D11 frame without win32 import support")?;
+                let d = crate::d3d11::shared_slot(d)?;
                 let started = std::time::Instant::now();
-                let imported = hw
-                    .imports
-                    .get_or_import(&self.device, &hw.ext_mem_win32, &d)?;
+                let imported = hw.imports.get_or_import(
+                    &self.device,
+                    &hw.ext_mem_win32,
+                    hw.ext_sem_win32.as_ref(),
+                    &d,
+                    self.knobs.hw_fault,
+                )?;
                 self.last_import_us = started.elapsed().as_micros() as u32;
                 Lane::D3d11(d, imported)
             }
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             FrameInput::PyroWave(f) => Lane::Pyro(f),
-            // Same device; decoder already made the per-plane views — no import,
-            // no view create, nothing that can fail here.
-            FrameInput::NativeVk(f) => Lane::Native(f),
+            // Same device; the decoder already made the views, so no import and no view
+            // create. Only the conversion pipe can fail here, and here is before acquire.
+            FrameInput::NativeVk(f) => {
+                if f.ycbcr_view != 0 {
+                    self.ensure_csc_ycbcr(vk::Format::from_raw(f.vk_format.0))?;
+                }
+                Lane::Native(f)
+            }
         })
     }
 
@@ -1478,12 +1582,17 @@ impl Presenter {
                         );
                     }
                 }
-                // Decoder-owned plane views.
-                self.csc.bind_planes(
-                    &self.device,
-                    vk::ImageView::from_raw(f.plane_views[0]),
-                    vk::ImageView::from_raw(f.plane_views[1]),
-                );
+                // Decoder-owned views.
+                if f.ycbcr_view != 0 {
+                    self.csc_ycbcr
+                        .bind_ycbcr(&self.device, vk::ImageView::from_raw(f.ycbcr_view));
+                } else {
+                    self.csc.bind_planes(
+                        &self.device,
+                        vk::ImageView::from_raw(f.plane_views[0]),
+                        vk::ImageView::from_raw(f.plane_views[1]),
+                    );
+                }
             }
             // Decode leaves planes in GENERAL; CPU uploads arrive in SHADER_READ_ONLY_OPTIMAL.
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
@@ -1496,25 +1605,48 @@ impl Presenter {
         Ok(None)
     }
 
+    /// The conversion pipe for `format`, built on the first picture that needs it and again
+    /// when the stream changes format. `import` calls this: a failure there spends no acquire,
+    /// and the wait here leaves nothing submitted that references the pipe it replaces.
+    fn ensure_csc_ycbcr(&mut self, format: vk::Format) -> Result<()> {
+        if self.csc_ycbcr_format == format {
+            return Ok(());
+        }
+        self.quiesce_own()?;
+        // SAFETY: `pdev` is one of `instance`'s physical devices.
+        let conversion = unsafe {
+            pf_vkdecode::caps::device_ycbcr_conversion(&self.instance, self.pdev, format)
+        }
+        .with_context(|| format!("find a Y'CbCr conversion for {format:?}"))?;
+        let descriptors = ycbcr_descriptors(&self.instance, self.pdev, format)?;
+        let pass = CscPass::new_ycbcr(&self.device, super::VIDEO_FORMAT, &conversion, descriptors)?;
+        std::mem::replace(&mut self.csc_ycbcr, pass).destroy(&self.device);
+        self.csc_ycbcr_format = format;
+        Ok(())
+    }
+
     /// YCbCr→RGBA CSC: a fullscreen triangle with the CICP push-constant rows, drawn where
-    /// `target` says. `planar` picks the 3-plane pipe (PyroWave, software I420) over the
-    /// NV12 one (dmabuf, Vulkan Video, D3D11 slots). `uv_scale` is picture/surface per
-    /// axis: `[1.0, 1.0]` unless the bound planes are a decode pool larger than the
-    /// picture (see the shader's `params.zw`).
+    /// `target` says. `pipe` is the pass that matches the bound views. `uv_scale` is
+    /// picture/surface per axis: `[1.0, 1.0]` unless the bound planes are a decode pool
+    /// larger than the picture (see the shader's `params.zw`).
     ///
     /// # Safety
     /// `self.cmd_buf` must be recording; the pass's descriptor set must point at live
     /// plane views.
     unsafe fn record_csc(
         &self,
-        planar: bool,
+        pipe: CscPipe,
         target: CscTarget,
         uv_scale: [f32; 2],
         color: pf_client_core::video::ColorDesc,
         depth: u8,
         msb_packed: bool,
     ) {
-        let pass = if planar { &self.csc_planar } else { &self.csc };
+        let csc = match pipe {
+            CscPipe::Nv12 => &self.csc,
+            CscPipe::Planar => &self.csc_planar,
+            CscPipe::Ycbcr => &self.csc_ycbcr,
+        };
         let full = |extent: vk::Extent2D| vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent,
@@ -1524,8 +1656,8 @@ impl Presenter {
                 framebuffer,
                 extent,
             } => (
-                pass.render_pass,
-                pass.pipeline,
+                csc.pass.render_pass,
+                csc.pass.pipeline,
                 framebuffer,
                 full(extent),
                 full(extent),
@@ -1541,7 +1673,7 @@ impl Presenter {
                 } else {
                     self.direct.keep
                 },
-                if planar {
+                if pipe == CscPipe::Planar {
                     self.direct.planar
                 } else {
                     self.direct.nv12
@@ -1586,9 +1718,9 @@ impl Presenter {
             self.device.cmd_bind_descriptor_sets(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                pass.pipeline_layout,
+                csc.pass.pipeline_layout,
                 0,
-                &[pass.desc_set],
+                &[csc.desc_set],
                 &[],
             );
             let rows = csc_rows(color, depth, msb_packed);
@@ -1602,14 +1734,14 @@ impl Presenter {
             let mut pc = [0f32; 16];
             pc[..12].copy_from_slice(rows.as_flattened());
             pc[12] = mode;
-            pc[13] = tonemap_peak();
+            pc[13] = self.knobs.tonemap_peak.unwrap_or(4.9);
             pc[14] = uv_scale[0];
             pc[15] = uv_scale[1];
             let words = pc.map(f32::to_ne_bytes);
             let bytes = words.as_flattened();
             self.device.cmd_push_constants(
                 self.cmd_buf,
-                pass.pipeline_layout,
+                csc.pass.pipeline_layout,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytes,
@@ -1674,6 +1806,18 @@ fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loop reads the marker under whatever context is added on the way up.
+    #[test]
+    fn a_window_error_keeps_its_class_through_the_chain() {
+        let tagged = Err::<(), _>(vk::Result::ERROR_SURFACE_LOST_KHR)
+            .context("vkAcquireNextImageKHR")
+            .context(PresentError::Window)
+            .context("hardware present");
+        assert!(PresentError::is_window(&tagged.unwrap_err()));
+        let lane = Err::<(), _>(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).context("import");
+        assert!(!PresentError::is_window(&lane.unwrap_err()));
+    }
 
     /// 8-bit math on a 10-bit `3PACK16` picture expands range and the PQ curve wrong.
     #[test]

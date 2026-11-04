@@ -9,13 +9,19 @@
 
 use crate::ipc::{Diagnostic, SeatingStatus};
 use crate::model::{Ledger, RuntimeStatus, Seat};
+use crate::secret::Secret;
 
 pub trait PlatformBackend: Send + Sync + 'static {
     fn provision(&self, seat: &Seat) -> Result<(), BackendError>;
     fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError>;
     fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError>;
     fn remove(&self, seat: &Seat) -> Result<(), BackendError>;
+    /// A pure read of `seat`'s state.
     fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError>;
+
+    /// Brings what runs beside `seat`'s unit level with `status`, a reading just taken. The
+    /// service calls it only for a seat that no start, stop or delete is changing.
+    fn reconcile(&self, _seat: &Seat, _status: &RuntimeStatus) {}
 
     fn doctor(&self, _ledger: &Ledger) -> Result<Vec<Diagnostic>, BackendError> {
         Ok(Vec::new())
@@ -29,6 +35,17 @@ pub trait PlatformBackend: Send + Sync + 'static {
     /// Check that `seat`, the owner's new row, names an ordinary account that already exists,
     /// and prepare what its host reads. Nothing is created: the account is the owner's own.
     fn adopt(&self, _seat: &Seat) -> Result<(), BackendError> {
+        Err(UnsupportedBackend::unavailable())
+    }
+
+    /// Make `seat`, a new adopted row, ready to run on its person's account with `password`. A
+    /// refusal undoes its own steps. `Ok(true)`: adopt put the account in Remote Desktop Users.
+    fn adopt_account(&self, _seat: &Seat, _password: &Secret) -> Result<bool, BackendError> {
+        Err(UnsupportedBackend::unavailable())
+    }
+
+    /// Verify `password`, an adopted row's new one, and store it in place of the old.
+    fn reseal(&self, _seat: &Seat, _password: &Secret) -> Result<(), BackendError> {
         Err(UnsupportedBackend::unavailable())
     }
 
@@ -58,6 +75,21 @@ pub trait PlatformBackend: Send + Sync + 'static {
     fn disable(&self, _keep_accounts: bool) -> Result<SeatingStatus, BackendError> {
         Err(UnsupportedBackend::unavailable())
     }
+
+    /// Install the Flatpak app `id`, already checked, from Flathub for every account on the box,
+    /// and answer its version.
+    fn install_flatpak(&self, _id: &str) -> Result<Option<String>, BackendError> {
+        Err(no_flatpaks())
+    }
+
+    /// Remove the box-wide Flatpak app `id`, already checked; `purge` deletes its data too.
+    fn remove_flatpak(&self, _id: &str, _purge: bool) -> Result<(), BackendError> {
+        Err(no_flatpaks())
+    }
+}
+
+fn no_flatpaks() -> BackendError {
+    BackendError::new("not_supported", "box-wide Flatpaks are Linux's")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

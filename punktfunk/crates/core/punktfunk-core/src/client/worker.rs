@@ -16,8 +16,7 @@ use std::sync::{Arc, Mutex};
 
 /// Cells [`NativeClient`] and the worker's tasks share, one `Arc` per dial.
 ///
-/// `clock_offset` and `shutdown` stay `Arc`s: embedders and the data-punch thread hold
-/// those cells on their own.
+/// `clock_offset` and `shutdown` stay `Arc`s: embedders hold those cells on their own.
 pub(crate) struct ClientShared {
     pub(crate) frames: FrameChannel,
     pub(crate) shutdown: Arc<AtomicBool>,
@@ -58,8 +57,15 @@ pub(crate) struct ClientShared {
     pub(crate) feedback: Mutex<super::recovery::FeedbackOut>,
     /// Where feedback datagrams leave: the session's connection, from when the pump has one.
     pub(crate) feedback_tx: std::sync::OnceLock<FeedbackTx>,
+    /// Re-picks the shared socket's source address after the device's path changed.
+    pub(crate) reconnect: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// The host answered `Pending`: its operator is deciding about this device.
+    pub(crate) pending: AtomicBool,
     /// Keyframe asks sent; the pump drains them per report window as the ABR recovery signal.
     pub(crate) recovery_kf: AtomicU32,
+    /// Keyframe asks no lost frame stands behind: a starved, rebuilt or shed decoder's.
+    /// Logged, never judged.
+    pub(crate) starved_kf: AtomicU32,
     /// This device's end of the path, as the dial read it.
     pub(crate) client_link: Mutex<crate::quic::LinkFacts>,
     /// The link rate the host paces at and where it came from, as last told.
@@ -80,8 +86,18 @@ pub(crate) struct ClientShared {
     pub(crate) local_ip: Mutex<Option<std::net::IpAddr>>,
     /// The `punktfunk/2` session id the host issued, kept for a resume if the link is lost.
     pub(crate) v2_session: Mutex<Option<[u8; 16]>>,
-    /// Moves [`Self::mode`] at the first frame of each configured epoch.
-    pub(crate) anchor: Mutex<super::pump::anchor::ModeAnchor>,
+    /// Moves [`Self::mode`] at the first frame of each configured epoch, and books each
+    /// epoch's video format.
+    pub(crate) anchor: Mutex<super::pump::anchor::EpochAnchor>,
+    /// The format of the newest frame handed to the embedder: the Welcome's, then each
+    /// [`crate::session::Frame::new_format`].
+    pub(crate) video_format: Mutex<crate::quic::VideoFormat>,
+    /// `CODEC_*` bits of the last codec ask the host refused; `0` while none was.
+    pub(crate) codec_refused: AtomicU8,
+    /// The desktop audio stream's live format and the `AudioConfig` that moves it next.
+    pub(crate) audio_anchor: Mutex<super::pump::anchor::AudioAnchor>,
+    /// The audio format of the newest packet handed to the embedder; `None` = the Welcome's.
+    pub(crate) audio_out: Mutex<Option<crate::audio::plane::PlaneFormat>>,
     /// Live encoder target (kbps): the Welcome seed, then every `BitrateChanged` ack.
     pub(crate) live_bitrate_kbps: AtomicU32,
     /// [`crate::hud::RateCut`] code the pump publishes each window; `0` = no standing cut.
@@ -117,6 +133,13 @@ pub(crate) struct ClientShared {
     pub(crate) end_reject_code: AtomicU32,
     /// The host's own sentence for that close. Set once, only with non-empty text.
     pub(crate) end_reject_said: std::sync::OnceLock<String>,
+    /// A frame reached the embedder: the host got as far as streaming.
+    pub(crate) streamed: AtomicBool,
+    /// AU memory the embedder installed and the pump has not yet handed its session
+    /// ([`NativeClient::set_au_memory`](super::NativeClient::set_au_memory)).
+    pub(crate) au_memory: Mutex<Option<Arc<dyn crate::au::AuMemory>>>,
+    /// Screens past the first: their lanes and the host's layout.
+    pub(crate) screens: super::screens::Screens,
 }
 
 impl ClientShared {
@@ -143,7 +166,10 @@ impl ClientShared {
             host_link: Mutex::default(),
             feedback: Mutex::default(),
             feedback_tx: std::sync::OnceLock::new(),
+            reconnect: std::sync::OnceLock::new(),
+            pending: AtomicBool::new(false),
             recovery_kf: AtomicU32::new(0),
+            starved_kf: AtomicU32::new(0),
             client_link: Mutex::default(),
             link: Mutex::new((crate::abr::LINK_FLOOR_KBPS, crate::abr::LinkSource::Floor)),
             wake_shape: AtomicBool::new(false),
@@ -154,6 +180,10 @@ impl ClientShared {
             local_ip: Mutex::default(),
             v2_session: Mutex::default(),
             anchor: Mutex::default(),
+            video_format: Mutex::default(),
+            codec_refused: AtomicU8::new(0),
+            audio_anchor: Mutex::default(),
+            audio_out: Mutex::default(),
             live_bitrate_kbps: AtomicU32::new(0),
             rate_cut: AtomicU8::new(0),
             quality_floor_kbps: AtomicU32::new(0),
@@ -170,6 +200,9 @@ impl ClientShared {
             access_deadline_unix: AtomicU64::new(0),
             end_reject_code: AtomicU32::new(0),
             end_reject_said: std::sync::OnceLock::new(),
+            streamed: AtomicBool::new(false),
+            au_memory: Mutex::default(),
+            screens: Default::default(),
         }
     }
 
@@ -185,9 +218,21 @@ impl ClientShared {
         }
     }
 
-    /// Ask for a keyframe. Every keyframe ask leaves here, so here it is counted.
+    /// Ask for a keyframe, counted in `recovery_kf`. Every keyframe ask leaves here or through
+    /// [`Self::ask_starved_keyframe`], so these two count them.
     pub(crate) fn ask_keyframe(&self) {
         self.recovery_kf.fetch_add(1, Ordering::Relaxed);
+        self.send_keyframe_ask();
+    }
+
+    /// [`Self::ask_keyframe`] for an ask no lost frame stands behind, counted in `starved_kf`
+    /// instead.
+    pub(crate) fn ask_starved_keyframe(&self) {
+        self.starved_kf.fetch_add(1, Ordering::Relaxed);
+        self.send_keyframe_ask();
+    }
+
+    fn send_keyframe_ask(&self) {
         let fb = self
             .feedback
             .lock()

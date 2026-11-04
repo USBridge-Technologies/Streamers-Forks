@@ -54,7 +54,7 @@ const TRAY_ENV_VAR: &str = "PUNKTFUNK_TRAY_TOKEN";
 pub(crate) const TRAY_FILE: &str = "tray-token";
 
 /// 32 random bytes as hex: safe in `KEY=VALUE` and in a bearer header.
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     let mut buf = [0u8; 32];
     rand::rng().fill_bytes(&mut buf);
     hex::encode(buf)
@@ -95,7 +95,9 @@ pub fn load_or_generate() -> Result<String> {
 /// PLUGIN, which is what lets the management API refuse a plugin writing another's registration.
 /// Keyed by what is installed now: every install path calls this before it restarts the runner.
 pub fn load_or_generate_per_plugin() -> Result<BTreeMap<String, String>> {
-    let ids: Vec<String> = crate::plugins::manifest::installed().into_keys().collect();
+    let ids: Vec<String> = crate::plugins::manifest::runner_plugins()
+        .into_keys()
+        .collect();
     load_or_generate_per_plugin_in(&pf_paths::config_dir(), &ids)
 }
 

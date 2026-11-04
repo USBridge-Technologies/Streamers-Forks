@@ -265,7 +265,8 @@ mod session_main {
         let mgmt = host.map_or(pf_client_core::library::DEFAULT_MGMT_PORT, |h| {
             h.effective_mgmt_port()
         });
-        match pf_client_core::profiles::fetch_enumerate(addr, mgmt, identity, Some(pin)) {
+        let port = host.map_or(0, |h| h.port);
+        match pf_client_core::profiles::fetch_enumerate(addr, mgmt, port, identity, Some(pin)) {
             Ok(Some(listed)) => {
                 pf_client_core::profiles::find(&listed, &wanted).map_or(wanted, |p| p.id.clone())
             }
@@ -448,17 +449,12 @@ mod session_main {
     /// The Match-window hook (design/midstream-resolution-resize.md D1/D2): each resize-end's
     /// logical size goes out as a `window` line and the spawner persists it.
     /// `persist_locally` is for a hand-run session, where nobody reads stdout.
-    pub(crate) fn match_window(
-        settings: &trust::Settings,
-        persist_locally: bool,
-    ) -> Option<Box<dyn FnMut(u32, u32)>> {
-        settings.match_window.then(|| {
-            Box::new(move |w: u32, h: u32| {
-                emit(SessionLine::Window { w, h });
-                if persist_locally {
-                    pf_client_core::orchestrate::persist_window_size(w, h);
-                }
-            }) as Box<dyn FnMut(u32, u32)>
+    pub(crate) fn on_window_size(persist_locally: bool) -> Box<dyn FnMut(u32, u32)> {
+        Box::new(move |w: u32, h: u32| {
+            emit(SessionLine::Window { w, h });
+            if persist_locally {
+                pf_client_core::orchestrate::persist_window_size(w, h);
+            }
         })
     }
 
@@ -531,7 +527,10 @@ mod session_main {
     /// Per-adapter Vulkan Video decode capability, in human words — a triage tool, not a
     /// picker source. That is why it is its own flag: `--list-adapters` is parsed
     /// line-by-line by the desktop shells' GPU picker and must keep printing bare names.
+    /// It opens with the presenter backend a session would pick, and why.
     fn probe_decode_report() -> u8 {
+        let (backend, why) = pf_presenter::probe_backend();
+        println!("presenter backend: {backend} ({why})");
         match pf_presenter::vk::probe_decode() {
             Ok(adapters) => {
                 if adapters.is_empty() {
@@ -543,6 +542,7 @@ mod session_main {
                     // a default run presents on — the decoder shares that device, so
                     // on a hybrid box this line is usually the answer.
                     let kind = if a.discrete { "discrete" } else { "integrated" };
+                    let marked = i == 0 && backend == "vulkan";
                     // `a.index`, NOT the loop position: this list is sorted
                     // discrete-first, while PUNKTFUNK_VK_DEVICE indexes the raw
                     // enumeration, which puts the iGPU first on some hybrids. The
@@ -552,7 +552,7 @@ mod session_main {
                         "[{}] {} ({kind}){}",
                         a.index,
                         a.name,
-                        if i == 0 { "  <- default presenter" } else { "" }
+                        if marked { "  <- default presenter" } else { "" }
                     );
                     println!(
                         "     vulkan video decode: {}",
@@ -618,6 +618,70 @@ mod session_main {
     /// early exits. Those create Vulkan instances of their own and Mesa latches these
     /// variables when its ICD initialises, so a later call leaves the triage tools
     /// describing a device that cannot decode while the streaming path decodes on it.
+    /// Inside gamescope with another compositor's `WAYLAND_DISPLAY` (a flatpak binds the
+    /// desktop's `wayland-0`), runs this binary again, same argv, on gamescope's socket name.
+    /// gamescope's WSI layer stays off for a process whose `WAYLAND_DISPLAY` is not
+    /// gamescope's. The new process finds the name in place, so it does not restart again.
+    /// Returns only when the exec fails; the presenter then routes SDL itself.
+    #[cfg(target_os = "linux")]
+    fn restart_on_gamescope() {
+        use std::os::unix::process::CommandExt as _;
+        let Some(name) = pf_client_core::gamescope::foreign() else {
+            return;
+        };
+        tracing::info!(wayland_display = ?name, "restarting on gamescope's socket");
+        let mut argv = std::env::args_os();
+        let err = std::process::Command::new("/proc/self/exe")
+            .arg0(argv.next().unwrap_or_default())
+            .args(argv)
+            .env("WAYLAND_DISPLAY", &name)
+            .exec();
+        tracing::warn!(error = %err, "restart on gamescope's socket did not exec");
+    }
+
+    /// What Steam's launch hands a title and the session must not carry. The SDL device
+    /// filter names every pad Steam Input virtualised, and the Deck's own pad needs it
+    /// gone. On Linux under Steam, a game's graphics environment goes too: a Vulkan driver
+    /// or layer named by manifest path (Armada's Turnip variants live under `/usr/share`,
+    /// a path no sandbox has), Steam's overlay and fossilize layers, Mesa debug switches;
+    /// the loader's own search then finds the box's driver. `SDL_*` hints and
+    /// `ENABLE_GAMESCOPE_WSI` stay: the pads and the HDR swapchain need them.
+    fn steam_foreign_vars() -> Vec<&'static str> {
+        const GRAPHICS: [&str; 19] = [
+            "VK_DRIVER_FILES",
+            "VK_ICD_FILENAMES",
+            "VK_ADD_DRIVER_FILES",
+            "VK_LOADER_DRIVERS_SELECT",
+            "VK_LOADER_DRIVERS_DISABLE",
+            "VK_LAYER_PATH",
+            "VK_INSTANCE_LAYERS",
+            "VK_LOADER_LAYERS_ENABLE",
+            "VK_LOADER_LAYERS_DISABLE",
+            "ENABLE_VK_LAYER_VALVE_steam_overlay_1",
+            "ENABLE_VK_LAYER_VALVE_steam_fossilize_1",
+            "TU_DEBUG",
+            "FD_MESA_DEBUG",
+            "IR3_SHADER_DEBUG",
+            "MESA_LOADER_DRIVER_OVERRIDE",
+            "MESA_VK_WSI_PRESENT_MODE",
+            "LIBGL_ALWAYS_SOFTWARE",
+            "vblank_mode",
+            "__GL_SYNC_TO_VBLANK",
+        ];
+        let pads = [
+            "SDL_GAMECONTROLLER_IGNORE_DEVICES",
+            "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
+        ];
+        let under_steam =
+            std::env::var_os("SteamAppId").is_some() || std::env::var_os("SteamGameId").is_some();
+        let graphics: &[&str] = if cfg!(target_os = "linux") && under_steam {
+            &GRAPHICS
+        } else {
+            &[]
+        };
+        pads.into_iter().chain(graphics.iter().copied()).collect()
+    }
+
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)] // the SAFETY-commented single-threaded-startup env write below
     fn enable_mesa_video_decode() {
@@ -712,6 +776,22 @@ mod session_main {
         // SEH last-resort: a driver AV otherwise leaves only an exit code in the shell's log.
         #[cfg(windows)]
         punktfunk_core::crash::install();
+        // Before any Vulkan instance: gamescope's WSI layer reads WAYLAND_DISPLAY once.
+        #[cfg(target_os = "linux")]
+        restart_on_gamescope();
+        // Steam's launch variables go before the Vulkan loader or SDL reads them — ahead of
+        // the probe flags below too, so triage sees the environment the stream will run on.
+        for var in steam_foreign_vars() {
+            if let Ok(v) = std::env::var(var) {
+                tracing::info!(var, value = %v, "dropping a variable of Steam's launch");
+                // SAFETY: the single-threaded top of `run()`, before the Vulkan loader, SDL
+                // or any other thread exists — nothing reads the environment concurrently.
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::env::remove_var(var)
+                };
+            }
+        }
 
         // Runs before ANY Vulkan call, including the probe flags below — hence the top of
         // `run`, ahead of the early exits, so triage answers the same question the streaming
@@ -805,24 +885,6 @@ mod session_main {
             }
         }
 
-        // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming
-        // every pad Steam Input has virtualized; capturing the Deck's real built-in
-        // controller needs it cleared (same rationale as the GTK client's `app::run`).
-        for var in [
-            "SDL_GAMECONTROLLER_IGNORE_DEVICES",
-            "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
-        ] {
-            if let Ok(v) = std::env::var(var) {
-                tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
-                // SAFETY: as the settings block above — single-threaded startup, before SDL
-                // (the reader of these variables) or any other thread exists.
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::env::remove_var(var)
-                };
-            }
-        }
-
         if arg_flag("--browse") {
             // Bare `--browse` opens the console home (hosts, pairing, settings);
             // `--browse host[:port]` opens straight into that host's library.
@@ -841,8 +903,8 @@ mod session_main {
         }
         let Some(target) = arg_value("--connect") else {
             eprintln!(
-                "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--preset REF] [--as PROFILE] [--fullscreen]\n\
-                 \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--json-status] [--until-no-controller]\n\
+                "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--preset REF] [--as PROFILE] [--fullscreen] [--all-screens]\n\
+                 \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--all-screens] [--json-status] [--until-no-controller]\n\
                  \x20      punktfunk-session --pair - --connect host[:port] [--name LABEL]\n\
                  \n\
                  Streams from a paired punktfunk host in a Vulkan window. --browse opens the\n\
@@ -851,6 +913,7 @@ mod session_main {
                  library; --until-no-controller returns once the last controller is gone\n\
                  and no stream is up. --preset picks a preset by id or name for this session\n\
                  only (\"\" = the global defaults); without it the host's own preset applies.\n\
+                 --all-screens asks for a host screen per monitor, as the Screens setting does.\n\
                  --connect never dials a host it has no pinned fingerprint for —\n\
                  enrol with --pair (no display needed), in the console, or from the desktop\n\
                  client."
@@ -954,7 +1017,6 @@ mod session_main {
             mouse_mode: settings.mouse_mode(),
             invert_scroll: settings.invert_scroll,
             inhibit_shortcuts: settings.inhibit_shortcuts,
-            overlay_actions: settings.overlay_actions.clone(),
             present_priority: settings.present_priority(),
             vsync: settings.vsync,
             allow_vrr: settings.allow_vrr,
@@ -977,14 +1039,16 @@ mod session_main {
             #[cfg(not(feature = "ui"))]
             overlay: None,
             window_size: window_size(&settings),
+            match_window: settings.match_window,
             // A spawned session (spec mode) reports its window; a hand-run one persists it.
-            match_window: match_window(&settings, spec.is_none()),
+            on_window_size: on_window_size(spec.is_none()),
             render_scale: settings.render_scale,
             render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings.codec),
             video_fit: punktfunk_core::video_fit::VideoFit::from_name(&settings.video_fit),
             until_no_pads: false,
         };
 
+        let all_screens = arg_flag("--all-screens");
         let profile =
             arg_value("--as").map(|wanted| as_profile(&addr, known_host, &identity, pin, wanted));
         let outcome =
@@ -1021,6 +1085,7 @@ mod session_main {
                     ),
                 };
                 params.profile = profile;
+                params.shows_screens |= all_screens;
                 params
             });
 

@@ -7,6 +7,8 @@ use crate::quic::{ClipControl, ClipOffer, ProbeRequest, Welcome};
 /// borrows across branches do not compile.
 pub(crate) enum CtrlRequest {
     Mode(Mode),
+    /// A codec ask: these `CODEC_*` bits can't be decoded here.
+    Codec(u8),
     Probe(ProbeRequest),
     ProbeShaped(crate::quic::ProbeShaped),
     /// The pump's [`BitrateController`] sends this (kbps) when bitrate is Automatic.
@@ -26,6 +28,8 @@ pub(crate) enum CtrlRequest {
     InputEdge(crate::input::InputEvent),
     /// A captured Steam Controller 2's identity, ahead of its arrival.
     PadIdentity(crate::quic::PadIdentity),
+    /// The screens the embedder shows now, screen 0 first.
+    Screens(Vec<crate::quic::v2::msg::Screen>),
 }
 
 /// Handshake snapshot the worker reports to [`NativeClient::connect`]: the host's offer as sent,
@@ -42,4 +46,6 @@ pub(crate) struct Negotiated {
     pub(crate) clock_rtt_ns: Option<u64>,
     /// The profile the host resolved this session to; `None` from a host without profiles.
     pub(crate) profile: Option<String>,
+    /// The host counts axis-unit scroll (`FEATURE_SCROLL_AXIS_UNITS`).
+    pub(crate) scroll_axis_units: bool,
 }

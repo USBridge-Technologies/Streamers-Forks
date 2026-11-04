@@ -63,6 +63,8 @@ pub enum CompositorPref {
     Windows,
     /// niri with virtual outputs (the biri fork today).
     Niri,
+    /// Umbriel, Noctalia's wlroots compositor: native virtual outputs.
+    Umbriel,
 }
 
 impl CompositorPref {
@@ -76,6 +78,7 @@ impl CompositorPref {
             CompositorPref::Hyprland => 5,
             CompositorPref::Windows => 6,
             CompositorPref::Niri => 7,
+            CompositorPref::Umbriel => 8,
         }
     }
 
@@ -89,6 +92,7 @@ impl CompositorPref {
             5 => CompositorPref::Hyprland,
             6 => CompositorPref::Windows,
             7 => CompositorPref::Niri,
+            8 => CompositorPref::Umbriel,
             _ => CompositorPref::Auto,
         }
     }
@@ -104,6 +108,7 @@ impl CompositorPref {
             "hyprland" => CompositorPref::Hyprland,
             "windows" => CompositorPref::Windows,
             "niri" | "biri" => CompositorPref::Niri,
+            "umbriel" => CompositorPref::Umbriel,
             _ => return None,
         })
     }
@@ -118,6 +123,7 @@ impl CompositorPref {
             CompositorPref::Hyprland => "hyprland",
             CompositorPref::Windows => "windows",
             CompositorPref::Niri => "niri",
+            CompositorPref::Umbriel => "umbriel",
         }
     }
 }
@@ -514,22 +520,40 @@ pub fn shard_payload_for_wire_mtu(wire_mtu: usize, peer: core::net::IpAddr) -> u
     shard_payload_for_udp_budget(wire_mtu.saturating_sub(ip_udp_overhead(peer)), peer)
 }
 
-/// Operator jumbo opt-in (`design/shard-payload-reneg.md`): target on-wire IP MTU,
-/// or `None` = never probe or grow above the 1500 default. `PUNKTFUNK_WIRE_MTU`
-/// above 1500 is that number; `PUNKTFUNK_JUMBO=1` is the 9000 profile. Sessions
-/// still start at the family default; growth is ACK-gated toward a client that
-/// advertised [`max_shard_payload`] headroom.
-pub fn jumbo_wire_mtu() -> Option<usize> {
-    if let Ok(v) = std::env::var("PUNKTFUNK_WIRE_MTU") {
-        if let Ok(mtu) = v.trim().parse::<usize>() {
-            if mtu > 1500 {
-                return Some(mtu);
-            }
-        }
+/// Jumbo target on-wire IP MTU (`design/shard-payload-reneg.md`), or `None` = never probe or
+/// grow above the 1500 default. `adapter_mtu` is what the OS reports for the adapter toward
+/// the peer (`0` = unknown); above 1500 it is the target. `PUNKTFUNK_WIRE_MTU` pins it (above
+/// 1500 that number, else no jumbo); `PUNKTFUNK_JUMBO=1` forces 9000 and `0` turns it off.
+/// Sessions still start at the family default; growth waits for the path to prove it.
+pub fn jumbo_wire_mtu(adapter_mtu: u32) -> Option<usize> {
+    jumbo_decision(
+        std::env::var("PUNKTFUNK_WIRE_MTU").ok().as_deref(),
+        std::env::var("PUNKTFUNK_JUMBO").ok().as_deref(),
+        adapter_mtu,
+    )
+}
+
+/// [`jumbo_wire_mtu`] for the adapter this device reaches `peer` through. Loopback is not a
+/// jumbo LAN.
+#[cfg(not(target_family = "wasm"))]
+pub fn jumbo_wire_mtu_toward(peer: core::net::IpAddr) -> Option<usize> {
+    let adapter = if peer.to_canonical().is_loopback() {
+        0
+    } else {
+        crate::transport::ifinfo::mtu_toward(peer)
+    };
+    jumbo_wire_mtu(adapter)
+}
+
+/// [`jumbo_wire_mtu`]'s rule on the two variables' raw values.
+fn jumbo_decision(wire_mtu: Option<&str>, jumbo: Option<&str>, adapter_mtu: u32) -> Option<usize> {
+    if let Some(mtu) = wire_mtu.and_then(|v| v.trim().parse::<usize>().ok()) {
+        return (mtu > 1500).then_some(mtu);
     }
-    match std::env::var("PUNKTFUNK_JUMBO") {
-        Ok(v) if v.trim() == "1" => Some(9000),
-        _ => None,
+    match jumbo.map(str::trim) {
+        Some("1") => Some(9000),
+        Some("0") => None,
+        _ => (adapter_mtu > 1500).then_some(adapter_mtu as usize),
     }
 }
 
@@ -623,6 +647,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pin beats the switch, the switch beats the adapter, and only an adapter above 1500
+    /// opts in by itself.
+    #[test]
+    fn jumbo_follows_the_adapter_unless_an_operator_pins_it() {
+        assert_eq!(jumbo_decision(None, None, 9000), Some(9000));
+        assert_eq!(jumbo_decision(None, None, 1500), None);
+        assert_eq!(jumbo_decision(None, None, 0), None);
+        assert_eq!(jumbo_decision(None, Some("0"), 9000), None);
+        assert_eq!(jumbo_decision(None, Some("1"), 1500), Some(9000));
+        assert_eq!(jumbo_decision(None, Some("yes"), 9000), Some(9000));
+        assert_eq!(jumbo_decision(Some("8972"), Some("0"), 1500), Some(8972));
+        assert_eq!(jumbo_decision(Some("1400"), Some("1"), 9000), None);
+        assert_eq!(jumbo_decision(Some("nine"), None, 9000), Some(9000));
+    }
 
     /// Client `shard_payload` comes from Welcome and is the reassembler floor;
     /// a sub-floor value must fail rather than lower that floor.
@@ -813,6 +852,7 @@ mod tests {
             CompositorPref::Hyprland,
             CompositorPref::Windows,
             CompositorPref::Niri,
+            CompositorPref::Umbriel,
         ] {
             assert_eq!(CompositorPref::from_u8(p.to_u8()), p);
             assert_eq!(CompositorPref::from_name(p.as_str()), Some(p));
@@ -827,6 +867,7 @@ mod tests {
             Some(CompositorPref::Niri)
         );
         assert_eq!(CompositorPref::from_u8(7), CompositorPref::Niri);
+        assert_eq!(CompositorPref::from_u8(8), CompositorPref::Umbriel);
         assert_eq!(CompositorPref::from_name("nope"), None);
         // Unknown wire byte degrades to Auto.
         assert_eq!(CompositorPref::from_u8(200), CompositorPref::Auto);

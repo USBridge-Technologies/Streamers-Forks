@@ -28,6 +28,7 @@ use crate::pic_h265::PlanToVkH265Error;
 use crate::session::SessionError;
 
 pub(crate) mod core;
+pub mod waiter;
 
 /// 5 s: longer than a real decode, finite against a wedged driver. Matches the
 /// encoder fence budget so session recovery is never parked forever.
@@ -58,11 +59,15 @@ pub struct DecodedVkFrame {
     /// and a renegotiation can change format mid-stream. [`crate::plane_formats`]
     /// maps this to [`Self::plane_views`].
     pub format: vk::Format,
-    /// A decode binding. It cannot be sampled: use [`Self::plane_views`].
+    /// A decode binding. It cannot be sampled: use [`Self::plane_views`], or
+    /// [`Self::ycbcr_view`] where those are null.
     pub view: vk::ImageView,
     /// Presenter sampler views; formats from [`crate::plane_formats`] on
-    /// [`Self::format`].
+    /// [`Self::format`]. Null on a device with no plane views.
     pub plane_views: [vk::ImageView; 2],
+    /// The picture through a sampler Y'CbCr conversion built from
+    /// [`crate::caps::ycbcr_conversion_info`]. Null where [`Self::plane_views`] exist.
+    pub ycbcr_view: vk::ImageView,
     /// Array layer this picture occupies; 0 when its backing image is private.
     pub layer: u32,
     /// Layout at the semaphore signal, and the layout the consumer must restore

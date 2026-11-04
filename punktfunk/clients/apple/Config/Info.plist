@@ -8,6 +8,9 @@
 	     GCSupportsGameMode (build settings) covers the older releases. -->
 	<key>LSSupportsGameMode</key>
 	<true/>
+	<!-- visionOS reads Config/Info-visionOS.plist: these keys plus the SpatialGamepad profile,
+	     which App Store export refuses on iOS, macOS and tvOS. Change both files together;
+	     apple.yml checks they match. -->
 	<key>GCSupportedGameControllers</key>
 	<array>
 		<dict>

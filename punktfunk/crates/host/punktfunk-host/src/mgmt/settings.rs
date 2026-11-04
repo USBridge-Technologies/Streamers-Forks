@@ -4,7 +4,8 @@
 //! force, the console's own value, and what set it. A row this host does not act on is
 //! left out, not flagged — the Seat defaults while seats are off included. PATCH merges into
 //! `host-settings.json`; a value an env var or CLI flag overrides is still stored, and takes
-//! effect once that override is gone.
+//! effect once that override is gone. On a door, the rows of the host that streams are the owner's
+//! host's ([`door_row`]).
 
 use super::shared::*;
 use pf_host_config::registry::{Apply, Group, Kind};
@@ -263,8 +264,107 @@ pub(crate) async fn get_playing_apps() -> Json<PlayingApps> {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn get_host_settings() -> Json<HostSettingsState> {
-    Json(state(seats_on().await))
+pub(crate) async fn get_host_settings(State(st): State<Arc<MgmtState>>) -> Response {
+    answer(&st).await
+}
+
+/// What the door acts on itself: its name and discovery, the seats and every row their Seat
+/// defaults carry, and the updates. Every other row is the owner's host's.
+fn door_row(id: &str) -> bool {
+    pf_host_config::registry::find(id).is_some_and(|s| s.group == Group::Seats)
+        || pf_host_config::seat_defaults::ROWS.contains(&id)
+        || matches!(id, "host_name" | "mdns" | "update_check" | "update_apply")
+}
+
+/// Before the door switches off, the rows it kept go to the owner's host, which serves the box
+/// again: what the console set on the door stays set. A row the door never stored stays the
+/// owner's. `Err` while the owner's host can't take them yet.
+pub(crate) async fn hand_door_rows_home(st: &MgmtState) -> Result<(), Response> {
+    let rows: serde_json::Map<String, Value> = pf_host_config::snapshot()
+        .settings
+        .iter()
+        .filter(|r| r.setting.available() && door_row(r.setting.id))
+        .filter_map(|r| Some((r.setting.id.to_string(), r.stored.clone()?)))
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let body = Value::Object(rows).to_string().into_bytes();
+    match st
+        .owner_call("PATCH", "host/settings", Some(body), true)
+        .await
+    {
+        answer @ (super::owner::Answer::Starting | super::owner::Answer::Down) => {
+            Err(answer.into_response())
+        }
+        super::owner::Answer::Reply(200, ..) | super::owner::Answer::NoSeat => Ok(()),
+        // An owner's host that won't take a row never keeps the box behind the door.
+        _ => {
+            tracing::warn!("door settings not handed to the owner's host");
+            Ok(())
+        }
+    }
+}
+
+/// This host's state; on a door, its own rows and the owner's host's others.
+async fn answer(st: &MgmtState) -> Response {
+    let own = state(seats_on().await);
+    if st.door.is_none() {
+        return Json(own).into_response();
+    }
+    match st.owner_call("GET", "host/settings", None, true).await {
+        super::owner::Answer::NoSeat => Json(own).into_response(),
+        super::owner::Answer::Reply(200, _, body) => match with_owner_rows(own, &body) {
+            Some(merged) => Json(merged).into_response(),
+            None => api_error(
+                StatusCode::BAD_GATEWAY,
+                "The owner's host answered with settings this console can't read.",
+            ),
+        },
+        other => other.into_response(),
+    }
+}
+
+/// The door's rows of `own` and the other rows of the owner's `owner`, in page order. A row is
+/// pinned in the owner's `host.env`, so that is the file named.
+fn with_owner_rows(own: HostSettingsState, owner: &[u8]) -> Option<Value> {
+    let owner: Value = serde_json::from_slice(owner).ok()?;
+    let own = serde_json::to_value(own).ok()?;
+    let keep = |state: &Value, key: &str, door: bool| -> Vec<Value> {
+        state
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|v| {
+                let id = v.get("id").unwrap_or(v).as_str().unwrap_or_default();
+                door_row(id) == door
+            })
+            .cloned()
+            .collect()
+    };
+    let mut settings = [
+        keep(&own, "settings", true),
+        keep(&owner, "settings", false),
+    ]
+    .concat();
+    let page = |row: &Value| {
+        let id = row.get("id").and_then(Value::as_str);
+        pf_host_config::registry::SETTINGS
+            .iter()
+            .position(|s| Some(s.id) == id)
+    };
+    settings.sort_by_key(page);
+    let pending = [
+        keep(&own, "restart_pending", true),
+        keep(&owner, "restart_pending", false),
+    ]
+    .concat();
+    Some(serde_json::json!({
+        "settings": settings,
+        "restart_pending": pending,
+        "env_file": owner.get("env_file").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 /// Change host settings
@@ -285,8 +385,39 @@ pub(crate) async fn get_host_settings() -> Json<HostSettingsState> {
         (status = INTERNAL_SERVER_ERROR, description = "The settings file could not be written", body = ApiError),
     )
 )]
-pub(crate) async fn patch_host_settings(ApiJson(patch): ApiJson<HostSettingsPatch>) -> Response {
-    let patch: serde_json::Map<String, Value> = patch.0.into_iter().collect();
+pub(crate) async fn patch_host_settings(
+    State(st): State<Arc<MgmtState>>,
+    ApiJson(patch): ApiJson<HostSettingsPatch>,
+) -> Response {
+    let door = st.door.is_some();
+    let (patch, owner): (
+        serde_json::Map<String, Value>,
+        serde_json::Map<String, Value>,
+    ) = patch
+        .0
+        .into_iter()
+        .partition(|(id, _)| !door || door_row(id));
+    if !owner.is_empty() {
+        let body = Value::Object(owner.clone()).to_string().into_bytes();
+        match st
+            .owner_call("PATCH", "host/settings", Some(body), true)
+            .await
+        {
+            super::owner::Answer::Reply(200, ..) => {}
+            super::owner::Answer::NoSeat => {
+                return api_error(StatusCode::SERVICE_UNAVAILABLE, super::owner::NO_OWNER)
+            }
+            other => return other.into_response(),
+        }
+    }
+    save(&st, patch).await
+}
+
+/// Store `patch` in this host's own file, then answer with the state.
+async fn save(st: &MgmtState, patch: serde_json::Map<String, Value>) -> Response {
+    if patch.is_empty() {
+        return answer(st).await;
+    }
     if let Some(id) = patch
         .keys()
         .find(|id| pf_host_config::registry::find(id).is_some_and(|s| !s.available()))
@@ -315,12 +446,62 @@ pub(crate) async fn patch_host_settings(ApiJson(patch): ApiJson<HostSettingsPatc
     crate::diagnostics::registry().set(crate::diagnostics::catalog::restart_pending());
     crate::events::emit(crate::events::EventKind::SettingsChanged { ids });
     write_seat_defaults();
-    Json(state(seats_on().await)).into_response()
+    // Seats read their copy within a tick; a grant made in that tick stays until the box restarts.
+    #[cfg(target_os = "windows")]
+    if patch.contains_key("seat_background_input") {
+        crate::windows::background_input::apply();
+    }
+    answer(st).await
 }
 
 /// Hands every seat the box's Seat defaults: at start, and after each settings write.
 pub(crate) fn write_seat_defaults() {
     if let Err(error) = pf_host_config::seat_defaults::write(&pf_paths::config_dir()) {
         tracing::warn!(%error, "seat defaults not written");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seats' copies come from the door's own file, so the door keeps every row they carry.
+    #[test]
+    fn every_seat_default_is_a_door_row() {
+        for id in pf_host_config::seat_defaults::ROWS {
+            assert!(pf_host_config::registry::find(id).is_some(), "{id}");
+            assert!(door_row(id), "{id}");
+        }
+        assert!(!door_row("encoder"));
+    }
+
+    /// A door shows its own name and discovery, and the owner's host's value for what streams,
+    /// pinned in the owner's `host.env`.
+    #[test]
+    fn a_door_shows_its_own_rows_and_the_owner_s_others() {
+        let own = state(SeatsOn::default());
+        let mut owner = serde_json::to_value(state(SeatsOn::default())).unwrap();
+        for row in owner["settings"].as_array_mut().unwrap() {
+            row["title"] = "owner".into();
+        }
+        owner["restart_pending"] = serde_json::json!(["mdns", "idle_timeout_ms"]);
+        owner["env_file"] = "/home/me/.config/punktfunk/host.env".into();
+        let merged = with_owner_rows(own, owner.to_string().as_bytes()).unwrap();
+        let title = |id: &str| {
+            merged["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id)
+                .map(|row| row["title"].clone())
+        };
+        assert_eq!(title("mdns"), Some("Local discovery".into()));
+        assert_eq!(title("host_name"), Some("Host name".into()));
+        assert_eq!(title("idle_timeout_ms"), Some("owner".into()));
+        assert_eq!(
+            merged["restart_pending"],
+            serde_json::json!(["idle_timeout_ms"])
+        );
+        assert_eq!(merged["env_file"], "/home/me/.config/punktfunk/host.env");
     }
 }

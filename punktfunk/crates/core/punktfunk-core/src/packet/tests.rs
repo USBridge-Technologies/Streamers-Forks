@@ -52,6 +52,7 @@ impl Rig {
             stamp: V2Stamp {
                 seq: 0,
                 epoch: 0,
+                stream: 0,
                 clock_origin_ns: 0,
                 max_data_per_block: limits.max_data_shards as u16,
             },
@@ -204,6 +205,39 @@ fn incomplete_frames_age_out_by_capture_time_not_frame_count() {
     assert_eq!(rig.stats.snapshot().frames_dropped, 1, "no double-count");
 }
 
+/// A flush tears the frame in flight and leaves the parity of the one it had just finished
+/// on the wire. What arrives after it is the client's own discard: no frame is booked lost.
+#[test]
+fn a_frame_a_flush_tore_is_no_drop() {
+    const FRAME_NS: u64 = 8_333_333;
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
+    let shard = |frame_index: u32, shard_index: u16| {
+        let mut h = base_header();
+        h.frame_index = frame_index;
+        h.pts_ns = u64::from(frame_index) * FRAME_NS;
+        h.data_shards = 2;
+        h.recovery_shards = 1;
+        h.frame_bytes = 32;
+        h.shard_index = shard_index;
+        packet(h)
+    };
+    assert!(rig.push_all(&[shard(0, 0), shard(0, 1)]).is_some());
+    assert!(rig.push(&shard(1, 0)).is_none());
+    rig.r.reset();
+    assert!(
+        rig.push(&shard(1, 1)).is_none(),
+        "the torn frame stays gone"
+    );
+    assert!(
+        rig.push(&shard(0, 2)).is_none(),
+        "the finished one's parity too"
+    );
+    for i in 2..=20 {
+        assert!(rig.push_all(&[shard(i, 0), shard(i, 1)]).is_some());
+    }
+    assert_eq!(rig.stats.snapshot().frames_dropped, 0);
+}
+
 /// Explicit `frame_index` must not bump the packetizer's internal video or probe counters.
 #[test]
 fn explicit_frame_index_is_stamped_and_internal_counter_untouched() {
@@ -284,6 +318,31 @@ fn aged_out_probe_frames_do_not_count_as_dropped() {
         0,
         "probe-window drops must not fire video loss recovery"
     );
+}
+
+/// Probe filler never takes the decoder's lent memory: a probe left incomplete after its burst
+/// would hold a slot until the next burst.
+#[test]
+fn probe_frames_never_take_lent_memory() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    struct Counting(AtomicUsize);
+    impl crate::au::AuMemory for Counting {
+        fn take(&self, _: usize) -> Option<Box<dyn crate::au::AuStore>> {
+            self.0.fetch_add(1, Relaxed);
+            None
+        }
+    }
+    let lent = std::sync::Arc::new(Counting(AtomicUsize::new(0)));
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
+    rig.r.set_memory(lent.clone());
+
+    let mut p = base_header();
+    p.user_flags = FLAG_PROBE as u32;
+    p.data_shards = 2;
+    p.frame_bytes = 32;
+    assert!(rig.push(&packet(p)).is_none());
+    assert!(rig.push(&packet(base_header())).is_some());
+    assert_eq!(lent.0.load(Relaxed), 1, "only the video frame borrows");
 }
 
 fn e2e_config(scheme: FecScheme, fec_percent: u8) -> Config {
@@ -1143,7 +1202,7 @@ fn parts_coalesce_across_reordered_blocks() {
     assert_eq!(got[0].data.len(), 720 + 288, "blocks 0-2 in one part");
     let p1 = got[1].part.unwrap();
     assert!(p1.last && got[1].complete);
-    let mut rebuilt = got[0].data.clone();
+    let mut rebuilt = got[0].data.to_vec();
     rebuilt.extend_from_slice(&got[1].data);
     assert_eq!(rebuilt, src);
 }
@@ -1706,7 +1765,7 @@ fn shard_size_firewall_bounds() {
 
 /// The delay reading a lost frame would otherwise take with it: the sample is
 /// taken when the frame OPENS, so a frame whose other shards never arrive is
-/// still timed, and probe filler is not timed at all.
+/// still timed, and probe filler is not timed at all. It carries the frame's pts.
 #[test]
 fn a_frame_that_never_completes_is_still_timed() {
     let mut rig = Rig::with(limits(), FecScheme::Gf8);
@@ -1729,12 +1788,17 @@ fn a_frame_that_never_completes_is_still_timed() {
     probe.user_flags = FLAG_PROBE as u32;
     rig.push(&packet(probe));
 
-    let got: Vec<i64> = rig.r.take_shard_delays().collect();
+    let got: Vec<(u64, i64)> = rig.r.take_shard_delays().collect();
     assert_eq!(got.len(), 1, "one sample for the one frame that opened");
+    let (pts_ns, delay_ns) = got[0];
     assert!(
-        (25_000_000..60_000_000).contains(&got[0]),
-        "a 30 ms-old capture read {} ns",
-        got[0]
+        (25_000_000..60_000_000).contains(&delay_ns),
+        "a 30 ms-old capture read {delay_ns} ns"
+    );
+    assert!(
+        pts_ns.abs_diff(h.pts_ns) < 1_000,
+        "named by the pts its host timing carries: {pts_ns} vs {}",
+        h.pts_ns
     );
     assert_eq!(
         rig.r.take_shard_delays().count(),
@@ -1809,7 +1873,7 @@ mod geometry_proptests {
             for (_, _, p) in &all {
                 if let Some(f) = rig.push(p) {
                     prop_assert!(f.complete);
-                    prop_assert!(delivered.insert(f.frame_index, f.data).is_none(),
+                    prop_assert!(delivered.insert(f.frame_index, f.data.to_vec()).is_none(),
                         "a frame must deliver exactly once");
                 }
             }
@@ -1862,6 +1926,42 @@ fn loss_is_counted_by_its_place_in_the_frame() {
         "drained"
     );
     assert_eq!(s.fec_recovered_shards - s.fec_late_shards, 2);
+}
+
+/// A frame that dies with one block repaired and one past its parity: each missing data
+/// shard is loss once, the repair in `fec_recovered_shards`, the dead block's three holes
+/// in `dead_shards_lost`.
+#[test]
+fn a_dead_frame_counts_its_holes_once() {
+    let cfg = e2e_config(FecScheme::Gf16, 50);
+    let coder = coder_for(FecScheme::Gf16);
+    let mut pk = Packetizer::new(&cfg);
+    let mut rig = Rig::new(&cfg);
+    // 640 B / 16 B = 40 data shards in ten blocks of 4 + 2: data 0..40, then parity 40..60.
+    let src = vec![7u8; 640];
+    let a = packetize(&mut pk, &src, 1_000_000, coder.as_ref());
+    let kept: Vec<_> = a
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| ![1, 2, 3, 4].contains(i))
+        .map(|(_, p)| p.clone())
+        .collect();
+    assert!(rig.push_all(&kept).is_none(), "block 0 is past its parity");
+    let b = packetize(
+        &mut pk,
+        &src,
+        1_000_000 + LOSS_WINDOW_NS + 1_000,
+        coder.as_ref(),
+    );
+    rig.push_all(&b).expect("the next frame is whole");
+    let s = rig.stats.snapshot();
+    assert_eq!((s.frames_dropped, s.fec_recovered_shards), (1, 1));
+    assert_eq!((s.partial_shards_lost, s.dead_shards_lost), (0, 3));
+    let received = (kept.len() + b.len()) as u64;
+    assert_eq!(
+        crate::quic::window_loss_ppm(1, 0, s.dead_shards_lost, received),
+        4 * 1_000_000 / 120
+    );
 }
 
 /// What a frame still lacks: its data shards by AU index, then its parity numbered after

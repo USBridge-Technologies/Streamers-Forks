@@ -57,22 +57,20 @@ export const SectionLogs: FC = () => {
 
 	const host = useHostLog();
 	const devices = useDeviceLogs();
-	// Every seat whose own host runs: its log is a source like the box's, one chip each.
+	// Every seat with a host of its own: its log is a source like the box's, one chip each.
 	const profiles = useListProfiles({ query: { retry: false } });
 	const info = useGetHostInfo();
 	const seats = useMemo<SeatSource[]>(
 		() =>
 			(profiles.data ?? [])
-				.filter(
-					(p) =>
-						isFullSeat(p, info.data?.os, info.data?.door === true) &&
-						(p.seat?.state === "occupied" ||
-							p.seat?.state === "ready" ||
-							p.seat?.state === "starting"),
-				)
+				.filter((p) => isFullSeat(p, info.data?.os, info.data?.door === true))
 				.map((p) => ({
 					id: p.id,
 					label: m.logs_source_seat({ name: p.display_name }),
+					live:
+						p.seat?.state === "occupied" ||
+						p.seat?.state === "ready" ||
+						p.seat?.state === "starting",
 				})),
 		[profiles.data, info.data],
 	);
@@ -82,6 +80,15 @@ export const SectionLogs: FC = () => {
 	const [selected, setSelected] = useState<Set<string>>(
 		() => new Set([HOST_SOURCE, PLUGINS_SOURCE]),
 	);
+	// On a door the owner's host streams and runs the plugins: its log opens selected too.
+	const ownerId = profiles.data?.find((p) => p.owner)?.id;
+	const ownerSeat =
+		info.data?.door === true
+			? seats.find((s) => s.id === ownerId)?.id
+			: undefined;
+	useEffect(() => {
+		if (ownerSeat) setSelected((s) => new Set(s).add(seatSource(ownerSeat)));
+	}, [ownerSeat]);
 	const [shareMode, setShareMode] = useState<ShareMode | null>(null);
 	const [exporting, setExporting] = useState(false);
 
@@ -100,7 +107,7 @@ export const SectionLogs: FC = () => {
 		diagnostics.error instanceof ApiError && diagnostics.error.status === 404;
 
 	const fromHost = useMemo(() => hostRows(host.entries), [host.entries]);
-	const fromSeats = useSeatLogs(seats, selected);
+	const { rows: fromSeats, shown: shownSeats } = useSeatLogs(seats, selected);
 
 	// Only SELECTED device bundles reach the merge. An export loads every bundle as a side effect,
 	// and without this the pool would silently grow by a few thousand rows per device that nobody
@@ -129,7 +136,7 @@ export const SectionLogs: FC = () => {
 				label: m.logs_source_plugins(),
 				selected: selected.has(PLUGINS_SOURCE),
 			},
-			...seats.map((seat) => ({
+			...shownSeats.map((seat) => ({
 				id: seatSource(seat.id),
 				label: seat.label,
 				selected: selected.has(seatSource(seat.id)),
@@ -147,7 +154,7 @@ export const SectionLogs: FC = () => {
 							: undefined,
 			})),
 		],
-		[seats, devices.bundles, selected],
+		[shownSeats, devices.bundles, selected],
 	);
 
 	const onToggleSource = (id: string) => {
@@ -176,9 +183,9 @@ export const SectionLogs: FC = () => {
 					generatedAt: new Date(),
 					checks: diagnostics.data?.checks ?? [],
 					checksUnavailable: checksUnsupported,
-					// The full host buffer, not `rows` — the export is "everything", and what the
-					// viewer is filtered to has no bearing on that.
-					rows: fromHost,
+					// The full host buffer and each selected seat's, not `rows` — the export is
+					// "everything", and what the viewer is filtered to has no bearing on that.
+					rows: mergeRows([fromHost, fromSeats]),
 					bundles,
 				}),
 				diagnosticsFilename(new Date()),

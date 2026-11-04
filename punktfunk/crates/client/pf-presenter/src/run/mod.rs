@@ -18,6 +18,7 @@
 //! In-stream chords share Ctrl+Alt+Shift: Q release/engage, M mouse model, D
 //! disconnect, S stats tier, O quick-action ring, V microphone mute.
 
+use crate::backend::Presenter;
 use crate::input::{Capture, FingerPhase};
 use crate::overlay::{
     FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerButton, PointerInput, RingCommand,
@@ -27,7 +28,7 @@ use crate::present_pace::{
     off_grid_ns, Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, SourcePacer,
 };
 use crate::touch::{Abs, Act};
-use crate::vk::{FrameInput, Presented, Presenter};
+use crate::vk::{FrameInput, Presented};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::{GamepadPump, GamepadService, MenuEvent, SelectChord};
 use pf_client_core::orchestrate::{emit, SessionLine};
@@ -35,7 +36,7 @@ use pf_client_core::session::{self, DecodeFacts, SessionEvent, SessionHandle, Se
 use pf_client_core::trust::{MouseMode, PresentPriority, StatsVerbosity, TouchMode};
 use pf_client_core::video::VulkanDecodeDevice;
 use pf_client_core::video::{DecodeHealth, DecodedFrame, DecodedImage};
-use punktfunk_core::client::NativeClient;
+use punktfunk_core::client::{NativeClient, PunktfunkEndReason};
 use punktfunk_core::config::{CompositorPref, Mode};
 use punktfunk_core::hud::{self, HudLine, StatsSnapshot};
 use punktfunk_core::quic::HdrMeta;
@@ -48,7 +49,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod events;
+mod overlay_facts;
 mod pace;
+mod pace_step;
+mod restart;
+mod screens;
 mod shell;
 mod stream;
 
@@ -59,6 +64,9 @@ use stream::ResizeIndicator;
 /// port (`0` = none advertised).
 pub type ConnectedFn = Box<dyn FnMut([u8; 32], u16)>;
 
+/// The input, present and sizing fields seed the window. Browse mode replaces them with
+/// each launch's [`SessionParams`] values, so a setting changed in the console applies to the
+/// next stream.
 pub struct SessionOpts {
     pub window_title: String,
     pub fullscreen: bool,
@@ -67,7 +75,7 @@ pub struct SessionOpts {
     pub window_pos: Option<(i32, i32)>,
     /// OSD tier at start; also gates stdout `stats:` lines. Ctrl+Alt+Shift+S cycles live.
     pub stats_verbosity: StatsVerbosity,
-    /// Latched per session. A mouse-only client leaves the default and never sees a finger.
+    /// Per stream. A mouse-only client leaves the default and never sees a finger.
     pub touch_mode: TouchMode,
     /// `Capture` (pointer lock + relative) or `Desktop` (uncaptured absolute). Ctrl+Alt+Shift+M
     /// flips it live; hosts without absolute injection (gamescope) stay captured.
@@ -77,8 +85,6 @@ pub struct SessionOpts {
     /// Applies in both mouse models; desktop mode's unlocked pointer clicking another window
     /// is the way back. See [`apply_capture`](shell::apply_capture).
     pub inhibit_shortcuts: bool,
-    /// Quick-action ring blob; empty = the platform default ring.
-    pub overlay_actions: String,
     /// `Latency` = newest-wins arrival pacing; `Smooth { buffer }` = FIFO one frame per latch
     /// slot. `PUNKTFUNK_PRESENTER=arrival` forces the latency drain without a rebuild.
     pub present_priority: PresentPriority,
@@ -98,10 +104,11 @@ pub struct SessionOpts {
     /// then resizes to the stream. Match-window passes the persisted last size so the first
     /// connect's mode already matches the glass.
     pub window_size: Option<(u32, u32)>,
-    /// `Some` = stream mode follows the window: start params use physical pixels, a mid-session
-    /// resize sends a debounced `Reconfigure`. The callback gets logical size at each resize-end
-    /// for persist. `None` = never auto-resize.
-    pub match_window: Option<Box<dyn FnMut(u32, u32)>>,
+    /// Stream mode follows the window: start params use physical pixels, a mid-session resize
+    /// sends a debounced `Reconfigure`. Off = never auto-resize.
+    pub match_window: bool,
+    /// Gets the logical size at each Match-window resize-end, for persist.
+    pub on_window_size: Box<dyn FnMut(u32, u32)>,
     /// Multiplier on the window pixel size under Match-window. `> 1` supersamples; `1.0` is
     /// native pixels. See [`punktfunk_core::render_scale`].
     pub render_scale: f64,
@@ -317,10 +324,14 @@ struct Shell {
     pump: GamepadPump,
     gamepad: GamepadService,
     overlay: Option<Box<dyn Overlay>>,
-    /// `PUNKTFUNK_OSD_SCALE` on top of the display DPI: a preference, read once.
+    /// `knobs.osd_scale` on top of the display DPI: a preference, read once.
     osd_scale_pref: f32,
-    /// `false` under `PUNKTFUNK_PRESENTER=arrival`: no glass gate, no presenter window line.
+    /// `false` under `knobs.presenter_arrival`: no glass gate, no presenter window line.
     pacing_active: bool,
+    /// Read once at open; each stream's pacer and each further screen's presenter take theirs.
+    knobs: crate::knobs::Knobs,
+    /// Chosen once at open; each further screen's presenter is the same backend.
+    backend: crate::backend::Backend,
     present_priority: PresentPriority,
     presenter: Presenter,
     scroll_routing: crate::scroll_routing::ScrollRouting,
@@ -357,6 +368,9 @@ struct StreamState {
     /// User canceled this connect: skip capture/attach on a late `Connected` and
     /// route its end back silently.
     canceled: bool,
+    /// Redials of a lost session this stream is: 0 for a plain dial, and again once it
+    /// connects. A loss, or a failed redial, dials attempt `redials` next.
+    redials: u32,
     ready_announced: bool,
     mode_line: String,
     /// Settings preset this session resolved; `None` = global defaults, nothing shown.
@@ -405,15 +419,13 @@ struct StreamState {
     mode_period_ns: u64,
     /// Smoothing: one present per latch slot, aimed a measured margin ahead.
     slots: crate::slot_pick::SlotPick,
-    /// What the held frame waits on. The fence paces the loop itself (the presenter waits
-    /// it for a millisecond per pass), so the pass turns straight around and drains the
-    /// channel first: a newer frame replaces the held one instead of queuing behind it.
-    busy_on: crate::vk::BusyOn,
+    /// `(pts, aimed latch)` of presents awaiting their glass stamp; 0 = not slot-aimed.
+    aimed: std::collections::VecDeque<(u64, u64)>,
+    /// The pace step's memory: the slot mark and what holds the front frame.
+    pace: pace_step::PaceState,
     last_displayed_ns: u64,
     /// Source stamp of the frame last seen on glass, for the spacing-error ledger.
     last_shown_pts_ns: u64,
-    /// The presenter handed the frame back (no swapchain image yet): wake in 1 ms.
-    busy_retry: bool,
     /// Present turn of the newest wavelet frame taken in.
     newest_turn: u64,
     /// One-shot log latch: smoothness was requested but PyroWave collapsed the store
@@ -461,6 +473,8 @@ struct StreamState {
     /// Host's pinned fingerprint once connected — the key the pre-fetched host-actions cache uses.
     fp_hex: String,
     native_mode: (u32, u32, u32),
+    /// The further screens' windows, empty unless the stream asked for screens.
+    screens: screens::ScreenWindows,
     /// Launch params, kept for codec-fallback re-dial. Clone is at start, so a mid-session
     /// accepted mode switch is not in here — the retry re-reads it from the connector.
     /// The latch grid rides by `Arc` (it is the presenter's). `force_software` does not:
@@ -568,6 +582,9 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
                 Some(st) => sh.video_tick(st)?,
                 None => false,
             };
+            if let Some(st) = stream.as_mut() {
+                sh.screens_tick(st);
+            }
 
             sh.present_overlay_alone(&stream, presented_video)?;
         })
@@ -625,16 +642,9 @@ fn window_display_hdr(window: &sdl3::video::Window) -> Option<HdrMeta> {
     }
 }
 
-/// Inside a gamescope session? `overlay_focus` exists only on Linux; elsewhere, no.
+/// Inside a gamescope session? Off Linux, no.
 fn in_gamescope() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        pf_client_core::overlay_focus::gamescope_session()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+    pf_client_core::gamescope::under_gamescope()
 }
 
 #[cfg(test)]

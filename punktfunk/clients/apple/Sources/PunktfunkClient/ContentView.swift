@@ -274,6 +274,11 @@ struct ContentView: View {
                 LandscapeLock.streaming = up
             }
             #endif
+            #if os(visionOS)
+            // The Home sits on the system glass; a stream is a square-cornered rectangle, like
+            // the monitor it shows.
+            .glassBackgroundEffect(displayMode: model.phase == .streaming ? .never : .always)
+            #endif
     }
 
     /// The confirmed link's action: exactly what a `.known` (id-referenced) link would have done,
@@ -316,6 +321,7 @@ struct ContentView: View {
                     download: model.launchDownload,
                     sourceRect: hold.sourceRect,
                     onShow: { model.revealStream() })
+                    .overFlatPicture()
                     // Its own view per launch — a reused one keeps the last flight's state.
                     .id(hold.seq)
                     .transition(.asymmetric(insertion: .identity, removal: .opacity))
@@ -323,6 +329,13 @@ struct ContentView: View {
         }
         .animation(.easeInOut(duration: 0.3), value: model.launchHold)
         .onAppear {
+            // A plain connect the host parked for its operator gets the request-access wait.
+            let approval = $awaitingApproval
+            model.onAwaitingApproval = { host in
+                if approval.wrappedValue == nil {
+                    approval.wrappedValue = ApprovalRequest(host: host, advertisedFingerprint: nil)
+                }
+            }
             DemoMode.resume(in: store)
             autoConnectIfAsked()
             // An intent that ran before this window subscribed. Ahead of the start screen,
@@ -523,6 +536,7 @@ struct ContentView: View {
             active: fullscreenAlways || (fullscreenForSession && model.connection != nil),
             stream: model.connection.map { CGSize(width: Int($0.width), height: Int($0.height)) },
             captured: model.mouseCaptured,
+            spansDisplays: model.connection?.showsScreens == true,
             isFullscreen: $isFullscreen, appDriven: $appDrivenFullscreen, edge: fullscreenEdge))
         #endif
         // A game launched from the library just exited, so the session ended on purpose: put the
@@ -840,6 +854,8 @@ struct ContentView: View {
     /// during the delegated-approval wait (that has its own "Waiting for approval" prompt, so the
     /// takeover must not stack over it) and, of course, when idle or streaming.
     private var connectingOverlayName: String? {
+        // A lost session waiting out its redial keeps the takeover between its dials.
+        if model.phase == .idle, let redial = model.redial { return redial.host.displayName }
         // A launch dial has the launch hold instead — that says which GAME is coming, and stacking
         // "Connecting to <host>" on top of it would be two takeovers for one act.
         guard awaitingApproval == nil, model.launchHold == nil,
@@ -902,7 +918,7 @@ struct ContentView: View {
             requestAccess: flow.consoleRequestAccess,
             requestAccessDiscovered: flow.requestAccessDiscovered,
             launchTitle: { launch($0, $1, profile: .send($2)) }, connectShelf: connectFromShelf,
-            wakeOnly: { flow.wakeOnly($0) })
+            wakeOnly: { flow.wakeOnly($0) }, awaitingApproval: awaitingApproval != nil)
     }
 
     #if !os(macOS)
@@ -990,7 +1006,7 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.22), value: model.resizing)
                 .overlay {
                     if pendingFingerprint != nil {
-                        Color.black.opacity(0.45)
+                        Color.black.opacity(0.45).overFlatPicture()
                     }
                 }
                 // The resize spinner rides over the (blurred) stream; suppressed under the trust
@@ -1004,6 +1020,7 @@ struct ContentView: View {
                 .overlay {
                     if pendingFingerprint == nil, model.resizing {
                         ResizeIndicatorView(active: true)
+                            .overFlatPicture()
                             .transition(.opacity.combined(with: .scale(scale: 0.92)))
                     }
                 }
@@ -1023,6 +1040,7 @@ struct ContentView: View {
                         model.rejectTrust()
                         pairingTarget = host
                     })
+                    .overFlatPicture()
             }
         }
         #if os(macOS)
@@ -1170,6 +1188,11 @@ struct ContentView: View {
         if let kbps = ProcessInfo.processInfo.environment["PUNKTFUNK_BITRATE_KBPS"],
            let v = Int(kbps) {
             effective.bitrateKbps = v
+        }
+        // PUNKTFUNK_HDR=1|0: the global HDR switch is the only one a record-less connect
+        // sees, so an unattended HDR run needs this.
+        if let hdr = ProcessInfo.processInfo.environment["PUNKTFUNK_HDR"] {
+            effective.hdrEnabled = hdr == "1"
         }
         model.connect(to: host, effective: effective, gamepad: pad, autoTrust: true)
         #endif

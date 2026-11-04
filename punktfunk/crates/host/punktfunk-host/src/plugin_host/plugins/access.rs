@@ -12,6 +12,7 @@
 //! runner's unit must see a root too: [`AccessStore::runner_roots`] feeds its drop-in.
 
 use super::manifest::PluginManifest;
+use super::walks::{self, AccessWalk};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
@@ -37,6 +38,10 @@ pub struct Grant {
     /// with `by: "form"` goes when the last of them lets go.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forms: Vec<String>,
+    /// The folder and the files directly in it, nothing below. Its ACE lands at once however
+    /// large the tree under it is, where a recursive one rewrites every file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub files: bool,
 }
 
 /// `by` on a grant only plugin forms made.
@@ -59,6 +64,13 @@ pub struct PendingRequest {
     /// The plugin asks to read and restore emulator saves; `path` is the folder that grant lands on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub saves: bool,
+    /// The folder and the files directly in it, nothing below. See [`Grant::files`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub files: bool,
+    /// How the plugin spelled `path` when that goes through a link. An allow records it in
+    /// [`PluginAccess::links`]: on Windows the link itself needs the runner's ACE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spelled: Option<String>,
 }
 
 /// One plugin's entry in `plugin-grants.json`.
@@ -68,8 +80,9 @@ pub struct PluginAccess {
     pub grants: Vec<Grant>,
     #[serde(default)]
     pub denied: Vec<String>,
-    /// A path the plugin asked for through a link → the granted path it resolves to. The
-    /// sandbox binds only the latter, so the runner recreates each link inside.
+    /// A path the plugin asked for through a link → the granted path it resolves to. The Linux
+    /// sandbox binds only the latter, so the runner recreates each link inside; on Windows each
+    /// link on the way gets its own ACE, since a DACL set by name lands on the target.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub links: BTreeMap<String, String>,
 }
@@ -81,6 +94,17 @@ pub struct PluginAccessSnapshot {
     pub grants: Vec<Grant>,
     pub pending: Vec<PendingRequest>,
     pub denied: Vec<String>,
+    /// Folders whose access is changing for this plugin right now.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub walks: Vec<AccessWalk>,
+}
+
+/// One folder a plugin asks for. `files` means nothing with `write`, which takes the tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskedPath {
+    pub path: String,
+    pub write: bool,
+    pub files: bool,
 }
 
 /// The operator's answer to a pending request. `Forget` removes a grant or denial.
@@ -104,6 +128,13 @@ pub struct RequestOutcome {
 pub struct RunnerRoot {
     pub path: PathBuf,
     pub write: bool,
+    /// The folder and the files directly in it. See [`Grant::files`].
+    #[cfg_attr(not(windows), allow(dead_code, reason = "a bind costs no walk"))]
+    pub files: bool,
+    /// A junction or symbolic link on the way to a root, as spelled: the link object alone,
+    /// nothing it points at. Windows only; bwrap follows a link.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "bwrap follows a link"))]
+    pub link: bool,
 }
 
 /// `changed` is what the caller emits `plugins.changed` on; `value` is the payload.
@@ -140,6 +171,7 @@ impl AccessEntry {
                         at: String::new(),
                         by: "legacy".into(),
                         forms: Vec::new(),
+                        files: false,
                     })
                     .collect(),
                 denied: Vec::new(),
@@ -265,33 +297,184 @@ fn home_path(p: &str, policy: &PathPolicy) -> PathBuf {
 }
 
 /// `raw` → `canon` when the plugin reached `canon` through a link: a plain absolute spelling
-/// that differs from where it resolves. A Windows prefix is never plain; ACLs follow junctions.
+/// that differs from where it resolves. A drive is plain; a verbatim or UNC prefix is not.
 fn link_of(raw: &str, canon: &str) -> Option<(String, String)> {
     let p = Path::new(raw);
     let plain = p.is_absolute()
-        && p.components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+        && p.components().all(|c| match c {
+            Component::RootDir | Component::Normal(_) => true,
+            Component::Prefix(prefix) => matches!(prefix.kind(), std::path::Prefix::Disk(_)),
+            Component::CurDir | Component::ParentDir => false,
+        });
     let spelled: PathBuf = p.components().collect();
-    (plain && spelled != Path::new(canon))
+    (plain && !path_eq(&spelled, Path::new(canon)))
         .then(|| (spelled.to_string_lossy().into_owned(), canon.to_string()))
 }
 
-/// Is `canonical` inside a declared manifest root or an existing grant that allows `write`?
-/// Declared roots (`(path, writable)`) are canonicalized when they resolve so both sides speak
-/// the same spelling. A read-only root never answers a write request.
+/// The reparse points on the way to `spelled`, nearest the leaf first: the runner opens through
+/// each, so each needs an ACE of its own. A drive root is never one. Spelled with one separator:
+/// a manifest path keeps the `/` that followed its `%Variable%`.
+#[cfg(windows)]
+fn link_components(spelled: &Path) -> Vec<PathBuf> {
+    spelled
+        .ancestors()
+        .filter(|a| a.parent().is_some())
+        .filter(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink()))
+        .map(|a| a.components().collect())
+        .collect()
+}
+
+/// A path with one `*` component: `base\*\tail` names each folder one level under `base` that
+/// holds `tail`, which may be empty, and `base` itself, whose listing is what the pattern is
+/// about. Always a files pattern, whatever flag came with it: a plugin on a kit that predates
+/// `files` asks with a plain string. One whole `*`, at least one real component before it, no
+/// other component carrying one.
+struct Pattern {
+    base: PathBuf,
+    tail: PathBuf,
+}
+
+fn pattern_of(p: &Path) -> Option<Pattern> {
+    let comps: Vec<Component> = p.components().collect();
+    let star = comps
+        .iter()
+        .position(|c| matches!(c, Component::Normal(n) if *n == "*"))?;
+    let (base, tail) = (&comps[..star], &comps[star + 1..]);
+    let starry =
+        |c: &Component| matches!(c, Component::Normal(n) if n.to_string_lossy().contains('*'));
+    if base.iter().any(starry) || tail.iter().any(starry) {
+        return None;
+    }
+    if !base.iter().any(|c| matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    if tail.iter().any(|c| !matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    Some(Pattern {
+        base: base.iter().collect(),
+        tail: tail.iter().collect(),
+    })
+}
+
+impl Pattern {
+    /// The folders the pattern names today, sorted. A missing base names none.
+    fn expand(&self) -> Vec<PathBuf> {
+        let Ok(listed) = std::fs::read_dir(&self.base) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = listed
+            .flatten()
+            .map(|entry| {
+                let dir = entry.path();
+                if self.tail.as_os_str().is_empty() {
+                    dir
+                } else {
+                    dir.join(&self.tail)
+                }
+            })
+            .filter(|p| p.is_dir())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Is `canonical` one of the folders this pattern names: the canonical base, or one
+    /// component under it and then the tail?
+    fn names(&self, canonical: &Path) -> bool {
+        let Ok(base) = self.base.canonicalize() else {
+            return false;
+        };
+        if path_eq(canonical, &base) {
+            return true;
+        }
+        let Some(rest) = rel_after(canonical, &base) else {
+            return false;
+        };
+        let mut comps = Path::new(&rest).components();
+        comps
+            .next()
+            .is_some_and(|c| matches!(c, Component::Normal(_)))
+            && path_eq(&comps.collect::<PathBuf>(), &self.tail)
+    }
+}
+
+/// `act` on `dir`, or on each folder its pattern names today, the base first.
+fn each_named(dir: &Path, act: &mut dyn FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
+    match pattern_of(dir) {
+        Some(pattern) => {
+            act(&pattern.base)?;
+            pattern.expand().iter().try_for_each(|d| act(d))
+        }
+        None => act(dir),
+    }
+}
+
+/// A root a request is checked against: `(path, writable, files)`.
+type Declared = (PathBuf, bool, bool);
+
+/// Does this root answer for `canonical`? A read-only root never answers a write. A files root
+/// answers a files request, for itself alone or for each folder its pattern names; a tree root
+/// answers both below it.
+fn answers(
+    root: &Path,
+    writable: bool,
+    own_files: bool,
+    canonical: &Path,
+    write: bool,
+    files: bool,
+) -> bool {
+    (writable || !write)
+        && if own_files {
+            files
+                && match pattern_of(root) {
+                    Some(pattern) => pattern.names(canonical),
+                    None => path_eq(canonical, root),
+                }
+        } else {
+            within(canonical, root)
+        }
+}
+
+/// What holds `canonical`: a tree root, declared or granted, outranks a files root that is it
+/// or whose pattern names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cover {
+    None,
+    Files,
+    Tree,
+}
+
+/// Declared roots are canonicalized when they resolve so both sides speak the same spelling.
 fn covers(
-    declared: &[(PathBuf, bool)],
+    declared: &[Declared],
     grants: &[Grant],
     canonical: &Path,
     write: bool,
+    files: bool,
     policy: &PathPolicy,
-) -> bool {
-    declared.iter().any(|(r, writable)| {
-        let root = r.canonicalize().unwrap_or_else(|_| r.clone());
-        (*writable || !write) && within(canonical, &root)
-    }) || grants
+) -> Cover {
+    let declared = declared.iter().map(|(r, writable, own_files)| {
+        (
+            r.canonicalize().unwrap_or_else(|_| r.clone()),
+            *writable,
+            *own_files,
+        )
+    });
+    let granted = grants
         .iter()
-        .any(|g| (g.write || !write) && within(canonical, &home_path(&g.path, policy)))
+        .map(|g| (home_path(&g.path, policy), g.write, g.files));
+    let mut cover = Cover::None;
+    for (root, writable, own_files) in declared.chain(granted) {
+        if !answers(&root, writable, own_files, canonical, write, files) {
+            continue;
+        }
+        if !own_files {
+            return Cover::Tree;
+        }
+        cover = Cover::Files;
+    }
+    cover
 }
 
 /// Windows-only refusals: `C:\Users`, the profile roots directly under it, `C:\Windows` and
@@ -455,31 +638,35 @@ fn replace(path: &Path, body: &[u8]) -> io::Result<()> {
     }
 }
 
-/// The ACL half of a grant, mapped into `io::Error` for the store's signatures. Runs only
-/// once a grant is certain to be recorded — a cap refusal never leaves an unrecorded ACE.
-fn apply_acl(dir: &Path, write: bool) -> io::Result<()> {
+/// The ACL half of a grant, mapped into `io::Error` for the store's signatures: the runner's
+/// ACE, and `plugin`'s capability ACE when named. Runs only once a grant is certain to be
+/// recorded — a cap refusal never leaves an unrecorded ACE. Called with no lock held: a large
+/// tree takes minutes, and every reader of this store would wait. A pattern lands on each
+/// folder it names today; the converge places the ones that appear later.
+fn apply_acl(plugin: Option<&str>, dir: &Path, write: bool, files: bool) -> io::Result<()> {
     #[cfg(test)]
     ACL_CALLS.with(|calls| calls.set(calls.get() + 1));
-    super::grant_acl(dir, write)
+    each_named(dir, &mut |d| super::grant_acl(plugin, d, write, files))
 }
 
-/// Match the ACL on `path` to the grants left after one came off. Every Windows plugin is the
-/// same principal, so the ACE goes only when no plugin holds the folder, and a write ACE falls
-/// back to read when only read grants remain. Best-effort: the record is already written.
-fn settle_acl(access: &BTreeMap<String, PluginAccess>, path: &str) {
-    let held: Vec<bool> = access
+/// Match the ACL on `path` to the grants left after `plugin`'s came off. Every Windows plugin
+/// shares the runner's account, so its ACE goes, with `plugin`'s capability ACE, only when no
+/// plugin holds the folder, and a write ACE falls back to read when only read grants remain.
+/// `files` is the kind that came off. Best-effort: the record is already written.
+fn settle_acl(access: &BTreeMap<String, PluginAccess>, plugin: &str, path: &str, files: bool) {
+    let held: Vec<&Grant> = access
         .values()
         .flat_map(|a| a.grants.iter())
         .filter(|g| same_path(&g.path, path))
-        .map(|g| g.write)
         .collect();
     let dir = Path::new(path);
     let result = if held.is_empty() {
         #[cfg(test)]
         ACL_REMOVES.with(|calls| calls.set(calls.get() + 1));
-        super::revoke_acl(dir)
+        each_named(dir, &mut |d| super::revoke_acl(plugin, d, files))
     } else {
-        apply_acl(dir, held.contains(&true))
+        let write = held.iter().any(|g| g.write);
+        apply_acl(None, dir, write, held.iter().all(|g| g.files))
     };
     if let Err(e) = result {
         tracing::warn!(path, error = %e, "revoked folder keeps its runner ACE");
@@ -633,21 +820,22 @@ impl AccessStore {
     /// sticky-denied is answered without a new row; anything the host would never grant is
     /// `refused:<rule>` here rather than offered to the operator. A granted path asked for
     /// through a link records that link for the runner.
-    pub fn request(
+    pub fn request_paths(
         &self,
         id: &str,
-        paths: &[(String, bool)],
+        paths: &[AskedPath],
         reason: Option<String>,
     ) -> io::Result<Mutation<Vec<RequestOutcome>>> {
         let _guard = self.exclusive()?;
         let mut access = self.load_access()?;
         let mut pending_all = self.load_pending();
-        let declared: Vec<(PathBuf, bool)> = crate::plugins::manifest::for_provider(id)
+        let declared: Vec<Declared> = crate::plugins::manifest::for_provider(id)
             .map(|m| {
-                let reads = m.reads.iter().map(|p| (home_path(p, &self.policy), false));
-                reads
-                    .chain(m.writes.iter().map(|p| (home_path(p, &self.policy), true)))
-                    .collect()
+                let root = |p: &String, w, f| (home_path(p, &self.policy), w, f);
+                let reads = m.reads.iter().map(|p| root(p, false, false));
+                let files = m.files.iter().map(|p| root(p, false, true));
+                let writes = m.writes.iter().map(|p| root(p, true, false));
+                reads.chain(files).chain(writes).collect()
             })
             .unwrap_or_default();
         let entry = access.get(id).cloned().unwrap_or_default();
@@ -655,10 +843,12 @@ impl AccessStore {
         let mut changed = false;
         let outcomes: Vec<RequestOutcome> = paths
             .iter()
-            .map(|(raw, write)| {
+            .map(|asked| {
                 self.request_one(
-                    raw,
-                    *write,
+                    id,
+                    &asked.path,
+                    asked.write,
+                    asked.files && !asked.write,
                     &reason,
                     &declared,
                     &entry,
@@ -681,7 +871,7 @@ impl AccessStore {
             .iter()
             .zip(&outcomes)
             .filter(|(_, o)| o.outcome == "granted")
-            .filter_map(|((raw, _), o)| link_of(raw, &o.path))
+            .filter_map(|(asked, o)| link_of(&asked.path, &o.path))
             .filter(|(k, v)| entry.links.get(k) != Some(v))
             .collect();
         if !links.is_empty() {
@@ -697,8 +887,10 @@ impl AccessStore {
                     .iter()
                     .any(|g| within(Path::new(target), &home_path(&g.path, &self.policy)))
             });
+            // A new link is a new root for the runner, so the caller converges on it.
             if e.links != entry.links {
                 self.write_access(&access)?;
+                changed = true;
             }
         }
         Ok(Mutation {
@@ -707,13 +899,33 @@ impl AccessStore {
         })
     }
 
+    /// [`Self::request_paths`] for folders asked for whole.
+    pub fn request(
+        &self,
+        id: &str,
+        paths: &[(String, bool)],
+        reason: Option<String>,
+    ) -> io::Result<Mutation<Vec<RequestOutcome>>> {
+        let asked: Vec<AskedPath> = paths
+            .iter()
+            .map(|(path, write)| AskedPath {
+                path: path.clone(),
+                write: *write,
+                files: false,
+            })
+            .collect();
+        self.request_paths(id, &asked, reason)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn request_one(
         &self,
+        id: &str,
         raw: &str,
         write: bool,
+        files: bool,
         reason: &Option<String>,
-        declared: &[(PathBuf, bool)],
+        declared: &[Declared],
         entry: &PluginAccess,
         pending: &mut Vec<PendingRequest>,
         changed: &mut bool,
@@ -723,8 +935,16 @@ impl AccessStore {
             outcome: outcome.into(),
         };
         let raw_path = Path::new(raw);
-        // Shape first: a malformed string is refused before it touches the filesystem.
-        let canonical = match raw_path.canonicalize() {
+        // Shape first: a malformed string is refused before it touches the filesystem. A pattern
+        // is a files request however it was asked, judged by its base; the `*` and the tail stay
+        // as written.
+        let pattern = pattern_of(raw_path).filter(|_| !write);
+        let files = files || pattern.is_some();
+        let resolved = match &pattern {
+            Some(pattern) => pattern.base.canonicalize(),
+            None => raw_path.canonicalize(),
+        };
+        let canonical = match resolved {
             Ok(c) => c,
             Err(_) if raw_path.is_absolute() => {
                 // The refusal rule still applies its string checks; a path that does not
@@ -740,8 +960,14 @@ impl AccessStore {
             }
             Err(_) => return outcome(raw.to_string(), "refused:not_absolute"),
         };
-        let canon = canonical.to_string_lossy().into_owned();
+        // The rules judge `canonical`; the row and the grant carry `stored`, a pattern's base
+        // with its `*` and tail put back.
         let facts = path_facts(&canonical);
+        let stored = match &pattern {
+            Some(pattern) => canonical.join("*").join(&pattern.tail),
+            None => canonical.clone(),
+        };
+        let canon = stored.to_string_lossy().into_owned();
         // A repost returns pending even at the cap — but a stale row under a path that is
         // refused today answers refused, never pending.
         if let Some(row) = pending.iter().find(|p| same_path(&p.path, &canon)) {
@@ -753,8 +979,19 @@ impl AccessStore {
         if let Some(rule) = refusal_rule(raw_path, &canonical, write, false, &self.policy, facts) {
             return outcome(canon, &format!("refused:{rule}"));
         }
-        if covers(declared, &entry.grants, &canonical, write, &self.policy) {
-            return outcome(canon, "granted");
+        match covers(declared, &entry.grants, &stored, write, files, &self.policy) {
+            Cover::None => {}
+            Cover::Tree => return outcome(canon, "granted"),
+            Cover::Files => {
+                // A folder a pattern names, or one reached through a link, gets its ACE now, so
+                // the scan this answer goes back to can read it.
+                if pattern.is_none() {
+                    if let Err(e) = apply_acl(Some(id), &stored, false, true) {
+                        tracing::warn!(plugin = id, path = %canon, error = %e, "covered folder not opened");
+                    }
+                }
+                return outcome(canon, "granted");
+            }
         }
         if entry.denied.iter().any(|d| same_path(d, &canon)) {
             return outcome(canon, "denied");
@@ -766,6 +1003,10 @@ impl AccessStore {
             return outcome(canon, "refused:pending_limit");
         }
         pending.push(PendingRequest {
+            spelled: match pattern {
+                Some(_) => None,
+                None => link_of(raw, &canon).map(|(spelled, _)| spelled),
+            },
             path: canon.clone(),
             write,
             reason: reason.clone(),
@@ -773,6 +1014,7 @@ impl AccessStore {
             emulator: None,
             core: None,
             saves: false,
+            files,
         });
         *changed = true;
         outcome(canon, "pending")
@@ -853,6 +1095,8 @@ impl AccessStore {
                 emulator: emulator.map(str::to_string),
                 core: core.map(str::to_string),
                 saves,
+                files: false,
+                spelled: None,
             });
             pending_all.insert(id.to_string(), pending);
             self.write_pending(&pending_all)?;
@@ -871,11 +1115,11 @@ impl AccessStore {
     /// write grant. A path that doesn't resolve is checked as given.
     pub fn may_write(&self, id: &str, path: &Path) -> bool {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let declared: Vec<(PathBuf, bool)> = crate::plugins::manifest::for_provider(id)
+        let declared: Vec<Declared> = crate::plugins::manifest::for_provider(id)
             .map(|m| {
                 m.writes
                     .iter()
-                    .map(|p| (home_path(p, &self.policy), true))
+                    .map(|p| (home_path(p, &self.policy), true, false))
                     .collect()
             })
             .unwrap_or_default();
@@ -885,7 +1129,7 @@ impl AccessStore {
             .map(|e| e.grants.clone())
             .unwrap_or_default();
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        covers(&declared, &grants, &canonical, true, &self.policy)
+        covers(&declared, &grants, &canonical, true, false, &self.policy) != Cover::None
     }
 
     /// The emulator a pending row asks for, when it is one.
@@ -921,110 +1165,149 @@ impl AccessStore {
         decision: Decision,
         by: &str,
     ) -> io::Result<Mutation<PluginAccessSnapshot>> {
-        let _guard = self.exclusive()?;
         let stored_path = resolve_stored(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the path must be absolute with no '..' component",
             )
         })?;
+        match decision {
+            Decision::Allow => self.allow(id, &stored_path, by),
+            Decision::Deny => self.deny(id, &stored_path),
+            Decision::Forget => self.forget(id, &stored_path),
+        }
+    }
+
+    fn allow(
+        &self,
+        id: &str,
+        stored_path: &str,
+        by: &str,
+    ) -> io::Result<Mutation<PluginAccessSnapshot>> {
+        let no_row = || io::Error::new(io::ErrorKind::NotFound, "no pending request for that path");
+        // The cap is checked before the ACL and before the pending row moves: a refused allow
+        // leaves no ACE on disk and the request stays actionable.
+        let row = {
+            let _guard = self.exclusive()?;
+            let access = self.load_access()?;
+            let row = self.load_pending().get(id).and_then(|rows| {
+                rows.iter()
+                    .find(|p| same_path(&p.path, stored_path))
+                    .cloned()
+            });
+            let row = row.ok_or_else(no_row)?;
+            let grants = access.get(id).map_or(&[][..], |e| &e.grants);
+            if !grants.iter().any(|g| same_path(&g.path, &row.path)) && grants.len() >= MAX_GRANTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the grant limit is reached",
+                ));
+            }
+            row
+        };
+        apply_acl(Some(id), Path::new(&row.path), row.write, row.files)?;
+        let guard = self.exclusive()?;
         let mut access = self.load_access()?;
         let mut pending_all = self.load_pending();
-        let mut grants_changed = false;
-        let mut pending_changed = false;
-        let mut ungranted = false;
-        match decision {
-            Decision::Allow => {
-                // The cap is checked before the ACL and before the pending row moves: a
-                // refused allow leaves no ACE on disk and the request stays actionable.
-                let row = pending_all.get(id).and_then(|rows| {
-                    rows.iter()
-                        .find(|p| same_path(&p.path, &stored_path))
-                        .cloned()
-                });
-                let Some(row) = row else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "no pending request for that path",
-                    ));
-                };
-                let entry = access.entry(id.to_string()).or_default();
-                if !entry.grants.iter().any(|g| same_path(&g.path, &row.path))
-                    && entry.grants.len() >= MAX_GRANTS
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "the grant limit is reached",
-                    ));
-                }
-                apply_acl(Path::new(&row.path), row.write)?;
-                if let Some(rows) = pending_all.get_mut(id) {
-                    rows.retain(|p| !same_path(&p.path, &stored_path));
-                }
-                pending_changed = true;
-                if let Some(g) = entry
-                    .grants
-                    .iter_mut()
-                    .find(|g| same_path(&g.path, &row.path))
-                {
-                    g.write = row.write;
-                    g.at = now_rfc3339();
-                    g.by = by.to_string();
-                } else {
-                    entry.grants.push(Grant {
-                        path: row.path,
-                        write: row.write,
-                        at: now_rfc3339(),
-                        by: by.to_string(),
-                        forms: Vec::new(),
-                    });
-                }
-                grants_changed = true;
-            }
-            Decision::Deny => {
-                // Every row on the folder goes, as an allow takes them all: RetroArch's cores
-                // share one.
-                let found = pending_all.get_mut(id).is_some_and(|rows| {
-                    let before = rows.len();
-                    rows.retain(|p| !same_path(&p.path, &stored_path));
-                    rows.len() != before
-                });
-                if !found {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "no pending request for that path",
-                    ));
-                }
-                pending_changed = true;
-                let entry = access.entry(id.to_string()).or_default();
-                if !entry.denied.iter().any(|d| same_path(d, &stored_path)) {
-                    entry.denied.push(stored_path.clone());
-                }
-                grants_changed = true;
-            }
-            Decision::Forget => {
-                if let Some(entry) = access.get_mut(id) {
-                    let before = entry.grants.len() + entry.denied.len();
-                    let granted = entry.grants.len();
-                    entry.grants.retain(|g| !same_path(&g.path, &stored_path));
-                    ungranted = entry.grants.len() != granted;
-                    entry.denied.retain(|d| !same_path(d, &stored_path));
-                    grants_changed = entry.grants.len() + entry.denied.len() != before;
-                }
+        let answered = pending_all.get_mut(id).is_some_and(|rows| {
+            let before = rows.len();
+            rows.retain(|p| !same_path(&p.path, stored_path));
+            rows.len() != before
+        });
+        // A no that landed during the walk stands, and the ACE comes back off.
+        if !answered {
+            drop(guard);
+            settle_acl(&access, id, &row.path, row.files);
+            return Err(no_row());
+        }
+        let entry = access.entry(id.to_string()).or_default();
+        if let Some(g) = entry
+            .grants
+            .iter_mut()
+            .find(|g| same_path(&g.path, &row.path))
+        {
+            g.write = row.write;
+            g.files = row.files;
+            g.at = now_rfc3339();
+            g.by = by.to_string();
+        } else {
+            entry.grants.push(Grant {
+                path: row.path.clone(),
+                write: row.write,
+                at: now_rfc3339(),
+                by: by.to_string(),
+                forms: Vec::new(),
+                files: row.files,
+            });
+        }
+        if let Some(spelled) = row.spelled {
+            if entry.links.len() < MAX_GRANTS || entry.links.contains_key(&spelled) {
+                entry.links.insert(spelled, row.path);
             }
         }
-        if grants_changed {
-            self.write_access(&access)?;
-        }
-        if ungranted {
-            settle_acl(&access, &stored_path);
-        }
-        if pending_changed {
-            self.write_pending(&pending_all)?;
-        }
+        self.write_access(&access)?;
+        self.write_pending(&pending_all)?;
         Ok(Mutation {
             value: snapshot_of(id, &access, &pending_all),
-            changed: grants_changed || pending_changed,
+            changed: true,
+        })
+    }
+
+    /// Every row on the folder goes, as an allow takes them all: RetroArch's cores share one.
+    fn deny(&self, id: &str, stored_path: &str) -> io::Result<Mutation<PluginAccessSnapshot>> {
+        let _guard = self.exclusive()?;
+        let mut access = self.load_access()?;
+        let mut pending_all = self.load_pending();
+        let found = pending_all.get_mut(id).is_some_and(|rows| {
+            let before = rows.len();
+            rows.retain(|p| !same_path(&p.path, stored_path));
+            rows.len() != before
+        });
+        if !found {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no pending request for that path",
+            ));
+        }
+        let entry = access.entry(id.to_string()).or_default();
+        if !entry.denied.iter().any(|d| same_path(d, stored_path)) {
+            entry.denied.push(stored_path.to_string());
+        }
+        self.write_access(&access)?;
+        self.write_pending(&pending_all)?;
+        Ok(Mutation {
+            value: snapshot_of(id, &access, &pending_all),
+            changed: true,
+        })
+    }
+
+    fn forget(&self, id: &str, stored_path: &str) -> io::Result<Mutation<PluginAccessSnapshot>> {
+        let guard = self.exclusive()?;
+        let mut access = self.load_access()?;
+        let pending = self.load_pending();
+        let (mut changed, mut ungranted, mut files) = (false, false, false);
+        if let Some(entry) = access.get_mut(id) {
+            let before = entry.grants.len() + entry.denied.len();
+            let granted = entry.grants.len();
+            files = entry
+                .grants
+                .iter()
+                .any(|g| g.files && same_path(&g.path, stored_path));
+            entry.grants.retain(|g| !same_path(&g.path, stored_path));
+            ungranted = entry.grants.len() != granted;
+            entry.denied.retain(|d| !same_path(d, stored_path));
+            changed = entry.grants.len() + entry.denied.len() != before;
+        }
+        if changed {
+            self.write_access(&access)?;
+        }
+        drop(guard);
+        if ungranted {
+            settle_acl(&access, id, stored_path, files);
+        }
+        Ok(Mutation {
+            value: snapshot_of(id, &access, &pending),
+            changed,
         })
     }
 
@@ -1071,69 +1354,138 @@ impl AccessStore {
             let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
             self.granted()
         };
-        let declared = manifests.values().flat_map(|m| {
-            let reads = m.reads.iter().map(|p| (p.as_str(), false, false));
-            reads.chain(m.writes.iter().map(|p| (p.as_str(), true, false)))
-        });
+        let declared = manifests.values().flat_map(declared_entries);
         let granted = access
             .values()
-            .flat_map(|a| a.grants.iter().map(|g| (g.path.as_str(), g.write, true)));
-        self.resolve_roots(declared.chain(granted))
+            .flat_map(|a| a.grants.iter().map(grant_entry));
+        let links = access.values().flat_map(|a| a.links.keys());
+        self.resolve_roots(declared.chain(granted), links.map(String::as_str))
     }
 
     /// [`Self::runner_roots`] for one plugin: what its manifest declares plus its own grants,
-    /// which is what its own account or package gets an ACE for.
+    /// which is what its own account or capability gets an ACE for.
     #[cfg_attr(not(windows), allow(dead_code, reason = "Windows grants per plugin"))]
     pub fn plugin_roots(&self, id: &str, manifest: &PluginManifest) -> Vec<RunnerRoot> {
         let access = {
             let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
             self.granted()
         };
-        let reads = manifest.reads.iter().map(|p| (p.as_str(), false, false));
-        let writes = manifest.writes.iter().map(|p| (p.as_str(), true, false));
         let granted = access
             .get(id)
             .into_iter()
-            .flat_map(|a| a.grants.iter().map(|g| (g.path.as_str(), g.write, true)));
-        self.resolve_roots(reads.chain(writes).chain(granted))
+            .flat_map(|a| a.grants.iter().map(grant_entry));
+        let links = access.get(id).into_iter().flat_map(|a| a.links.keys());
+        self.resolve_roots(
+            declared_entries(manifest).chain(granted),
+            links.map(String::as_str),
+        )
     }
 
-    /// `(spelled, write, operator)` entries into the real roots a runner may see.
+    /// May the runner see `real`, asked for as `spelled`? A missing root is the drop-in's `-`
+    /// prefix's business, and a root may be a file.
+    fn may_bind(&self, spelled: &Path, real: &Path, write: bool, operator: bool) -> bool {
+        let facts = PathFacts {
+            is_dir: true,
+            ..path_facts(real)
+        };
+        refusal_rule(spelled, real, write, operator, &self.policy, facts).is_none()
+    }
+
+    /// The links on the way to `spelled` when it resolves elsewhere, each a root of its own,
+    /// judged as a folder would be.
+    #[cfg(windows)]
+    fn link_roots(&self, spelled: &Path, real: &Path, operator: bool) -> Vec<RunnerRoot> {
+        if path_eq(real, spelled) {
+            return Vec::new();
+        }
+        link_components(spelled)
+            .into_iter()
+            .filter(|link| self.may_bind(link, link, false, operator))
+            .map(|path| RunnerRoot {
+                path,
+                write: false,
+                files: false,
+                link: true,
+            })
+            .collect()
+    }
+
+    /// One spelled root into `roots`: its real path, the links on the way to it on Windows, and
+    /// on Linux the real directory holding a link, which bwrap follows in the runner.
+    fn bind(
+        &self,
+        roots: &mut Vec<RunnerRoot>,
+        spelled: PathBuf,
+        write: bool,
+        files: bool,
+        operator: bool,
+    ) {
+        let real = spelled.canonicalize().unwrap_or_else(|_| spelled.clone());
+        if !self.may_bind(&spelled, &real, write, operator) {
+            return;
+        }
+        #[cfg(windows)]
+        roots.extend(self.link_roots(&spelled, &real, operator));
+        if real != spelled {
+            let holder = spelled
+                .ancestors()
+                .skip(1)
+                .find(|a| a.canonicalize().is_ok_and(|c| c == *a));
+            if let Some(dir) = holder.filter(|d| self.may_bind(d, d, false, operator)) {
+                roots.push(RunnerRoot {
+                    path: dir.to_path_buf(),
+                    write: false,
+                    files: false,
+                    link: false,
+                });
+            }
+        }
+        roots.push(RunnerRoot {
+            path: real,
+            write,
+            files,
+            link: false,
+        });
+    }
+
+    /// `(spelled, write, files, operator)` entries into the real roots a runner may see, plus
+    /// the links a plugin asked through, which Windows binds as roots of their own.
     fn resolve_roots<'a>(
         &self,
-        entries: impl Iterator<Item = (&'a str, bool, bool)>,
+        entries: impl Iterator<Item = (&'a str, bool, bool, bool)>,
+        links: impl Iterator<Item = &'a str>,
     ) -> Vec<RunnerRoot> {
-        // A missing root is the drop-in's `-` prefix's business, and a root may be a file.
-        let allowed = |spelled: &Path, real: &Path, write: bool, operator: bool| {
-            let facts = PathFacts {
-                is_dir: true,
-                ..path_facts(real)
-            };
-            refusal_rule(spelled, real, write, operator, &self.policy, facts).is_none()
-        };
         let mut roots = Vec::new();
-        for (p, write, operator) in entries {
+        for (p, write, files, operator) in entries {
             let spelled = home_path(p, &self.policy);
-            let real = spelled.canonicalize().unwrap_or_else(|_| spelled.clone());
-            if !allowed(&spelled, &real, write, operator) {
-                continue;
-            }
-            if real != spelled {
-                let holder = spelled
-                    .ancestors()
-                    .skip(1)
-                    .find(|a| a.canonicalize().is_ok_and(|c| c == *a));
-                if let Some(dir) = holder.filter(|d| allowed(d, d, false, operator)) {
-                    roots.push(RunnerRoot {
-                        path: dir.to_path_buf(),
-                        write: false,
-                    });
+            // A pattern binds its base and each folder it names today, all by their own files;
+            // the next converge sees new ones.
+            match pattern_of(&spelled).filter(|_| !write) {
+                Some(pattern) => {
+                    self.bind(&mut roots, pattern.base.clone(), false, true, operator);
+                    for dir in pattern.expand() {
+                        self.bind(&mut roots, dir, false, true, operator);
+                    }
                 }
+                None => self.bind(&mut roots, spelled, write, files, operator),
             }
-            roots.push(RunnerRoot { path: real, write });
         }
-        // Writable first, so the dedup keeps the stronger of two entries for one path.
-        roots.sort_by(|a, b| a.path.cmp(&b.path).then(b.write.cmp(&a.write)));
+        #[cfg(windows)]
+        for spelled in links.map(PathBuf::from) {
+            let real = spelled.canonicalize().unwrap_or_else(|_| spelled.clone());
+            roots.extend(self.link_roots(&spelled, &real, true));
+        }
+        #[cfg(not(windows))]
+        let _ = links;
+        // Strongest first, so the dedup keeps it: a write, then a tree, then a folder's own
+        // files, then a link.
+        let strength = |r: &RunnerRoot| match (r.write, r.files, r.link) {
+            (true, _, _) => 3,
+            (false, _, true) => 0,
+            (false, true, false) => 1,
+            (false, false, false) => 2,
+        };
+        roots.sort_by(|a, b| a.path.cmp(&b.path).then(strength(b).cmp(&strength(a))));
         roots.dedup_by(|later, kept| later.path == kept.path);
         let writable: Vec<PathBuf> = roots
             .iter()
@@ -1167,7 +1519,7 @@ impl AccessStore {
         form: &str,
         keep: &[String],
     ) -> io::Result<Mutation<Vec<Grant>>> {
-        let _guard = self.exclusive()?;
+        let guard = self.exclusive()?;
         let kept: Vec<String> = keep.iter().flat_map(|p| grant_keys(Path::new(p))).collect();
         let mut access = self.load_access()?;
         let Some(entry) = access.get_mut(id) else {
@@ -1186,15 +1538,16 @@ impl AccessStore {
             changed = true;
             let last = g.forms.is_empty() && g.by == BY_FORM;
             if last {
-                gone.push(g.path.clone());
+                gone.push((g.path.clone(), g.files));
             }
             !last
         });
         let grants = entry.grants.clone();
         if changed {
             self.write_access(&access)?;
-            for path in &gone {
-                settle_acl(&access, path);
+            drop(guard);
+            for (path, files) in &gone {
+                settle_acl(&access, id, path, *files);
             }
         }
         Ok(Mutation {
@@ -1211,7 +1564,6 @@ impl AccessStore {
         by: &str,
         form: Option<&str>,
     ) -> io::Result<Vec<Grant>> {
-        let _guard = self.exclusive()?;
         if !dir.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1226,26 +1578,34 @@ impl AccessStore {
                 format!("'{}' can't be granted ({rule})", canonical.display()),
             ));
         }
+        let path = canonical.to_string_lossy().into_owned();
+        let write = {
+            let _guard = self.exclusive()?;
+            let access = self.load_access()?;
+            let grants = access.get(id).map_or(&[][..], |e| &e.grants);
+            let existing = grants.iter().find(|g| same_path(&g.path, &path));
+            // Cap before ACL: a refused grant must not leave an ACE on the directory.
+            if existing.is_none() && grants.len() >= MAX_GRANTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the grant limit is reached",
+                ));
+            }
+            match (existing, form) {
+                (Some(g), Some(_)) => write || g.write,
+                _ => write,
+            }
+        };
+        apply_acl(Some(id), &canonical, write, false)?;
+        let _guard = self.exclusive()?;
         let mut access = self.load_access()?;
         let entry = access.entry(id.to_string()).or_default();
-        let path = canonical.to_string_lossy().into_owned();
         let existing = entry.grants.iter().position(|g| same_path(&g.path, &path));
-        // Cap before ACL: a refused grant must not leave an ACE on the directory.
-        if existing.is_none() && entry.grants.len() >= MAX_GRANTS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the grant limit is reached",
-            ));
-        }
-        let write = match (existing, form) {
-            (Some(i), Some(_)) => write || entry.grants[i].write,
-            _ => write,
-        };
-        apply_acl(&canonical, write)?;
         match (existing, form) {
             (Some(i), Some(form)) => {
                 let g = &mut entry.grants[i];
                 g.write = write;
+                g.files = false;
                 if !g.forms.iter().any(|f| f == form) {
                     g.forms.push(form.to_string());
                 }
@@ -1253,6 +1613,7 @@ impl AccessStore {
             (Some(i), None) => {
                 let g = &mut entry.grants[i];
                 g.write = write;
+                g.files = false;
                 g.at = now_rfc3339();
                 g.by = by.to_string();
             }
@@ -1262,6 +1623,7 @@ impl AccessStore {
                 at: now_rfc3339(),
                 by: by.to_string(),
                 forms: form.map(|f| vec![f.to_string()]).unwrap_or_default(),
+                files: false,
             }),
         }
         let grants = entry.grants.clone();
@@ -1280,7 +1642,7 @@ impl AccessStore {
     /// Remove a grant by its stored absolute spelling — no canonicalize, so an unplugged
     /// drive's grant still comes off. A no-op revoke writes nothing.
     pub fn revoke(&self, id: &str, path: &Path) -> io::Result<Vec<Grant>> {
-        let _guard = self.exclusive()?;
+        let guard = self.exclusive()?;
         let stored = resolve_stored(&path.to_string_lossy()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1288,10 +1650,14 @@ impl AccessStore {
             )
         })?;
         let mut access = self.load_access()?;
-        let mut changed = false;
+        let (mut changed, mut files) = (false, false);
         let grants = match access.get_mut(id) {
             Some(entry) => {
                 let before = entry.grants.len();
+                files = entry
+                    .grants
+                    .iter()
+                    .any(|g| g.files && same_path(&g.path, &stored));
                 entry.grants.retain(|g| !same_path(&g.path, &stored));
                 changed = entry.grants.len() != before;
                 entry.grants.clone()
@@ -1300,7 +1666,8 @@ impl AccessStore {
         };
         if changed {
             self.write_access(&access)?;
-            settle_acl(&access, &stored);
+            drop(guard);
+            settle_acl(&access, id, &stored, files);
         }
         Ok(grants)
     }
@@ -1350,6 +1717,18 @@ fn grant_keys(p: &Path) -> Vec<String> {
         .collect()
 }
 
+/// A manifest's roots as [`AccessStore::resolve_roots`] takes them.
+fn declared_entries(m: &PluginManifest) -> impl Iterator<Item = (&str, bool, bool, bool)> {
+    let reads = m.reads.iter().map(|p| (p.as_str(), false, false, false));
+    let files = m.files.iter().map(|p| (p.as_str(), false, true, false));
+    let writes = m.writes.iter().map(|p| (p.as_str(), true, false, false));
+    reads.chain(files).chain(writes)
+}
+
+fn grant_entry(g: &Grant) -> (&str, bool, bool, bool) {
+    (g.path.as_str(), g.write, g.files, true)
+}
+
 fn snapshot_of(
     id: &str,
     access: &BTreeMap<String, PluginAccess>,
@@ -1361,6 +1740,7 @@ fn snapshot_of(
         grants: entry.grants,
         pending: pending.get(id).cloned().unwrap_or_default(),
         denied: entry.denied,
+        walks: walks::of(id),
     }
 }
 
@@ -1674,6 +2054,7 @@ mod tests {
             },
             by: by.into(),
             forms: forms.iter().map(|form| (*form).to_string()).collect(),
+            files: false,
         };
         let demo = PluginAccess {
             grants: vec![
@@ -1821,10 +2202,17 @@ mod tests {
         assert_eq!(m.value[0].outcome, "granted");
         assert!(!m.changed, "an already-reachable path stores no row");
         // The pure rule knows the manifest-declared half of the same check, and its mode.
-        let declared = vec![(f.policy.home.join("Games"), false)];
+        let declared = vec![(f.policy.home.join("Games"), false, false)];
         let x = f.policy.home.join("Games/x");
-        assert!(covers(&declared, &[], &x, false, &f.policy));
-        assert!(!covers(&declared, &[], &x, true, &f.policy), "a read root");
+        assert_eq!(
+            covers(&declared, &[], &x, false, false, &f.policy),
+            Cover::Tree
+        );
+        assert_eq!(
+            covers(&declared, &[], &x, true, false, &f.policy),
+            Cover::None,
+            "a read root"
+        );
         // A write request over a read grant is a new request, not "granted".
         let w = s
             .request("demo", &[(sub.to_str().unwrap().to_string(), true)], None)
@@ -1841,6 +2229,7 @@ mod tests {
                     at: String::new(),
                     by: "legacy".into(),
                     forms: Vec::new(),
+                    files: false,
                 }],
                 denied: Vec::new(),
                 links: BTreeMap::new(),
@@ -1975,6 +2364,7 @@ mod tests {
                     at: String::new(),
                     by: "legacy".into(),
                     forms: Vec::new(),
+                    files: false,
                 },
                 Grant {
                     path: "/mnt/older".into(),
@@ -1982,6 +2372,7 @@ mod tests {
                     at: String::new(),
                     by: "legacy".into(),
                     forms: Vec::new(),
+                    files: false,
                 },
             ]
         );
@@ -2169,6 +2560,7 @@ mod tests {
                     at: "x".into(),
                     by: "cli".into(),
                     forms: Vec::new(),
+                    files: false,
                 }],
                 denied: vec![gone.into()],
                 links: BTreeMap::new(),
@@ -2267,7 +2659,161 @@ mod tests {
             at: String::new(),
             by: "cli".into(),
             forms: Vec::new(),
+            files: false,
         }
+    }
+
+    fn ask_files(s: &AccessStore, path: &Path) -> String {
+        let asked = AskedPath {
+            path: path.to_str().unwrap().to_string(),
+            write: false,
+            files: true,
+        };
+        s.request_paths("demo", &[asked], None).unwrap().value[0]
+            .outcome
+            .clone()
+    }
+
+    #[test]
+    fn a_files_grant_answers_for_its_folder_alone() {
+        let f = fixture();
+        let lib = f.dir("data/lib");
+        let below = f.dir("data/lib/common");
+        let s = f.store();
+        assert_eq!(ask_files(&s, &lib), "pending");
+        let path = lib.to_str().unwrap();
+        s.decide("demo", path, Decision::Allow, "console").unwrap();
+        assert!(s.grants_for("demo")[0].files);
+        assert_eq!(ask_files(&s, &lib), "granted");
+        // What it does not reach is asked for, and the operator can widen it.
+        assert_eq!(ask_files(&s, &below), "pending");
+        assert_eq!(f.request(path), "pending");
+        s.decide("demo", path, Decision::Allow, "console").unwrap();
+        assert!(!s.grants_for("demo")[0].files);
+        assert_eq!(ask_files(&s, &lib), "granted");
+    }
+
+    /// A `files` pattern: one prompt for a library folder answers each game folder under it,
+    /// new ones included, and the runner binds what the pattern names today.
+    #[test]
+    fn a_files_pattern_answers_each_folder_it_names() {
+        let f = fixture();
+        let lib = f.dir("data/lib");
+        let a = f.dir("data/lib/GameA/__Installer");
+        f.dir("data/lib/GameB");
+        std::fs::write(lib.join("notes.txt"), "x").unwrap();
+        let s = f.store();
+        let pattern = lib.join("*").join("__Installer");
+        assert_eq!(ask_files(&s, &pattern), "pending");
+        let row = s.snapshot_for("demo").unwrap().pending.remove(0);
+        assert!(row.files && row.spelled.is_none());
+        assert_eq!(row.path, pattern.to_string_lossy());
+        s.decide("demo", &row.path, Decision::Allow, "console")
+            .unwrap();
+        let grant = &s.grants_for("demo")[0];
+        assert!(grant.files && grant.path.contains('*'));
+        assert_eq!(ask_files(&s, &a), "granted");
+        assert_eq!(ask_files(&s, &lib), "granted", "the base lists its names");
+        assert_eq!(
+            ask_files(&s, &lib.join("GameB")),
+            "pending",
+            "the tail is part of the name"
+        );
+        assert_eq!(ask_files(&s, &pattern), "granted", "the same pattern again");
+        let b = f.dir("data/lib/GameB/__Installer");
+        assert_eq!(ask_files(&s, &b), "granted", "a folder that appeared later");
+        let roots = s.runner_roots(&BTreeMap::new());
+        let bound: Vec<&Path> = roots
+            .iter()
+            .filter(|r| r.files)
+            .map(|r| r.path.as_path())
+            .collect();
+        assert_eq!(bound, vec![lib.as_path(), a.as_path(), b.as_path()]);
+        assert!(!s.may_write("demo", &a));
+    }
+
+    /// A pattern is judged by the folder its base names, and needs exactly one whole `*`.
+    #[test]
+    fn a_pattern_needs_a_real_base_and_one_star() {
+        let f = fixture();
+        let s = f.store();
+        let x = f.dir("data/x");
+        assert_eq!(
+            ask_files(&s, &f.policy.home.join("*")),
+            "refused:broad_root"
+        );
+        assert_eq!(
+            ask_files(&s, &x.join("*").join("*")),
+            "refused:not_directory"
+        );
+        assert_eq!(
+            ask_files(&s, &x.join("goggame-*.info")),
+            "refused:not_directory"
+        );
+        // A kit that predates `files` asks with a plain string: a `*` is a files pattern anyway.
+        let whole = s
+            .request(
+                "demo",
+                &[(x.join("*").to_string_lossy().into_owned(), false)],
+                None,
+            )
+            .unwrap();
+        assert_eq!(whole.value[0].outcome, "pending");
+        assert!(s.snapshot_for("demo").unwrap().pending[0].files);
+    }
+
+    #[test]
+    fn a_whole_folder_answers_a_files_request_below_it() {
+        let f = fixture();
+        let lib = f.dir("data/lib");
+        let below = f.dir("data/lib/steamapps");
+        let s = f.store();
+        s.grant("demo", &lib, false, "cli").unwrap();
+        assert_eq!(ask_files(&s, &below), "granted");
+    }
+
+    #[test]
+    fn a_write_asks_for_the_tree_not_the_files() {
+        let f = fixture();
+        let lib = f.dir("data/lib");
+        let asked = AskedPath {
+            path: lib.to_str().unwrap().to_string(),
+            write: true,
+            files: true,
+        };
+        let s = f.store();
+        s.request_paths("demo", &[asked], None).unwrap();
+        let row = s.snapshot_for("demo").unwrap().pending.remove(0);
+        assert!(row.write && !row.files);
+    }
+
+    #[test]
+    fn a_root_keeps_the_strongest_kind_any_plugin_asked() {
+        let f = fixture();
+        let lib = f.dir("data/lib");
+        let spelled = lib.to_str().unwrap().to_string();
+        let declared = |files: &[&str], reads: &[&str], writes: &[&str]| {
+            let list = |v: &[&str]| v.iter().map(|p| (*p).to_string()).collect();
+            [(
+                "demo".to_string(),
+                PluginManifest {
+                    files: list(files),
+                    reads: list(reads),
+                    writes: list(writes),
+                    ..Default::default()
+                },
+            )]
+            .into()
+        };
+        let s = f.store();
+        let kinds = |m: &BTreeMap<String, PluginManifest>| {
+            let root = s.runner_roots(m).remove(0);
+            (root.write, root.files)
+        };
+        let one = [spelled.as_str()];
+        assert_eq!(kinds(&declared(&one, &[], &[])), (false, true));
+        assert_eq!(kinds(&declared(&one, &one, &[])), (false, false));
+        assert_eq!(kinds(&declared(&one, &[], &one)), (true, false));
     }
 
     #[test]
@@ -2289,6 +2835,8 @@ mod tests {
                 emulator: None,
                 core: None,
                 saves: false,
+                files: false,
+                spelled: None,
             })
             .collect();
         let s = write_state(&f, entry, pending);
@@ -2321,6 +2869,8 @@ mod tests {
                 emulator: None,
                 core: None,
                 saves: false,
+                files: false,
+                spelled: None,
             }],
         );
         let acl_before = acl_calls();
@@ -2418,6 +2968,54 @@ mod tests {
         // Ordinary profile content is not protected — only the named roots are.
         assert!(!windows_protected(Path::new(r"C:\Users\ann\Games")));
         assert!(!windows_protected(Path::new(r"D:\data\games")));
+    }
+
+    /// A junction is a link the runner opens through, so the ACE must land on it as well as on
+    /// its target: a request keeps its spelling, an allow records the link, and the link is a
+    /// root of its own. `mklink /J` needs no privilege.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_through_a_junction_keeps_its_spelling_and_binds_the_link() {
+        assert_eq!(
+            link_of(r"C:\Games\Lib", r"\\?\D:\Lib"),
+            Some((r"C:\Games\Lib".to_string(), r"\\?\D:\Lib".to_string()))
+        );
+        assert_eq!(link_of(r"C:\Games\Lib", r"\\?\c:\games\lib"), None);
+        assert_eq!(link_of(r"\\?\C:\Games\Lib", r"\\?\D:\Lib"), None);
+        assert_eq!(link_of(r"\\srv\share\Lib", r"\\?\UNC\srv\share\Lib"), None);
+
+        let f = fixture();
+        let plain = |p: &Path| PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\"));
+        let target = plain(&f.dir("data/lib"));
+        let link = plain(&f.dir("home/Games")).join("Lib");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let spelled = link.to_string_lossy().into_owned();
+        let canon = link.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(link_of(&spelled, &canon), Some((spelled.clone(), canon)));
+        assert_eq!(link_components(&link.join("steamapps")), vec![link.clone()]);
+        assert!(link_components(&target).is_empty());
+
+        let s = f.store();
+        assert_eq!(f.request(&spelled), "pending");
+        let row = s.snapshot_for("demo").unwrap().pending.remove(0);
+        assert_eq!(row.spelled.as_deref(), Some(spelled.as_str()));
+        s.decide("demo", &row.path, Decision::Allow, "console")
+            .unwrap();
+        let entry = s.load_access().unwrap().remove("demo").unwrap();
+        assert_eq!(entry.links.get(&spelled), Some(&row.path));
+        let roots = s.runner_roots(&BTreeMap::new());
+        assert!(roots.iter().any(|r| r.link && r.path == link), "{roots:?}");
+        assert!(roots.iter().any(|r| !r.link && !r.files && !r.write));
     }
 
     #[test]

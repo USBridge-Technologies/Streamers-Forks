@@ -24,6 +24,12 @@ object NativeBridge {
      */
     external fun nativeConnect(requestJson: String): Long
 
+    /**
+     * True while the dial [nativeConnect] is blocked on has been parked by the host for its
+     * operator's approval. The dial then waits for the verdict; show the approval wait.
+     */
+    external fun nativeDialPending(): Boolean
+
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */
     external fun nativeHostFingerprint(handle: Long): String
 
@@ -47,6 +53,19 @@ object NativeBridge {
      * ending. Cheap (one atomic load); UI-safe.
      */
     external fun nativeEndReason(handle: Long): Int
+
+    /** Milliseconds before redial [attempt] of a session that ended with [endReason]; -1 = stay ended. */
+    external fun nativeRedialDelayMs(endReason: Int, attempt: Int): Long
+
+    /**
+     * Milliseconds before dialing again a host that refused a connect with [token]
+     * ([nativeTakeLastError]), [sinceFirstMs] after its first such refusal (-1: the first);
+     * -1 = show the refusal. The woken-host rule every client shares.
+     */
+    external fun nativeWakeRedialDelayMs(autoWake: Boolean, token: String, sinceFirstMs: Long): Long
+
+    /** [nativeWakeRedialDelayMs] for a session that ended: its close counts only before any frame. */
+    external fun nativeSessionWakeRedialDelayMs(handle: Long, autoWake: Boolean, sinceFirstMs: Long): Long
 
     /**
      * The session's live access state as `[grants, remainingSecs, updateSeq]`, or `null` on a `0`
@@ -89,12 +108,26 @@ object NativeBridge {
     ): String
 
     /**
-     * The native client's recent log ring rendered as one text bundle, oldest first,
-     * prefixed by [header] (this app's identity line) — the body for "Send logs to host"
-     * (`POST /api/v1/client-logs` over the same mTLS client the library fetch uses).
-     * Never empty; cheap (string copy, no I/O).
+     * The native client's log rendered as one text bundle, oldest first, prefixed by [header]
+     * (this app's identity line) — the body for "Send logs to host" (`POST /api/v1/client-logs`
+     * over the same mTLS client the library fetch uses). It is the newest 768 KiB of the file
+     * [nativeOpenLogFile] opened, earlier runs included, or the in-memory ring when none is open.
+     * Never empty; reads the file, so call it off the main thread.
      */
     external fun nativeRenderLogs(header: String): String
+
+    /** Keep every native log line in [dir]`/client.log` from now on, rotated at 768 KiB. */
+    external fun nativeOpenLogFile(dir: String)
+
+    /** Each line of [text] as an ERROR `pf.crash` line in the log, on disk before this returns. */
+    external fun nativeLogCrash(text: String)
+
+    /**
+     * How the previous run ended: [summary] (`ApplicationExitInfo.toString()`) as one log line,
+     * then, by [reason], the crashing thread of a native crash's tombstone or the main thread of
+     * an ANR from [trace] (its `traceInputStream`, empty when Android kept none).
+     */
+    external fun nativeLogExit(summary: String, reason: Int, trace: ByteArray)
 
     /**
      * One `pf.wifi` line in the log ring above: why it was written, then the Wi-Fi link's signal
@@ -122,6 +155,9 @@ object NativeBridge {
      * WHY instead of the old catch-all that blamed the PIN for dead network paths.
      */
     external fun nativeTakeLastError(): String
+
+    /** The host's own sentence with the last refusal, cleared on read; "" when it said none. */
+    external fun nativeTakeLastSaid(): String
 
     /**
      * Signal a **deliberate** user disconnect on [handle] before [nativeClose]: the session closes
@@ -178,6 +214,25 @@ object NativeBridge {
      * blocking socket sends); run it on a background dispatcher.
      */
     external fun nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean
+
+    /**
+     * `method path` with [body] over the host's stream port as this device, refusing any host
+     * but [pinHex]. An empty [contentType] sends none. The reply as two bytes of big-endian
+     * status, then its body; null when the port carried nothing, so HTTPS may. One connection
+     * per host serves every call. Blocking; never on the main thread.
+     */
+    external fun nativeMgmtRequest(
+        host: String,
+        port: Int,
+        certPem: String,
+        keyPem: String,
+        pinHex: String,
+        method: String,
+        path: String,
+        contentType: String,
+        body: ByteArray,
+        timeoutMs: Int,
+    ): ByteArray?
 
     /**
      * Bounded QUIC reachability probe to [host]:[port] (mDNS-independent): the lowercase-hex
@@ -575,6 +630,9 @@ object NativeBridge {
     /** Live natural-scroll toggle, applied once at the core's outbound seam. False on a dead session. */
     external fun nativeSetInvertScroll(handle: Long, invert: Boolean): Boolean
 
+    /** The default network or its addresses changed: the host follows a roam within a round trip. */
+    external fun nativePathChanged(handle: Long): Boolean
+
     /**
      * Whether this stream holds the screen awake right now: always with [keepAwake] (the "Keep
      * screen awake" setting) on, else only while the player's input is recent, so the device's
@@ -610,6 +668,24 @@ object NativeBridge {
      * for splitting stylus pointers out of the touch path onto the pen plane. False on `0`.
      */
     external fun nativeHostSupportsPen(handle: Long): Boolean
+
+    /** Whether the host forwards its cursor instead of compositing it (`HOST_CAP_CURSOR`). */
+    external fun nativeCursorChannel(handle: Long): Boolean
+
+    /**
+     * The newest host cursor state as `[serial, flags, x, y]`, the hotspot in frame pixels;
+     * flags bit 0 = visible. Waits up to 100 ms; `null` when none came.
+     */
+    external fun nativeNextCursorState(handle: Long): IntArray?
+
+    /**
+     * One queued host cursor shape as `[serial, w, h, hotX, hotY, pixels…]`, the pixels
+     * unpremultiplied ARGB. Never waits; `null` when none is queued.
+     */
+    external fun nativeNextCursorShape(handle: Long): IntArray?
+
+    /** `true`: this client draws the pointer and the host leaves it out of the picture. */
+    external fun nativeSetCursorRender(handle: Long, clientDraws: Boolean)
 
     /**
      * Whether the host advertised touch injection (`HOST_CAP2_TOUCH`). Without it a passthrough
@@ -910,7 +986,8 @@ object NativeBridge {
 
     /**
      * Where the session the console asked for stands: 0 connecting, 1 streaming, 2 failed([message]),
-     * 3 ended ([message] = the abnormal reason, or "" for a clean end), 4 reconnecting([message]).
+     * 3 ended ([message] = the abnormal reason, or "" for a clean end), 4 reconnecting([message]),
+     * 5 failed as profile-unknown([message]), 6 awaiting the host operator's approval.
      */
     external fun nativeConsoleSessionPhase(handle: Long, phase: Int, message: String)
 
@@ -977,6 +1054,9 @@ object NativeBridge {
 
     /** One title's poster, encoded (JPEG/PNG bytes). */
     external fun nativeConsoleLibraryArt(handle: Long, id: String, bytes: ByteArray)
+
+    /** A profile's picture, encoded, under the URL `FetchAvatar` named. */
+    external fun nativeConsoleAvatar(handle: Long, url: String, bytes: ByteArray)
 
     /** The host's `/status` games: `[{"app_id": "steam:570", "state": "running"}, …]`. */
     external fun nativeConsoleLibraryRunning(handle: Long, json: String)

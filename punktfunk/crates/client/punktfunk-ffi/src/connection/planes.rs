@@ -4,7 +4,8 @@
 #[cfg(feature = "quic")]
 use crate::*;
 
-// Handshake-resolved audio format, read fresh each call; the host never changes it live.
+// The audio format of the newest packet pulled, read fresh each call: a host may change it at a
+// marked packet (`PUNKTFUNK_REFORMAT_AUDIO`).
 #[cfg(feature = "quic")]
 use punktfunk_core::audio::plane::PlaneFormat as AudioFormat;
 
@@ -23,6 +24,8 @@ pub(super) struct AudioPcmState {
     frame_samples: usize,
     /// PLC frames already given during a drought. Subtract so a later gap is not covered twice.
     drought_frames: u32,
+    /// The first packet of a new format, kept back while the embedder reopens its player.
+    held: Option<punktfunk_core::client::AudioPacket>,
 }
 
 #[cfg(feature = "quic")]
@@ -38,6 +41,18 @@ impl AudioPcmState {
         self.pcm = vec![0f32; (1 + run) * fmt.max_frame_samples().max(1)];
         // Cap the tracker at this same run. A larger cap would silently truncate frames.
         self.gaps = punktfunk_core::audio::AudioGapTracker::new_at_frame_us(fmt.frame_us);
+    }
+
+    /// A new format starts: everything sized or built for the old one goes. The embedder holds
+    /// no pointer into `pcm` across the status that announces it.
+    fn reopen(&mut self, first: punktfunk_core::client::AudioPacket) {
+        *self = AudioPcmState {
+            held: Some(punktfunk_core::client::AudioPacket {
+                new_format: None,
+                ..first
+            }),
+            ..AudioPcmState::default()
+        };
     }
 
     /// Decode one packet into `pcm`. Missing seqs are concealed first, then the
@@ -130,21 +145,30 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
                 let mut slot = lock_recover(&c.last);
                 let f = slot.insert(frame);
                 // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
-                unsafe {
-                    *out = PunktfunkFrame {
-                        data: f.data.as_ptr(),
-                        len: f.data.len(),
-                        frame_index: f.frame_index,
-                        pts_ns: f.pts_ns,
-                        flags: f.flags,
-                        received_ns: f.received_ns,
-                    };
-                }
+                unsafe { *out = frame_view(f) };
                 PunktfunkStatus::Ok
             }
             Err(e) => e.status(),
         }
     })
+}
+
+/// `f` as the caller reads it, borrowing `f.data`; a new format sets `FRAME_NEW_FORMAT`.
+#[cfg(feature = "quic")]
+pub(super) fn frame_view(f: &punktfunk_core::session::Frame) -> PunktfunkFrame {
+    PunktfunkFrame {
+        data: f.data.as_ptr(),
+        len: f.data.len(),
+        frame_index: f.frame_index,
+        pts_ns: f.pts_ns,
+        flags: f.flags
+            | if f.new_format.is_some() {
+                punktfunk_core::packet::FRAME_NEW_FORMAT
+            } else {
+                0
+            },
+        received_ns: f.received_ns,
+    }
 }
 
 /// One audio packet. Opus on ordinary sessions, PCM on `0xD3`. `data` borrows
@@ -238,7 +262,8 @@ pub unsafe extern "C" fn punktfunk_connection_audio_mute(
 /// Host-resolved audio channel count: `2` (stereo), `6` (5.1) or `8` (7.1).
 /// `*out` is filled when non-NULL. Raw `0xC9` Opus is encoded for this layout
 /// ([`punktfunk_core::audio::layout_for`]); or use [`punktfunk_connection_next_audio_pcm`].
-/// Fixed until a reconfigure.
+/// It and the other audio getters read the newest packet's format, which moves only where
+/// `next_audio_pcm` returned `PUNKTFUNK_STATUS_AUDIO_FORMAT`.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -248,7 +273,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    conn_out!(c, out => c.inner.audio_channels)
+    conn_out!(c, out => c.inner.audio_format().channels)
 }
 
 /// Resolved sample rate. Open the device from this, not `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`
@@ -262,7 +287,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_sample_rate(
     c: *mut PunktfunkConnection,
     out: *mut u32,
 ) -> PunktfunkStatus {
-    conn_out!(c, out => c.inner.audio_sample_rate_hz)
+    conn_out!(c, out => c.inner.audio_format().rate_hz)
 }
 
 /// Resolved sample depth (`16`, or `24` on lossless). Plane is
@@ -276,10 +301,10 @@ pub unsafe extern "C" fn punktfunk_connection_audio_bits(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    conn_out!(c, out => c.inner.audio_bits)
+    conn_out!(c, out => c.inner.audio_format().bits)
 }
 
-/// Resolved frame length in µs (ladder has sub-ms rungs). `0` = use
+/// Resolved frame length in µs (ladder has sub-ms rungs); Opus is
 /// `PUNKTFUNK_AUDIO_FRAME_MS × 1000`. On 44.1 kHz this is a nominal length, not a
 /// duration — size rings from it, advance clocks from samples / rate.
 /// Not derivable from `next_audio_pcm`'s `frame_count` (that includes concealment).
@@ -292,7 +317,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_frame_us(
     c: *mut PunktfunkConnection,
     out: *mut u16,
 ) -> PunktfunkStatus {
-    conn_out!(c, out => c.inner.audio_frame_us)
+    conn_out!(c, out => u16::try_from(c.inner.audio_format().frame_us).unwrap_or(u16::MAX))
 }
 
 /// Why the session ended (`PUNKTFUNK_END_REASON_*`). Latches after `Closed`.
@@ -307,6 +332,70 @@ pub unsafe extern "C" fn punktfunk_connection_end_reason(
     out: *mut u8,
 ) -> PunktfunkStatus {
     conn_out!(c, out => c.inner.end_reason() as u8)
+}
+
+/// Milliseconds to wait before redial `attempt` (0-based) of a session that ended with
+/// `end_reason` (`PUNKTFUNK_END_REASON_*`); `-1` means stay ended. Only `LOST` redials, on
+/// one schedule every client shares. The redial reuses the dial that started the session.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub extern "C" fn punktfunk_redial_delay_ms(end_reason: u8, attempt: u32) -> i64 {
+    punktfunk_core::client::PunktfunkEndReason::from_u8(end_reason)
+        .redial_delay(attempt)
+        .map_or(-1, |d| d.as_millis() as i64)
+}
+
+/// `since_first_ms` as the core reads it: `-1` (any negative) is no refusal yet.
+#[cfg(feature = "quic")]
+fn since_first(since_first_ms: i64) -> Option<std::time::Duration> {
+    u64::try_from(since_first_ms)
+        .ok()
+        .map(std::time::Duration::from_millis)
+}
+
+/// Milliseconds to wait before dialing again a host that refused a connect with `refusal` (the
+/// connect's `PUNKTFUNK_STATUS_*`), `since_first_ms` after its first such refusal (`-1`: this is
+/// the first); `-1` means show the refusal. With `auto_wake` on, a setup refusal dials again for
+/// 20 s from the first: a host that just woke answers before it can stream. One rule for every
+/// client.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub extern "C" fn punktfunk_wake_redial_delay_ms(
+    auto_wake: bool,
+    refusal: i32,
+    since_first_ms: i64,
+) -> i64 {
+    use punktfunk_core::{error::PunktfunkError, reject::RejectReason};
+    let refused = RejectReason::ALL
+        .iter()
+        .copied()
+        .find(|&r| PunktfunkError::Rejected(r, String::new()).status() as i32 == refusal);
+    punktfunk_core::reject::wake_redial_delay(
+        auto_wake,
+        refused,
+        false,
+        since_first(since_first_ms),
+    )
+    .map_or(-1, |d| d.as_millis() as i64)
+}
+
+/// [`punktfunk_wake_redial_delay_ms`] for a session that ended: its typed close counts only
+/// before any frame. Writes `-1` to `out` when it stays ended. Ask after `Closed`, before free.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `i64`.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_wake_redial_delay_ms(
+    c: *const PunktfunkConnection,
+    auto_wake: bool,
+    since_first_ms: i64,
+    out: *mut i64,
+) -> PunktfunkStatus {
+    conn_out!(c, out => c
+        .inner
+        .wake_redial_delay(auto_wake, since_first(since_first_ms))
+        .map_or(-1, |d| d.as_millis() as i64))
 }
 
 /// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved
@@ -332,6 +421,8 @@ pub struct PunktfunkAudioPcm {
 /// call; size the ring from [`punktfunk_connection_audio_sample_rate`]. Seq-gap
 /// concealment is prepended in the same buffer. Quiet-wire droughts:
 /// [`punktfunk_connection_audio_plc`]. Mutually exclusive with `next_audio`.
+/// `PUNKTFUNK_STATUS_AUDIO_FORMAT`, only under `PUNKTFUNK_REFORMAT_AUDIO`: the next packet is
+/// in a new format; reopen the player from the audio getters and call again.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable. At most one audio puller.
@@ -346,16 +437,23 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        let fmt = AudioFormat::of(&c.inner);
-        let channels = fmt.channels;
-        let pkt = match c
-            .inner
-            .next_audio(std::time::Duration::from_millis(timeout_ms as u64))
-        {
-            Ok(pkt) => pkt,
-            Err(e) => return e.status(),
-        };
         let mut state = lock_recover(&c.audio_pcm);
+        let pkt = match state.held.take() {
+            Some(pkt) => pkt,
+            None => match c
+                .inner
+                .next_audio(std::time::Duration::from_millis(timeout_ms as u64))
+            {
+                Ok(pkt) => pkt,
+                Err(e) => return e.status(),
+            },
+        };
+        if pkt.new_format.is_some() {
+            state.reopen(pkt);
+            return PunktfunkStatus::AudioFormat;
+        }
+        let fmt = c.inner.audio_format();
+        let channels = fmt.channels;
         match state.decode_packet(&pkt.data, pkt.seq, fmt) {
             // Nothing to hand out: a DTX silence marker with no loss owed before it.
             Ok(0) => PunktfunkStatus::NoFrame,
@@ -395,7 +493,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_plc(
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        let fmt = AudioFormat::of(&c.inner);
+        let fmt = c.inner.audio_format();
         let channels = fmt.channels;
         let mut state = lock_recover(&c.audio_pcm);
         match state.conceal(fmt) {
@@ -515,6 +613,25 @@ mod tests {
         frame_us: punktfunk_core::audio::pcm::FRAME_US_LADDER[0],
         layout: 0,
     };
+
+    /// A new format drops the decoder and the buffer the old one sized, and holds its first
+    /// packet back unmarked for the call after the status.
+    #[test]
+    fn a_new_audio_format_reopens_and_holds_its_first_packet() {
+        let mut state = AudioPcmState::default();
+        let frames = PCM_48K_24.frame_samples();
+        let (_, wire) = pcm_frame(frames, punktfunk_core::audio::pcm::BITS_24);
+        assert_eq!(state.decode_packet(&wire, 0, PCM_48K_24), Ok(frames));
+        state.reopen(punktfunk_core::client::AudioPacket {
+            seq: 1,
+            pts_ns: 0,
+            data: Vec::new(),
+            new_format: Some(OPUS_48K),
+        });
+        assert!(state.decoder.is_none() && state.pcm.is_empty());
+        let held = state.held.as_ref().map(|p| (p.seq, p.new_format));
+        assert_eq!(held, Some((1, None)));
+    }
 
     /// Concealment run a 5 ms session owes: ten frames (50 ms cap).
     const CONCEAL_RUN: u32 =

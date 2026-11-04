@@ -16,12 +16,15 @@ use crate::send_pacing::{frame_driven_enabled, CaptureCredit};
 
 mod cursor;
 mod encode;
+mod facts;
 mod pipeline;
 mod ramp;
 mod rebuild;
+mod rebuild_plan;
 mod recovery;
 #[cfg(target_os = "windows")]
 mod resize;
+mod screens;
 mod send;
 mod session_watch;
 mod state;
@@ -51,8 +54,8 @@ use self::state::StreamState;
 pub(super) use self::synth_abr::{synthetic_abr_stream, SynthAbrContext};
 pub use self::synth_abr::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
 
-/// Test frames at 60 Hz. The frames have no size, so an accepted mode switch is delivered as
-/// the next epoch, the way a rebuilt pipeline delivers one.
+/// Test frames at 60 Hz. The frames have no size, so an accepted mode switch or codec ask is
+/// delivered as the next epoch, the way a rebuilt pipeline delivers one.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn synthetic_stream(
     session: &mut Session,
@@ -62,6 +65,7 @@ pub(super) fn synthetic_stream(
     fec_target: &AtomicU8,
     timing_conn: Option<&super::link::SessionLink>,
     probe_seq: bool,
+    (mut mode, mut format): (punktfunk_core::Mode, punktfunk_core::quic::VideoFormat),
 ) -> Result<()> {
     let (probe_rx, probe_result_tx) = (&ends.probe_rx, &ends.probe_result_tx);
     let interval = std::time::Duration::from_millis(1000 / 60);
@@ -70,14 +74,24 @@ pub(super) fn synthetic_stream(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        if let Some(mode) = ends.reconfig.try_iter().last() {
+        let asked_mode = ends.reconfig.try_iter().last();
+        let asked_codec = ends.format_rx.try_iter().last();
+        if asked_mode.is_some() || asked_codec.is_some() {
             epoch = epoch.wrapping_add(1);
             session.set_epoch(epoch);
+            mode = asked_mode.unwrap_or(mode);
+            if let Some(codec) = asked_codec {
+                format.codec = crate::encode::codec_to_wire(codec);
+            }
             let _ = ends.reconfig_result_tx.send(super::wiring::Delivered {
                 mode,
+                format,
                 epoch,
                 corrects: false,
             });
+            if asked_codec.is_some() {
+                let _ = ends.format_result_tx.send(asked_codec);
+            }
         }
         apply_fec_target(session, fec_target);
         service_probes(session, stop, probe_rx, probe_result_tx, probe_seq);
@@ -126,7 +140,9 @@ pub(super) fn software_stream(
     );
     let (w, h, fps) = (mode.width, mode.height, mode.refresh_hz.max(1));
     let mut capturer = crate::capture::SyntheticCapturer::new(w, h, fps);
-    let mut frame = capturer.next_frame().context("first synthetic frame")?;
+    let mut frame = capturer
+        .next_frame(pf_capture::FirstFrame::Default)
+        .context("first synthetic frame")?;
     let mut encoder =
         pf_encode::open_software_h264(frame.format, w, h, fps, u64::from(bitrate_kbps) * 1000)
             .context("open the software encoder")?;
@@ -148,7 +164,9 @@ pub(super) fn software_stream(
             frames += 1;
         }
         std::thread::sleep(interval);
-        frame = capturer.next_frame().context("synthetic frame")?;
+        frame = capturer
+            .next_frame(pf_capture::FirstFrame::Default)
+            .context("synthetic frame")?;
     }
     tracing::info!(frames, "software stream complete");
     Ok(())
@@ -384,6 +402,9 @@ fn service_burst(
     match burst.as_mut() {
         Some(b) => {
             b.pump(session);
+            // Filler is never resent, and an AU's plaintext was drained when it was sealed:
+            // let go of the tap's copies now, not at the next AU after the whole burst.
+            session.drain_plaintext(|_| {});
             if b.expired() {
                 let done = burst.take().expect("armed on this branch");
                 let _ = probe_result_tx.send(done.finish());
@@ -402,7 +423,7 @@ fn service_burst(
     }
 }
 
-/// A diagnostic session (`EXT_DELIVERY_PROBE_ONLY`): the punched data plane serves every
+/// A diagnostic session (`EXT_DELIVERY_PROBE_ONLY`): the bound data plane serves every
 /// probe in full and nothing else — no display, encoder, launch or seat — until the client
 /// closes, [`PROBE_ONLY_MAX`] passes, or the probes have cost [`PROBE_ONLY_BYTES`]. Past the
 /// byte cap the rest are declined; the per-request clamps still apply to each.
@@ -456,7 +477,7 @@ fn service_probes(
 
 /// Seal one AU and send it on the session's [`Pacer`](crate::send_pacing::Pacer): every
 /// group on the clock at the link rate. Chunks go out as they are sealed, so the first
-/// packet leaves after one chunk, not the frame.
+/// packet leaves after one chunk, not the frame. `ring` keeps its plaintext for a NACK.
 fn paced_submit(
     session: &mut Session,
     data: &[u8],
@@ -464,11 +485,13 @@ fn paced_submit(
     flags: u32,
     frame_index: u32,
     pacer: &mut crate::send_pacing::Pacer,
-    ring: &mut recovery::ResendRing,
+    mut ring: Option<&mut recovery::ResendRing>,
 ) -> Result<PaceStat> {
-    pacer.begin(session.frame_wire_len(data.len()));
+    pacer.begin(session.frame_wire_len(data, flags));
     session.drain_plaintext(|_| {});
-    ring.begin(frame_index);
+    if let Some(r) = ring.as_deref_mut() {
+        r.begin(frame_index);
+    }
     let sealed =
         session.seal_frame_chunks_at(data, pts_ns, flags, frame_index, &mut |chunk, send| {
             let mut refs: Vec<&[u8]> = chunk.iter().map(|w| w.as_slice()).collect();
@@ -477,7 +500,10 @@ fn paced_submit(
         });
     let (stat, sock_ns) = pacer.finish();
     session.note_sock_ns(sock_ns);
-    session.drain_plaintext(|p| ring.note(p));
+    match ring {
+        Some(r) => session.drain_plaintext(|p| r.note(p)),
+        None => session.drain_plaintext(|_| {}),
+    }
     sealed.map_err(|e| anyhow!("seal_frame: {e:?}"))?;
     Ok(stat)
 }
@@ -496,7 +522,7 @@ fn pace_sealed(
     result.map_err(|e| anyhow!("send_sealed: {e:?}"))
 }
 
-/// What every stream source takes from its session: the punched session, its schedule, the
+/// What every stream source takes from its session: the bound session, its schedule, the
 /// stream thread's [`StreamEnds`], the [`SessionShared`] values and the session's identity.
 /// [`SessionContext`] and [`SynthAbrContext`] both carry one.
 ///
@@ -512,7 +538,7 @@ pub(crate) struct StreamCommon {
     pub(crate) counters: Arc<crate::session_status::SessionCounters>,
     pub(crate) ends: super::wiring::StreamEnds,
     pub(crate) shared: super::wiring::SessionShared,
-    /// Total wire budget (kbps): video + FEC + framing + audio reservation. PyroWave is identity.
+    /// Total wire budget (kbps): video + FEC + framing + audio reservation, PyroWave's pin too.
     pub(crate) bitrate_kbps: u32,
     pub(crate) audio_reserved_kbps: u32,
     pub(crate) shard_payload: u16,
@@ -532,6 +558,16 @@ pub(crate) struct StreamCommon {
     pub(crate) hdr: bool,
     pub(crate) bit_depth: u8,
     pub(crate) chroma: crate::encode::ChromaFormat,
+    /// The colour the Welcome promised.
+    pub(crate) color: punktfunk_core::quic::ColorInfo,
+}
+
+impl StreamCommon {
+    /// The mode and video format the Welcome promised.
+    pub(crate) fn opened_as(&self) -> (punktfunk_core::Mode, punktfunk_core::quic::VideoFormat) {
+        let format = state::video_format(self.codec, self.bit_depth, self.color, self.chroma);
+        (self.mode, format)
+    }
 }
 
 /// Owned per-session inputs for [`virtual_stream`]: the [`StreamCommon`] plus what a display
@@ -541,6 +577,12 @@ pub(super) struct SessionContext {
     pub(super) compositor: crate::vdisplay::Compositor,
     /// Per-instance, not via `PUNKTFUNK_GAMESCOPE_NODE` — two sessions must not overwrite each other.
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
+    /// What the handshake's format rule read, re-run for a codec change.
+    pub(super) format_facts: super::handshake::FormatFacts,
+    /// The handshake's encode resolution, which the session keeps for every open.
+    pub(super) encoder: Arc<crate::encode::Resolved>,
+    pub(super) host_knobs: &'static super::HostKnobs,
+    pub(super) knobs: super::SessionKnobs,
     /// `Hello::bitrate_kbps == 0`. A mode switch re-resolves PyroWave's pin either way, and an
     /// Automatic rate is held inside the new bounds. Another codec's explicit rate stays.
     pub(super) bitrate_auto: bool,
@@ -549,8 +591,9 @@ pub(super) struct SessionContext {
     pub(super) conn: super::link::SessionLink,
     pub(super) cursor_forward: bool,
     pub(super) streamed_au: bool,
-    /// `false` = single-slice. TV-SoC decoders (Amlogic) wedge on multi-slice.
-    pub(super) multi_slice: bool,
+    /// H.264/HEVC slices per frame; 1 = single-slice. TV-SoC decoders (Amlogic) wedge on
+    /// multi-slice.
+    pub(super) slices: u32,
     pub(super) launch: Option<String>,
     pub(super) launch_target: Option<crate::library::LaunchTarget>,
     /// This session's launch record, claimed before prep and the launch hold.
@@ -587,6 +630,8 @@ pub(super) struct SessionContext {
     /// The seat's own session: it follows the seat's Game Mode switch (`seats/session_switch.rs`).
     #[cfg(target_os = "linux")]
     pub(super) follows_seat: bool,
+    /// The client's screens when the session negotiated them, screen 0 first; `None` without.
+    pub(super) screens: Option<Vec<punktfunk_core::quic::v2::msg::Screen>>,
 }
 
 /// The virtual-display session: bring up, then tick until the client leaves.
@@ -779,13 +824,15 @@ mod tests {
 
     #[test]
     fn reconfig_allowed_gates_gamescope_and_per_client_mode() {
-        use crate::vdisplay::Compositor::{Gamescope, Hyprland, Kwin, Mutter, Niri, Wlroots};
+        use crate::vdisplay::Compositor::{
+            Gamescope, Hyprland, Kwin, Mutter, Niri, Umbriel, Wlroots,
+        };
         assert!(!reconfig_allowed(Some(Gamescope), false, false));
         assert!(!reconfig_allowed(Some(Gamescope), true, false));
         assert!(!reconfig_allowed(Some(Kwin), true, false));
         assert!(!reconfig_allowed(Some(Mutter), true, false));
         assert!(!reconfig_allowed(None, true, false));
-        for c in [Kwin, Mutter, Wlroots, Hyprland, Niri] {
+        for c in [Kwin, Mutter, Wlroots, Hyprland, Niri, Umbriel] {
             assert!(
                 reconfig_allowed(Some(c), false, false),
                 "{c:?} should allow live reconfigure"
@@ -796,8 +843,8 @@ mod tests {
 
     #[test]
     fn reconfig_allowed_rejects_a_monitor_mirror_on_every_backend() {
-        use crate::vdisplay::Compositor::{Hyprland, Kwin, Mutter, Niri, Wlroots};
-        for c in [Kwin, Mutter, Wlroots, Hyprland, Niri] {
+        use crate::vdisplay::Compositor::{Hyprland, Kwin, Mutter, Niri, Umbriel, Wlroots};
+        for c in [Kwin, Mutter, Wlroots, Hyprland, Niri, Umbriel] {
             assert!(
                 reconfig_allowed(Some(c), false, false),
                 "{c:?} without a pin should still allow live reconfigure"

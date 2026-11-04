@@ -69,7 +69,10 @@ pub struct DecodedFrame {
 
 /// Re-export so the presenter names every frame type through `video::`.
 #[cfg(windows)]
-pub use crate::video_d3d11::{D3d11Frame, SlotFormat, SlotHandle};
+pub use crate::video_d3d11::{
+    D3d11Frame, PoolSlice, SharedSlot, SliceGuard, SliceMode, SliceRelease, SlotFence, SlotFormat,
+    SlotHandle,
+};
 
 pub enum DecodedImage {
     /// Tightly-packed 8-bit I420 for the presenter's planar CSC upload.
@@ -182,7 +185,11 @@ pub struct NativeVkFrame {
     /// the stream's and can change mid-stream. Assuming 8-bit over P010 displays wrong.
     pub vk_format: RawVkFormat,
     /// Per-plane `VkImageView`s for [`Self::vk_format`] — the presenter's planar CSC contract.
+    /// Zero on a device with no plane views; read [`Self::ycbcr_view`] there.
     pub plane_views: [u64; 2],
+    /// The picture through a sampler Y'CbCr conversion built from
+    /// `pf_vkdecode::ycbcr_conversion_info`. Zero where [`Self::plane_views`] exist.
+    pub ycbcr_view: u64,
     pub layer: u32,
     /// Layout when the semaphore signals. The presenter must restore it after sampling.
     pub layout: NativeVkLayout,
@@ -236,7 +243,7 @@ impl DecodedImage {
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.keyframe,
             #[cfg(windows)]
-            DecodedImage::D3d11(f) => f.keyframe,
+            DecodedImage::D3d11(f) => f.keyframe(),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => f.keyframe,
             DecodedImage::NativeVk(f) => f.keyframe,
@@ -266,7 +273,7 @@ impl DecodedImage {
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.references_clean,
             #[cfg(windows)]
-            DecodedImage::D3d11(f) => f.references_clean,
+            DecodedImage::D3d11(f) => f.references_clean(),
             _ => return AnchorEvidence::Unavailable,
         };
         if clean {
@@ -292,7 +299,7 @@ impl DecodedImage {
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => (f.width, f.height),
             #[cfg(windows)]
-            DecodedImage::D3d11(f) => (f.width, f.height),
+            DecodedImage::D3d11(f) => (f.width(), f.height()),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => (f.width, f.height),
             DecodedImage::NativeVk(f) => (f.width, f.height),
@@ -300,14 +307,20 @@ impl DecodedImage {
     }
 
     /// The rung that decoded this frame, as the `stats:` decode-path tag. A machine
-    /// interface: additive only, and surviving tags keep their exact spelling.
+    /// interface: additive only, and surviving tags keep their exact spelling. A D3D11VA
+    /// pool slice adds how the presenter reads it: the pool itself or a copy.
     pub fn path_label(&self) -> &'static str {
         match self {
             DecodedImage::Cpu(f) => f.path,
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.path,
             #[cfg(windows)]
-            DecodedImage::D3d11(_) => "native-d3d11va",
+            DecodedImage::D3d11(D3d11Frame::Slice(s)) => match s.mode {
+                SliceMode::Bind => "native-d3d11va-bind",
+                SliceMode::Copy => "native-d3d11va-copy",
+            },
+            #[cfg(windows)]
+            DecodedImage::D3d11(D3d11Frame::Shared(_)) => "native-d3d11va",
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(_) => "pyrowave",
             DecodedImage::NativeVk(_) => "native-vulkan",
@@ -553,6 +566,8 @@ pub struct Decoder {
     /// The presenter can re-sample its last picture until a new one displaces it, so its
     /// pools outlive the swap ([`RETIRE_HANDOVERS`]).
     retiring: Option<(Box<dyn Rung>, u32, std::time::Instant)>,
+    /// [`Self::set_decode_wake`]'s callback, re-armed on every rung the pump installs.
+    wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Negotiated `quic::CODEC_*` bit. Every rung map and the software refusal
     /// key on it, so a demotion rebuilds for the same codec.
     wire_codec: u8,
@@ -576,6 +591,11 @@ pub struct Decoder {
     /// one again: the two native rungs demote onto each other and could otherwise
     /// bounce the session.
     ran: Vec<NativeRung>,
+    /// Rungs whose pictures the presenter could not show. A device fact, not a codec's:
+    /// a new format's walk passes over them too.
+    refused: Vec<NativeRung>,
+    /// The resolved decoder preference the ladder was walked for; a new format walks it again.
+    choice: String,
 }
 
 /// Consecutive decode errors before hardware demotion. A lone transient re-requests an IDR and stays.
@@ -645,6 +665,48 @@ fn native_vaapi_codec(wire: u8) -> Option<pf_vaapi::Codec> {
     }
 }
 
+/// The ladder's first rung that opens for `wire` and `stream` under `choice`, else the CPU
+/// rung. The walk passes over `refused`. `?` can carry `NoSoftwareRung` (HEVC with no
+/// hardware), typed to the pump ([`last_rung_verdict`]).
+fn first_rung(
+    choice: &str,
+    wire: u8,
+    stream: StreamFormat,
+    vk: Option<&VulkanDecodeDevice>,
+    refused: &[NativeRung],
+) -> Result<Box<dyn Rung>> {
+    for step in ladder(Os::HOST, choice, wire, vk) {
+        let rung = match step {
+            Step::Try(rung) | Step::Pin(rung) if refused.contains(&rung) => {
+                tracing::info!(
+                    "{} passed over: the presenter can't show its pictures",
+                    rung.label()
+                );
+                continue;
+            }
+            Step::Try(rung) | Step::Pin(rung) => rung,
+            Step::Note(note) => {
+                log_note(note, choice, wire, vk);
+                continue;
+            }
+        };
+        match build_rung(rung, wire, stream, vk) {
+            Ok(built) => return Ok(built),
+            // A pin's failure warns: it must not be quieter than auto's, which only informs.
+            Err(e) if matches!(step, Step::Pin(_)) => {
+                tracing::warn!(reason = %format!("{e:#}"),
+                    "{} init failed — demoting to the standard ladder", rung.name());
+            }
+            Err(e) => {
+                tracing::info!(reason = %format!("{e:#}"),
+                    "{} unavailable — continuing down the ladder", rung.name());
+            }
+        }
+    }
+    // `?` can carry `NoSoftwareRung` (HEVC with no hardware). Stays typed to the pump ([`last_rung_verdict`]).
+    Ok(Box::new(SoftwareDecoder::new(wire)?))
+}
+
 /// Build `rung` for `wire` on the presenter's device and log it active. Pin, auto and
 /// demotion all build here; each keeps its own admission gate and failure log. `Err` is
 /// a rung that cannot run: no decoder for the codec, no device it needs, or a failed init.
@@ -669,16 +731,19 @@ fn build_rung(
         }
         #[cfg(windows)]
         NativeRung::D3d11va => {
-            // A DXVA frame reaches the screen only through the presenter's win32 import.
-            let v = vk.filter(|v| v.d3d11_import).context(
-                "the presenter's device lacks the win32 external-memory import extensions",
+            // A DXVA frame reaches the screen through the Vulkan presenter's win32 import,
+            // or as a pool slice on the D3D11 presenter's own device.
+            let v = vk.filter(|v| v.d3d11_import || v.d3d11_present).context(
+                "the presenter neither imports D3D11 textures nor presents through D3D11",
             )?;
             let codec = native_d3d11_codec(wire).context("no DXVA decoder for this codec")?;
             let d = crate::video_d3d11_native::NativeD3d11Decoder::new(
                 codec,
                 stream,
+                v.d3d11_device.as_ref().map(|h| h.device().clone()),
                 v.adapter_luid,
                 v.d3d11_hdr10,
+                v.d3d11_fence,
             )?;
             Box::new(d.with_planar(v.d3d11_nv12, v.d3d11_p010))
         }
@@ -830,47 +895,41 @@ impl Decoder {
                  same hardware path"
             );
         }
-        let done = |rung: Box<dyn Rung>| {
-            // One exit every rung leaves through, so a session that never
-            // reaches the native constructor still reports `PUNKTFUNK_AU_FAULT`.
-            report_au_fault_env(rung.id() == Some(NativeRung::Vulkan));
-            log_rung(rung.as_ref(), wire);
-            Ok(Decoder {
-                ran: rung.id().into_iter().collect(),
-                retiring: None,
-                rung,
-                wire_codec: wire,
-                fails: 0,
-                first_fail: None,
-                want_keyframe: false,
-                delivered: false,
-                vk: vk.cloned(),
-                stream,
-            })
-        };
-        for step in ladder(Os::HOST, &choice, wire, vk) {
-            let rung = match step {
-                Step::Try(rung) | Step::Pin(rung) => rung,
-                Step::Note(note) => {
-                    log_note(note, &choice, wire, vk);
-                    continue;
-                }
-            };
-            match build_rung(rung, wire, stream, vk) {
-                Ok(built) => return done(built),
-                // A pin's failure warns: it must not be quieter than auto's, which only informs.
-                Err(e) if matches!(step, Step::Pin(_)) => {
-                    tracing::warn!(reason = %format!("{e:#}"),
-                        "{} init failed — demoting to the standard ladder", rung.name());
-                }
-                Err(e) => {
-                    tracing::info!(reason = %format!("{e:#}"),
-                        "{} unavailable — continuing down the ladder", rung.name());
-                }
-            }
-        }
-        // `?` can carry `NoSoftwareRung` (HEVC with no hardware). Stays typed to the pump ([`last_rung_verdict`]).
-        done(Box::new(SoftwareDecoder::new(wire)?))
+        let rung = first_rung(&choice, wire, stream, vk, &[])?;
+        // One exit every rung leaves through, so a session that never reaches the native
+        // constructor still reports `PUNKTFUNK_AU_FAULT`.
+        report_au_fault_env(rung.id() == Some(NativeRung::Vulkan));
+        log_rung(rung.as_ref(), wire);
+        Ok(Decoder {
+            ran: rung.id().into_iter().collect(),
+            refused: Vec::new(),
+            retiring: None,
+            wake: None,
+            rung,
+            wire_codec: wire,
+            fails: 0,
+            first_fail: None,
+            want_keyframe: false,
+            delivered: false,
+            vk: vk.cloned(),
+            stream,
+            choice,
+        })
+    }
+
+    /// The host changed the stream's codec or picture shape at the frame about to decode:
+    /// walk the ladder again for `wire` and `stream` and install its first rung that opens,
+    /// as a connect would. A Vulkan rung retires as on a demotion. The rungs run so far were
+    /// another format's, but the presenter's refusals stand. `Err` is the typed refusal
+    /// when nothing can decode it.
+    pub fn reformat(&mut self, wire: u8, stream: StreamFormat) -> Result<()> {
+        let rung = first_rung(&self.choice, wire, stream, self.vk.as_ref(), &self.refused)?;
+        log_rung(rung.as_ref(), wire);
+        (self.wire_codec, self.stream) = (wire, stream);
+        self.ran.clone_from(&self.refused);
+        self.install(rung);
+        self.want_keyframe = false;
+        Ok(())
     }
 
     /// Wait for a Vulkan-Video GPU decode (timeline). `false` declines the
@@ -916,16 +975,22 @@ impl Decoder {
     ) -> Result<Decoder> {
         // Never the native rung — see [`report_au_fault_env`].
         report_au_fault_env(false);
+        let mut rung = crate::video_pyrowave::PyroWaveDecoder::new(
+            vk,
+            width,
+            height,
+            shard_payload,
+            chroma444,
+            color,
+            hdr16,
+        )?;
+        // The presenter's device outlives every frame it is handed, as it does for the
+        // plane ring: nothing else holds it for a lent slot.
+        if let Err(e) = rung.enable_in_place(std::sync::Arc::new(())) {
+            tracing::info!(error = %format!("{e:#}"), "PyroWave AUs are copied into the decoder");
+        }
         Ok(Decoder {
-            rung: Box::new(crate::video_pyrowave::PyroWaveDecoder::new(
-                vk,
-                width,
-                height,
-                shard_payload,
-                chroma444,
-                color,
-                hdr16,
-            )?),
+            rung: Box::new(rung),
             wire_codec: punktfunk_core::quic::CODEC_PYROWAVE,
             fails: 0,
             first_fail: None,
@@ -936,7 +1001,10 @@ impl Decoder {
             vk: None,
             stream: StreamFormat::SDR_420_8,
             ran: Vec::new(),
+            refused: Vec::new(),
             retiring: None,
+            choice: String::new(),
+            wake: None,
         })
     }
 
@@ -948,9 +1016,19 @@ impl Decoder {
 
     /// Swap the rung in and reset the old one's health. One place so a call
     /// site cannot forget [`Self::ran`] and loop the ladder.
+    /// Run `wake` off the pump's thread as each hardware decode completes, so the pump
+    /// can block for the next AU and the pixels at once ([`Rung::set_decode_wake`]).
+    pub fn set_decode_wake(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.rung.set_decode_wake(wake.clone());
+        self.wake = Some(wake);
+    }
+
     fn install(&mut self, rung: Box<dyn Rung>) {
         self.ran.extend(rung.id());
         let old = std::mem::replace(&mut self.rung, rung);
+        if let Some(wake) = &self.wake {
+            self.rung.set_decode_wake(wake.clone());
+        }
         if old.id() == Some(NativeRung::Vulkan) {
             self.retiring = Some((old, 0, std::time::Instant::now()));
         }
@@ -965,7 +1043,7 @@ impl Decoder {
         match build_rung(rung, self.wire_codec, self.stream, self.vk.as_ref()) {
             Ok(built) => {
                 tracing::warn!(error = %format!("{e:#}"), fails = self.fails, from,
-                    "hardware decode failing repeatedly — demoting to {}", rung.name());
+                    "hardware decode failing — demoting to {}", rung.name());
                 self.install(built);
                 true
             }
@@ -977,18 +1055,46 @@ impl Decoder {
         }
     }
 
-    /// Demote to software when the presenter cannot display hardware frames.
-    /// Decode still succeeds in that state, so the error streak never fires
-    /// and without this the stream stays black. No-op when already software.
-    pub fn force_software(&mut self) -> Result<()> {
-        if self.rung.id() == Some(NativeRung::Software) {
+    /// Leave the failing `from` rung for each hardware rung [`demotions`] offers, then the
+    /// CPU rung. `Err` is the CPU rung's typed refusal: HEVC has none, so the pump asks for
+    /// another codec.
+    fn demote(&mut self, e: &anyhow::Error, from: &str) -> Result<()> {
+        for rung in demotions(Os::HOST, self.wire_codec, self.vk.as_ref(), &self.ran) {
+            if self.demote_into(e, from, rung) {
+                return Ok(());
+            }
+        }
+        tracing::warn!(error = %format!("{e:#}"), fails = self.fails,
+            "{from} decode failing — demoting to software");
+        self.install(Box::new(SoftwareDecoder::new(self.wire_codec)?));
+        Ok(())
+    }
+
+    /// The presenter can't show this rung's pictures: demote as a failing decode does, and
+    /// never build a rung on that lane again in the session. Decode still succeeds in that
+    /// state, so the error streak never fires. Vulkan Video imports nothing, so a dma-buf or
+    /// D3D11 import fault lands there before the CPU rung. No-op on the CPU rung.
+    pub fn demote_for_presenter(&mut self) -> Result<()> {
+        let id = self.rung.id();
+        if id == Some(NativeRung::Software) {
             return Ok(());
         }
-        tracing::warn!("presenter can't display hardware frames — demoting to software decode");
-        // Same typed refusal as every software construction: HEVC has nothing below, so the pump reconnects.
-        self.install(Box::new(SoftwareDecoder::new(self.wire_codec)?));
+        let lane = match id {
+            // Both reach the presenter as dma-bufs, on the lane it just refused.
+            Some(NativeRung::Vaapi | NativeRung::V4l2) => {
+                &[NativeRung::Vaapi, NativeRung::V4l2][..]
+            }
+            _ => id.as_slice(),
+        };
+        self.refused.extend(lane);
+        // `ran` steers the demotion below off the refused lane too.
+        self.ran.extend(lane);
         self.want_keyframe = true;
-        Ok(())
+        let from = id.map_or(self.rung.name(), NativeRung::label);
+        self.demote(
+            &anyhow::anyhow!("the presenter can't show its pictures"),
+            from,
+        )
     }
 
     /// The freeze gate lifted on intra refresh marks. The wave healed the picture by
@@ -1015,7 +1121,35 @@ impl Decoder {
         user_flags: u32,
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
-        let out = self.decode_frame_inner(au, user_flags, complete);
+        self.feed(|rung| rung.decode(au, user_flags, complete), complete)
+    }
+
+    /// [`Self::decode_frame`] with the AU's own buffer: PyroWave reads it where it lies.
+    pub fn decode_au(
+        &mut self,
+        au: punktfunk_core::au::AuBuf,
+        user_flags: u32,
+        complete: bool,
+    ) -> Result<Option<DecodedImage>> {
+        self.feed(
+            move |rung| rung.decode_au(au, user_flags, complete),
+            complete,
+        )
+    }
+
+    /// Memory the rung reads AUs from in place, for the session to lend; `None` = the heap.
+    pub fn au_memory(&self) -> Option<std::sync::Arc<dyn punktfunk_core::au::AuMemory>> {
+        self.rung.au_memory()
+    }
+
+    /// Run one decode through the rung, counting a picture as a handover for the
+    /// retiring rung.
+    fn feed(
+        &mut self,
+        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<DecodedImage>>,
+        complete: bool,
+    ) -> Result<Option<DecodedImage>> {
+        let out = self.decode_frame_inner(feed, complete);
         if let (Ok(Some(_)), Some(r)) = (&out, self.retiring.as_mut()) {
             r.1 += 1;
             if r.1 >= RETIRE_HANDOVERS && r.2.elapsed() >= RETIRE_MIN_AGE {
@@ -1027,11 +1161,10 @@ impl Decoder {
 
     fn decode_frame_inner(
         &mut self,
-        au: &[u8],
-        user_flags: u32,
+        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<DecodedImage>>,
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
-        let result = self.rung.decode(au, user_flags, complete);
+        let result = feed(self.rung.as_mut());
         // PyroWave and the CPU rung have nothing below them: their error is the pump's.
         let Some(from) = self.rung.id().filter(|r| *r != NativeRung::Software) else {
             return result;
@@ -1066,19 +1199,7 @@ impl Decoder {
                 if device_fact
                     || (self.fails >= HW_DEMOTE_AFTER && first.elapsed() >= HW_DEMOTE_MIN_STREAK)
                 {
-                    // A never-delivered hardware rung is a decoder the session never
-                    // had; it must not cost the rung below.
-                    let (vk, ran) = (self.vk.as_ref(), &self.ran);
-                    for rung in demotions(Os::HOST, self.wire_codec, vk, ran) {
-                        if self.demote_into(&e, which, rung) {
-                            return Ok(None);
-                        }
-                    }
-                    tracing::warn!(error = %format!("{e:#}"), fails = self.fails,
-                        "{which} decode failing repeatedly — demoting to software");
-                    // Ladder bottom. H.264/AV1 always builds; HEVC `?` carries
-                    // `NoSoftwareRung` to the pump, which reconnects without HEVC.
-                    self.install(Box::new(SoftwareDecoder::new(self.wire_codec)?));
+                    self.demote(&e, which)?;
                 } else {
                     tracing::debug!(backend = which, error = %e,
                         "decode error — requesting keyframe, keeping hardware decode");
@@ -1093,6 +1214,23 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::video_caps::tests::decode_device;
+
+    /// A new format rebuilds onto a rung for its codec. One nothing here decodes leaves the
+    /// decoder as it was, with the typed refusal the pump turns into a codec ask.
+    #[test]
+    fn a_new_format_rebuilds_the_decoder_or_leaves_it() {
+        use punktfunk_core::quic::{CODEC_H264, CODEC_HEVC};
+        if std::env::var_os("PUNKTFUNK_DECODER").is_some() {
+            return;
+        }
+        let sdr = StreamFormat::SDR_420_8;
+        let mut d = Decoder::new(CODEC_H264, "software", None, sdr).expect("software H.264");
+        let e = d.reformat(CODEC_HEVC, sdr).expect_err("no software HEVC");
+        assert!(e.downcast_ref::<NoSoftwareRung>().is_some(), "{e:#}");
+        assert_eq!(d.wire_codec, CODEC_H264, "the old decoder stays");
+        d.reformat(CODEC_H264, sdr).expect("software H.264 again");
+        assert_eq!(d.wire_codec, CODEC_H264);
+    }
 
     /// DXGI packs the four Device Manager fields high to low, 16 bits each.
     #[test]

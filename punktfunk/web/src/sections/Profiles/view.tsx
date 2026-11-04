@@ -5,11 +5,14 @@ import {
 	CircleX,
 	ImageMinus,
 	ImagePlus,
+	KeyRound,
 	Pencil,
 	Plus,
 	RotateCw,
 	Trash2,
 	TriangleAlert,
+	UserPlus,
+	UserRound,
 	Users,
 } from "lucide-react";
 import { motion } from "motion/react";
@@ -38,7 +41,15 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
+import { apiErrorMessage } from "@/lib/errors";
 import { fmtDateTimeSecs } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { cn } from "@/lib/utils";
@@ -83,7 +94,9 @@ export function playsLine(p: ProfileAdmin, ownerName: string): string {
 		return seat.detail || m.profiles_seat_starting();
 	if (seat.state === "unavailable")
 		return seat.detail || STATE_WORD.unavailable();
-	return m.profiles_outcome_desktop();
+	return seat.take_turns
+		? m.profiles_outcome_account()
+		: m.profiles_outcome_desktop();
 }
 
 /** The doctor's line under the cards. `message` is its first error, `notes` its warnings. */
@@ -102,6 +115,8 @@ export type SeatActions = {
 	onStart: (p: ProfileAdmin) => void;
 	onStop: (p: ProfileAdmin) => void;
 	onEnd: (p: ProfileAdmin) => void;
+	/** Opens **Update password** for a seat on an existing Windows account. */
+	onPassword?: (p: ProfileAdmin) => void;
 	/** `null` until the doctor has answered. */
 	doctor: DoctorLine | null;
 };
@@ -120,8 +135,6 @@ export type DoorControl = {
 /** The page: one card per profile, the owner first, and **Add profile**. */
 export const ProfilesView: FC<{
 	profiles: Loadable<ProfileAdmin[]>;
-	/** Bumped per profile after a picture upload, so the new one shows. */
-	avatarVersions?: Record<string, number>;
 	onAdd: () => void;
 	onRename: (p: ProfileAdmin) => void;
 	onPicture: (p: ProfileAdmin, file: File) => void;
@@ -134,7 +147,6 @@ export const ProfilesView: FC<{
 	door?: DoorControl;
 }> = ({
 	profiles,
-	avatarVersions,
 	onAdd,
 	onRename,
 	onPicture,
@@ -177,7 +189,6 @@ export const ProfilesView: FC<{
 									profile={p}
 									ownerName={ownerName}
 									seats={seats}
-									version={avatarVersions?.[p.id]}
 									busy={busyId === p.id}
 									onRename={() => onRename(p)}
 									onPicture={(f) => onPicture(p, f)}
@@ -262,7 +273,6 @@ const ProfileRow: FC<{
 	profile: ProfileAdmin;
 	ownerName: string;
 	seats?: SeatActions;
-	version?: number;
 	busy: boolean;
 	onRename: () => void;
 	onPicture: (file: File) => void;
@@ -272,7 +282,6 @@ const ProfileRow: FC<{
 	profile: p,
 	ownerName,
 	seats,
-	version,
 	busy,
 	onRename,
 	onPicture,
@@ -281,6 +290,9 @@ const ProfileRow: FC<{
 }) => {
 	const file = useRef<HTMLInputElement>(null);
 	const state = p.seat?.state;
+	// A take-turns profile has no managed seat to start/stop by hand — the client drives the
+	// switch. Its card shows no seat buttons.
+	const managed = p.seat?.take_turns ? undefined : seats;
 	const facts = [
 		playsLine(p, ownerName),
 		p.home === "bigpicture"
@@ -293,7 +305,7 @@ const ProfileRow: FC<{
 	return (
 		<div className="flex flex-col gap-3 border-b pb-4 last:border-0 last:pb-0 sm:flex-row sm:items-center">
 			<div className="flex min-w-0 flex-1 items-center gap-3">
-				<ProfileAvatar profile={p} version={version} className="size-11" />
+				<ProfileAvatar profile={p} className="size-11" />
 				<div className="min-w-0">
 					<div className="flex flex-wrap items-center gap-2">
 						<span className="truncate font-medium">{p.display_name}</span>
@@ -309,30 +321,35 @@ const ProfileRow: FC<{
 						)}
 					</div>
 					<p className="text-sm text-muted-foreground">{facts.join(" · ")}</p>
+					{p.seat?.account && (
+						<p className="text-sm text-muted-foreground">
+							{m.profiles_seat_account_line({ account: p.seat.account })}
+						</p>
+					)}
 				</div>
 			</div>
 			<div className="flex shrink-0 items-center justify-end gap-1">
-				{seats && state === "stopped" && (
+				{managed && state === "stopped" && (
 					<Button
 						variant="outline"
 						size="sm"
 						disabled={busy}
-						onClick={() => seats.onStart(p)}
+						onClick={() => managed.onStart(p)}
 					>
 						{m.profiles_seat_start()}
 					</Button>
 				)}
-				{seats && state === "occupied" && (
+				{managed && state === "occupied" && (
 					<Button
 						variant="outline"
 						size="sm"
 						disabled={busy}
-						onClick={() => seats.onEnd(p)}
+						onClick={() => managed.onEnd(p)}
 					>
 						{m.profiles_seat_end()}
 					</Button>
 				)}
-				{seats &&
+				{managed &&
 					(state === "ready" ||
 						state === "occupied" ||
 						state === "starting") && (
@@ -340,11 +357,23 @@ const ProfileRow: FC<{
 							variant="outline"
 							size="sm"
 							disabled={busy}
-							onClick={() => seats.onStop(p)}
+							onClick={() => managed.onStop(p)}
 						>
 							{m.profiles_seat_stop()}
 						</Button>
 					)}
+				{managed?.onPassword && p.seat?.account && (
+					<Button
+						variant="ghost"
+						size="icon"
+						aria-label={m.profiles_seat_password_update()}
+						title={m.profiles_seat_password_update()}
+						disabled={busy}
+						onClick={() => managed.onPassword?.(p)}
+					>
+						<KeyRound className="size-4" />
+					</Button>
+				)}
 				<Button
 					variant="ghost"
 					size="icon"
@@ -405,12 +434,17 @@ const ProfileRow: FC<{
 	);
 };
 
-/** One answer to where a new profile plays. `seats` is a desktop of its own. */
-type Outcome = "shared" | "seats";
+/** One answer to where a new profile plays. `seats` is a desktop of its own; `account` is a
+ * Windows account taking the console in turn. */
+type Outcome = "shared" | "seats" | "account";
+
+/** The Windows account a desktop of its own signs in to: one punktfunk makes, or one of this PC's. */
+type SeatAccount = "new" | "existing";
 
 /**
  * **Add profile**: the picture beside a name and a colour, then one question answered as
- * outcomes. The home follows the answer on the host.
+ * outcomes. The home follows the answer on the host. A Windows desktop of its own asks a
+ * second: a new account, or an existing one with its password.
  */
 export const AddProfileDialog: FC<{
 	open: boolean;
@@ -423,6 +457,8 @@ export const AddProfileDialog: FC<{
 	door?: boolean;
 	/** This Windows runs one desktop at a time: seats need Windows Server. */
 	needsServer?: boolean;
+	/** Local Windows accounts no profile holds: a take-turns profile or a seat can take one. */
+	windowsAccounts?: readonly string[];
 	/** Colours other profiles have: the form starts on the first free one. */
 	takenAccents?: readonly string[];
 	onCancel: () => void;
@@ -436,6 +472,7 @@ export const AddProfileDialog: FC<{
 	seatsOn = false,
 	door = false,
 	needsServer = false,
+	windowsAccounts = [],
 	takenAccents = [],
 	onCancel,
 	onCreate,
@@ -446,24 +483,56 @@ export const AddProfileDialog: FC<{
 	const [accent, setAccent] = useState<string>(freeAccent);
 	const [picture, setPicture] = useState<File | null>(null);
 	const [outcome, setOutcome] = useState<Outcome>("shared");
+	const [account, setAccount] = useState<string>("");
+	const [seatAccount, setSeatAccount] = useState<SeatAccount>("new");
+	const [password, setPassword] = useState("");
 	useEffect(() => {
 		if (!open) return;
 		setName("");
 		setAccent(freeAccent);
 		setPicture(null);
 		setOutcome("shared");
+		setAccount("");
+		setSeatAccount("new");
+		setPassword("");
 	}, [open, freeAccent]);
+	const asksAccount = windows && seatsOn && outcome === "seats";
+	const adopting = asksAccount && seatAccount === "existing";
+	const accountReady =
+		outcome === "account"
+			? account !== ""
+			: !adopting || (account !== "" && password !== "");
 	const submit = () => {
-		if (!name.trim()) return;
+		if (!name.trim() || !accountReady) return;
 		onCreate(
 			{
 				display_name: name.trim(),
 				accent,
 				seat: outcome === "seats",
+				...(outcome === "account" ? { windows_account: account } : {}),
+				...(adopting ? { seat_account: account, seat_password: password } : {}),
 			},
 			picture,
 		);
 	};
+	const seatAccounts: Choice<SeatAccount>[] = [
+		{
+			id: "new",
+			icon: <UserPlus />,
+			label: m.profiles_seat_account_new(),
+			hint: m.profiles_seat_account_new_hint(),
+		},
+		{
+			id: "existing",
+			icon: <UserRound />,
+			label: m.profiles_seat_account_existing(),
+			hint:
+				windowsAccounts.length > 0
+					? m.profiles_seat_account_existing_hint()
+					: m.profiles_seat_account_none(),
+			disabled: windowsAccounts.length === 0,
+		},
+	];
 	const outcomes: Choice<Outcome>[] = [
 		{
 			id: "shared",
@@ -472,24 +541,37 @@ export const AddProfileDialog: FC<{
 			hint: m.profiles_outcome_shared_hint(),
 			disabled: false,
 		},
-		{
-			id: "seats",
-			icon: <AppWindow />,
-			label: m.profiles_outcome_desktop(),
-			hint: windows
-				? seatsOn
-					? m.profiles_outcome_desktop_hint()
-					: needsServer
-						? m.profiles_outcome_needs_server()
-						: m.profiles_outcome_seats_off()
-				: linux
-					? door
-						? m.profiles_outcome_desktop_hint_linux()
-						: m.profiles_outcome_door_off()
-					: m.profiles_outcome_needs_seats(),
-			disabled: windows ? !seatsOn : !(linux && door),
-		},
 	];
+	// Take turns is a Windows account on the one console — any edition, no seats.
+	if (windows) {
+		outcomes.push({
+			id: "account",
+			icon: <UserRound />,
+			label: m.profiles_outcome_account(),
+			hint:
+				windowsAccounts.length > 0
+					? m.profiles_outcome_account_hint()
+					: m.profiles_outcome_account_none(),
+			disabled: windowsAccounts.length === 0,
+		});
+	}
+	outcomes.push({
+		id: "seats",
+		icon: <AppWindow />,
+		label: m.profiles_outcome_desktop(),
+		hint: windows
+			? seatsOn
+				? m.profiles_outcome_desktop_hint()
+				: needsServer
+					? m.profiles_outcome_needs_server()
+					: m.profiles_outcome_seats_off()
+			: linux
+				? door
+					? m.profiles_outcome_desktop_hint_linux()
+					: m.profiles_outcome_door_off()
+				: m.profiles_outcome_needs_seats(),
+		disabled: windows ? !seatsOn : !(linux && door),
+	});
 	return (
 		<Dialog open={open} onOpenChange={(o) => !o && onCancel()}>
 			<DialogContent className="max-w-md sm:max-w-lg">
@@ -538,6 +620,61 @@ export const AddProfileDialog: FC<{
 								onChange={setOutcome}
 							/>
 						</motion.div>
+						{asksAccount && (
+							<motion.div variants={ROW}>
+								<ChoiceCards
+									label={m.profiles_seat_account()}
+									value={seatAccount}
+									choices={seatAccounts}
+									onChange={setSeatAccount}
+								/>
+							</motion.div>
+						)}
+						{(outcome === "account" || adopting) && (
+							<motion.div variants={ROW} className="space-y-2">
+								<Label htmlFor="profile-account">
+									{m.profiles_account_which()}
+								</Label>
+								<Select value={account} onValueChange={setAccount}>
+									<SelectTrigger
+										id="profile-account"
+										aria-label={m.profiles_account_which()}
+									>
+										<SelectValue placeholder={m.profiles_account_pick()} />
+									</SelectTrigger>
+									<SelectContent>
+										{windowsAccounts.map((a) => (
+											<SelectItem key={a} value={a}>
+												{a}
+											</SelectItem>
+										))}
+									</SelectContent>
+								</Select>
+								{!adopting && (
+									<p className="text-sm text-muted-foreground">
+										{m.profiles_account_turns()}
+									</p>
+								)}
+							</motion.div>
+						)}
+						{adopting && (
+							<motion.div variants={ROW} className="space-y-2">
+								<Label htmlFor="profile-seat-password">
+									{m.profiles_seat_password()}
+								</Label>
+								<Input
+									id="profile-seat-password"
+									type="password"
+									autoComplete="off"
+									data-1p-ignore
+									value={password}
+									onChange={(e) => setPassword(e.target.value)}
+								/>
+								<p className="text-sm text-muted-foreground">
+									{m.profiles_seat_account_lock()}
+								</p>
+							</motion.div>
+						)}
 						<DialogFooter>
 							<Button
 								type="button"
@@ -547,7 +684,10 @@ export const AddProfileDialog: FC<{
 							>
 								{m.common_cancel()}
 							</Button>
-							<Button type="submit" disabled={isPending || !name.trim()}>
+							<Button
+								type="submit"
+								disabled={isPending || !name.trim() || !accountReady}
+							>
 								{m.profiles_add()}
 							</Button>
 						</DialogFooter>
@@ -560,7 +700,8 @@ export const AddProfileDialog: FC<{
 
 /**
  * **Remove**, behind the console password. `erase` is offered where this host keeps the
- * profile's Steam; the account of a desktop of its own always goes with it.
+ * profile's Steam. A desktop of its own always sends it: the host removes the account it made,
+ * and gives an existing one back with its files.
  */
 export const RemoveProfileDialog: FC<{
 	profile: ProfileAdmin | null;
@@ -573,9 +714,18 @@ export const RemoveProfileDialog: FC<{
 		if (profile) setErase(false);
 	}, [profile]);
 	if (!profile) return null;
-	// A Windows seat is always a desktop of its own; on Linux the kind says so.
+	// A Windows seat is always a desktop of its own; on Linux the kind says so. A take-turns
+	// profile binds to the player's own Windows account, which removal leaves alone.
 	const ownAccount =
-		profile.seat != null && (windows || profile.seat.kind === "desktop");
+		profile.seat != null &&
+		!profile.seat.take_turns &&
+		(windows || profile.seat.kind === "desktop");
+	const adopted = profile.seat?.account;
+	const goes = adopted
+		? m.profiles_remove_adopted({ account: adopted })
+		: (windows ? m.profiles_remove_windows : m.profiles_remove_linux)({
+				name: profile.display_name,
+			});
 	return (
 		<PasswordConfirmDialog
 			open
@@ -585,8 +735,7 @@ export const RemoveProfileDialog: FC<{
 			body={
 				<>
 					{m.profiles_remove_body({ name: profile.display_name })}
-					{ownAccount &&
-						` ${(windows ? m.profiles_remove_windows : m.profiles_remove_linux)({ name: profile.display_name })}`}
+					{ownAccount && ` ${goes}`}
 				</>
 			}
 			submitLabel={m.profiles_remove()}
@@ -610,6 +759,86 @@ export const RemoveProfileDialog: FC<{
 				</div>
 			)}
 		</PasswordConfirmDialog>
+	);
+};
+
+/**
+ * **Update password**: the password a seat's existing Windows account signs in with now. A
+ * refusal shows the host's sentence and keeps the dialog open.
+ */
+export const SeatPasswordDialog: FC<{
+	profile: ProfileAdmin | null;
+	onUpdate: (id: string, password: string) => Promise<unknown>;
+	onClose: () => void;
+}> = ({ profile, onUpdate, onClose }) => {
+	const [password, setPassword] = useState("");
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	// A close clears the typed password as well as an opening.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: `profile` is the open/close signal.
+	useEffect(() => {
+		setPassword("");
+		setError(null);
+	}, [profile]);
+	const account = profile?.seat?.account;
+	if (!profile || !account) return null;
+	const submit = async () => {
+		if (!password || busy) return;
+		setBusy(true);
+		setError(null);
+		try {
+			await onUpdate(profile.id, password);
+			onClose();
+		} catch (e) {
+			setError(apiErrorMessage(e) ?? m.profiles_seat_password_failed());
+		} finally {
+			setBusy(false);
+		}
+	};
+	return (
+		<Dialog open onOpenChange={(o) => !o && !busy && onClose()}>
+			<DialogContent className="max-w-md">
+				<DialogHeader>
+					<DialogTitle>
+						{m.profiles_seat_password_title({ name: profile.display_name })}
+					</DialogTitle>
+				</DialogHeader>
+				<form
+					className="space-y-3"
+					onSubmit={(e) => {
+						e.preventDefault();
+						void submit();
+					}}
+				>
+					<Label htmlFor="seat-password">
+						{m.profiles_seat_password_body({ account })}
+					</Label>
+					<Input
+						id="seat-password"
+						type="password"
+						autoComplete="off"
+						data-1p-ignore
+						autoFocus
+						value={password}
+						onChange={(e) => setPassword(e.target.value)}
+					/>
+					{error && <p className="text-sm text-destructive">{error}</p>}
+					<DialogFooter>
+						<Button
+							type="button"
+							variant="outline"
+							onClick={onClose}
+							disabled={busy}
+						>
+							{m.common_cancel()}
+						</Button>
+						<Button type="submit" disabled={!password || busy}>
+							{m.profiles_seat_password_save()}
+						</Button>
+					</DialogFooter>
+				</form>
+			</DialogContent>
+		</Dialog>
 	);
 };
 

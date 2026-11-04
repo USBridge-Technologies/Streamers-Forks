@@ -58,7 +58,7 @@ pub const OSTREE_BOOTED: &str = "/run/ostree-booted";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallKind {
     WindowsInstaller,
-    /// Client only — the sandboxed GTK app (`io.unom.Punktfunk`).
+    /// Client only — the sandboxed GTK app (`io.unom.punktfunk`).
     Flatpak,
     Sysext,
     RpmOstree,
@@ -108,9 +108,21 @@ pub struct Probe {
 /// The Deck build's checkout, under `$HOME`.
 pub const SOURCE_CHECKOUT: &str = "punktfunk";
 
+/// Where a Deck build's checkout comes from. A system copy has no checkout to ask, so a door
+/// built from a fork reads as behind.
+pub const SOURCE_REMOTE: &str = "https://git.unom.io/unom/punktfunk";
+
 /// The copy of a Deck build that its door and seats run, outside the owner's 0700 home
-/// (`scripts/steamdeck/door.sh`). `source-head` beside it is the checkout's `.git/HEAD`.
+/// (`scripts/steamdeck/door.sh`). `source-head` and `source-commit` beside it are the checkout's
+/// `.git/HEAD` and the commit it was built from.
 pub const STEAMOS_SYSTEM_COPY: &str = "/opt/punktfunk/host";
+
+/// A system copy built from `built`, against its branch's `git ls-remote` line: 1 when the tip has
+/// moved on, 0 when it hasn't, `None` when the remote has no such branch.
+pub fn copy_behind(built: &str, ls_remote: &str) -> Option<u64> {
+    let tip = ls_remote.split_whitespace().next()?;
+    Some(u64::from(tip != built.trim()))
+}
 
 /// A Deck build's channel is the branch its checkout follows: `stable` moves at each announced
 /// release, anything else (`main`, a detached tree) is canary.
@@ -252,9 +264,11 @@ pub fn update_command(kind: InstallKind, product: Product) -> String {
         (InstallKind::WindowsInstaller, _) => {
             "winget upgrade unom.PunktfunkHost   (or re-run the newer installer)".into()
         }
-        (InstallKind::Flatpak, _) => "flatpak update --user io.unom.Punktfunk".into(),
+        (InstallKind::Flatpak, _) => "flatpak update --user io.unom.punktfunk".into(),
         // The signed feed carries the host image only; the client sysext is a local rebuild.
-        (InstallKind::Sysext, Product::Host) => "sudo punktfunk-sysext update".into(),
+        (InstallKind::Sysext, Product::Host) => "sudo punktfunk-sysext update   (an image you \
+             built with packaging/arch/build-sysext.sh: rebuild it the same way)"
+            .into(),
         (InstallKind::Sysext, Product::Client) => {
             "rebuild the client sysext: bash packaging/arch/build-sysext.sh <new .pkg.tar.zst> \
              && sudo cp punktfunk-client.raw /var/lib/extensions/ && sudo systemd-sysext refresh"
@@ -287,6 +301,20 @@ pub fn update_command(kind: InstallKind, product: Product) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_system_copy_is_behind_when_its_branch_moved_on() {
+        let tip = "75438381b41dcd3c7514cb1c4e2e868ddc2c122d\trefs/heads/main\n";
+        assert_eq!(
+            copy_behind("75438381b41dcd3c7514cb1c4e2e868ddc2c122d\n", tip),
+            Some(0)
+        );
+        assert_eq!(
+            copy_behind("bd072336f0000000000000000000000000000000\n", tip),
+            Some(1)
+        );
+        assert_eq!(copy_behind("75438381b", ""), None, "no such branch");
+    }
 
     fn probe(exe: &str) -> Probe {
         Probe {

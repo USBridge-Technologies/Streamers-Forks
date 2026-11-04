@@ -1,10 +1,11 @@
 //! Headless keyboard/mouse/touch on KWin via `org_kde_kwin_fake_input`.
 //!
 //! KWin advertises this restricted global only to a client whose installed `.desktop`
-//! lists it under `X-KDE-Wayland-Interfaces` (`io.unom.Punktfunk.Host.desktop`). Binding
+//! lists it under `X-KDE-Wayland-Interfaces` (`io.unom.punktfunk.host.desktop`). Binding
 //! is the grant — no RemoteDesktop portal and no "Allow remote control?" dialog — so it
 //! works with nobody at the seat. Connect on the session `$WAYLAND_DISPLAY`. Keys are
 //! raw Linux evdev codes; KWin maps them through the session keymap (no keymap upload).
+//! Committed text goes as keysyms (v6, Plasma 6.5+), which KWin types in the session layout.
 //! Absolute pointer/touch use *logical* compositor pixels (post scale). At scale ≠ 1 the
 //! logical edge is `physical / scale`; a streamed pixel coordinate then lands `scale×`
 //! too far toward the bottom-right. Track each output's logical rectangle via
@@ -48,8 +49,8 @@ pub mod fake {
 
 use fake::org_kde_kwin_fake_input::OrgKdeKwinFakeInput as FakeInput;
 
-/// `keyboard_key` arrived at v4; bind no higher.
-const MAX_VERSION: u32 = 4;
+/// `keyboard_keysym` arrived at v6; bind no higher.
+const MAX_VERSION: u32 = 6;
 
 const AXIS_VERTICAL: u32 = 0;
 const AXIS_HORIZONTAL: u32 = 1;
@@ -264,14 +265,58 @@ pub struct KwinFakeInjector {
 /// Cap geometry roundtrips at 2 Hz. A roundtrip on every mouse-move would stall the control path.
 const GEO_REFRESH: Duration = Duration::from_millis(500);
 
+/// The session's KWin socket, else `$WAYLAND_DISPLAY`.
+fn connect() -> Result<Connection> {
+    match pf_host_config::session::wayland_stream() {
+        Some(Ok(stream)) => Connection::from_socket(stream),
+        Some(Err(_)) => Err(wayland_client::ConnectError::NoCompositor),
+        None => Connection::connect_to_env(),
+    }
+    .context("connect to KWin Wayland")
+}
+
+/// Whether KWin offers this host `keyboard_keysym` (fake_input v6), so committed text types.
+/// Every Welcome asks, and the probe is a connect plus a blocking roundtrip, so KWin's first
+/// answer is kept. A failed connect keeps nothing: the next Welcome asks again.
+pub(crate) fn keysym_supported() -> bool {
+    use wayland_client::globals::{registry_queue_init, GlobalListContents};
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&answer) = ANSWER.get() {
+        return answer;
+    }
+    struct Probe;
+    impl Dispatch<WlRegistry, GlobalListContents> for Probe {
+        fn event(
+            _: &mut Self,
+            _: &WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    let Ok(conn) = connect() else { return false };
+    let Ok((globals, _queue)) = registry_queue_init::<Probe>(&conn) else {
+        return false;
+    };
+    let answer = globals.contents().with_list(|list| {
+        list.iter()
+            .any(|g| g.interface == "org_kde_kwin_fake_input" && g.version >= MAX_VERSION)
+    });
+    *ANSWER.get_or_init(|| answer)
+}
+
+/// The keysym that types `cp`. `None` for a control character (Enter and Tab ride the VK path).
+fn text_keysym(cp: u32) -> Option<u32> {
+    char::from_u32(cp).filter(|c| !c.is_control())?;
+    let sym = xkbcommon::xkb::utf32_to_keysym(cp).raw();
+    (sym != xkbcommon::xkb::keysyms::KEY_NoSymbol).then_some(sym)
+}
+
 impl KwinFakeInjector {
     pub fn open() -> Result<Self> {
-        let conn = match pf_host_config::session::wayland_stream() {
-            Some(Ok(stream)) => Connection::from_socket(stream),
-            Some(Err(_)) => Err(wayland_client::ConnectError::NoCompositor),
-            None => Connection::connect_to_env(),
-        }
-        .context("connect to KWin Wayland")?;
+        let conn = connect()?;
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());
@@ -282,7 +327,7 @@ impl KwinFakeInjector {
 
         let fake = state.fake.clone().context(
             "KWin does not expose org_kde_kwin_fake_input to this client — install the host's \
-             .desktop (io.unom.Punktfunk.Host.desktop, X-KDE-Wayland-Interfaces) and re-login so \
+             .desktop (io.unom.punktfunk.host.desktop, X-KDE-Wayland-Interfaces) and re-login so \
              KWin authorizes it (the grant is cached per-exe on first connect), or this is not a \
              KWin session",
         )?;
@@ -344,21 +389,24 @@ impl KwinFakeInjector {
             .iter()
             .filter_map(|o| o.geo.facts())
             .collect();
-        let (lx, ly, lw, lh) =
-            match head_pick::pick(&heads, &crate::stream_target(), Some((abs.w, abs.h))) {
-                Some(i) => {
-                    let h = heads[i];
-                    let (x, y) = (f64::from(h.x), f64::from(h.y));
-                    (x, y, f64::from(h.logical_w), f64::from(h.logical_h))
-                }
-                None => (0.0, 0.0, f64::from(abs.w), f64::from(abs.h)),
-            };
+        let (lx, ly, lw, lh) = match head_pick::pick(
+            &heads,
+            &crate::stream_target_for(abs.screen),
+            Some((abs.w, abs.h)),
+        ) {
+            Some(i) => {
+                let h = heads[i];
+                let (x, y) = (f64::from(h.x), f64::from(h.y));
+                (x, y, f64::from(h.logical_w), f64::from(h.logical_h))
+            }
+            None => (0.0, 0.0, f64::from(abs.w), f64::from(abs.h)),
+        };
         let (nx, ny) = abs.normalized();
         (lx + nx * lw, ly + ny * lh)
     }
 
     /// Emit one planned op. Keys are evdev codes; KWin owns the keymap and modifier state, so
-    /// there is no modifiers request. A touch is one frame per event.
+    /// there is no modifiers request. Text is a keysym tap. A touch is one frame per event.
     fn emit(&mut self, op: Op) {
         match op {
             Op::Motion { dx, dy } => self.fake.pointer_motion(dx.into(), dy.into()),
@@ -382,8 +430,13 @@ impl KwinFakeInjector {
                 self.fake.touch_up(id);
                 self.fake.touch_frame();
             }
-            // Host-layout keycodes only; this backend does not advertise HOST_CAP_TEXT_INPUT.
-            Op::Text(_) => {}
+            // Below v6 there is no keysym request, and the host offers no text.
+            Op::Text(cp) => {
+                if let Some(sym) = text_keysym(cp).filter(|_| self.fake.version() >= MAX_VERSION) {
+                    self.fake.keyboard_keysym(sym, 1);
+                    self.fake.keyboard_keysym(sym, 0);
+                }
+            }
         }
     }
 
@@ -429,5 +482,21 @@ impl InputInjector for KwinFakeInjector {
             .context("wayland dispatch")?;
         self.conn.flush().context("wayland flush")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_keysym;
+
+    #[test]
+    fn text_maps_to_layout_free_keysyms() {
+        assert_eq!(text_keysym('"' as u32), Some(0x22));
+        assert_eq!(text_keysym('A' as u32), Some(0x41));
+        assert_eq!(text_keysym('é' as u32), Some(0xe9));
+        assert_eq!(text_keysym('€' as u32), Some(0x20ac));
+        assert_eq!(text_keysym('😀' as u32), Some(0x0100_0000 | 0x1f600));
+        assert_eq!(text_keysym('\n' as u32), None);
+        assert_eq!(text_keysym(0xd800), None);
     }
 }

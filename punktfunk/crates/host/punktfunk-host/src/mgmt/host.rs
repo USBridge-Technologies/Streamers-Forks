@@ -57,8 +57,18 @@ pub(crate) struct HostInfo {
     door: bool,
     /// Why turning the door on would be refused here, as the operator's next move: the files a
     /// channel installs it with are missing, or the account isn't in `punktfunk-update`. `null`
-    /// when it would start, and on the door itself.
+    /// when it would start, on the door itself and on a seat host, and for every lane but the
+    /// admin one. The answer is up to 30 s old; a switch request drops it.
     door_unavailable: Option<String>,
+    /// The switch this host last started ran and failed, so the console stops waiting for it.
+    /// Admin lane only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schema(required = false)]
+    door_switch_failed: bool,
+    /// Whether hooks and prep steps marked `elevated` run as administrator: `true` once an
+    /// administrator ran `punktfunk-host hooks elevated on` here. `null` where commands can't
+    /// elevate (every OS but Windows), and for every lane but the admin one.
+    elevated_commands: Option<bool>,
     /// Hex SHA-256 of this host's leaf certificate — what a client pins. Public by
     /// construction: every client reads it off the handshake. Carried here so a connect link
     /// can name it, and a first connect over an untrusted path is verified rather than blind.
@@ -69,17 +79,41 @@ pub(crate) struct HostInfo {
 }
 
 /// Ports a client needs. Moonlight derives stream ports from HTTP; a control pane should not.
+/// A port the host does not serve right now is left out.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PortMap {
     mgmt: u16,
-    /// nvhttp plain HTTP (serverinfo, pairing).
-    http: u16,
+    /// UDP: the native stream port. Video, audio, control and the paired-device library.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    native: Option<u16>,
+    /// UDP: the browser client's plane, while it is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    browser: Option<u16>,
+    /// UDP: each seat's stream port, while seats are on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    seats: Vec<u16>,
+    /// nvhttp plain HTTP (serverinfo, pairing). This and the five below: GameStream only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    http: Option<u16>,
     /// nvhttp mutual-TLS HTTPS (post-pairing).
-    https: u16,
-    rtsp: u16,
-    video: u16,
-    control: u16,
-    audio: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    https: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    rtsp: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    video: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    control: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    audio: Option<u16>,
 }
 
 /// Wire token is the stack's canonical codec name (`Codec::label`). `H265` serializes as `"hevc"`, not `"h265"`.
@@ -387,6 +421,9 @@ pub(crate) struct ActiveGame {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[schema(required = false)]
     endable: bool,
+    /// On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seat: Option<String>,
 }
 
 /// One live session as the Dashboard lists it: who, where, since when, and the state
@@ -420,6 +457,9 @@ pub(crate) struct SessionRow {
     /// session on the cert lane.
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<crate::events::ProfileRef>,
+    /// On a door, to the operator: the profile whose seat host runs it, whose proxy reaches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seat: Option<String>,
     /// `WxH@Hz`.
     #[schema(example = "3840x2160@120")]
     mode: String,
@@ -537,6 +577,61 @@ pub(crate) async fn get_health() -> Json<Health> {
     })
 }
 
+/// How long a probe of the door's blockers answers: it forks `id`.
+const DOOR_PROBE_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+type DoorProbe = std::sync::Mutex<Option<(std::time::Instant, Option<String>)>>;
+
+static DOOR_PROBE: DoorProbe = std::sync::Mutex::new(None);
+
+/// The door's blockers, read only for the console: a paired device is not told which account
+/// the host runs as, and a seat host has no door to turn on.
+async fn door_unavailable(lane: AuthLane) -> Option<String> {
+    if lane != AuthLane::Admin || pf_paths::seat::role().is_seat_host() {
+        return None;
+    }
+    tokio::task::spawn_blocking(|| probe_door(&DOOR_PROBE, crate::door::unavailable))
+        .await
+        .unwrap_or_default()
+}
+
+/// Whether the owner's host behind this door serves Moonlight, for the console's pairing card:
+/// the door never does, and the owner's row may. Never starts the owner's session.
+async fn owner_gamestream(st: &MgmtState, lane: AuthLane) -> bool {
+    if lane != AuthLane::Admin {
+        return false;
+    }
+    st.owner_call("GET", "host", None, false)
+        .await
+        .ok_body()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|v| v.get("gamestream")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Drops the remembered blockers, so the next read asks again. A door switch request changes what
+/// they are: the operator fixes one, or the switch starts.
+pub(super) fn forget_door_probe() {
+    forget_probe(&DOOR_PROBE);
+}
+
+fn forget_probe(last: &DoorProbe) {
+    *last.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// `probe`'s answer, or the last one if it is under [`DOOR_PROBE_FRESH`] old.
+fn probe_door(last: &DoorProbe, probe: impl FnOnce() -> Option<String>) -> Option<String> {
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, answer)) = last.as_ref() {
+        if at.elapsed() < DOOR_PROBE_FRESH {
+            return answer.clone();
+        }
+    }
+    let answer = probe();
+    *last = Some((std::time::Instant::now(), answer.clone()));
+    answer
+}
+
 /// Host identity and capabilities
 #[utoipa::path(
     get,
@@ -548,11 +643,27 @@ pub(crate) async fn get_health() -> Json<Health> {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<HostInfo> {
+pub(crate) async fn get_host_info(
+    State(st): State<Arc<MgmtState>>,
+    Extension(lane): Extension<AuthLane>,
+) -> Json<HostInfo> {
     let h = &st.app.host;
-    let door_unavailable = tokio::task::spawn_blocking(crate::door::unavailable)
-        .await
-        .unwrap_or_default();
+    let door_unavailable = door_unavailable(lane).await;
+    let door_switch_failed = lane == AuthLane::Admin
+        && tokio::task::spawn_blocking(crate::door::switch_failed)
+            .await
+            .unwrap_or(false);
+    // The ledger asks the seat supervisor: off the async workers.
+    let seats = tokio::task::spawn_blocking(|| {
+        let ledger = crate::seats::ledger();
+        match ledger.on {
+            true => ledger.seats.iter().map(|s| s.native_port).collect(),
+            false => Vec::new(),
+        }
+    })
+    .await
+    .unwrap_or_default();
+    let gs = st.gamestream_enabled || owner_gamestream(&st, lane).await;
     Json(HostInfo {
         hostname: h.hostname.clone(),
         uniqueid: h.uniqueid.clone(),
@@ -563,13 +674,13 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
         gfe_version: GFE_VERSION.into(),
         os: h.os_chain.clone(),
         os_name: h.os_name.clone(),
-        // Same mask as GameStream/QUIC negotiation (`host_wire_caps`), not the compile-time list.
+        // Same mask as GameStream/QUIC negotiation (`wire_caps`), not the compile-time list.
         // A door encodes nothing, so it names none and never probes the GPU.
         codecs: {
             let caps = if pf_paths::seat::role().is_door() {
                 0
             } else {
-                crate::encode::host_wire_caps()
+                crate::encode::resolve().wire_caps()
             };
             use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
             [
@@ -583,20 +694,129 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
             .map(|(_, codec)| codec)
             .collect()
         },
-        gamestream: st.gamestream_enabled,
+        gamestream: gs,
         door: pf_paths::seat::role().is_door(),
         door_unavailable,
+        door_switch_failed,
+        elevated_commands: (cfg!(windows) && lane == AuthLane::Admin)
+            .then(crate::hooks::elevated_on),
         fingerprint: st.identity_fingerprint.map(hex::encode),
         ports: PortMap {
             mgmt: st.port,
-            http: h.http_port,
-            https: h.https_port,
-            rtsp: RTSP_PORT,
-            video: VIDEO_PORT,
-            control: CONTROL_PORT,
-            audio: AUDIO_PORT,
+            native: st.app.native_port.get().copied(),
+            browser: crate::webtransport::published().map(|p| p.port),
+            seats,
+            http: gs.then_some(h.http_port),
+            https: gs.then_some(h.https_port),
+            rtsp: gs.then_some(RTSP_PORT),
+            video: gs.then_some(VIDEO_PORT),
+            control: gs.then_some(CONTROL_PORT),
+            audio: gs.then_some(AUDIO_PORT),
         },
     })
+}
+
+/// `own` as this host answers, or on a door with every seat's sessions, games and downloads
+/// in it: the door streams nothing, so without them a client sees no game to resume and the
+/// console no session. `caller` is the device asking on the cert lane, which sees the others'
+/// rows without their identity, as on one host.
+async fn with_seats(st: &MgmtState, own: RuntimeStatus, caller: Option<String>) -> Response {
+    if st.door.is_none() {
+        return Json(own).into_response();
+    }
+    let snapshot = st.seats_snapshot().await;
+    let profiles = st.app.profiles.get().map(|p| p.list()).unwrap_or_default();
+    let seats: Vec<(Option<String>, &serde_json::Value)> = snapshot
+        .seats
+        .iter()
+        .filter_map(|seat| {
+            let status = snapshot.statuses.get(seat.id.as_str())?;
+            Some((crate::seats::profile_on(seat, &profiles), status))
+        })
+        .collect();
+    let Ok(own) = serde_json::to_value(own) else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "status did not serialize",
+        );
+    };
+    Json(merged_status(own, &seats, caller.as_deref())).into_response()
+}
+
+/// [`with_seats`] on the wire shapes: `seats` in ledger order with the profile each plays as,
+/// `caller` the device's fingerprint. Another device's row loses what `get_status` withholds
+/// from it: who plays, and whether this caller may end it. Only the operator learns the seat.
+fn merged_status(
+    mut own: serde_json::Value,
+    seats: &[(Option<String>, &serde_json::Value)],
+    caller: Option<&str>,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let mine = |row: &Value| {
+        caller.is_none_or(|fp| {
+            row.get("client")
+                .and_then(Value::as_str)
+                .is_some_and(|c| !c.is_empty() && fp.starts_with(c))
+        })
+    };
+    for (profile, seat) in seats {
+        for key in ["sessions", "games"] {
+            let rows = seat
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if rows.is_empty() {
+                continue;
+            }
+            // A list the door left out as empty is empty, not absent.
+            if !own[key].is_array() {
+                own[key] = Value::Array(Vec::new());
+            }
+            let Some(into) = own[key].as_array_mut() else {
+                continue;
+            };
+            for mut row in rows {
+                let theirs = !mine(&row);
+                if let Some(o) = row.as_object_mut() {
+                    if theirs {
+                        o.insert("client".into(), Value::String(String::new()));
+                        o.remove("client_name");
+                        o.remove("profile");
+                        o.remove("endable");
+                    }
+                    if let (None, Some(profile)) = (caller, profile) {
+                        o.insert("seat".into(), Value::String(profile.clone()));
+                    }
+                }
+                into.push(row);
+            }
+        }
+        if let Some(rows) = seat.get("downloads").and_then(Value::as_array) {
+            if !rows.is_empty() && !own["downloads"].is_array() {
+                own["downloads"] = Value::Array(Vec::new());
+            }
+            if let Some(into) = own["downloads"].as_array_mut() {
+                into.extend(rows.iter().cloned());
+            }
+        }
+        for flag in ["video_streaming", "audio_streaming"] {
+            if seat.get(flag).and_then(Value::as_bool) == Some(true) {
+                own[flag] = Value::Bool(true);
+            }
+        }
+        // One representative, as on one host: the door's own first, else the first seat's.
+        if own["session"].is_null() && !seat["session"].is_null() {
+            for key in ["session", "stream", "session_id"] {
+                if let Some(v) = seat.get(key) {
+                    own[key] = v.clone();
+                }
+            }
+        }
+    }
+    let count = own["sessions"].as_array().map_or(0, Vec::len);
+    own["active_sessions"] = Value::from(count as u64);
+    own
 }
 
 /// A compositor backend and whether it is usable now.
@@ -663,12 +883,18 @@ pub(crate) async fn get_status(
     State(st): State<Arc<MgmtState>>,
     Extension(lane): Extension<AuthLane>,
     device: Option<Extension<PairedDevice>>,
-) -> Json<RuntimeStatus> {
+) -> Response {
     let ender = super::session::GameEnder::of(&st, lane, device.as_ref().map(|d| d.0 .0.as_str()));
     let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
     // Stream slot is GameStream-featured only; a native-only build has no compat-plane stream.
     #[cfg(feature = "gamestream")]
-    let gs_stream = *st.app.gs.stream.lock().unwrap_or_else(|e| e.into_inner());
+    let gs_stream = st
+        .app
+        .gs
+        .stream
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let gs_video = st.app.streaming.load(Ordering::SeqCst);
     let gs_audio = st.app.audio_streaming.load(Ordering::SeqCst);
     // Native plane, published by the video loop; lives outside `AppState` (see `session_status`).
@@ -712,6 +938,7 @@ pub(crate) async fn get_status(
                 uptime_s: s.uptime_s,
                 link: s.link.clone(),
                 shared_path_with: s.shared_path_with.clone(),
+                seat: None,
             }
         })
         .collect();
@@ -761,7 +988,7 @@ pub(crate) async fn get_status(
             last_resize_ms: (s.last_resize_ms > 0).then_some(s.last_resize_ms),
         })
     });
-    Json(RuntimeStatus {
+    let status = RuntimeStatus {
         video_streaming: gs_video || !native.is_empty(),
         audio_streaming: gs_audio || !native.is_empty(),
         pin_pending: gs_pin_pending(&st),
@@ -808,6 +1035,7 @@ pub(crate) async fn get_status(
                 awaiting_window: g.awaiting_window,
                 grace_remaining_s: g.grace_remaining_s,
                 endable: ender.may_end(g.state, g.launched_by.as_deref()),
+                seat: None,
             })
             .collect(),
         downloads: crate::library::downloads::snapshot(),
@@ -818,7 +1046,8 @@ pub(crate) async fn get_status(
                 .unwrap_or(0)
         }),
         audio: audio_wiring(),
-    })
+    };
+    with_seats(&st, status, caller.map(str::to_string)).await
 }
 
 /// Loopback tray summary
@@ -911,4 +1140,68 @@ fn gs_pin_pending(st: &Arc<MgmtState>) -> bool {
 #[cfg(not(feature = "gamestream"))]
 fn gs_pin_pending(_st: &Arc<MgmtState>) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_door_probe_runs_once_a_while() {
+        let last: DoorProbe = std::sync::Mutex::new(None);
+        let mut runs = 0;
+        let mut ask = |answer: Option<&str>| {
+            probe_door(&last, || {
+                runs += 1;
+                answer.map(str::to_string)
+            })
+        };
+        assert_eq!(ask(Some("first")).as_deref(), Some("first"));
+        assert_eq!(ask(None).as_deref(), Some("first"));
+        assert_eq!(runs, 1);
+        *last.lock().unwrap() = Some((
+            std::time::Instant::now() - DOOR_PROBE_FRESH,
+            Some("stale".into()),
+        ));
+        assert_eq!(probe_door(&last, || None), None);
+    }
+
+    /// The operator learns which seat runs each row; a device sees another's row without who
+    /// plays it or the seat's own answer to whether it may end it.
+    #[test]
+    fn merged_rows_name_their_seat_to_the_operator_alone() {
+        let seat = serde_json::json!({
+            "sessions": [{"id": 3, "client": "aa11bb22cc33", "client_name": "Kid's Deck"}],
+            "games": [{"session_id": 3, "client": "aa11bb22cc33", "title": "Hades",
+                       "endable": true}],
+        });
+        let seats = [(Some("kid".to_string()), &seat)];
+        let admin = merged_status(serde_json::json!({}), &seats, None);
+        assert_eq!(admin["sessions"][0]["seat"], "kid");
+        assert_eq!(admin["games"][0]["seat"], "kid");
+        assert_eq!(admin["games"][0]["endable"], true);
+        let other = merged_status(serde_json::json!({}), &seats, Some("ffffffffffff"));
+        for key in ["sessions", "games"] {
+            let row = &other[key][0];
+            assert_eq!(row["client"], "", "{key}");
+            for gone in ["seat", "client_name", "endable"] {
+                assert!(row.get(gone).is_none(), "{key} {gone}");
+            }
+        }
+        let own = merged_status(serde_json::json!({}), &seats, Some("aa11bb22cc33dd"));
+        assert_eq!(own["games"][0]["endable"], true, "its own game");
+        assert!(own["games"][0].get("seat").is_none());
+    }
+
+    /// A switch request drops the answer a fresh probe would have kept.
+    #[test]
+    fn a_forgotten_door_probe_asks_again() {
+        let last: DoorProbe = std::sync::Mutex::new(None);
+        assert_eq!(
+            probe_door(&last, || Some("blocked".into())).as_deref(),
+            Some("blocked")
+        );
+        forget_probe(&last);
+        assert_eq!(probe_door(&last, || None), None);
+    }
 }

@@ -61,30 +61,31 @@ export const SectionControllers: FC = () => {
 	);
 };
 
+/** A session on this page: on a door each seat counts its own ids, so the seat is part of it. */
+const keyOf = (s: SessionRow & { id: number }) => `${s.seat ?? ""}:${s.id}`;
+
 /** One session at a time: a second stream would cost a second connection for nothing. */
 const SessionPads: FC<{ sessions: (SessionRow & { id: number })[] }> = ({
 	sessions,
 }) => {
 	const first = sessions[0];
-	const [chosen, setChosen] = useState(first?.id);
-	const session = sessions.find((s) => s.id === chosen) ?? first;
+	const [chosen, setChosen] = useState(first && keyOf(first));
+	const session = sessions.find((s) => keyOf(s) === chosen) ?? first;
 	const [paused, setPaused] = useState(false);
-	const feed = usePadFeed(session?.id, paused);
+	// On a door the session runs on a seat's host: its pads stream from there, through the box.
+	const feed = usePadFeed(session?.id, paused, session?.seat ?? null);
 	if (!session) return null;
 
 	return (
 		<div className="flex flex-col gap-card">
 			{sessions.length > 1 && (
-				<Select
-					value={String(session.id)}
-					onValueChange={(v) => setChosen(Number(v))}
-				>
+				<Select value={keyOf(session)} onValueChange={setChosen}>
 					<SelectTrigger className="w-72">
 						<SelectValue />
 					</SelectTrigger>
 					<SelectContent>
 						{sessions.map((s) => (
-							<SelectItem key={s.id} value={String(s.id)}>
+							<SelectItem key={keyOf(s)} value={keyOf(s)}>
 								{/* Whose session, where several people play. */}
 								{s.profile
 									? `${s.profile.display_name} · ${s.client_name ?? s.client}`

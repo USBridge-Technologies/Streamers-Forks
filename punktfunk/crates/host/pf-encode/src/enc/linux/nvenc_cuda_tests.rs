@@ -44,61 +44,11 @@ fn remove_env(key: &str) {
     unsafe { std::env::remove_var(key) };
 }
 
-/// SDR-10 rides NVENC's 8→10, which takes packed RGB (`ARGB`) only. A planar 8-bit surface
-/// (NV12/YUV444) stays 8-bit — feeding it a 10-bit session fails `register_resource`, the
-/// real-capture regression this guards. Packed 10-bit input is HDR (BT.2020 PQ) regardless.
-#[test]
-fn depth_and_hdr_needs_packed_rgb_for_ten_bit() {
-    use nv::NV_ENC_BUFFER_FORMAT as F;
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ARGB, 10, false),
-        (10, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ARGB, 8, false),
-        (8, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_NV12, 10, false),
-        (8, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_YUV444, 10, false),
-        (8, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ARGB10, 8, true),
-        (10, true)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ABGR10, 10, true),
-        (10, true)
-    );
-    // A 10-bit input carries the session's colour; an 8-bit stream is never HDR.
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_ABGR10, 10, false),
-        (10, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_YUV420_10BIT, 10, false),
-        (10, false)
-    );
-    assert_eq!(
-        depth_and_hdr(F::NV_ENC_BUFFER_FORMAT_NV12, 10, true),
-        (8, false)
-    );
-}
-
 #[test]
 fn ten_bit_rgb_maps_to_the_matching_nvenc_format_and_blend_mode() {
     use nv::NV_ENC_BUFFER_FORMAT as F;
-    // `x:R:G:B` = ARGB10; `x:B:G:R` = ABGR10.
-    assert!(is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_ARGB10));
-    assert!(is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_ABGR10));
-    assert!(!is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_ARGB));
-    assert!(!is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_NV12));
-    assert!(!is_ten_bit_input(F::NV_ENC_BUFFER_FORMAT_YUV444));
-    // Blend mode must unpack this channel order; a swap tints the pointer.
+    // `x:R:G:B` = ARGB10; `x:B:G:R` = ABGR10. Blend mode must unpack this channel order; a
+    // swap tints the pointer.
     assert_eq!(
         slot_fmt_of(F::NV_ENC_BUFFER_FORMAT_ARGB10),
         SlotFormat::X2Rgb10
@@ -108,6 +58,28 @@ fn ten_bit_rgb_maps_to_the_matching_nvenc_format_and_blend_mode() {
         SlotFormat::X2Bgr10
     );
     assert_eq!(slot_fmt_of(F::NV_ENC_BUFFER_FORMAT_ARGB), SlotFormat::Argb);
+}
+
+#[test]
+fn packed_ten_bit_keeps_its_depth_in_a_444_session() {
+    use nv::NV_ENC_BUFFER_FORMAT as F;
+    // NVENC converts packed 10-bit to 4:4:4 itself. A planar YUV444 slot is 8-bit and would
+    // cost an HDR session its depth.
+    for (fmt, want) in [
+        (PixelFormat::X2Rgb10, F::NV_ENC_BUFFER_FORMAT_ARGB10),
+        (PixelFormat::X2Bgr10, F::NV_ENC_BUFFER_FORMAT_ABGR10),
+    ] {
+        assert_eq!(raw_copy_format(fmt, true, false), want);
+        assert!(full_chroma_input(want), "{fmt:?} must keep 4:4:4");
+    }
+    assert_eq!(
+        raw_copy_format(PixelFormat::Bgra, true, true),
+        F::NV_ENC_BUFFER_FORMAT_YUV444
+    );
+    assert_eq!(
+        raw_copy_format(PixelFormat::Bgra, false, true),
+        F::NV_ENC_BUFFER_FORMAT_NV12
+    );
 }
 
 /// What `resolve_split_mode` actually reads (`query_caps` latch).
@@ -231,6 +203,8 @@ fn nvenc_cuda_smoke_rfi_anchor() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -312,6 +286,8 @@ fn nvenc_cuda_wave_soak() {
         ChromaFormat::Yuv420,
         false,
         1,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     soak.run(
@@ -355,11 +331,15 @@ fn rgb10_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
 }
 
 /// Hardware: packed 10-bit → `ARGB10`. Depth follows the input and the session's HDR
-/// verdict rides on it — that pair selects Main10 / BT.2020 PQ.
+/// verdict rides on it — that pair selects Main10 / BT.2020 PQ. HEVC keeps it at 4:4:4.
 #[test]
 #[ignore = "requires an NVIDIA GPU + driver with 10-bit encode"]
 fn nvenc_cuda_hdr10_packed_rgb() {
-    for codec in [Codec::H265, Codec::Av1] {
+    for (codec, chroma) in [
+        (Codec::H265, ChromaFormat::Yuv420),
+        (Codec::Av1, ChromaFormat::Yuv420),
+        (Codec::H265, ChromaFormat::Yuv444),
+    ] {
         const W: u32 = 1280;
         const H: u32 = 720;
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
@@ -373,9 +353,11 @@ fn nvenc_cuda_hdr10_packed_rgb() {
             true,
             10,
             true,
-            ChromaFormat::Yuv420,
+            chroma,
             false,
             4,
+            true,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
 
@@ -398,7 +380,8 @@ fn nvenc_cuda_hdr10_packed_rgb() {
         // Dump for out-of-band ffprobe. In-tree we only see the encoder's own config.
         if let Ok(home) = std::env::var("HOME") {
             let ext = if codec == Codec::Av1 { "obu" } else { "h265" };
-            let path = format!("{home}/nvenc-hdr10.{ext}");
+            let tag = if chroma.is_444() { "-444" } else { "" };
+            let path = format!("{home}/nvenc-hdr10{tag}.{ext}");
             if std::fs::write(&path, &stream).is_ok() {
                 println!(
                     "nvenc_cuda HDR10 {codec:?}: wrote {path} ({} bytes)",
@@ -418,6 +401,11 @@ fn nvenc_cuda_hdr10_packed_rgb() {
             enc.s.buffer_fmt,
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10,
             "{codec:?}: X2Rgb10 must ingest as ARGB10"
+        );
+        assert_eq!(
+            enc.caps().chroma_444,
+            chroma.is_444(),
+            "{codec:?}: packed 10-bit must keep the chroma asked for"
         );
         println!("nvenc_cuda HDR10 {codec:?}: {aus} AUs, ARGB10 in, 10-bit derived");
     }
@@ -465,6 +453,8 @@ fn nvenc_cuda_reframe_crops_and_scales() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     assert!(enc.caps().crops_input && enc.caps().downscales_input);
@@ -558,6 +548,216 @@ fn decode_first_rgb(stream: &[u8], name: &str, w: u32, h: u32) -> Option<Vec<u8>
     Some(out.stdout)
 }
 
+/// Hardware probe: what NVENC's own RGB conversion writes at the VUI's range (SDR at full and
+/// studio, HDR at full), for 8-bit BGRA (BT.709) and packed 10-bit RGB (HDR10 BT.2020, or 10-bit
+/// SDR BT.709), at 4:2:0 and 4:4:4. Solid white, mid grey and red go in packed (NVENC's CSC, no host pass) and the
+/// decoded codes come out untouched: white Y' 255 / 1023 means full range, 235 / 940 studio;
+/// red Y' 54 means BT.709, 76 BT.601, 269 BT.2020. Prints, never asserts: the answer decides
+/// which input paths skip the host's converter.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver with 10-bit HEVC 4:4:4, and ffmpeg — the RTX box (.21)"]
+fn nvenc_rgb_input_range_probe() {
+    const W: u32 = 256;
+    const H: u32 = 144;
+    pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+    // x:R:G:B 2:10:10:10 LE: B in the low bits.
+    let rgb10 = |r: u32, g: u32, b: u32| (b | g << 10 | r << 20).to_le_bytes();
+    let (c420, c444) = (ChromaFormat::Yuv420, ChromaFormat::Yuv444);
+    for (name, fmt, depth, hdr, chroma, px) in [
+        (
+            "white",
+            PixelFormat::Bgra,
+            8,
+            false,
+            c420,
+            [255u8, 255, 255, 255],
+        ),
+        (
+            "grey128",
+            PixelFormat::Bgra,
+            8,
+            false,
+            c420,
+            [128, 128, 128, 255],
+        ),
+        ("red", PixelFormat::Bgra, 8, false, c420, [0, 0, 255, 255]),
+        (
+            "white",
+            PixelFormat::X2Rgb10,
+            10,
+            true,
+            c420,
+            rgb10(1023, 1023, 1023),
+        ),
+        (
+            "grey512",
+            PixelFormat::X2Rgb10,
+            10,
+            true,
+            c420,
+            rgb10(512, 512, 512),
+        ),
+        (
+            "red",
+            PixelFormat::X2Rgb10,
+            10,
+            true,
+            c420,
+            rgb10(1023, 0, 0),
+        ),
+        (
+            "white",
+            PixelFormat::Bgra,
+            8,
+            false,
+            c444,
+            [255, 255, 255, 255],
+        ),
+        ("red", PixelFormat::Bgra, 8, false, c444, [0, 0, 255, 255]),
+        (
+            "white",
+            PixelFormat::X2Rgb10,
+            10,
+            false,
+            c444,
+            rgb10(1023, 1023, 1023),
+        ),
+        (
+            "red",
+            PixelFormat::X2Rgb10,
+            10,
+            false,
+            c444,
+            rgb10(1023, 0, 0),
+        ),
+    ] {
+        for asked_full in [true, false].into_iter().filter(|&f| f || !hdr) {
+            let mut enc = NvencCudaEncoder::open(
+                Codec::H265,
+                fmt,
+                W,
+                H,
+                60,
+                8_000_000,
+                false,
+                depth,
+                hdr,
+                chroma,
+                false,
+                1,
+                asked_full,
+                &Knobs::from_env(),
+            )
+            .expect("open NVENC CUDA session");
+            let mut stream = Vec::new();
+            for i in 0..4u32 {
+                let buf = DeviceBuffer::alloc(PlaneLayout::Packed32, W, H)
+                    .expect("alloc packed RGB device buffer");
+                let pixels = px.repeat((W * H) as usize);
+                // SAFETY: `buf` is a live packed allocation of `W`×`H` 4-byte pixels at `pitch`;
+                // the context is current (above).
+                unsafe {
+                    pf_zerocopy::cuda::write_plane_from_host(
+                        buf.ptr,
+                        buf.pitch,
+                        &pixels,
+                        (W * 4) as usize,
+                        H as usize,
+                    )
+                }
+                .expect("upload the fill");
+                let frame = CapturedFrame {
+                    provenance: Default::default(),
+                    width: W,
+                    height: H,
+                    pts_ns: u64::from(i) * 16_666_667,
+                    format: fmt,
+                    payload: FramePayload::Cuda(buf),
+                    cursor: None,
+                };
+                enc.submit_indexed(&frame, i).expect("submit");
+                while let Some(au) = enc.poll().expect("poll") {
+                    stream.extend_from_slice(&au.data);
+                }
+            }
+            enc.flush().expect("flush");
+            while let Some(au) = enc.poll().expect("poll") {
+                stream.extend_from_slice(&au.data);
+            }
+            let (full_range, buffer_fmt) = (enc.s.full_range, enc.s.buffer_fmt);
+            let is444 = chroma.is_444();
+            let file = format!(
+                "nvenc-range-{name}-{depth}-{}-{}.h265",
+                if is444 { 444 } else { 420 },
+                if asked_full { "full" } else { "studio" }
+            );
+            let Some(yuv) = decode_first_yuv(&stream, &file, W, H, depth == 10, is444) else {
+                println!("no ffmpeg — skipping the probe");
+                return;
+            };
+            let n = (W * H) as usize;
+            let plane = if is444 { n } else { n / 4 };
+            println!(
+                "nvenc packed-RGB {name} {depth}-bit {}{}: Y' {} Cb {} Cr {} (VUI full_range={}, \
+             input {buffer_fmt:?})",
+                if is444 { "4:4:4" } else { "4:2:0" },
+                if hdr { " HDR10" } else { "" },
+                yuv[n / 2],
+                yuv[n + plane / 2],
+                yuv[n + plane + plane / 2],
+                u8::from(full_range)
+            );
+        }
+    }
+}
+
+/// The first picture of an HEVC `stream` as `w`x`h` planar codes (`ten_bit`: 16-bit LE
+/// samples; `full_chroma`: 4:4:4), through ffmpeg and untouched by any range conversion.
+/// `None` without ffmpeg.
+fn decode_first_yuv(
+    stream: &[u8],
+    name: &str,
+    w: u32,
+    h: u32,
+    ten_bit: bool,
+    full_chroma: bool,
+) -> Option<Vec<u16>> {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, stream).expect("write the stream");
+    let pix_fmt = match (ten_bit, full_chroma) {
+        (false, false) => "yuv420p",
+        (true, false) => "yuv420p10le",
+        (false, true) => "yuv444p",
+        (true, true) => "yuv444p10le",
+    };
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"])
+        .output()
+        .ok()?;
+    let samples = (if full_chroma {
+        w * h * 3
+    } else {
+        w * h * 3 / 2
+    }) as usize;
+    let bytes = out.stdout;
+    assert_eq!(
+        bytes.len(),
+        samples * if ten_bit { 2 } else { 1 },
+        "decoded size: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(if ten_bit {
+        bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    } else {
+        bytes.iter().map(|&b| u16::from(b)).collect()
+    })
+}
+
 /// Hardware: an uploaded CPU frame takes the cursor blend, as a CUDA buffer does. The decoded
 /// picture holds the white pointer on the grey frame, and `caps()` reports the blend.
 #[test]
@@ -579,6 +779,8 @@ fn nvenc_cuda_cpu_frame_blends_the_cursor() {
         ChromaFormat::Yuv420,
         true,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     let cursor = pf_frame::CursorOverlay {
@@ -646,7 +848,7 @@ fn nvenc_cuda_hdr10_cursor_blend() {
     const W: u32 = 1280;
     const H: u32 = 720;
     pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
-    if !stream_ordered_requested() || async_retrieve_requested() {
+    if !Knobs::from_env().nvenc_stream_ordered || async_retrieve_requested() {
         println!("skipped: stream-ordered submit disabled by env");
         return;
     }
@@ -663,6 +865,8 @@ fn nvenc_cuda_hdr10_cursor_blend() {
         ChromaFormat::Yuv420,
         true, // Vulkan slot ring + 10-bit blend
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     let cursor = |serial: u64, x: i32, y: i32| pf_frame::CursorOverlay {
@@ -745,6 +949,8 @@ fn nvenc_cuda_sdr10_from_eight_bit_capture() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA SDR-10 session");
         let mut stream = Vec::new();
@@ -805,6 +1011,8 @@ fn nvenc_cuda_sdr10_from_eight_bit_capture() {
             chroma,
             false,
             4,
+            true,
+            &Knobs::from_env(),
         )
         .expect("open planar SDR-10 session");
         let mut aus = 0usize;
@@ -857,6 +1065,8 @@ fn nvenc_cuda_yuv444() {
         ChromaFormat::Yuv444,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA 4:4:4 session");
 
@@ -904,6 +1114,8 @@ fn nvenc_cuda_reconfigure_no_idr() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     crate::smoke_pattern::reconfigure_no_idr(
@@ -944,6 +1156,8 @@ fn nvenc_cuda_split_reconfigure_in_place() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -1077,6 +1291,8 @@ fn nvenc_cuda_split_reconfigure_takes_effect() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
 
@@ -1203,6 +1419,8 @@ fn nvenc_cuda_split_subframe_pair_reconfigure() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -1325,6 +1543,8 @@ fn nvenc_cuda_auto_split_with_subframe() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
         let mut times = Vec::new();
@@ -1425,6 +1645,8 @@ fn nvenc_cuda_split_hardware_max() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
         let mut times = Vec::new();
@@ -1514,6 +1736,8 @@ fn nvenc_cuda_split_arbitration_converges() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -1607,6 +1831,8 @@ fn nvenc_cuda_main10_split_ab() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
         let (mut times, mut bytes) = (Vec::new(), Vec::new());
@@ -1705,6 +1931,8 @@ fn nvenc_cuda_bits_per_frame_curve() {
                 ChromaFormat::Yuv420,
                 false,
                 4,
+                true,
+                &Knobs::from_env(),
             )
             .expect("open NVENC CUDA session");
             let (mut times, mut bytes) = (Vec::new(), Vec::new());
@@ -1755,6 +1983,8 @@ fn rfi_declines_impossible_ranges() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     ) else {
         eprintln!("skipping rfi_declines_impossible_ranges: NVENC unavailable (no NVIDIA driver)");
         return;
@@ -1782,6 +2012,8 @@ fn open_h265() -> NvencCudaEncoder {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA encoder")
 }
@@ -1816,6 +2048,8 @@ fn nvenc_cuda_codec_switch_reopen() {
             ChromaFormat::Yuv420,
             false,
             4,
+            true,
+            &Knobs::from_env(),
         )
         .expect("open");
         for f in 0..4u32 {
@@ -1850,6 +2084,8 @@ fn nvenc_cuda_h264_shows_each_picture_in_its_own_au() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -1988,7 +2224,7 @@ fn nvenc_cuda_stream_ordered_arms() {
     const H: u32 = 360;
     pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
     // Operator opt-out / two-thread mode: skip, don't fail.
-    if !stream_ordered_requested() || async_retrieve_requested() {
+    if !Knobs::from_env().nvenc_stream_ordered || async_retrieve_requested() {
         println!("skipped: stream-ordered submit disabled by env");
         return;
     }
@@ -2005,6 +2241,8 @@ fn nvenc_cuda_stream_ordered_arms() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     let frame = nv12_frame(W, H, 0);
@@ -2012,7 +2250,7 @@ fn nvenc_cuda_stream_ordered_arms() {
     let au = enc.poll().expect("poll").expect("AU");
     assert!(au.keyframe, "opening AU must be the session IDR");
     assert!(
-        enc.stream_ordered,
+        enc.stream_ordered(),
         "IO-stream binding must arm on a default-env session (NvEncSetIOCudaStreams rejected?)"
     );
     assert!(
@@ -2024,7 +2262,7 @@ fn nvenc_cuda_stream_ordered_arms() {
 /// Queue a convert-timeline wait nothing will signal, as a worker that died mid-pass leaves.
 fn wedge_copy_stream(enc: &mut NvencCudaEncoder) {
     const NEVER: u64 = 1_000;
-    let mut worker = pf_zerocopy::Importer::new_for_capture().expect("in-process importer");
+    let mut worker = pf_zerocopy::Importer::new_for_capture(true).expect("in-process importer");
     let fd = worker.convert_timeline().expect("convert timeline fd");
     let sem = cuda::ExternalSemaphore::import_timeline_fd(fd).expect("import the timeline");
     sem.wait(NEVER).expect("queue the wait");
@@ -2047,7 +2285,7 @@ fn nvenc_cuda_stuck_fused_wait_releases() {
     const H: u32 = 360;
     set_env("PUNKTFUNK_ZEROCOPY_INPROC", "1");
     pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
-    if !stream_ordered_requested() || async_retrieve_requested() {
+    if !Knobs::from_env().nvenc_stream_ordered || async_retrieve_requested() {
         println!("skipped: stream-ordered submit disabled by env");
         return;
     }
@@ -2064,12 +2302,14 @@ fn nvenc_cuda_stuck_fused_wait_releases() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     enc.submit_indexed(&nv12_frame(W, H, 0), 0).expect("submit");
     enc.poll().expect("poll").expect("AU");
     assert!(
-        enc.stream_ordered,
+        enc.stream_ordered(),
         "IO streams must be bound to the copy stream"
     );
 
@@ -2108,7 +2348,7 @@ fn nvenc_cuda_cursor_blend_stream_ordered() {
     const H: u32 = 720;
     pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
     // Operator opt-out / two-thread mode: skip, don't fail.
-    if !stream_ordered_requested() || async_retrieve_requested() {
+    if !Knobs::from_env().nvenc_stream_ordered || async_retrieve_requested() {
         println!("skipped: stream-ordered submit disabled by env");
         return;
     }
@@ -2125,6 +2365,8 @@ fn nvenc_cuda_cursor_blend_stream_ordered() {
         ChromaFormat::Yuv420,
         true, // Vulkan slot ring + blend
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     let cursor = |serial: u64, x: i32, y: i32| pf_frame::CursorOverlay {
@@ -2154,7 +2396,7 @@ fn nvenc_cuda_cursor_blend_stream_ordered() {
     }
     assert_eq!(aus, 6, "every cursor frame must deliver an AU");
     assert!(
-        enc.stream_ordered,
+        enc.stream_ordered(),
         "IO-stream binding must arm on a default-env session"
     );
     let vk = enc
@@ -2201,6 +2443,8 @@ fn nvenc_cuda_pipelined_escalation() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     for i in 0..3u32 {
@@ -2237,7 +2481,7 @@ fn nvenc_cuda_pipelined_escalation() {
         "retrieve thread must be live after escalation"
     );
     assert!(
-        !enc.stream_ordered,
+        !enc.stream_ordered(),
         "IO-stream binding must be gone in pipelined mode"
     );
     assert_eq!(aus, 10, "every post-escalation frame must deliver an AU");
@@ -2276,6 +2520,8 @@ fn nvenc_cuda_subframe_slice_probe() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -2359,6 +2605,8 @@ fn nvenc_cuda_chunked_poll_end_to_end() {
         ChromaFormat::Yuv420,
         false,
         4,
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -2453,6 +2701,8 @@ fn nvenc_cuda_single_slice_client_ceiling() {
         ChromaFormat::Yuv420,
         false,
         1, // client never advertised multi-slice
+        true,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     for i in 0..4u32 {
@@ -2523,4 +2773,490 @@ fn nvenc_cuda_chunked_poll_fallback_whole_au() {
     );
     let au = enc.poll().expect("poll").expect("AU");
     assert!(au.keyframe && !au.data.is_empty());
+}
+
+/// A LINEAR dma-buf holding `bytes`, exported from its own Vulkan device the way gamescope
+/// shares a screencast buffer. Lives until this drops.
+struct LinearDmabuf {
+    fd: std::os::fd::OwnedFd,
+    _vk: (ash::Entry, ash::Instance, ash::Device),
+}
+
+impl LinearDmabuf {
+    fn new(bytes: &[u8]) -> LinearDmabuf {
+        use ash::vk;
+        use pf_zerocopy::vkdev::{memory_type, MappedMemory};
+        // SAFETY: test fixture over raw Vulkan handles it creates; the device outlives the fd's
+        // users because the struct keeps it.
+        unsafe {
+            let entry = ash::Entry::load().expect("load libvulkan");
+            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+            let instance = entry
+                .create_instance(
+                    &vk::InstanceCreateInfo::default().application_info(&app),
+                    None,
+                )
+                .expect("instance");
+            let phys = instance
+                .enumerate_physical_devices()
+                .expect("devices")
+                .into_iter()
+                .find(|&p| instance.get_physical_device_properties(p).vendor_id == 0x10DE)
+                .expect("an NVIDIA device");
+            let mp = instance.get_physical_device_memory_properties(phys);
+            let exts = [
+                ash::khr::external_memory_fd::NAME.as_ptr(),
+                ash::ext::external_memory_dma_buf::NAME.as_ptr(),
+            ];
+            let prio = [1.0f32];
+            let qci = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(0)
+                .queue_priorities(&prio)];
+            let device = instance
+                .create_device(
+                    phys,
+                    &vk::DeviceCreateInfo::default()
+                        .queue_create_infos(&qci)
+                        .enabled_extension_names(&exts),
+                    None,
+                )
+                .expect("device");
+            let size = bytes.len() as u64;
+            let buffer = |usage, export: bool| {
+                let mut ext = vk::ExternalMemoryBufferCreateInfo::default()
+                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                let mut info = vk::BufferCreateInfo::default().size(size).usage(usage);
+                if export {
+                    info = info.push_next(&mut ext);
+                }
+                let buf = device.create_buffer(&info, None).expect("buffer");
+                let req = device.get_buffer_memory_requirements(buf);
+                let flags = if export {
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                } else {
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+                };
+                let mut exp = vk::ExportMemoryAllocateInfo::default()
+                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                let mut alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(
+                        memory_type(&mp, req.memory_type_bits, flags).expect("type"),
+                    );
+                if export {
+                    alloc = alloc.push_next(&mut exp);
+                }
+                let mem = device.allocate_memory(&alloc, None).expect("memory");
+                device.bind_buffer_memory(buf, mem, 0).expect("bind");
+                (buf, mem)
+            };
+            let (dst, dst_mem) = buffer(vk::BufferUsageFlags::TRANSFER_DST, true);
+            let (src, src_mem) = buffer(vk::BufferUsageFlags::TRANSFER_SRC, false);
+            MappedMemory::map(&device, src_mem, bytes.len())
+                .expect("map staging")
+                .copy_from_slice(bytes);
+            let pool = device
+                .create_command_pool(&vk::CommandPoolCreateInfo::default(), None)
+                .expect("pool");
+            let cmd = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .command_buffer_count(1),
+                )
+                .expect("cmd")[0];
+            device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+                .expect("begin");
+            device.cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy::default().size(size)]);
+            device.end_command_buffer(cmd).expect("end");
+            let cmds = [cmd];
+            let queue = device.get_device_queue(0, 0);
+            device
+                .queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                    vk::Fence::null(),
+                )
+                .expect("submit");
+            device.queue_wait_idle(queue).expect("wait");
+            let fd = ash::khr::external_memory_fd::Device::new(&instance, &device)
+                .get_memory_fd(
+                    &vk::MemoryGetFdInfoKHR::default()
+                        .memory(dst_mem)
+                        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
+                )
+                .expect("export dma-buf");
+            LinearDmabuf {
+                fd: std::os::fd::FromRawFd::from_raw_fd(fd),
+                _vk: (entry, instance, device),
+            }
+        }
+    }
+
+    /// One captured frame over this buffer, held the way the capture holds it.
+    fn frame(
+        &self,
+        fmt: PixelFormat,
+        fourcc: &[u8; 4],
+        w: u32,
+        h: u32,
+        stride: u32,
+        i: u32,
+    ) -> CapturedFrame {
+        CapturedFrame {
+            provenance: Default::default(),
+            width: w,
+            height: h,
+            pts_ns: u64::from(i) * 16_666_667,
+            format: fmt,
+            payload: FramePayload::Dmabuf(pf_frame::DmabufFrame {
+                fd: self.fd.try_clone().expect("dup"),
+                fourcc: u32::from_le_bytes(*fourcc),
+                modifier: 0,
+                plane1: None,
+                offset: 0,
+                stride,
+                hold: Some(std::sync::Arc::new(())),
+                health: pf_zerocopy::zero_copy_health(0x5002),
+                rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            cursor: None,
+        }
+    }
+}
+
+/// The first picture of `stream` as raw `pix_fmt` bytes, through ffmpeg.
+fn decode_first(stream: &[u8], name: &str, pix_fmt: &str) -> Vec<u8> {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, stream).expect("write the stream");
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"])
+        .output()
+        .expect("run ffmpeg");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// Encode `frames` of one LINEAR buffer through the in-place lane and return the stream.
+/// Asserts the lane took them: a mapped buffer, never the worker.
+fn encode_in_place(
+    dmabuf: &LinearDmabuf,
+    frame: impl Fn(u32) -> CapturedFrame,
+    depth: u8,
+    hdr: bool,
+    chroma: ChromaFormat,
+    frames: u32,
+) -> (NvencCudaEncoder, Vec<u8>) {
+    pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+    let first = frame(0);
+    let mut enc = NvencCudaEncoder::open(
+        Codec::H265,
+        first.format,
+        first.width,
+        first.height,
+        60,
+        80_000_000,
+        false,
+        depth,
+        hdr,
+        chroma,
+        false,
+        1,
+        true,
+        &Knobs::from_env(),
+    )
+    .expect("open NVENC CUDA session");
+    let mut stream = Vec::new();
+    for i in 0..frames {
+        enc.submit_indexed(&frame(i), i).expect("submit in place");
+        while let Some(au) = enc.poll().expect("poll") {
+            stream.extend_from_slice(&au.data);
+        }
+    }
+    let _ = dmabuf;
+    assert!(
+        enc.lane.in_place != InPlace::Closed,
+        "the in-place lane latched off"
+    );
+    assert!(
+        enc.direct.as_ref().is_some_and(|d| !d.bufs.is_empty()),
+        "no buffer was encoded in place"
+    );
+    assert!(enc.worker.is_none(), "a frame went through the worker");
+    (enc, stream)
+}
+
+fn close(got: u32, want: u32, tol: u32, what: &str) {
+    assert!(
+        got.abs_diff(want) <= tol,
+        "{what}: got {got}, want {want} ±{tol}"
+    );
+}
+
+/// Hardware: a producer NV12 encodes in place, chroma read from right below the luma or below
+/// padding rows (the producer's `plane1`). Padding holds 255, so a misread chroma shows.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver and ffmpeg"]
+fn nvenc_cuda_in_place_nv12() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let left = |x: u32| x < W / 2;
+    for pad in [0u32, 16] {
+        let mut bytes = Vec::new();
+        for _ in 0..H {
+            bytes.extend((0..W).map(|x| if left(x) { 40u8 } else { 200 }));
+        }
+        bytes.extend(std::iter::repeat_n(255u8, (W * pad) as usize));
+        for _ in 0..H / 2 {
+            bytes.extend((0..W).map(|x| match (left(x), x % 2) {
+                (true, 0) => 100u8,
+                (true, _) => 160,
+                (false, 0) => 160,
+                (false, _) => 100,
+            }));
+        }
+        let buf = LinearDmabuf::new(&bytes);
+        let frame = |i| {
+            let mut f = buf.frame(PixelFormat::Nv12, b"NV12", W, H, W, i);
+            if let FramePayload::Dmabuf(d) = &mut f.payload {
+                d.plane1 = Some((W * (H + pad), W));
+            }
+            f
+        };
+        let (enc, stream) = encode_in_place(&buf, frame, 8, false, ChromaFormat::Yuv420, 3);
+        assert_eq!(
+            enc.s.buffer_fmt,
+            nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12
+        );
+        let out = decode_first(&stream, "in-place-nv12.h265", "nv12");
+        let (y, uv) = out.split_at((W * H) as usize);
+        let at = |x: u32, row: u32| (row * W + x) as usize;
+        let what = |s: &str| format!("pad {pad}: {s}");
+        close(u32::from(y[at(W / 4, H / 2)]), 40, 3, &what("left luma"));
+        close(
+            u32::from(y[at(3 * W / 4, H - 1)]),
+            200,
+            3,
+            &what("right luma, last row"),
+        );
+        close(
+            u32::from(uv[at((W / 4) & !1, 0)]),
+            100,
+            3,
+            &what("left U, first row"),
+        );
+        close(
+            u32::from(uv[at(((W / 4) & !1) + 1, H / 4)]),
+            160,
+            3,
+            &what("left V"),
+        );
+        close(
+            u32::from(uv[at((3 * W / 4) & !1, H / 2 - 1)]),
+            160,
+            3,
+            &what("right U, last row"),
+        );
+    }
+}
+
+/// Hardware: a producer P010 (HDR, or gamescope's 10-bit SDR) encodes in place as Main10.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver with 10-bit encode, and ffmpeg"]
+fn nvenc_cuda_in_place_p010() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let sample = |v: u16| (v << 6).to_le_bytes();
+    let mut bytes = Vec::new();
+    for _ in 0..H {
+        bytes.extend((0..W).flat_map(|x| sample(if x < W / 2 { 160 } else { 800 })));
+    }
+    for _ in 0..H / 2 {
+        bytes.extend((0..W).flat_map(|x| sample(if x % 2 == 0 { 400 } else { 640 })));
+    }
+    let buf = LinearDmabuf::new(&bytes);
+    for hdr in [true, false] {
+        let (enc, stream) = encode_in_place(
+            &buf,
+            |i| buf.frame(PixelFormat::P010, b"P010", W, H, W * 2, i),
+            10,
+            hdr,
+            ChromaFormat::Yuv420,
+            3,
+        );
+        assert_eq!(
+            enc.s.buffer_fmt,
+            nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT
+        );
+        assert_eq!((enc.s.bit_depth, enc.s.hdr), (10, hdr));
+        let out = decode_first(&stream, "in-place-p010.h265", "p010le");
+        let px = |i: usize| u32::from(u16::from_le_bytes([out[2 * i], out[2 * i + 1]]) >> 6);
+        let luma = (W * H) as usize;
+        close(px((H / 2 * W + W / 4) as usize), 160, 4, "left luma");
+        close(px((H / 2 * W + 3 * W / 4) as usize), 800, 4, "right luma");
+        close(px(luma + (H / 4 * W + 200) as usize), 400, 4, "U");
+        close(px(luma + (H / 4 * W + 201) as usize), 640, 4, "V");
+    }
+}
+
+/// Hardware: packed 8-bit RGB encodes in place as 4:4:4. One-pixel red/blue columns survive
+/// only at full chroma; 4:2:0 would blur both to purple.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver with HEVC 4:4:4, and ffmpeg"]
+fn nvenc_cuda_in_place_444_rgb() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let bytes: Vec<u8> = (0..H)
+        .flat_map(|_| {
+            (0..W).flat_map(|x| {
+                if x % 2 == 0 {
+                    [0u8, 0, 255, 255]
+                } else {
+                    [255, 0, 0, 255]
+                }
+            })
+        })
+        .collect();
+    let buf = LinearDmabuf::new(&bytes);
+    let (enc, stream) = encode_in_place(
+        &buf,
+        |i| buf.frame(PixelFormat::Bgrx, b"XR24", W, H, W * 4, i),
+        8,
+        false,
+        ChromaFormat::Yuv444,
+        3,
+    );
+    assert_eq!(
+        enc.s.buffer_fmt,
+        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+    );
+    assert!(enc.caps().chroma_444, "the session must encode 4:4:4");
+    let rgb = decode_first(&stream, "in-place-444.h265", "rgb24");
+    let at = |x: u32| ((H / 2 * W + x) * 3) as usize;
+    let (red, blue) = (&rgb[at(100)..at(100) + 3], &rgb[at(101)..at(101) + 3]);
+    assert!(
+        red[0] > 200 && red[2] < 60,
+        "even column is not red: {red:?}"
+    );
+    assert!(
+        blue[2] > 200 && blue[0] < 60,
+        "odd column is not blue: {blue:?}"
+    );
+}
+
+/// Hardware: packed 10-bit (gamescope's HDR fallback) encodes in place, at 4:2:0 and 4:4:4.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver with 10-bit HEVC 4:4:4, and ffmpeg"]
+fn nvenc_cuda_in_place_packed_10bit() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let px = |r: u32, g: u32, b: u32| (b | g << 10 | r << 20).to_le_bytes();
+    let bytes: Vec<u8> = (0..H)
+        .flat_map(|_| {
+            (0..W).flat_map(move |x| {
+                if x < W / 2 {
+                    px(800, 200, 100)
+                } else {
+                    px(100, 500, 900)
+                }
+            })
+        })
+        .collect();
+    let buf = LinearDmabuf::new(&bytes);
+    for chroma in [ChromaFormat::Yuv420, ChromaFormat::Yuv444] {
+        let (enc, stream) = encode_in_place(
+            &buf,
+            |i| buf.frame(PixelFormat::X2Rgb10, b"XR30", W, H, W * 4, i),
+            10,
+            true,
+            chroma,
+            3,
+        );
+        assert_eq!(
+            enc.s.buffer_fmt,
+            nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10
+        );
+        assert_eq!((enc.s.bit_depth, enc.s.hdr), (10, true));
+        assert_eq!(enc.caps().chroma_444, chroma.is_444());
+        let rgb = decode_first(&stream, "in-place-rgb10.h265", "rgb48le");
+        let ch = |x: u32, c: u32| {
+            let i = (((H / 2 * W + x) * 3 + c) * 2) as usize;
+            u32::from(u16::from_le_bytes([rgb[i], rgb[i + 1]]) >> 6)
+        };
+        for (x, want) in [(W / 4, [800, 200, 100]), (3 * W / 4, [100, 500, 900])] {
+            for (c, &want) in want.iter().enumerate() {
+                close(
+                    ch(x, c as u32),
+                    want,
+                    24,
+                    &format!("{chroma:?} x={x} channel {c}"),
+                );
+            }
+        }
+    }
+}
+
+/// Hardware: a repeat of a buffer whose encodes are still in flight takes a registration of
+/// its own. NVENC hands a doubly mapped registration one mapping, which the first retire
+/// would unmap under the second.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver"]
+fn nvenc_cuda_in_place_repeats_in_flight() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let buf = LinearDmabuf::new(&vec![128u8; (W * H * 3 / 2) as usize]);
+    pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+    let mut enc = NvencCudaEncoder::open(
+        Codec::H265,
+        PixelFormat::Nv12,
+        W,
+        H,
+        60,
+        20_000_000,
+        false,
+        8,
+        false,
+        ChromaFormat::Yuv420,
+        false,
+        1,
+        true,
+        &Knobs::from_env(),
+    )
+    .expect("open NVENC CUDA session");
+    assert!(enc.set_pipelined(true), "pipelined retrieve refused");
+    let (mut aus, n) = (0, 24u32);
+    for i in 0..n {
+        enc.submit_indexed(&buf.frame(PixelFormat::Nv12, b"NV12", W, H, W, i), i)
+            .expect("submit");
+        while let Some(_au) = enc.poll().expect("poll") {
+            aus += 1;
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while aus < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {aus} of {n} AUs came back"
+        );
+        match enc.poll().expect("drain") {
+            Some(_) => aus += 1,
+            None => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
+    }
+    let regs = enc
+        .direct
+        .as_ref()
+        .map_or(0, |d| d.bufs.values().map(|b| b.regs.len()).sum());
+    assert!(
+        regs > 1,
+        "repeats in flight shared one registration ({regs})"
+    );
+    println!("in-place repeats: {aus} AUs over {regs} registrations of one buffer");
 }

@@ -22,7 +22,7 @@ changed**, and choosing that shows them. While you edit a [preset](/docs/presets
 it overrides shows either way.
 
 The advanced rows are **Advanced statistics**, **Statistics position**, **Statistics size**, **Exit
-hint**, **Reduce interface resolution**, **Smoothness buffer**, **Render scale**, **Video codec**,
+hint**, **Reduce interface resolution**, **Smoothness buffer**, **Render scale**,
 **Full chroma (4:4:4)**, **10-bit SDR**, **V-Sync**, **Follow variable refresh**, **Host
 compositor**, **Video decoder**, **GPU**, **Low-latency mode**, **Keep screen awake**, **Audio quality**, **Keep host audio playing**, **Echo cancellation**, **Forward controllers**,
 **Use controller**, **Guide button**, **Hold Select for guide**, **Controller haptics**,
@@ -42,16 +42,17 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | **Resolution** | Native display | The host builds a display at exactly this size. **Native display** is the screen the window is on. **Aspect ratio** picks which sizes are listed; **Custom…** takes a typed width and height. | All. Apple TV: **Stream mode** (Native, or 720p, 1080p or 4K at 60 Hz) and **Custom size**. Android adds **Native display (safe area)**. |
 | **Match window** | Off | The stream follows the window's size; each resize renegotiates. Fullscreen uses the screen's own mode. On a foldable iPhone that covers a fold, an unfold, a rotation and the upright half of a half-open one ([foldable iPhone](/docs/input#foldable-iphone)). | Linux, Windows, Mac, iPhone, iPad, console |
 | **Refresh rate** | Native | The stream's frame rate. | All. Apple TV sets it with **Stream mode**. |
-| **Bitrate** | Automatic | The whole budget on the wire: video, error correction and audio. **Automatic** starts at 20 Mbps, adapts to the link and never drops below 2 Mbps. A fixed rate holds for the session. | All. iPhone, iPad and Mac: **Automatic bitrate** plus a slider; elsewhere type any rate. |
+| **Bitrate** | Automatic | The whole budget on the wire: video, error correction and audio. **Automatic** starts at 20 Mbps, adapts to the link and never drops below 2 Mbps. A fixed rate holds for the session. With PyroWave it offers **Automatic** or **Fixed**, and **PyroWave quality** sets the rate. | All. iPhone, iPad and Mac: **Automatic bitrate** plus a slider, the switch alone with PyroWave; elsewhere type any rate. |
 | **Render scale** | Native (1×) | The host renders at your resolution times this, 0.5× to 4×: pick a stop, or type any percent from 50 to 400. Your device scales the picture to the window. Above 1× is sharper and costs bandwidth. | All |
 | **Picture fit** | Fit | When the stream's shape differs from the screen: **Fit** adds black bars, **Crop to fill** cuts the edges, **Stretch to fill** distorts. | All. On Android 9, **Crop to fill** squeezes instead. |
 | **Second screen** | On | A dual-screen handheld's lower panel, or a foldable half open, shows the companion panel — or the picture, with **Screens** ([dual-screen handhelds](/docs/input#dual-screen-handhelds)). Off keeps the stream on this screen and leaves the other to the system: for a phone on a TV. A preset can carry it. | Android |
+| **Screens** | This monitor | **All monitors** opens a fullscreen window on each of this computer's monitors, one host screen each, laid out as your monitors sit. A monitor plugged in mid-stream joins; close a window to give its monitor back. Needs a host that builds its own displays (not gamescope). A preset can carry it. | Linux, Windows, Mac |
 | **Video codec** | Automatic | Your pick when the host can encode it, otherwise HEVC, then AV1, then H.264. [PyroWave](/docs/pyrowave) is never picked automatically. | All. Apple and Android hide AV1 and PyroWave when the device can't decode them; the console marks them **(unsupported)**. |
-| **PyroWave quality** | 1.6 bits per pixel | Takes **Bitrate**'s place while the codec is PyroWave. The slider reads as the rate it needs at your stream's size and refresh, such as `3840×2160 at 120 Hz: 1.6 Gbit/s`; higher is sharper. A warning says when this device is on Wi-Fi or its port can't carry that rate. On a weak network the stream still sends less. See [Bits per pixel](/docs/pyrowave#bits-per-pixel). | Linux, Windows, Mac, iPhone, iPad, Apple TV, Android, console. Apple TV picks from a list of rates. |
+| **PyroWave quality** | 1.6 bits per pixel | Sets the rate while the codec is PyroWave. The slider reads as the rate it needs at your stream's size and refresh, such as `3840×2160 at 120 Hz: 1.6 Gbit/s`; higher is sharper. A warning says when this device is on Wi-Fi or its port can't carry that rate. With **Bitrate** on **Automatic**, a weak network lowers it; on **Fixed** the stream holds it. See [Bits per pixel](/docs/pyrowave#bits-per-pixel). | Linux, Windows, Mac, iPhone, iPad, Apple TV, Android, console. Apple TV picks from a list of rates. |
 | **10-bit HDR** | On | Off never sends HDR. On sends 10-bit HDR when the host has HDR content and can encode it. See [HDR](/docs/hdr). | All. Android greys it on a screen without HDR10. |
 | **Full chroma (4:4:4)** | Off | Sharper text and thin lines, at more bandwidth. Needs HEVC or PyroWave and a host that can encode it. | Linux, Windows, Mac, iPhone, iPad, Apple TV |
 | **10-bit SDR** | Off | Smoother gradients without HDR, when the host has a 10-bit desktop or allows widening (see [10-bit SDR](/docs/hdr#10-bit-sdr)) and its encoder supports it. HDR takes over when it engages. | All |
-| **Prioritize** | Lowest latency | **Lowest latency** shows each frame at once. **Smoothness** holds a small buffer that evens out network hiccups, at that much delay. | All |
+| **Prioritize** | Lowest latency | **Lowest latency** shows each frame at the next refresh it can make, with no buffer. **Smoothness** holds a small buffer that evens out network hiccups, at that much delay. | All |
 | **Smoothness buffer** | Automatic (2 frames) | Frames held under **Smoothness**, 1 to 3. Each adds about one screen refresh of delay. | All |
 | **V-Sync** | On (Mac: off) | Off shows each frame as soon as it's ready, with tearing. A driver without a tearing mode stays tear-free. | Linux, Windows, Mac |
 | **Follow variable refresh** | On | Prefers the driver's variable-refresh present mode where it offers one. Whether a VRR, FreeSync or G-Sync screen then follows the stream is the compositor's call: Linux desktops want the window fullscreen and focused. | Linux, Windows, Mac, iPhone, iPad |
@@ -59,6 +60,7 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | **Video decoder**, **GPU** | Automatic | The decoder and graphics card this device uses. Change them only to debug; `PUNKTFUNK_DECODER` [overrides](/docs/configuration#client-side-native-clients) the decoder. | Linux, Windows. **GPU**: Windows, and Linux with more than one GPU. |
 | **Low-latency mode** | On | Asks the decoder and system for their low-latency paths. Turn it off if a device misbehaves. | Android |
 | **Keep screen awake** | On | Off, a stream keeps the screen awake only while you play: five minutes after your last key, touch or controller input, this device's own screen saver or sleep takes over. | Linux, Windows, Android, Apple |
+| **Screen** | Flat | Flat, or bent like a curved monitor: the radius in millimetres, 800R the tightest. | Apple Vision Pro |
 
 **Test network speed…** in a host card's menu measures the link — what it carries, then loss and
 jitter at half of that, a rate the link holds — and suggests a bitrate (Android: **Network speed
@@ -77,6 +79,7 @@ the rate instead of **Bitrate**.
 | **Keep host audio playing** | Off | Off, the host goes quiet while you stream. On, its own speakers keep playing too. With several clients, one asking is enough. | All |
 | **Stream microphone** | Off | Sends this device's microphone to the host. **Ctrl+Alt+Shift+V** [mutes it](/docs/input#muting-your-microphone). | All but Apple TV |
 | **Echo cancellation** | On | Keeps the host's audio, playing from your speakers, out of the microphone. Turn it off if your microphone does its own processing. See [Why do I hear myself](/docs/echo). | All but Apple TV |
+| **Spatial audio** | On | On, the sound comes from the window. Off plays the game's own mix straight to your ears. | Apple Vision Pro |
 | **Speaker**, **Microphone** | System default | Which output plays the stream and which input feeds the microphone. | Linux, Windows, Mac (plus **Microphone channel**) |
 
 ## Input
@@ -175,7 +178,7 @@ it really sends.
 | You ask for | The host |
 |---|---|
 | A resolution and refresh rate | Builds a display at exactly that mode. A host [streaming a real monitor](/docs/virtual-displays#stream-a-real-monitor-instead) keeps that monitor's mode and your device scales. A size the encoder can't take fails the connect. |
-| A bitrate | Clamps it to 500 kbps – 8 Gbps. PyroWave ignores it. |
+| A bitrate | Clamps it to 500 kbps – 8 Gbps. PyroWave reads only zero (**Automatic**) or not (**Fixed**, at your quality). |
 | A PyroWave quality | Holds it between 0.5 and 2 bits per pixel, under its **PyroWave bitrate cap**. A host that doesn't read it uses its own **PyroWave quality**. |
 | A codec | Uses it if it can encode it, otherwise HEVC, AV1, H.264 in that order. |
 | 10-bit HDR | Sends it only for HDR content on an encoder that can; otherwise 8-bit SDR. |

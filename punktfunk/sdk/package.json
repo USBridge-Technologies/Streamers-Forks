@@ -1,6 +1,6 @@
 {
 	"name": "@punktfunk/host",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "TypeScript SDK for the punktfunk streaming host: typed management-API client + lifecycle event stream, built on Effect.",
 	"type": "module",
 	"license": "MIT OR Apache-2.0",
@@ -11,7 +11,7 @@
 		"directory": "sdk"
 	},
 	"bugs": {
-		"url": "https://git.unom.io/unom/punktfunk/issues"
+		"url": "https://punktfunk.unom.io/community#bugs"
 	},
 	"keywords": [
 		"punktfunk",
@@ -67,6 +67,6 @@
 		"typescript": "^7.0.2"
 	},
 	"optionalDependencies": {
-		"undici": "^8.11.2"
+		"undici": "^8.12.2"
 	}
 }

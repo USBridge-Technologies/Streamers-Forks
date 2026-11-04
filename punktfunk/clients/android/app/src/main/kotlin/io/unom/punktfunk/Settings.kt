@@ -438,8 +438,11 @@ private fun probeDisplay(context: Context, secondScreen: Boolean = true): Displa
 
 /**
  * The device's native display mode as a landscape `(width, height, hz)` — the long edge is the
- * width, since we stream a desktop. Falls back to 1920×1080@60 if no display can be read at all
- * (see [probeDisplay] for the cold-start fallback that makes that a last resort).
+ * width, since we stream a desktop. `hz` is the panel's highest refresh at its current size, from
+ * the mode TABLE: the live mode is whatever the system holds the app at, and Android 15+ holds a
+ * game at 60. A TV keeps its live HDMI mode, which the box's own setting picked.
+ * Falls back to 1920×1080@60 if no display can be read at all (see [probeDisplay] for the
+ * cold-start fallback that makes that a last resort).
  */
 fun nativeDisplayMode(
     context: Context,
@@ -450,12 +453,14 @@ fun nativeDisplayMode(
     val mode = display.mode
     val w = mode.physicalWidth
     val h = mode.physicalHeight
-    // ROUNDED, not truncated: TVs report the fractional NTSC rates over HDMI (59.94, 29.97,
-    // 23.976), and `toInt()` turns 59.94 into 59 — a rate no display mode anywhere has, which the
-    // host then serves by clamping DOWN to the highest mode it advertises at or below it. Rounding
-    // also keeps this agreeing with `Display.streamPanelFps`, which already rounds; the two
-    // describe the same panel and must not disagree.
-    val hz = kotlin.math.round(mode.refreshRate).toInt().coerceAtLeast(1)
+    val rate = if (isTvDevice(context)) {
+        mode.refreshRate
+    } else {
+        display.sameResolutionModes().maxOfOrNull { it.refreshRate } ?: mode.refreshRate
+    }
+    // ROUNDED, not truncated: 59.94 must not become 59, a rate no display mode has, which the
+    // host serves by clamping DOWN. Agrees with `Display.streamPanelFps`, which also rounds.
+    val hz = kotlin.math.round(rate).toInt().coerceAtLeast(1)
     // A picture spanning two screens is two equal halves at this screen's size
     // (design/android-dual-screen.md §3.2); the codec ceiling clamps the ask later.
     return Triple(maxOf(w, h), minOf(w, h) * (if (spanned && secondScreen) 2 else 1), hz)
@@ -561,10 +566,17 @@ fun safeDisplayMode(
 }
 
 /**
- * True when this device's display can actually present HDR10, so we should advertise HDR to the
- * host. On an SDR panel we advertise `0` instead — the host then sends a proper 8-bit BT.709 stream
- * rather than BT.2020 PQ the panel would mis-tone-map (the washed-out/dark failure). Mirrors the
- * capability gate the Apple/Windows clients apply.
+ * Whether to ask the host for HDR10: the panel lists HDR10 or HDR10+, and the OS can light HDR
+ * above SDR white. [headroom] is `Display.isHdrSdrRatioAvailable`, or `null` where Android gives no
+ * such signal: below API 34, on a TV, or on a screen other than the built-in one (a TV or an HDMI
+ * sink shows HDR itself). A built-in panel without headroom tone-maps PQ under its SDR white, a
+ * darker picture than the SDR stream. The Apple client's potential-EDR-headroom gate is the twin.
+ */
+internal fun advertiseHdr(hdr10: Boolean, headroom: Boolean?): Boolean = hdr10 && headroom != false
+
+/**
+ * True when the picture's display can present HDR10 ([advertiseHdr]), so the session asks the host
+ * for it. Otherwise the host sends 8-bit BT.709, and the HDR toggle says the display can't.
  */
 fun displaySupportsHdr(context: Context): Boolean {
     val display = probeDisplay(context)
@@ -587,10 +599,18 @@ fun displaySupportsHdr(context: Context): Boolean {
         display.hdrCapabilities?.supportedHdrTypes?.forEach { add(it) }
     }
     // HDR10/HDR10+ only: the stream is BT.2020 PQ — a Dolby-Vision/HLG-only panel can't present it.
-    val supported = types.any {
+    val hdr10 = types.any {
         it == Display.HdrCapabilities.HDR_TYPE_HDR10 || it == Display.HdrCapabilities.HDR_TYPE_HDR10_PLUS
     }
-    Log.i("punktfunk", "display HDR types=$types → advertise HDR10=$supported")
+    val headroom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+        !isTvDevice(context) && display.displayId == Display.DEFAULT_DISPLAY
+    ) {
+        display.isHdrSdrRatioAvailable
+    } else {
+        null
+    }
+    val supported = advertiseHdr(hdr10, headroom)
+    Log.i("punktfunk", "display HDR types=$types headroom=${headroom ?: "n/a"} → advertise HDR10=$supported")
     return supported
 }
 
@@ -1069,6 +1089,7 @@ val COMPOSITOR_OPTIONS = listOf(
     3 to "Mutter (GNOME)",
     5 to "Hyprland",
     7 to "niri",
+    8 to "Umbriel",
     2 to "wlroots (Sway / River)",
     4 to "gamescope",
 )

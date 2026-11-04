@@ -31,6 +31,8 @@ and forces it off for an SDR session; Windows' own **Use HDR** switch doesn't ma
   was told HDR. This is the one case where the client's `HDR` label is wrong.
 - Switching HDR off on the virtual display during a session (**Win+Alt+B** on the host) turns
   the stream SDR until HDR is back on.
+- On a [Windows seat](/docs/windows-seats), resizing the stream mid-session turns it SDR until
+  the next connect.
 - Vulkan games need the installer's **HDR Vulkan layer** (on by default); see
   [the troubleshooting entry](#a-vulkan-game-on-windows-says-hdr-isnt-supported).
 
@@ -42,8 +44,8 @@ The Linux route to HDR on KDE and GNOME, and in Game Mode everywhere.
    [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) covers every distro.
 2. Restart the host. It reads what the gamescope build can do once, at startup.
 3. Let the host start the gamescope session, which is the default. A session it attaches to
-   instead streams SDR: turn off **Attach mode** under **Host → Game Mode**, or delete
-   the `PUNKTFUNK_GAMESCOPE_ATTACH` line from `host.env` if the row says that file set it.
+   instead streams SDR: clear **Stream this monitor** under **Displays**, and delete any
+   `PUNKTFUNK_GAMESCOPE_ATTACH` line from `host.env`.
 4. For Steam's own HDR setting to be available, the build must be `+pfhdr14` or newer. Check with
    `punktfunk-gamescope --version`.
 
@@ -115,14 +117,8 @@ SDR** (`PUNKTFUNK_10BIT_SDR_WIDEN`, advanced, off by default) is on.
 
 ## HDR and 4:4:4
 
-[Full chroma](/docs/client-settings#video) and HDR together:
-
-| Host | HEVC | PyroWave |
-|---|---|---|
-| Windows | Both | Both |
-| Linux | HDR, at 4:2:0 | Both |
-
-AV1 is always 4:2:0.
+[Full chroma](/docs/client-settings#video) and HDR work together on Windows and Linux hosts,
+with HEVC or PyroWave. AV1 is always 4:2:0.
 
 ## Check it
 

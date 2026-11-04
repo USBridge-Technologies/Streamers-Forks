@@ -52,7 +52,7 @@ pub enum PixelFormat {
     /// Linear scRGB half floats (DXGI `R16G16B16A16_FLOAT`), 8 bpp: what Windows composes an
     /// HDR desktop in. 1.0 is 80 nits, BT.709 primaries. GPU-only; AMF ingests it as `RGBA_F16`.
     RgbaF16,
-    /// Planar 8-bit YUV 4:4:4 (BT.709; range via `PUNKTFUNK_444_FULLRANGE`). GPU-only
+    /// Planar 8-bit YUV 4:4:4 (BT.709 full range). GPU-only
     /// ([`FramePayload::Cuda`] / `DeviceBuffer::yuv444`); never a CPU payload. NVENC Range-Extensions.
     Yuv444,
     /// Packed `x:R:G:B 2:10:10:10` LE (SPA `xRGB_210LE`, DRM `XR30`, NVENC `ARGB10`).
@@ -244,6 +244,10 @@ pub struct OutputFormat {
     /// section so DWM stops compositing the pointer; capturer surfaces it via
     /// `Capturer::cursor()`. Ignored on Linux (`SPA_META_Cursor` already separates it).
     pub hw_cursor: bool,
+    /// The range of the YUV that capture converts or asks a producer for (Linux SDR: the NV12
+    /// and P010 pods, the zero-copy converters). `false` is studio. The encoder signals the same
+    /// range from `pf_encode::OpenParams::full_range`. Ignored on Windows, whose driver converts.
+    pub full_range: bool,
 }
 
 impl OutputFormat {
@@ -262,6 +266,7 @@ impl OutputFormat {
             hw_cursor: false,
             // Codec unresolved here; Moonlight may pick H264 (VAAPI cannot ingest NV12).
             nv12_native: false,
+            full_range: true,
         }
     }
 }

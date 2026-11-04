@@ -8,30 +8,34 @@
 //! verdict.
 //!
 //! Pin with `PUNKTFUNK_WIRE_MTU=<bytes>`. Watch records a below-ceiling
-//! settle; the next handshake clamps. Jumbo grow starts the next session at
-//! the sealed jumbo size only after a live re-proof — PyroWave cannot re-key
-//! mid-stream. Evidence: [`jumbo_session_start`].
+//! settle; the next handshake clamps. Jumbo follows this host's adapter toward
+//! the client and grows only to what the path proved. It starts the next session
+//! at that size only after a live re-proof — PyroWave cannot re-key mid-stream.
+//! Evidence: [`jumbo_session_start`]. The watch lives as long as the connection:
+//! a client that moves to a new address is re-measured.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use punktfunk_core::config::{
-    jumbo_shard_payload_for, jumbo_wire_mtu, mtu1500_shard_payload_for, sealed_datagram_bytes,
-    shard_payload_for_udp_budget, shard_payload_for_wire_mtu, video_datagram_udp_ceiling,
+    jumbo_shard_payload_for, jumbo_wire_mtu_toward, mtu1500_shard_payload_for,
+    sealed_datagram_bytes, shard_payload_for_udp_budget, shard_payload_for_wire_mtu,
+    video_datagram_udp_ceiling,
 };
+use punktfunk_core::packet::WIRE_OVERHEAD;
+use punktfunk_core::quic::PATH_SHRANK_CLOSE_CODE;
 
-/// Mid-session re-key driver. `None` at [`spawn_watch`] is observe-and-learn
-/// only. Built only when the client advertised per-frame geometry and the
+/// Mid-session re-key driver. `None` at [`spawn_watch`] observes and learns,
+/// and ends a session a move left too big. Built only when the client advertised per-frame geometry and the
 /// wire is not chunk-aligned — PyroWave pins `Welcome` once over the C ABI,
 /// so a mid-stream re-key would corrupt its parse.
 pub(super) struct ShardReneg {
-    /// Client receive ceiling in shard bytes; > 0 by construction.
-    pub client_ceiling: u16,
     /// Sole writer of the control stream: `ShardPayloadChanged{n}`.
     pub change_tx: tokio::sync::mpsc::UnboundedSender<u16>,
     /// Client `ShardPayloadAck`s — the grow does not apply until one matches.
-    pub ack_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
+    pub ack_rx: tokio::sync::mpsc::Receiver<u16>,
     /// Encode loop: [`Session::set_shard_payload`] between AUs, next to `bitrate_rx`.
     pub apply_tx: std::sync::mpsc::Sender<usize>,
 }
@@ -59,12 +63,12 @@ struct PathKey {
     peer: IpAddr,
 }
 
-/// A completed MTU-discovery search that reached the sealed jumbo size.
+/// A completed MTU-discovery search that settled at a jumbo shard.
 #[derive(Clone, Copy, Debug)]
 struct JumboVerdict {
     udp_budget: u16,
-    /// Operator jumbo target at proof time. A later `PUNKTFUNK_JUMBO` /
-    /// `PUNKTFUNK_WIRE_MTU` change invalidates rather than reinterpreting.
+    /// Jumbo target at proof time. A later change (adapter MTU or an override)
+    /// invalidates rather than reinterpreting.
     target_wire_mtu: usize,
     /// Instant of the proof; see [`JUMBO_VERDICT_TTL`].
     at: std::time::Instant,
@@ -100,7 +104,7 @@ fn path_key(conn: &super::link::SessionLink) -> PathKey {
 /// `proven_udp_budget` is observed on this connection during this handshake.
 #[derive(Clone, Copy, Debug)]
 struct JumboStart {
-    /// Operator jumbo opt-in ([`jumbo_wire_mtu`]); `None` = never jumbo.
+    /// Jumbo target for this path ([`jumbo_wire_mtu_toward`]); `None` = never jumbo.
     target_wire_mtu: Option<usize>,
     /// `Hello::max_shard_payload`. 0 = legacy client: never a geometry it
     /// did not advertise.
@@ -114,33 +118,43 @@ struct JumboStart {
     clamped_udp_budget: Option<u16>,
 }
 
-/// Jumbo shard for `peer`, or `None` when there is nothing to gain. Shared
-/// by the decision, the wait, and the watcher so all three use one number.
+/// Jumbo shard for `peer` that seals within `udp_budget`, or `None` when there is nothing to
+/// gain. The budget is a settle above the 1500 wire; `u16::MAX` asks for the target alone. Ends
+/// whose adapters differ settle below the larger one, so the settle, not the target, sizes it.
+/// Shared by the decision, the wait, and the watcher so all three use one number.
 fn jumbo_target(
     target_wire_mtu: Option<usize>,
     client_ceiling: u16,
+    udp_budget: u16,
     peer: IpAddr,
 ) -> Option<usize> {
     let mtu = target_wire_mtu?;
-    let t = jumbo_shard_payload_for(mtu, peer).min(client_ceiling as usize);
+    if udp_budget as usize <= video_datagram_udp_ceiling() {
+        return None;
+    }
+    let t = jumbo_shard_payload_for(mtu, peer)
+        .min(client_ceiling as usize)
+        .min((udp_budget as usize).saturating_sub(WIRE_OVERHEAD));
     let t = t - t % 2; // FEC requires even shards
     (t > mtu1500_shard_payload_for(peer)).then_some(t)
 }
 
-/// Session-start jumbo shard, or `None`. A remembered verdict only decides
-/// whether to wait; `live_udp_mtu` is the authorisation — an acked datagram
-/// of that size on this connection. PyroWave cannot re-key mid-stream, so a
-/// stale memory must never seal a jumbo `Welcome`.
+/// Session-start jumbo shard, or `None`: what a remembered verdict proved, once
+/// `live_udp_mtu` — an acked datagram of that size on this connection — re-proves
+/// it. PyroWave cannot re-key mid-stream, so a stale memory must never seal a
+/// jumbo `Welcome`.
 fn jumbo_session_start(i: JumboStart, peer: IpAddr) -> Option<usize> {
-    let target = jumbo_target(i.target_wire_mtu, i.client_ceiling, peer)?;
+    let target = jumbo_target(
+        i.target_wire_mtu,
+        i.client_ceiling,
+        i.proven_udp_budget?,
+        peer,
+    )?;
     let sealed = sealed_datagram_bytes(target);
     if let Some(clamp) = i.clamped_udp_budget {
         if (clamp as usize) < sealed {
             return None;
         }
-    }
-    if (i.proven_udp_budget? as usize) < sealed {
-        return None;
     }
     if (i.live_udp_mtu as usize) < sealed {
         return None;
@@ -148,26 +162,17 @@ fn jumbo_session_start(i: JumboStart, peer: IpAddr) -> Option<usize> {
     Some(target)
 }
 
-/// Shard payload for a new session on `conn`. Async only for the bounded
-/// [`JUMBO_PROOF_WAIT`], entered only on a path a previous session already
-/// proved jumbo.
+/// Shard payload for a new session on `conn`, under the session's `PUNKTFUNK_WIRE_MTU`
+/// (`env`). Async only for the bounded [`JUMBO_PROOF_WAIT`], entered only on a path a
+/// previous session already proved jumbo.
 pub(super) async fn negotiated_shard_payload(
     conn: &super::link::SessionLink,
     client_ceiling: u16,
+    env: Option<usize>,
 ) -> usize {
     let peer = conn.remote_address().ip();
-    let env = match std::env::var("PUNKTFUNK_WIRE_MTU") {
-        Ok(v) => match v.trim().parse::<usize>() {
-            Ok(mtu) => Some(mtu),
-            Err(_) => {
-                tracing::warn!(value = %v, "PUNKTFUNK_WIRE_MTU is not a number — ignoring it");
-                None
-            }
-        },
-        Err(_) => None,
-    };
     let learned_budget = learned().lock().unwrap().get(&peer).copied();
-    let target_wire_mtu = jumbo_wire_mtu();
+    let target_wire_mtu = jumbo_wire_mtu_toward(peer);
     let proven_udp_budget = fresh_verdict(path_key(conn), target_wire_mtu);
     let mut jumbo = JumboStart {
         target_wire_mtu,
@@ -177,7 +182,7 @@ pub(super) async fn negotiated_shard_payload(
         clamped_udp_budget: learned_budget,
     };
     let awaited_proof = proven_udp_budget
-        .and_then(|_| jumbo_target(target_wire_mtu, client_ceiling, peer))
+        .and_then(|b| jumbo_target(target_wire_mtu, client_ceiling, b, peer))
         .map(|t| sealed_datagram_bytes(t) as u16);
     if let Some(sealed) = awaited_proof {
         if jumbo.live_udp_mtu < sealed {
@@ -214,7 +219,7 @@ fn fresh_verdict(key: PathKey, target_wire_mtu: Option<usize>) -> Option<u16> {
     Some(v.udp_budget)
 }
 
-/// Proven jumbo, else env override, else learned budget, else family default.
+/// Proven jumbo, else an env pin below 1500, else learned budget, else family default.
 /// Tested core of [`negotiated_shard_payload`].
 fn resolve(
     env_wire_mtu: Option<usize>,
@@ -223,9 +228,8 @@ fn resolve(
     peer: IpAddr,
 ) -> usize {
     let default = mtu1500_shard_payload_for(peer);
-    // Jumbo first: `jumbo_wire_mtu()` is only above 1500, and the env branch
-    // below clamps to the family default, so `PUNKTFUNK_WIRE_MTU=9000` would
-    // otherwise start at 1408.
+    // Jumbo first: a jumbo target is only above 1500, and only a proven,
+    // re-proven path starts there.
     if let Some(p) = jumbo_session_start(jumbo, peer) {
         tracing::info!(
             peer = %peer,
@@ -238,7 +242,9 @@ fn resolve(
         );
         return p;
     }
-    if let Some(mtu) = env_wire_mtu {
+    // Below 1500 the variable pins a smaller wire; 1500 and up is the jumbo opt-in, which
+    // leaves a small path to its learned clamp.
+    if let Some(mtu) = env_wire_mtu.filter(|&m| m < 1500) {
         let p = shard_payload_for_wire_mtu(mtu, peer);
         if p != default {
             tracing::info!(
@@ -268,237 +274,351 @@ fn resolve(
     default
 }
 
-/// After discovery settles, record a path verdict. With a [`ShardReneg`]
-/// driver, shrink or (ack-gated) grow the live wire. A settled-at-jumbo
-/// reading also files the next-session verdict. Without a grow the task
-/// ends after the last sample (~10 s, a `Connection` handle); after a grow
-/// or a jumbo start it stays as the revert guard until the connection closes.
+/// How often the watch looks at the connection: how soon a client's move is seen.
+const TICK: Duration = Duration::from_millis(250);
+/// The jumbo revert reads `current_mtu` once per this many ticks (5 s).
+const REVERT_TICKS: u32 = 20;
+/// After a move, how long a session that cannot re-key gives discovery to finish climbing
+/// before a path that is too small ends it.
+const SHRANK_CONFIRM: Duration = Duration::from_secs(5);
+
+/// The shard to drop to when the path carries `udp_budget`, or `None` while `current` fits.
+fn shrink_to(current: usize, udp_budget: u16, peer: IpAddr) -> Option<usize> {
+    if sealed_datagram_bytes(current) <= udp_budget as usize {
+        return None;
+    }
+    let to = shard_payload_for_udp_budget(udp_budget as usize, peer);
+    (to < current).then_some(to)
+}
+
+/// The shard a settle at `settled` grows to: back toward `start` after a move, or a `jumbo`
+/// target the settle proves. `None` when that is no bigger than `current`.
+fn grow_to(
+    settled: u16,
+    start: usize,
+    current: usize,
+    jumbo: Option<usize>,
+    peer: IpAddr,
+) -> Option<usize> {
+    let back = shard_payload_for_udp_budget(settled as usize, peer).min(start);
+    let jumbo = jumbo.filter(|&t| settled as usize >= sealed_datagram_bytes(t));
+    let to = back.max(jumbo.unwrap_or(0));
+    (to > current).then_some(to)
+}
+
+/// Watch the path MTU for the connection's life.
+///
+/// Each settle files a path verdict for the next session and, with a [`ShardReneg`] driver,
+/// shrinks the live wire to fit or grows it (ack-gated). A client move that restarts quinn's
+/// discovery shrinks video to the restart floor at once; the next settle grows it back toward
+/// the session's start shard. A session without a driver whose video does not fit the path
+/// closes with [`PATH_SHRANK_CLOSE_CODE`], and the client redials at a size that fits.
 pub(super) fn spawn_watch(
     conn: super::link::SessionLink,
     session_shard_payload: usize,
     client_ceiling: u16,
     reneg: Option<ShardReneg>,
 ) {
-    tokio::spawn(async move {
-        let peer = conn.remote_address().ip();
-        let ceiling = video_datagram_udp_ceiling() as u16;
-        // Sealed jumbo size for this path, or `None` without opt-in and
-        // client headroom. Read once: the verdict stores that same target.
-        let target_wire_mtu = jumbo_wire_mtu();
-        let jumbo_proof =
-            jumbo_target(target_wire_mtu, client_ceiling, peer).map(sealed_datagram_bytes);
-        // Two samples: LAN is a handful of RTTs; a constrained path needs a
-        // loss timeout per failed probe. `max`, because discovery only raises
-        // `current_mtu` here. Goal is jumbo-or-ceiling so a jumbo search is
-        // not cut off at 1500.
-        let goal = jumbo_proof
-            .unwrap_or(ceiling as usize)
-            .max(ceiling as usize) as u16;
+    let target_wire_mtu = jumbo_wire_mtu_toward(conn.remote_address().ip());
+    let watch = Watch {
+        conn,
+        start: session_shard_payload,
+        current: session_shard_payload,
+        client_ceiling,
+        reneg,
+        target_wire_mtu,
+    };
+    tokio::spawn(watch.run());
+}
+
+/// [`spawn_watch`]'s state.
+struct Watch {
+    conn: super::link::SessionLink,
+    /// The shard `Welcome` sealed. A grow back after a move stops here.
+    start: usize,
+    /// The shard the encoder seals now.
+    current: usize,
+    client_ceiling: u16,
+    reneg: Option<ShardReneg>,
+    /// Read once: a filed jumbo verdict stores this same target.
+    target_wire_mtu: Option<usize>,
+}
+
+impl Watch {
+    async fn run(mut self) {
+        let mut addr = self.conn.remote_address();
+        let mut moved = false;
+        loop {
+            let settled = match self.settle(addr).await {
+                Ok(settled) => settled,
+                Err(next) => {
+                    (addr, moved) = (next, true);
+                    self.on_move(addr);
+                    continue;
+                }
+            };
+            let peer = addr.ip();
+            self.file_jumbo_verdict(peer, settled);
+            self.learn(peer, settled);
+            if self.conn.close_reason().is_some() || !self.fit(addr, settled, moved).await {
+                return;
+            }
+            self.grow(peer, settled).await;
+            let Some(next) = self.hold(addr).await else {
+                return;
+            };
+            (addr, moved) = (next, true);
+            self.on_move(addr);
+        }
+    }
+
+    /// Discovery's settle: the larger of samples at 3 s and 7 s. LAN takes a handful of RTTs;
+    /// a constrained path needs a loss timeout per failed probe. `Err` carries the client's new
+    /// address when it moves first.
+    async fn settle(&self, addr: SocketAddr) -> Result<u16, SocketAddr> {
+        // Jumbo-or-ceiling, so a jumbo search is not cut off at 1500.
+        let goal = jumbo_target(
+            self.target_wire_mtu,
+            self.client_ceiling,
+            u16::MAX,
+            addr.ip(),
+        )
+        .map_or(0, sealed_datagram_bytes)
+        .max(video_datagram_udp_ceiling()) as u16;
+        let t0 = tokio::time::Instant::now();
         let mut settled = 0u16;
-        for wait_s in [3u64, 7] {
-            tokio::time::sleep(std::time::Duration::from_secs(wait_s)).await;
-            settled = settled.max(conn.current_mtu());
+        for mark in [3u64, 7] {
+            while t0.elapsed() < Duration::from_secs(mark) {
+                tokio::time::sleep(TICK).await;
+                let now = self.conn.remote_address();
+                if now != addr {
+                    return Err(now);
+                }
+            }
+            settled = settled.max(self.conn.current_mtu());
             if settled >= goal {
                 break;
             }
         }
-        let mut current = session_shard_payload;
-        let mut reneg = reneg;
-        // File or erase the next-session jumbo verdict before any return.
-        // Record only a live connection that reached the sealed target;
-        // anything else (lower settle, died mid-window) drops it.
-        if let Some(need) = jumbo_proof {
-            let key = path_key(&conn);
-            if settled as usize >= need && conn.close_reason().is_none() {
-                jumbo_verdicts().lock().unwrap().insert(
-                    key,
-                    JumboVerdict {
-                        udp_budget: settled,
-                        target_wire_mtu: target_wire_mtu.unwrap_or_default(),
-                        at: std::time::Instant::now(),
-                    },
-                );
-                tracing::info!(peer = %peer, discovered_udp_mtu = settled, needed = need,
-                    "wire MTU: this path carries JUMBO video datagrams — the next session over \
-                     it starts at the big shard (it still has to re-prove the path live)");
-            } else if jumbo_verdicts().lock().unwrap().remove(&key).is_some() {
-                tracing::info!(peer = %peer, discovered_udp_mtu = settled, needed = need,
-                    "wire MTU: jumbo verdict cleared — this path no longer proves it");
-            }
+        Ok(settled)
+    }
+
+    /// File or erase the next-session jumbo verdict for this path. Only a live connection whose
+    /// settle proves a jumbo shard files one; a 1500 settle or a death mid-window drops it.
+    /// A live miss is logged either way: it is the host's only sign that jumbo is on.
+    fn file_jumbo_verdict(&self, peer: IpAddr, settled: u16) {
+        let (target, ceiling) = (self.target_wire_mtu, self.client_ceiling);
+        let Some(goal) = jumbo_target(target, ceiling, u16::MAX, peer).map(sealed_datagram_bytes)
+        else {
+            return;
+        };
+        let key = path_key(&self.conn);
+        let proven = jumbo_target(target, ceiling, settled, peer).is_some();
+        if proven && self.conn.close_reason().is_none() {
+            jumbo_verdicts().lock().unwrap().insert(
+                key,
+                JumboVerdict {
+                    udp_budget: settled,
+                    target_wire_mtu: self.target_wire_mtu.unwrap_or_default(),
+                    at: std::time::Instant::now(),
+                },
+            );
+            tracing::info!(peer = %peer, discovered_udp_mtu = settled, goal,
+                "wire MTU: this path carries JUMBO video datagrams — the next session over \
+                 it starts at the big shard (it still has to re-prove the path live)");
+        } else if jumbo_verdicts().lock().unwrap().remove(&key).is_some() {
+            tracing::info!(peer = %peer, discovered_udp_mtu = settled, goal,
+                "wire MTU: jumbo verdict cleared — this path no longer proves it");
+        } else if self.conn.close_reason().is_none() {
+            // 1472 is also what a client without a jumbo adapter, or an older one, accepts.
+            tracing::info!(peer = %peer, discovered_udp_mtu = settled, goal,
+                "wire MTU: jumbo not proven on this path — the client's adapter or a switch \
+                 on the path stops at MTU 1500, or the client predates automatic jumbo");
         }
-        if settled >= ceiling {
+    }
+
+    /// The clamp the next session from `peer` starts with. A full-size settle clears it; a
+    /// lower one counts only from a connection alive through the window, since a closed one
+    /// stops discovering and a high-RTT path can still be mid-search.
+    fn learn(&self, peer: IpAddr, settled: u16) {
+        if settled >= video_datagram_udp_ceiling() as u16 {
             if learned().lock().unwrap().remove(&peer).is_some() {
                 tracing::info!(peer = %peer,
                     "wire MTU: path re-measured at full size — learned clamp cleared");
             }
-            // `ceiling` is the 1500-byte video size. A jumbo start on a path
-            // that no longer carries it is dropping every video datagram.
-            // Verdict is already erased; re-key if this session can — PyroWave
-            // cannot (`Welcome` parse window), so those wait for next connect.
-            if sealed_datagram_bytes(current) > settled as usize {
-                tracing::warn!(
-                    peer = %peer,
-                    discovered_udp_mtu = settled,
-                    shard_payload = current,
-                    "wire MTU: this session started at a JUMBO shard but the path does not \
-                     carry it — video datagrams are oversized for a hop, which streams as a \
-                     black screen with zero reported loss. The jumbo verdict for this path is \
-                     cleared: the next connect starts at the standard 1500-byte wire."
-                );
-                if let Some(r) = reneg.as_ref() {
-                    let back = shard_payload_for_udp_budget(settled as usize, peer);
-                    if back < current
-                        && r.change_tx.send(back as u16).is_ok()
-                        && r.apply_tx.send(back).is_ok()
-                    {
-                        tracing::info!(peer = %peer, shard_payload = back, was = current,
-                            "wire MTU: video re-keyed mid-session back to the standard wire");
-                        current = back;
-                    }
-                }
-            }
-        } else {
-            // A closed connection stops discovering. Learn only from one that
-            // stayed alive through the whole window — a high-RTT path can
-            // still be mid-search here.
-            if conn.close_reason().is_some() {
-                return;
-            }
+        } else if self.conn.close_reason().is_none() {
             learned().lock().unwrap().insert(peer, settled);
-            if sealed_datagram_bytes(current) <= settled as usize {
-                // Path still constrained; this session already fits, so no WARN.
+        }
+    }
+
+    /// Shrink this session to fit `settled` if it does not. A session with no re-key driver
+    /// that still does not fit after [`SHRANK_CONFIRM`] is ended, whether the client moved or
+    /// the first settle found the path small: the learned clamp sizes its redial. `false` once
+    /// the session is ended.
+    async fn fit(&mut self, addr: SocketAddr, settled: u16, moved: bool) -> bool {
+        let peer = addr.ip();
+        let ceiling = video_datagram_udp_ceiling() as u16;
+        if sealed_datagram_bytes(self.current) <= settled as usize {
+            if settled < ceiling {
                 tracing::info!(peer = %peer, discovered_udp_mtu = settled,
                     "wire MTU: constrained path re-measured; this session's video is sized to fit");
-            } else {
-                tracing::warn!(
-                    peer = %peer,
-                    discovered_udp_mtu = settled,
-                    needed_udp_mtu = ceiling,
-                    "wire MTU: this path CANNOT carry full-size video datagrams — the control \
-                     plane works but every video packet is oversized for a hop, which streams as \
-                     an endless black screen with zero reported loss. Typical cause: a VPN/overlay \
-                     adapter (Tailscale / Cloudflare WARP / ZeroTier) claiming the LAN route, or a \
-                     lowered NIC MTU — compare `ping <client> -f -l 1450` vs `-l 1200` and check \
-                     `netsh interface ipv4 show subinterfaces` (Windows) / `ip link` (Linux). The \
-                     measured budget is recorded: the NEXT session from this client sizes video to \
-                     fit automatically. To pin it for all sessions set PUNKTFUNK_WIRE_MTU."
-                );
-                // Shrink this session now: smaller always fits, so ordering
-                // does not matter and the ack is telemetry. The learned
-                // record still starts session 2 at the right size.
-                if let Some(r) = reneg.as_ref() {
-                    let target = shard_payload_for_udp_budget(settled as usize, peer);
-                    if target < current
-                        && r.change_tx.send(target as u16).is_ok()
-                        && r.apply_tx.send(target).is_ok()
-                    {
-                        tracing::info!(
-                            peer = %peer,
-                            shard_payload = target,
-                            was = current,
-                            "wire MTU: video re-keyed mid-session to fit the constrained path \
-                             — the stream heals now instead of on the next connect"
-                        );
-                        current = target;
-                    }
-                }
             }
+            return true;
         }
-        // Revert guard for a jumbo start with no re-key channel (PyroWave).
-        // This session cannot recover; drop the verdict the moment quinn's
-        // blackhole detection says the path shrank. One sample per 5 s, and
-        // only while the session is still fitting.
-        if current > mtu1500_shard_payload_for(peer)
-            && reneg.is_none()
-            && sealed_datagram_bytes(current) <= settled as usize
+        if settled >= ceiling {
+            tracing::warn!(
+                peer = %peer,
+                discovered_udp_mtu = settled,
+                shard_payload = self.current,
+                "wire MTU: this session started at a JUMBO shard but the path does not \
+                 carry it — video datagrams are oversized for a hop, which streams as a \
+                 black screen with zero reported loss. The jumbo verdict for this path is \
+                 cleared: the next connect starts at the standard 1500-byte wire."
+            );
+        } else {
+            tracing::warn!(
+                peer = %peer,
+                discovered_udp_mtu = settled,
+                needed_udp_mtu = ceiling,
+                "wire MTU: this path CANNOT carry full-size video datagrams — the control \
+                 plane works but every video packet is oversized for a hop, which streams as \
+                 an endless black screen with zero reported loss. Typical cause: a VPN/overlay \
+                 adapter (Tailscale / Cloudflare WARP / ZeroTier) claiming the LAN route, or a \
+                 lowered NIC MTU — compare `ping <client> -f -l 1450` vs `-l 1200` and check \
+                 `netsh interface ipv4 show subinterfaces` (Windows) / `ip link` (Linux). The \
+                 measured budget is recorded: the NEXT session from this client sizes video to \
+                 fit automatically. To pin it for all sessions set PUNKTFUNK_WIRE_MTU."
+            );
+        }
+        if self.reneg.is_some() {
+            self.shrink(settled, peer, "fit the measured path");
+            return true;
+        }
+        tokio::time::sleep(SHRANK_CONFIRM).await;
+        if self.conn.close_reason().is_some() {
+            return false;
+        }
+        if self.conn.remote_address() != addr
+            || sealed_datagram_bytes(self.current) <= self.conn.current_mtu() as usize
         {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if conn.close_reason().is_some() {
-                    return;
-                }
-                let mtu_now = conn.current_mtu();
-                if (mtu_now as usize) < sealed_datagram_bytes(current) {
-                    jumbo_verdicts().lock().unwrap().remove(&path_key(&conn));
-                    tracing::warn!(peer = %peer, discovered_udp_mtu = mtu_now,
-                        shard_payload = current,
-                        "wire MTU: the jumbo path this session started on stopped fitting — this \
-                         session cannot be re-keyed (chunk-aligned client parse window), so it \
-                         will not recover, but the verdict is cleared and the next connect \
-                         starts at the standard wire");
-                    return;
-                }
-            }
+            return true;
         }
-        // Jumbo grow: operator opt-in, client headroom, settled-at-jumbo
-        // proof. Ack-gated — no sealed datagram above the old size leaves
-        // before the client's ack, even though its buffers are static.
-        let Some(r) = reneg.as_mut() else {
+        tracing::warn!(peer = %peer, discovered_udp_mtu = settled, shard_payload = self.current,
+            moved,
+            "wire MTU: this session's video does not fit the client's path, and this session \
+             cannot be re-keyed — ending it so the client reconnects at a size that fits");
+        let why = if moved {
+            "The network path changed and this stream can't be resized."
+        } else {
+            "This network path can't carry the stream at its packet size."
+        };
+        self.conn.refuse(PATH_SHRANK_CLOSE_CODE, why).await;
+        false
+    }
+
+    /// Re-key down to fit `udp_budget`. Smaller always fits, so the client's ack is telemetry.
+    fn shrink(&mut self, udp_budget: u16, peer: IpAddr, why: &'static str) {
+        let (Some(r), Some(to)) = (
+            self.reneg.as_ref(),
+            shrink_to(self.current, udp_budget, peer),
+        ) else {
             return;
         };
-        let grow = target_wire_mtu.map(|mtu| {
-            let target = jumbo_shard_payload_for(mtu, peer).min(r.client_ceiling as usize);
-            (mtu, target - target % 2)
-        });
-        match grow {
-            Some((mtu, target))
-                if target > current && (settled as usize) >= sealed_datagram_bytes(target) =>
-            {
-                if r.change_tx.send(target as u16).is_err() {
-                    return;
-                }
-                let acked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    while let Some(v) = r.ack_rx.recv().await {
-                        if v as usize == target {
-                            return true;
-                        }
-                    }
-                    false
-                })
-                .await
-                .unwrap_or(false);
-                if !acked {
-                    tracing::warn!(peer = %peer, shard_payload = target,
-                        "wire MTU: jumbo grow not acked — staying at the current wire");
-                    return;
-                }
-                if r.apply_tx.send(target).is_err() {
-                    return;
-                }
-                tracing::info!(
-                    peer = %peer,
-                    shard_payload = target,
-                    was = current,
-                    wire_mtu = mtu,
-                    "wire MTU: jumbo grow acked and applied — packets-per-frame cut ~6×"
-                );
-                current = target;
-            }
-            // A jumbo start that can be re-keyed needs the same revert as a grow.
-            _ if current > mtu1500_shard_payload_for(peer) => {}
-            _ => return,
+        if r.change_tx.send(to as u16).is_ok() && r.apply_tx.send(to).is_ok() {
+            tracing::info!(peer = %peer, shard_payload = to, was = self.current, udp_budget, why,
+                "wire MTU: video re-keyed mid-session");
+            self.current = to;
         }
-        // Revert: quinn's PMTU blackhole detection lowers `current_mtu`
-        // when the big packets vanish. Sample and shrink via the same
-        // path the down-leg uses.
+    }
+
+    /// Grow to what this settle proves (see [`grow_to`]). Ack-gated: no datagram above the old
+    /// size leaves before the client's ack, even though its buffers are static. Only an ack
+    /// that arrives after the ask counts.
+    async fn grow(&mut self, peer: IpAddr, settled: u16) {
+        let jumbo = jumbo_target(self.target_wire_mtu, self.client_ceiling, settled, peer);
+        let Some(to) = grow_to(settled, self.start, self.current, jumbo, peer) else {
+            return;
+        };
+        let Some(r) = self.reneg.as_mut() else {
+            return;
+        };
+        while r.ack_rx.try_recv().is_ok() {}
+        if r.change_tx.send(to as u16).is_err() {
+            return;
+        }
+        let acked = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(v) = r.ack_rx.recv().await {
+                if v as usize == to {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        if !acked {
+            tracing::warn!(peer = %peer, shard_payload = to,
+                "wire MTU: grow not acked — staying at the current wire");
+            return;
+        }
+        if r.apply_tx.send(to).is_err() {
+            return;
+        }
+        tracing::info!(peer = %peer, shard_payload = to, was = self.current,
+            jumbo = jumbo == Some(to), "wire MTU: grow acked and applied");
+        self.current = to;
+    }
+
+    /// Run until the client moves (`Some` with its new address) or the connection ends. A
+    /// jumbo session meanwhile follows quinn's blackhole detection: once the big packets
+    /// vanish it re-keys down, or, unable to, clears the path's verdict.
+    async fn hold(&mut self, addr: SocketAddr) -> Option<SocketAddr> {
+        let peer = addr.ip();
+        let mut ticks = 0u32;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            if conn.close_reason().is_some() {
-                return;
+            tokio::time::sleep(TICK).await;
+            if self.conn.close_reason().is_some() {
+                return None;
             }
-            let mtu_now = conn.current_mtu();
-            if (mtu_now as usize) < sealed_datagram_bytes(current) {
-                let back = shard_payload_for_udp_budget(mtu_now as usize, peer);
+            let now = self.conn.remote_address();
+            if now != addr {
+                return Some(now);
+            }
+            ticks += 1;
+            if ticks % REVERT_TICKS != 0 || self.current <= mtu1500_shard_payload_for(peer) {
+                continue;
+            }
+            let mtu_now = self.conn.current_mtu();
+            if mtu_now as usize >= sealed_datagram_bytes(self.current) {
+                continue;
+            }
+            if jumbo_verdicts()
+                .lock()
+                .unwrap()
+                .remove(&path_key(&self.conn))
+                .is_some()
+            {
                 tracing::warn!(peer = %peer, discovered_udp_mtu = mtu_now,
-                    shard_payload = back, was = current,
-                    "wire MTU: jumbo path stopped fitting — reverting the wire to match");
-                if r.change_tx.send(back as u16).is_err() || r.apply_tx.send(back).is_err() {
-                    return;
-                }
-                current = back;
+                    shard_payload = self.current,
+                    "wire MTU: the jumbo path this session runs on stopped fitting — the \
+                     verdict is cleared and the next connect starts at the standard wire");
             }
+            self.shrink(mtu_now, peer, "jumbo path stopped fitting");
         }
-    });
+    }
+
+    /// The client's address moved. If quinn restarted discovery the new path is unproven, so
+    /// video drops to the restart floor now and the next settle grows it back.
+    fn on_move(&mut self, addr: SocketAddr) {
+        let floor = self.conn.current_mtu();
+        tracing::info!(peer = %addr, current_udp_mtu = floor, shard_payload = self.current,
+            "wire MTU: client moved to a new address");
+        self.shrink(
+            floor,
+            addr.ip(),
+            "client moved; holding the floor until the path settles",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +667,13 @@ mod tests {
     fn learned_budget_clamps() {
         // 1280-byte UDP budget − 46 header/tag = 1234.
         assert_eq!(resolve(None, Some(1280), NO_JUMBO, V4), 1234);
+    }
+
+    /// 1500 and up opts in to jumbo; it pins nothing, so a small path's verdict still binds.
+    #[test]
+    fn a_jumbo_opt_in_still_takes_the_learned_clamp() {
+        assert_eq!(resolve(Some(9000), Some(1280), NO_JUMBO, V4), 1234);
+        assert_eq!(resolve(Some(1500), Some(1280), NO_JUMBO, V4), 1234);
     }
 
     #[test]
@@ -625,10 +752,25 @@ mod tests {
     }
 
     #[test]
-    fn without_the_operator_opt_in_nothing_grows() {
-        let mut no_optin = proven_jumbo();
-        no_optin.target_wire_mtu = None;
-        assert_eq!(jumbo_session_start(no_optin, V4), None);
+    fn without_a_jumbo_target_nothing_grows() {
+        let mut no_target = proven_jumbo();
+        no_target.target_wire_mtu = None;
+        assert_eq!(jumbo_session_start(no_target, V4), None);
+    }
+
+    /// Adapters that differ settle below the larger one, or a few bytes short where the search
+    /// stopped: the proven budget sizes the shard, and a 1500 settle is never jumbo.
+    #[test]
+    fn the_proven_budget_sizes_the_jumbo_shard() {
+        let mut bigger_host = proven_jumbo();
+        bigger_host.target_wire_mtu = Some(9216);
+        assert_eq!(jumbo_session_start(bigger_host, V4), Some(8926));
+        let mut short = proven_jumbo();
+        short.proven_udp_budget = Some(8960);
+        short.live_udp_mtu = 8960;
+        assert_eq!(jumbo_session_start(short, V4), Some(8914));
+        assert_eq!(jumbo_target(Some(9000), u16::MAX, 1472, V4), None);
+        assert_eq!(jumbo_target(Some(9000), u16::MAX, 2000, V4), Some(1954));
     }
 
     /// Legacy (`Hello::max_shard_payload` = 0) never gets a geometry it did
@@ -653,7 +795,7 @@ mod tests {
     fn grown_shards_stay_even_and_inside_the_receive_ceiling() {
         for mtu in [2000usize, 4000, 4001, 9000, 9216, 64000] {
             for peer in [V4, V6] {
-                let Some(t) = jumbo_target(Some(mtu), u16::MAX, peer) else {
+                let Some(t) = jumbo_target(Some(mtu), u16::MAX, u16::MAX, peer) else {
                     continue;
                 };
                 assert_eq!(t % 2, 0, "odd shard for mtu {mtu}");
@@ -667,8 +809,11 @@ mod tests {
         }
         // A wire whose fit is the family default gains nothing.
         let default_wire = sealed_datagram_bytes(mtu1500_shard_payload_for(V4)) + 28;
-        assert_eq!(jumbo_target(Some(default_wire), u16::MAX, V4), None);
-        assert_eq!(jumbo_target(None, u16::MAX, V4), None);
+        assert_eq!(
+            jumbo_target(Some(default_wire), u16::MAX, u16::MAX, V4),
+            None
+        );
+        assert_eq!(jumbo_target(None, u16::MAX, u16::MAX, V4), None);
     }
 
     /// Same peer over two host NICs is two routes, so two keys.
@@ -690,5 +835,52 @@ mod tests {
                 peer: V4
             }
         );
+    }
+
+    /// A move that restarts discovery at quinn's 1200-byte floor drops a full-size session to
+    /// the floor's shard; one that keeps the path's MTU leaves it alone.
+    #[test]
+    fn a_move_shrinks_only_what_no_longer_fits() {
+        let full = mtu1500_shard_payload_for(V4);
+        let floor = shard_payload_for_udp_budget(1200, V4);
+        assert!(floor < full);
+        assert_eq!(shrink_to(full, 1200, V4), Some(floor));
+        assert_eq!(
+            shrink_to(full, sealed_datagram_bytes(full) as u16, V4),
+            None
+        );
+        assert_eq!(shrink_to(floor, 1200, V4), None);
+    }
+
+    /// After a move the next settle grows back toward the start shard, never past it, and
+    /// only to what the settle proves. Without a move the start shard is already current.
+    #[test]
+    fn a_settle_grows_back_to_the_start_shard() {
+        let full = mtu1500_shard_payload_for(V4);
+        let floor = shard_payload_for_udp_budget(1200, V4);
+        let ceiling = video_datagram_udp_ceiling() as u16;
+        assert_eq!(grow_to(ceiling, full, floor, None, V4), Some(full));
+        assert_eq!(
+            grow_to(1280, full, floor, None, V4),
+            Some(shard_payload_for_udp_budget(1280, V4))
+        );
+        assert_eq!(grow_to(ceiling, full, full, None, V4), None);
+        assert_eq!(grow_to(1200, full, floor, None, V4), None);
+        // A v4 session that moved to v6 grows to the v6 fit, not the v4 start.
+        assert_eq!(
+            grow_to(ceiling, full, floor, None, V6),
+            Some(mtu1500_shard_payload_for(V6).min(full))
+        );
+    }
+
+    /// The jumbo target wins only on a settle that carries it.
+    #[test]
+    fn a_settle_grows_to_jumbo_only_when_it_proves_it() {
+        let full = mtu1500_shard_payload_for(V4);
+        let jumbo = jumbo_target(Some(9000), u16::MAX, u16::MAX, V4);
+        assert!(jumbo.is_some());
+        assert_eq!(grow_to(8972, full, full, jumbo, V4), jumbo);
+        let ceiling = video_datagram_udp_ceiling() as u16;
+        assert_eq!(grow_to(ceiling, full, full, jumbo, V4), None);
     }
 }

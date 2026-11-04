@@ -6,7 +6,7 @@ use super::*;
 async fn native_pairing_arm_show_and_unpair() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-np-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-np.json")),
             None,
             false,
         )
@@ -66,7 +66,7 @@ async fn native_pairing_arm_show_and_unpair() {
 async fn native_unpair_all_empties_the_trust_store() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-np-all-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-np-all.json")),
             None,
             false,
         )
@@ -113,7 +113,7 @@ async fn native_unpair_all_without_a_native_host_is_unavailable() {
 async fn pending_devices_approve_and_deny() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-pending-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-pending.json")),
             None,
             false,
         )
@@ -125,8 +125,8 @@ async fn pending_devices_approve_and_deny() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b.as_array().unwrap().len(), 0);
 
-    np.note_pending("Enrico's MacBook", "aa11", Some(LAN_KNOCK), None);
-    np.note_pending("device bb22cc33", "bb22", Some(LAN_KNOCK), None);
+    np.note_pending("Enrico's MacBook", "aa11", Some(LAN_KNOCK), None, None);
+    np.note_pending("device bb22cc33", "bb22", Some(LAN_KNOCK), None, None);
     let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
     assert_eq!(b.as_array().unwrap().len(), 2);
     assert_eq!(b[0]["name"], "Enrico's MacBook");
@@ -195,7 +195,7 @@ async fn patch_native_access_reflects_in_list_and_fires_watch() {
     use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_POINTER};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-patch-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-patch.json")),
             None,
             false,
         )
@@ -305,9 +305,7 @@ async fn patch_native_access_validates_and_404s() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-patch-val-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-patch-val.json")),
             None,
             false,
         )
@@ -372,16 +370,14 @@ async fn patch_native_access_validates_and_404s() {
 async fn until_disconnect_alone_is_refused_rather_than_widening_access() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-lone-udc-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-lone-udc.json")),
             None,
             false,
         )
         .unwrap(),
     );
     let app = test_app_native(test_state(), np.clone());
-    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), None);
+    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), None, None);
     let id = np.pending()[0].id;
 
     let (s, _) = send(
@@ -431,9 +427,7 @@ async fn until_disconnect_alone_is_refused_rather_than_widening_access() {
 async fn a_wan_knock_is_listed_as_wan_and_refused_by_approve() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-wan-knock-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-wan-knock.json")),
             None,
             false,
         )
@@ -441,8 +435,8 @@ async fn a_wan_knock_is_listed_as_wan_and_refused_by_approve() {
     );
     let app = test_app_native(test_state(), np.clone());
     let wan = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5));
-    np.note_pending("Friend's Deck", "dd88", Some(wan), None);
-    np.note_pending("Living Room", "ee99", Some(LAN_KNOCK), None);
+    np.note_pending("Friend's Deck", "dd88", Some(wan), None, None);
+    np.note_pending("Living Room", "ee99", Some(LAN_KNOCK), None, None);
 
     let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
     let rows = b.as_array().unwrap();
@@ -495,10 +489,7 @@ async fn approve_with_access_pins_the_chosen_mask() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir()
-                    .join(format!("pf-mgmt-approve-acc-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-approve-acc.json")),
             None,
             false,
         )
@@ -506,7 +497,7 @@ async fn approve_with_access_pins_the_chosen_mask() {
     );
     let app = test_app_native(test_state(), np.clone());
 
-    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), None);
+    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), None, None);
     let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
     assert!(pend[0]["grants"].is_null());
     assert!(pend[0]["access_level"].is_null());
@@ -548,7 +539,7 @@ async fn approve_with_access_pins_the_chosen_mask() {
     assert_eq!(np.effective("cc33", now), Some(GRANT_GAMEPAD));
 
     // Re-knock surfaces the stored access for the approve dialog.
-    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), None);
+    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), None, None);
     let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
     assert_eq!(pend[0]["grants"], GRANT_GAMEPAD);
     assert_eq!(pend[0]["access_level"], "controller");
@@ -562,7 +553,7 @@ async fn arm_with_access_ceremony_inherits_the_choice() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-arm-acc-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-arm-acc.json")),
             None,
             false,
         )
@@ -613,10 +604,7 @@ async fn arm_with_access_ceremony_inherits_the_choice() {
 async fn approve_and_arm_without_access_fields_keep_todays_behavior() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir()
-                    .join(format!("pf-mgmt-acc-compat-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-acc-compat.json")),
             None,
             false,
         )
@@ -636,7 +624,7 @@ async fn approve_and_arm_without_access_fields_keep_todays_behavior() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(np.armed_access(), None, "no fields = no choice");
 
-    np.note_pending("Old Laptop", "ee55", Some(LAN_KNOCK), None);
+    np.note_pending("Old Laptop", "ee55", Some(LAN_KNOCK), None, None);
     let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
     let id = pend[0]["id"].as_u64().unwrap();
     let (s, b) = send(

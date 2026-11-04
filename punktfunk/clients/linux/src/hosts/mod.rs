@@ -9,6 +9,7 @@ mod detail;
 mod dialogs;
 mod form;
 mod model;
+pub mod picture;
 pub mod speed;
 
 use crate::discovery::{self, DiscoveredHost, DiscoveryEvent};
@@ -89,6 +90,8 @@ pub enum Act {
     SpeedTest(ConnectRequest),
     SwitchProfile(ConnectRequest),
     SendLogs(ConnectRequest),
+    /// End the stream from the host of this [`ConnectRequest::card_key`].
+    Disconnect(String),
     /// One of the host's own actions (`design/host-actions.md` §7); `danger` asks first.
     HostAction {
         req: ConnectRequest,
@@ -118,6 +121,8 @@ pub enum Act {
 
 pub struct HostsInit {
     pub store: Rc<Store>,
+    /// This device, for the management API a card's profile picture comes from.
+    pub identity: (String, String),
     /// The window's navigation, which host pages push onto.
     pub nav: adw::NavigationView,
     pub views: adw::ViewStack,
@@ -126,14 +131,15 @@ pub struct HostsInit {
 
 pub struct HostsPage {
     store: Rc<Store>,
+    identity: (String, String),
     nav: adw::NavigationView,
     sender: relm4::Sender<HostsMsg>,
     adverts: HashMap<String, DiscoveredHost>,
     /// Saved hosts proven reachable by the periodic QUIC probe (mDNS-independent), keyed by
     /// [`KnownHost::card_key`].
     probed: HashMap<String, bool>,
-    /// This device's session, by card key.
-    session: Option<(String, Phase)>,
+    /// This device's sessions, by card key.
+    sessions: HashMap<String, Phase>,
     /// What is on screen; a build equal to it redraws nothing.
     drawn: Option<(Vec<Band>, Vec<CardModel>, Vec<Preset>)>,
     detail: Option<detail::DetailPage>,
@@ -168,9 +174,9 @@ pub enum HostsMsg {
     Rescan,
     /// A completed reachability sweep: saved-host key → reachable.
     Probed(HashMap<String, bool>),
-    /// This device's session with the card of `ConnectRequest::card_key`; `None` when none
-    /// runs.
-    SetSession(Option<(String, Phase)>),
+    /// This device's session with the card of `ConnectRequest::card_key`; `None` when it
+    /// ended.
+    SetSession(String, Option<Phase>),
     ShowError(String),
     ClearError,
     ShowAddHost,
@@ -182,6 +188,8 @@ pub enum HostsMsg {
 #[derive(Debug)]
 pub enum HostsOutput {
     Connect(ConnectRequest),
+    /// End the stream from this card key's host.
+    Disconnect(String),
     /// A one-line confirmation for the window's toast overlay.
     Toast(String),
     WakeConnect(ConnectRequest),
@@ -219,6 +227,7 @@ impl SimpleComponent for HostsPage {
     ) -> ComponentParts<Self> {
         let HostsInit {
             store,
+            identity,
             nav,
             views,
             narrow,
@@ -391,12 +400,13 @@ impl SimpleComponent for HostsPage {
         }
 
         let mut model = HostsPage {
+            identity,
             store,
             nav,
             sender: sender.input_sender().clone(),
             adverts: HashMap::new(),
             probed: HashMap::new(),
-            session: None,
+            sessions: HashMap::new(),
             drawn: None,
             detail: None,
             widgets: PageWidgets {
@@ -443,8 +453,11 @@ impl SimpleComponent for HostsPage {
                 self.refresh_reachable();
                 self.rebuild();
             }
-            HostsMsg::SetSession(session) => {
-                self.session = session;
+            HostsMsg::SetSession(key, phase) => {
+                match phase {
+                    Some(phase) => self.sessions.insert(key, phase),
+                    None => self.sessions.remove(&key),
+                };
                 self.rebuild();
             }
             HostsMsg::ShowError(msg) => {
@@ -532,9 +545,9 @@ fn arrange_menu(store: &Rc<Store>) -> (gtk::MenuButton, gio::SimpleAction, gio::
 }
 
 impl HostsPage {
-    /// What a live advert teaches the saved host it matches: its wake MACs, its OS chain (so
-    /// the icon survives it going offline), its management port, and an address the probe
-    /// sweep asks. `learn_from_advert` writes only when something moved.
+    /// What a live advert teaches the saved host it matches: its name, its wake MACs, its OS
+    /// chain (so the icon survives it going offline), its management port, and an address the
+    /// probe sweep asks. `learn_from_advert` writes only when something moved.
     fn learn(&self, a: &DiscoveredHost) {
         let target = self
             .store
@@ -546,7 +559,7 @@ impl HostsPage {
         let Some((fp, addr, port)) = target else {
             return;
         };
-        trust::learn_from_advert(&fp, &addr, port, &a.addr, &a.mac, &a.os, a.mgmt_port);
+        trust::learn_from_advert(&fp, &addr, port, a);
         self.store.reload(Changed::Hosts);
     }
 
@@ -558,8 +571,8 @@ impl HostsPage {
                 continue;
             }
             let mgmt = self.mgmt_port(&k.fp_hex, &k.addr, k.port);
-            pf_client_core::host_actions::refresh(&k.addr, mgmt, &k.fp_hex);
-            pf_client_core::library::refresh_running(&k.addr, mgmt, &k.fp_hex);
+            pf_client_core::host_actions::refresh(&k.addr, mgmt, k.port, &k.fp_hex);
+            pf_client_core::library::refresh_running(&k.addr, mgmt, k.port, &k.fp_hex);
         }
     }
 
@@ -584,18 +597,11 @@ impl HostsPage {
         let playing = |fp: &str| pf_client_core::library::now_playing(fp);
         let live = Live {
             probed: &self.probed,
-            session: self
-                .session
-                .as_ref()
-                .map(|(key, phase)| (key.as_str(), *phase)),
+            sessions: &self.sessions,
             playing: &playing,
         };
         let bands = model::saved_bands(&hosts, &presets, &settings, &live);
-        let dialing = match &self.session {
-            Some((key, Phase::Connecting)) => Some(key.as_str()),
-            _ => None,
-        };
-        let discovered = model::discovered_cards(self.adverts.values(), &hosts, dialing);
+        let discovered = model::discovered_cards(self.adverts.values(), &hosts, &self.sessions);
         let next = (bands, discovered, presets);
         if self.drawn.as_ref() != Some(&next) {
             self.draw(&next);
@@ -617,13 +623,14 @@ impl HostsPage {
             w.saved.append(&heading);
             let grid = card_grid();
             for m in &band.cards {
-                grid.append(&card::build(m, presets, &self.sender));
+                grid.append(&card::build(m, presets, &self.identity, &self.sender));
             }
             w.saved.append(&grid);
         }
         w.discovered.remove_all();
         for m in discovered {
-            w.discovered.append(&card::build(m, presets, &self.sender));
+            w.discovered
+                .append(&card::build(m, presets, &self.identity, &self.sender));
         }
         let (have_saved, have_disc) = (!bands.is_empty(), !discovered.is_empty());
         w.discovered.set_visible(have_disc);
@@ -668,10 +675,7 @@ impl HostsPage {
         } else {
             pf_client_core::library::now_playing(&k.fp_hex)
         };
-        let phase = match &self.session {
-            Some((key, phase)) if *key == k.card_key() => Some(*phase),
-            _ => None,
-        };
+        let phase = self.sessions.get(&k.card_key()).copied();
         detail::Live {
             status: Status::of(k, online, phase, &playing, settings.auto_wake),
             online,
@@ -697,6 +701,7 @@ impl HostsPage {
             Act::SpeedTest(req) => out(HostsOutput::SpeedTest(req)),
             Act::Library(req) => out(HostsOutput::Library(req)),
             Act::SwitchProfile(req) => out(HostsOutput::SwitchProfile(req)),
+            Act::Disconnect(key) => out(HostsOutput::Disconnect(key)),
             Act::SendLogs(req) => {
                 let mgmt = self.mgmt_port_for(&req);
                 out(HostsOutput::SendLogs(req, mgmt));

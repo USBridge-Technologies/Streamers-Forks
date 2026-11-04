@@ -8,12 +8,16 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// The pick a device saves for a box. Shown on the card, so it carries the name.
+/// The pick a device saves for a box. Shown on the card, so it carries the name and the
+/// picture's URL.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfilePick {
     pub id: String,
     #[serde(default)]
     pub display_name: String,
+    /// Host-relative URL of the picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
     /// The player asked this device to remember the pick. The console applies only such a
     /// pick and asks otherwise; the other shells apply any saved pick.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -68,6 +72,7 @@ impl ListedProfile {
         ProfilePick {
             id: self.id.clone(),
             display_name: self.display_name.clone(),
+            avatar: self.avatar.clone(),
             remember: false,
         }
     }
@@ -255,54 +260,61 @@ pub fn wake_failed(display_name: &str, e: &crate::library::LibraryError) -> Stri
 pub fn fetch_enumerate(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
 ) -> Result<Option<Vec<ListedProfile>>, crate::library::LibraryError> {
-    use crate::library::{agent, base_url, classify, LibraryError};
-    let agent = agent(identity, pin)?;
-    let url = format!("{}/api/v1/profiles/enumerate", base_url(addr, mgmt_port));
-    let mut resp = match agent.get(&url).call() {
-        Ok(resp) => resp,
-        Err(ureq::Error::StatusCode(404)) => return Ok(None),
-        Err(e) => return Err(classify(e)),
-    };
-    let body = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?;
-    serde_json::from_str(&body)
+    use crate::library::{agent, HostApi, LibraryError};
+    let https = agent(identity, pin)?;
+    let api = HostApi::new(addr, mgmt_port, stream_port, identity, pin);
+    let reply = api.call(&https, "GET", "/api/v1/profiles/enumerate", None)?;
+    if reply.status == 404 {
+        return Ok(None);
+    }
+    serde_json::from_slice(&reply.ok()?)
         .map(Some)
         .map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
 }
 
+/// The picture at `path`, a row's [`ListedProfile::avatar`]: [`crate::art_cache`], else the
+/// host, which fills the cache. `None` leaves the initials up. Blocks.
+#[cfg(desktop)]
+pub fn fetch_avatar(api: &crate::library::HostApi, path: &str) -> Option<Vec<u8>> {
+    // Anything but a path could name another origin, and this request carries the device's cert.
+    if !path.starts_with('/') {
+        return None;
+    }
+    let https = crate::library::agent(&api.identity, api.pin).ok()?;
+    let url = format!("{}{path}", api.base());
+    crate::library::resolve_art(api, &https, path, &[url], || false)
+}
+
 /// `POST /api/v1/profiles/{id}/wake`: starts a stopped seat and answers with its row, which
-/// says `starting` until the seat is up. A refusal is `Http(403)` ([`wake_error`]).
+/// says `starting` until the seat is up. A refusal is `Http(403)` ([`wake_answer`]).
 #[cfg(desktop)]
 pub fn wake(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
     id: &str,
 ) -> Result<ListedProfile, crate::library::LibraryError> {
-    use crate::library::{agent, base_url, LibraryError};
-    let agent = agent(identity, pin)?;
-    let url = format!("{}/api/v1/profiles/{id}/wake", base_url(addr, mgmt_port));
-    let mut resp = agent.post(&url).send_empty().map_err(wake_error)?;
-    let body = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?;
-    serde_json::from_str(&body).map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
+    use crate::library::{agent, HostApi, LibraryError};
+    let https = agent(identity, pin)?;
+    let api = HostApi::new(addr, mgmt_port, stream_port, identity, pin);
+    let reply = api.call(&https, "POST", &format!("/api/v1/profiles/{id}/wake"), None)?;
+    serde_json::from_slice(&wake_answer(reply)?)
+        .map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
 }
 
-/// [`classify`](crate::library::classify) for a wake. The cert lane answers an unpaired device
-/// 401, so a 403 is the host refusing this device the profile's seat, not "pair first".
+/// [`Reply::ok`](crate::library::Reply::ok) for a wake. The cert lane answers an unpaired
+/// device 401, so a 403 is the host refusing this device the profile's seat, not "pair first".
 #[cfg(desktop)]
-fn wake_error(e: ureq::Error) -> crate::library::LibraryError {
-    match e {
-        ureq::Error::StatusCode(403) => crate::library::LibraryError::Http(403),
-        e => crate::library::classify(e),
+fn wake_answer(reply: crate::library::Reply) -> Result<Vec<u8>, crate::library::LibraryError> {
+    match reply.status {
+        403 => Err(crate::library::LibraryError::Http(403)),
+        _ => reply.ok(),
     }
 }
 
@@ -312,6 +324,7 @@ fn wake_error(e: ureq::Error) -> crate::library::LibraryError {
 pub fn fetch_within(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
     budget: Duration,
@@ -321,7 +334,13 @@ pub fn fetch_within(
     std::thread::Builder::new()
         .name("pf-profiles-fetch".into())
         .spawn(move || {
-            let _ = tx.send(fetch_enumerate(&addr, mgmt_port, &identity, pin));
+            let _ = tx.send(fetch_enumerate(
+                &addr,
+                mgmt_port,
+                stream_port,
+                &identity,
+                pin,
+            ));
         })
         .ok()?;
     match rx.recv_timeout(budget) {
@@ -343,9 +362,11 @@ pub fn fetch_within(
 /// ends the wait (the wake failed, or the host no longer lists the profile). A failed read
 /// waits for the next.
 #[cfg(desktop)]
+#[allow(clippy::too_many_arguments)]
 pub fn watch_seat(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
     row: &ListedProfile,
@@ -355,7 +376,7 @@ pub fn watch_seat(
     let name = &row.display_name;
     let mut row = row.clone();
     if seat_gate(&row) == SeatGate::Wake {
-        match wake(addr, mgmt_port, identity, pin, &row.id) {
+        match wake(addr, mgmt_port, stream_port, identity, pin, &row.id) {
             Ok(woken) => row = woken,
             Err(e) => {
                 each(Err(wake_failed(name, &e)));
@@ -371,7 +392,7 @@ pub fn watch_seat(
         if stop.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        let listed = match fetch_enumerate(addr, mgmt_port, identity, pin) {
+        let listed = match fetch_enumerate(addr, mgmt_port, stream_port, identity, pin) {
             Ok(listed) => listed,
             Err(e) => {
                 tracing::debug!(error = %e, "seat poll");
@@ -393,6 +414,53 @@ mod tests {
     use super::*;
     #[cfg(desktop)]
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn a_pick_carries_the_picture_and_a_kept_pick_follows_a_new_one() {
+        let row = |avatar: &str| ListedProfile {
+            id: "kid".into(),
+            display_name: "Kid".into(),
+            avatar: Some(avatar.into()),
+            ..ListedProfile::default()
+        };
+        let old = ProfilePick {
+            remember: true,
+            ..row("/p/kid/avatar?v=old").pick()
+        };
+        let listed = [row("/p/kid/avatar?v=new"), ListedProfile::default()];
+        let kept = picker_decision(Some(&listed), Some(&old), None).remember;
+        assert_eq!(
+            kept,
+            Some(ProfilePick {
+                avatar: Some("/p/kid/avatar?v=new".into()),
+                ..old.clone()
+            })
+        );
+    }
+
+    #[test]
+    fn a_saved_pick_without_a_picture_keeps_its_old_shape() {
+        let saved = ProfilePick {
+            id: "kid".into(),
+            display_name: "Kid".into(),
+            ..ProfilePick::default()
+        };
+        let json = serde_json::to_value(&saved).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"id": "kid", "display_name": "Kid"})
+        );
+        assert_eq!(serde_json::from_value::<ProfilePick>(json).unwrap(), saved);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn a_picture_must_be_a_path_on_the_host() {
+        let identity = (String::new(), String::new());
+        let api = crate::library::HostApi::new("10.0.0.2", 47990, 0, &identity, None);
+        assert_eq!(fetch_avatar(&api, "https://elsewhere.example/x.png"), None);
+        assert_eq!(fetch_avatar(&api, "@elsewhere.example/x.png"), None);
+    }
 
     #[test]
     fn a_seat_is_dialed_woken_waited_for_or_refused() {
@@ -436,10 +504,22 @@ mod tests {
         );
         #[cfg(desktop)]
         {
-            let refused = wake_error(ureq::Error::StatusCode(403));
-            assert!(matches!(refused, LibraryError::Http(403)), "{refused:?}");
-            let unpaired = wake_error(ureq::Error::StatusCode(401));
-            assert!(matches!(unpaired, LibraryError::NotPaired), "{unpaired:?}");
+            let answer = |status| {
+                wake_answer(crate::library::Reply {
+                    status,
+                    body: Vec::new(),
+                })
+            };
+            let refused = answer(403);
+            assert!(
+                matches!(refused, Err(LibraryError::Http(403))),
+                "{refused:?}"
+            );
+            let unpaired = answer(401);
+            assert!(
+                matches!(unpaired, Err(LibraryError::NotPaired)),
+                "{unpaired:?}"
+            );
         }
     }
 
@@ -500,6 +580,7 @@ mod tests {
             id: "kid".into(),
             display_name: "Old name".into(),
             remember: true,
+            ..ProfilePick::default()
         };
         let d = picker_decision(Some(&listed), Some(&saved), None);
         let kept = d.remember.expect("still listed");
@@ -539,7 +620,7 @@ mod tests {
         // An empty identity fails every request before it leaves this machine.
         let (bad, stop) = ((String::new(), String::new()), AtomicBool::new(false));
         let mut seen = Vec::new();
-        watch_seat("127.0.0.1", 1, &bad, None, &row("stopped"), &stop, |r| {
+        watch_seat("127.0.0.1", 1, 0, &bad, None, &row("stopped"), &stop, |r| {
             seen.push(r);
             true
         });
@@ -547,10 +628,19 @@ mod tests {
             matches!(&seen[..], [Err(l)] if l.starts_with("Couldn't wake Kid's desk \u{2014} "))
         );
         seen.clear();
-        watch_seat("127.0.0.1", 1, &bad, None, &row("starting"), &stop, |r| {
-            seen.push(r);
-            false
-        });
+        watch_seat(
+            "127.0.0.1",
+            1,
+            0,
+            &bad,
+            None,
+            &row("starting"),
+            &stop,
+            |r| {
+                seen.push(r);
+                false
+            },
+        );
         assert_eq!(seen, vec![Ok(row("starting"))]);
     }
 }

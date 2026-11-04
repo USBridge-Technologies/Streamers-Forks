@@ -77,10 +77,11 @@ impl EncoderCeiling {
     }
 
     /// What the encoder made of an ask of `want`. Short is the ceiling, again;
-    /// taking the whole ask is the ceiling gone.
+    /// taking a whole ask above the ceiling is the ceiling gone. A whole ask under
+    /// it is no evidence either way.
     pub(super) fn note_applied(&mut self, want: u32, applied: u32) {
         if applied >= want {
-            if self.cap.kbps().is_some() {
+            if self.cap.kbps().is_some_and(|cap| applied > cap) {
                 tracing::info!(
                     applied_kbps = applied,
                     "the encoder took the whole rate — dropping the ceiling it refused before"
@@ -151,53 +152,32 @@ pub(super) fn session_pyrowave_bpp(client_x100: u16) -> f64 {
 }
 
 /// PyroWave pins the session's bits per pixel (`pyrowave_bpp`, [`session_pyrowave_bpp`]) for
-/// the negotiated mode, not the 20 Mbps H.26x default: an explicit session runs at the pin, an
-/// Automatic one adapts under it. A client rate is ignored: bits per pixel is the quality
-/// knob, and it holds across modes. Every pin goes through `PUNKTFUNK_PYROWAVE_MAX_MBPS`.
-/// H.26x/AV1 explicit rates stand.
+/// the negotiated mode, not the 20 Mbps H.26x default: a Fixed session runs at the pin, an
+/// Automatic one adapts under it. A non-zero client rate asks for Fixed and its number is
+/// ignored: bits per pixel is the quality knob, and it holds across modes. Every pin goes
+/// through `ceiling`, the session's `PUNKTFUNK_PYROWAVE_MAX_MBPS` in kbps. H.26x/AV1 explicit
+/// rates stand.
 pub(super) fn resolve_bitrate_kbps_for(
     codec: crate::encode::Codec,
     requested: u32,
     mode: &punktfunk_core::config::Mode,
     chroma: crate::encode::ChromaFormat,
     bit_depth: u8,
-    pyrowave_bpp: f64,
-) -> u32 {
-    resolve_bitrate_kbps_under(
-        codec,
-        requested,
-        mode,
-        chroma,
-        bit_depth,
-        pyrowave_bpp,
-        pyrowave_auto_pin_ceiling_kbps,
-    )
-}
-
-/// [`resolve_bitrate_kbps_for`] with the PyroWave ceiling (kbps) read through `ceiling`, so a
-/// test hands one in without writing the process environment.
-#[allow(clippy::too_many_arguments)]
-fn resolve_bitrate_kbps_under(
-    codec: crate::encode::Codec,
-    requested: u32,
-    mode: &punktfunk_core::config::Mode,
-    chroma: crate::encode::ChromaFormat,
-    bit_depth: u8,
     bpp: f64,
-    ceiling: fn() -> Option<u32>,
+    ceiling: Option<u32>,
 ) -> u32 {
     if codec == crate::encode::Codec::PyroWave {
         if requested != 0 {
-            tracing::warn!(
+            tracing::info!(
                 requested_kbps = requested,
-                "a client bitrate does not apply to PyroWave — using the session's bits per pixel"
+                "fixed PyroWave session — pinned at the session's bits per pixel, not the client rate"
             );
         }
         let pin = punktfunk_core::pyrowave::kbps_for(mode, chroma.is_444(), bit_depth, bpp)
             .clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
         // Open-loop pin can outrun the link. `PUNKTFUNK_PYROWAVE_MAX_MBPS` caps it;
         // unset ⇒ no cap.
-        if let Some(ceiling) = ceiling() {
+        if let Some(ceiling) = ceiling {
             if pin > ceiling {
                 tracing::warn!(
                     pin_kbps = pin,
@@ -259,38 +239,52 @@ pub(super) struct EncDerive {
     pub(super) audio_kbps: u32,
     pub(super) shard_payload: u16,
     pub(super) fec_percent: u8,
-    /// PyroWave: pin is an encoder rate; both directions are identity.
-    pub(super) identity: bool,
+    /// PyroWave at this refresh rate: parity rides the frame's head only
+    /// ([`pyrowave_parity_pct`]). `None`: every block carries `fec_percent`.
+    pub(super) head_only_hz: Option<u32>,
+    /// This encoder's share of the session's video, per mille: [`SHARE_ALL`] alone, less while
+    /// further screens' encoders split the budget with it.
+    pub(super) share_permille: u16,
 }
 
+/// [`EncDerive::share_permille`] of a session with one screen.
+pub(super) const SHARE_ALL: u16 = 1000;
+
 impl EncDerive {
-    /// [`encoder_bps_for_budget`] in kbps, over sealed shards.
-    pub(super) fn enc_kbps(&self, budget_kbps: u32) -> u32 {
-        if self.identity {
-            budget_kbps
-        } else {
-            let bps = encoder_bps_for_budget(
+    /// The share of the wire parity takes at `budget_kbps`, as the budget prices it.
+    fn parity_pct(&self, budget_kbps: u32) -> u8 {
+        match self.head_only_hz {
+            None => self.fec_percent,
+            Some(hz) => pyrowave_parity_pct(
                 budget_kbps,
                 self.audio_kbps,
+                self.shard_payload,
+                hz,
                 self.fec_percent,
-                self.shard_payload.into(),
-                WireFraming::Shards,
-            );
-            (bps / 1000) as u32
+            ),
         }
     }
 
+    /// [`encoder_bps_for_budget`] in kbps, over sealed shards: this encoder's share of it.
+    pub(super) fn enc_kbps(&self, budget_kbps: u32) -> u32 {
+        let bps = encoder_bps_for_budget(
+            budget_kbps,
+            self.audio_kbps,
+            self.parity_pct(budget_kbps),
+            self.shard_payload.into(),
+            WireFraming::Shards,
+        );
+        let share = u64::from(self.share_permille.min(SHARE_ALL));
+        ((bps / 1000) * share / u64::from(SHARE_ALL)).max(u64::from(MIN_BITRATE_KBPS)) as u32
+    }
+
+    /// The budget an encoder rate spends. Parity is priced at the budget the rate alone
+    /// would need; it is a few percent, so that is the budget it lands in.
     pub(super) fn budget_kbps(&self, encoder_kbps: u32) -> u32 {
-        if self.identity {
-            encoder_kbps
-        } else {
-            budget_kbps_for_encoder(
-                encoder_kbps,
-                self.audio_kbps,
-                self.fec_percent,
-                self.shard_payload,
-            )
-        }
+        let share = u64::from(self.share_permille.clamp(1, SHARE_ALL));
+        let whole = (u64::from(encoder_kbps) * u64::from(SHARE_ALL) / share) as u32;
+        let at = |pct| budget_kbps_for_encoder(whole, self.audio_kbps, pct, self.shard_payload);
+        at(self.parity_pct(at(0)))
     }
 
     /// Read-back in the request's truncated terms. The roundtrip deflates, so a read-back
@@ -310,40 +304,63 @@ impl EncDerive {
     }
 }
 
-/// Audio reservation from the resolved Welcome: PCM cost, else the same
-/// [`plan_audio_budget`](punktfunk_core::audio::plan_audio_budget) rung the audio thread
-/// runs, with redundancy only when `HOST_CAP_AUDIO_RED` was granted.
+/// The share of a PyroWave frame its parity takes, as a percent of the frame: the head's parity
+/// over the frame's wire shards. The head is sized at 15 % of the frame, the most level 4 measured
+/// on game frames; its parity is `fec_percent` of that, never under
+/// [`HEAD_MIN_RECOVERY_SHARDS`](punktfunk_core::packet::HEAD_MIN_RECOVERY_SHARDS).
+fn pyrowave_parity_pct(
+    budget_kbps: u32,
+    audio_kbps: u32,
+    shard_payload: u16,
+    hz: u32,
+    fec_percent: u8,
+) -> u8 {
+    if fec_percent == 0 {
+        return 0;
+    }
+    let shards = punktfunk_core::abr::budget::wire_shards_per_frame(
+        punktfunk_core::abr::budget::FrameBudget {
+            budget_kbps,
+            audio_kbps,
+            shard_payload,
+            fps: hz,
+        },
+    );
+    let head = (shards * 15).div_ceil(100);
+    let parity = (head * u32::from(fec_percent))
+        .div_ceil(100)
+        .max(punktfunk_core::packet::HEAD_MIN_RECOVERY_SHARDS as u32);
+    (parity * 100).div_ceil(shards).min(100) as u8
+}
+
+/// Audio reservation from the resolved Welcome: PCM cost, the fixed AC-3 / E-AC-3 rate, else
+/// the budget the audio thread runs ([`audio_budget`](super::handshake::audio_budget), the
+/// operator's `audio.quality` included), with redundancy only when `HOST_CAP_AUDIO_RED` was
+/// granted.
 pub(super) fn audio_reserved_kbps(welcome: &punktfunk_core::quic::Welcome) -> u32 {
-    if welcome.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM {
+    use punktfunk_core::audio::bitstream;
+    if bitstream::is_bitstream(welcome.audio_codec) {
+        bitstream::bitrate_kbps(welcome.audio_codec, welcome.audio_channels)
+    } else if welcome.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM {
         punktfunk_core::audio::pcm::bitrate_kbps(
             welcome.audio_rate_hz,
             welcome.audio_bits,
             welcome.audio_channels,
         )
     } else {
-        punktfunk_core::audio::plan_audio_budget(
+        super::handshake::audio_budget(
+            welcome.host_caps & punktfunk_core::quic::HOST_CAP_AUDIO_RED != 0,
             welcome.bitrate_kbps,
             welcome.audio_channels,
             punktfunk_core::audio::AudioLayout::from_wire(welcome.audio_layout).unwrap_or_default(),
-            punktfunk_core::audio::AudioTier::default(),
-            welcome.host_caps & punktfunk_core::quic::HOST_CAP_AUDIO_RED != 0,
         )
         .kbps
     }
 }
 
-/// `PUNKTFUNK_PYROWAVE_MAX_MBPS` (Mb/s) → kbps. `None` when unset/zero/invalid (no cap).
-/// Every PyroWave session, including an explicit client rate, goes through the pin.
-pub(super) fn pyrowave_auto_pin_ceiling_kbps() -> Option<u32> {
-    pf_host_config::knob("PUNKTFUNK_PYROWAVE_MAX_MBPS")
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .filter(|&m| m > 0)
-        .map(|m| m.saturating_mul(1000))
-}
-
 /// A PyroWave session's `(floor, pin)` at `mode`, kbps: [`BPP_FLOOR`] and the session's `bpp`
-/// ([`session_pyrowave_bpp`]), the floor never over the pin. An Automatic session adapts
-/// between them.
+/// ([`session_pyrowave_bpp`]) under its `ceiling`, the floor never over the pin. An Automatic
+/// session adapts between them.
 ///
 /// [`BPP_FLOOR`]: punktfunk_core::pyrowave::BPP_FLOOR
 pub(super) fn pyrowave_bounds_kbps(
@@ -351,9 +368,9 @@ pub(super) fn pyrowave_bounds_kbps(
     chroma: crate::encode::ChromaFormat,
     bit_depth: u8,
     bpp: f64,
-    ceiling: fn() -> Option<u32>,
+    ceiling: Option<u32>,
 ) -> (u32, u32) {
-    let pin = resolve_bitrate_kbps_under(
+    let pin = resolve_bitrate_kbps_for(
         crate::encode::Codec::PyroWave,
         0,
         mode,
@@ -373,30 +390,22 @@ pub(super) fn pyrowave_bounds_kbps(
 }
 
 /// What a PyroWave session encodes at `mode`: the pin at the session's bits per pixel
-/// ([`SessionPlan::pyrowave_bpp`](crate::session_plan::SessionPlan::pyrowave_bpp)), or an
-/// Automatic session's `running` rate held inside that mode's bounds.
+/// ([`SessionPlan::pyrowave_bpp`](crate::session_plan::SessionPlan::pyrowave_bpp)) under the
+/// session's `ceiling`, or an Automatic session's `running` rate held inside that mode's bounds.
 pub(super) fn pyrowave_mode_kbps(
     running: Option<u32>,
     mode: &punktfunk_core::config::Mode,
     plan: &crate::session_plan::SessionPlan,
+    ceiling: Option<u32>,
 ) -> u32 {
     let (floor, pin) = pyrowave_bounds_kbps(
         mode,
         plan.chroma,
         plan.bit_depth,
         plan.pyrowave_bpp,
-        pyrowave_auto_pin_ceiling_kbps,
+        ceiling,
     );
     running.map_or(pin, |kbps| kbps.clamp(floor, pin))
-}
-
-/// `PUNKTFUNK_FEC_PCT` pins recovery and disables adaptive FEC. `None` ⇒ adaptive. `0`
-/// disables FEC. Clamped to ≤ 90.
-pub(super) fn fec_static_override() -> Option<u8> {
-    std::env::var("PUNKTFUNK_FEC_PCT")
-        .ok()
-        .and_then(|s| s.trim().parse::<u8>().ok())
-        .map(|p| p.min(90))
 }
 
 /// Whether this source adapts FEC: only sources that can keep encoder and packetizer
@@ -486,6 +495,28 @@ mod tests {
         }
     }
 
+    /// A screen at a quarter of the video encodes a quarter of the whole's rate, floored at
+    /// the minimum, and its full read-back is the session's budget.
+    #[test]
+    fn a_share_of_the_video_is_that_share_of_the_encoder_rate() {
+        let whole = EncDerive {
+            audio_kbps: 512,
+            shard_payload: 1408,
+            fec_percent: 10,
+            head_only_hz: None,
+            share_permille: SHARE_ALL,
+        };
+        let quarter = EncDerive {
+            share_permille: 250,
+            ..whole
+        };
+        let budget = 40_000;
+        assert_eq!(quarter.enc_kbps(budget), whole.enc_kbps(budget) / 4);
+        assert_eq!(quarter.enc_kbps(1), MIN_BITRATE_KBPS);
+        let asked = quarter.enc_kbps(budget);
+        assert_eq!(quarter.applied_budget_kbps(budget, asked), budget);
+    }
+
     #[test]
     fn full_apply_readback_is_the_request_not_the_deflated_roundtrip() {
         // A roundtrip that lost only truncation must report the full request, not a phantom ceiling.
@@ -493,7 +524,8 @@ mod tests {
             audio_kbps: 576,
             shard_payload: 1408,
             fec_percent: 8,
-            identity: false,
+            head_only_hz: None,
+            share_permille: SHARE_ALL,
         };
         for budget in [2349u32, 4799, 6857, 9798, 14000, 20000, 940_032] {
             let asked_enc = ed.enc_kbps(budget);
@@ -535,6 +567,19 @@ mod tests {
         assert_eq!(c.resolve(8_000_000), (8_000_000, AckReason::Granted));
     }
 
+    /// A rate under the ceiling, taken whole, says nothing about the ceiling: an ABR dip
+    /// keeps it and its back-off clock.
+    #[test]
+    fn a_full_apply_under_the_ceiling_keeps_it() {
+        let mut c = EncoderCeiling::new();
+        c.note_applied(400_000, 300_000);
+        let wait = c.wait();
+        assert_eq!(c.resolve(250_000), (250_000, AckReason::Granted));
+        c.note_applied(250_000, 250_000);
+        assert_eq!(c.resolve(400_000), (300_000, AckReason::EncoderLimit));
+        assert_eq!(c.wait(), wait);
+    }
+
     /// The encoder that refused a rate is gone (a mode switch, a rebuild on a
     /// new source), and so is what it taught.
     #[test]
@@ -561,7 +606,7 @@ mod tests {
         // A client that sends no quality gets the host's row: ~1.6 bpp, not 20 Mbps.
         let host = session_pyrowave_bpp(0);
         let at = |codec, requested, chroma, depth| {
-            resolve_bitrate_kbps_for(codec, requested, &mode, chroma, depth, host)
+            resolve_bitrate_kbps_for(codec, requested, &mode, chroma, depth, host, None)
         };
         let kbps = at(Codec::PyroWave, 0, ChromaFormat::Yuv420, 8);
         assert_eq!(kbps, 1920 * 1080 * 60 * 16 / 10 / 1000);
@@ -603,14 +648,10 @@ mod tests {
         assert_eq!(session_pyrowave_bpp(120), 1.2);
         assert_eq!(session_pyrowave_bpp(10), 0.5);
         assert_eq!(session_pyrowave_bpp(900), 2.0);
-        fn none() -> Option<u32> {
-            None
-        }
-        fn link() -> Option<u32> {
-            Some(200_000)
-        }
+        let none = None;
+        let link = Some(200_000);
         let pin = |x100, ceiling| {
-            resolve_bitrate_kbps_under(
+            resolve_bitrate_kbps_for(
                 Codec::PyroWave,
                 0,
                 &fhd,
@@ -639,6 +680,7 @@ mod tests {
     fn a_mode_switch_keeps_the_session_quality() {
         use crate::encode::{ChromaFormat, Codec};
         let mut plan = crate::session_plan::SessionPlan::resolve(
+            &crate::encode::resolve(),
             8,
             false,
             ChromaFormat::Yuv420,
@@ -654,7 +696,7 @@ mod tests {
             refresh_hz: 60,
         };
         assert_eq!(
-            pyrowave_mode_kbps(None, &uhd, &plan),
+            pyrowave_mode_kbps(None, &uhd, &plan, None),
             3840 * 2160 * 60 / 1000
         );
     }
@@ -675,6 +717,7 @@ mod tests {
                 crate::encode::ChromaFormat::Yuv420,
                 8,
                 session_pyrowave_bpp(0),
+                None,
             ),
             MIN_BITRATE_KBPS
         );
@@ -691,8 +734,8 @@ mod tests {
             refresh_hz: 240,
         };
         let host = session_pyrowave_bpp(0);
-        let pin = |requested, mode: &Mode, chroma, depth, ceiling: fn() -> Option<u32>| {
-            resolve_bitrate_kbps_under(
+        let pin = |requested, mode: &Mode, chroma, depth, ceiling: Option<u32>| {
+            resolve_bitrate_kbps_for(
                 Codec::PyroWave,
                 requested,
                 mode,
@@ -702,12 +745,8 @@ mod tests {
                 ceiling,
             )
         };
-        fn none() -> Option<u32> {
-            None
-        }
-        fn link() -> Option<u32> {
-            Some(4_500_000)
-        }
+        let none = None;
+        let link = Some(4_500_000);
         let uncapped = pin(0, &mode, ChromaFormat::Yuv444, 10, none);
         assert!(
             uncapped > 5_000_000,
@@ -742,12 +781,8 @@ mod tests {
         let bounds = |mode: &Mode, ceiling| {
             pyrowave_bounds_kbps(mode, ChromaFormat::Yuv420, 8, host, ceiling)
         };
-        fn none() -> Option<u32> {
-            None
-        }
-        fn tight() -> Option<u32> {
-            Some(300_000)
-        }
+        let none = None;
+        let tight = Some(300_000);
         let uhd = Mode {
             width: 3840,
             height: 2160,
@@ -773,6 +808,7 @@ mod tests {
         // A rebuild holds an Automatic rate inside the new mode's bounds.
         let (floor, pin) = bounds(&fhd, none);
         let mut plan = crate::session_plan::SessionPlan::resolve(
+            &crate::encode::resolve(),
             8,
             false,
             ChromaFormat::Yuv420,
@@ -782,7 +818,7 @@ mod tests {
             crate::session_plan::DEFAULT_SLICES,
         );
         plan.pyrowave_bpp = host;
-        let at = |running| pyrowave_mode_kbps(running, &fhd, &plan);
+        let at = |running| pyrowave_mode_kbps(running, &fhd, &plan, None);
         assert_eq!(at(None), pin, "an explicit session takes the pin");
         assert_eq!(at(Some(1_000)), floor);
         assert_eq!(at(Some(u32::MAX)), pin);
@@ -798,7 +834,8 @@ mod tests {
             audio_kbps: 512,
             shard_payload: 1408,
             fec_percent: 10,
-            identity: false,
+            head_only_hz: None,
+            share_permille: SHARE_ALL,
         };
         let bps = encoder_bps_for_budget(20_000, 512, 10, 1408, WireFraming::Shards);
         assert_eq!(
@@ -821,18 +858,35 @@ mod tests {
         }
     }
 
-    /// PyroWave's wire budget is its encoder rate, so a granted ask reaches the encoder's
-    /// in-place retarget as asked, and the read-back is the ask.
+    /// PyroWave's pin is its wire budget: the encoder gets it less seal, audio and the head's
+    /// parity, a few percent where a percent on every block took 5–10. The read-back of a full
+    /// apply is the ask.
     #[test]
-    fn a_pyrowave_retarget_reaches_the_encoder_as_asked() {
-        let ed = EncDerive {
+    fn a_pyrowave_pin_prices_only_its_head_parity() {
+        let at = |fec_percent, hz| EncDerive {
             audio_kbps: 512,
             shard_payload: 1408,
-            fec_percent: 20,
-            identity: true,
+            fec_percent,
+            head_only_hz: Some(hz),
+            share_permille: SHARE_ALL,
         };
-        assert_eq!(ed.enc_kbps(1_200_000), 1_200_000);
-        assert_eq!(ed.applied_budget_kbps(1_200_000, 1_200_000), 1_200_000);
+        // 4K60 at 1.6 bpp: 1126 wire shards a frame, a 169-shard head, 9 parity at 5 %.
+        let pin = 796_262;
+        let enc = at(5, 60).enc_kbps(pin);
+        let seal_only = u64::from(pin - 512) * 1408 / 1472;
+        assert!(enc as u64 * 100 >= seal_only * 99, "{enc} vs {seal_only}");
+        assert!(at(10, 60).enc_kbps(pin) < enc, "more parity, less encoder");
+        assert!(at(0, 60).enc_kbps(pin) as u64 >= seal_only);
+        // 720p60 at 1.6 bpp is 124 shards: the four-shard floor prices as 4 %.
+        assert_eq!(pyrowave_parity_pct(88_473, 512, 1408, 60, 5), 4);
+        assert_eq!(pyrowave_parity_pct(pin, 512, 1408, 60, 5), 1);
+        assert_eq!(pyrowave_parity_pct(pin, 512, 1408, 60, 50), 8);
+        for (fec, hz) in [(5, 60), (10, 120), (25, 60)] {
+            let ed = at(fec, hz);
+            let asked = ed.enc_kbps(pin);
+            assert!(ed.budget_kbps(asked) <= pin, "a roundtrip never inflates");
+            assert_eq!(ed.applied_budget_kbps(pin, asked), pin);
+        }
     }
 
     /// An RFI ask prices the report window it lands in. A report a window late closes a

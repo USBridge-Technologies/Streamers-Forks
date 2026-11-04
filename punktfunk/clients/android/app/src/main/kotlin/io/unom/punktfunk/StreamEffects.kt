@@ -173,6 +173,7 @@ internal fun SessionWatchEffect(
     initialAccess: IntArray?,
     ui: StreamUi,
     peripherals: StreamPeripherals,
+    wakeRedial: () -> Boolean,
     onSessionEnded: (SessionEndReason) -> Unit,
 ) {
     val context = LocalContext.current
@@ -217,6 +218,8 @@ internal fun SessionWatchEffect(
                 // died says the host may be asleep. A quit game or a deliberate host end is not
                 // a failure, and must not read like one.
                 val reason = SessionEndReason.fromNative(NativeBridge.nativeEndReason(handle))
+                // A woken host that refused before streaming is dialed again; that dial says why.
+                if (reason == SessionEndReason.HOST_ERROR && wakeRedial()) return@LaunchedEffect
                 when {
                     // Dying inside the countdown's final stretch IS the typed expiry close,
                     // recognized off the countdown because the end-reason byte has no expiry code.
@@ -226,12 +229,9 @@ internal fun SessionWatchEffect(
                             "Your access to this host has expired.",
                             Toast.LENGTH_LONG,
                         ).show()
+                    // The redial says what happens next; this only says why the picture went.
                     reason == SessionEndReason.LOST ->
-                        Toast.makeText(
-                            context,
-                            "Connection lost — the host may be asleep. Wake it to reconnect.",
-                            Toast.LENGTH_LONG,
-                        ).show()
+                        Toast.makeText(context, "Lost the connection — reconnecting.", Toast.LENGTH_SHORT).show()
                     reason == SessionEndReason.HOST_ERROR ->
                         Toast.makeText(
                             context,
@@ -266,7 +266,7 @@ internal fun rememberHostActions(handle: Long, host: KnownHost?): State<List<Hos
         } ?: return@LaunchedEffect
         while (true) {
             actions.value = withContext(Dispatchers.IO) {
-                HostActions.list(identity, kh.address, kh.effectiveMgmtPort, kh.fpHex)
+                HostActions.list(identity, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.port)
             }
             delay(300_000)
         }
@@ -290,7 +290,7 @@ internal fun rememberStreamedGame(handle: Long, host: KnownHost?, ringOpen: Bool
         } ?: return@LaunchedEffect
         game.value = withContext(Dispatchers.IO) {
             LibraryClient.fetchRunning(
-                kh.address, kh.effectiveMgmtPort, identity.certPem, identity.privateKeyPem, kh.fpHex,
+                kh.address, kh.effectiveMgmtPort, identity.certPem, identity.privateKeyPem, kh.fpHex, kh.port,
             )
         }.firstOrNull { it.streamedHere }
     }

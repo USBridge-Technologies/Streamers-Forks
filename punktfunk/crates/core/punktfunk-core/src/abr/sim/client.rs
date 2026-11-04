@@ -10,6 +10,7 @@ use super::link::LossDraw;
 use super::Rng;
 use crate::abr::{Driver, DriverConfig, ProbeReport};
 use crate::client::frame_channel::JumpToLive;
+use crate::client::recovery::{RecoveryAsk, RecoveryDriver, RecoveryEvent};
 use crate::quic::v2::dgram::NACK_SHORT;
 use crate::stats::Stats;
 use std::collections::VecDeque;
@@ -18,6 +19,8 @@ use std::time::{Duration, Instant};
 /// The webOS client's recovery throttle: one ask per 100 ms until a keyframe
 /// lands.
 const KEYFRAME_ASK_MS: u64 = 100;
+/// Android's no-output backstop: a starved decoder asks for a re-anchor this often.
+const STARVED_ASK_MS: u64 = 500;
 /// Header plus shard, the plaintext the reassembler counts per probe packet —
 /// not the sealed datagram. The field's `delivered_kbps` is in these bytes.
 const PROBE_PACKET_BYTES: u64 = 40 + 1408;
@@ -95,6 +98,28 @@ pub(super) struct ClientCfg {
     pub ports: Option<(u32, u32)>,
     /// After the scenario's injected lost frame, another this often. `0` = once.
     pub dead_every_ms: u64,
+    /// From here the decoder shows nothing: it reports no decode time and asks
+    /// for a re-anchor every [`STARVED_ASK_MS`], counted as starved asks.
+    pub starved_from_ms: Option<u64>,
+    /// The path holds a probe step's tail back this long at every rate, as a
+    /// Wi-Fi client's did in the field: the arrival interval runs over the
+    /// send span by it whether the link is near its wall or not. `0` = none.
+    pub probe_hold_ms: u32,
+    /// The decoder rebuilds at each `(at_ms, for_ms)`: it shows nothing, and the client asks
+    /// the core's recovery driver for a keyframe on every pass until it is back.
+    pub decoder_rebuilds: Vec<(u64, u64)>,
+    /// Steps of this client's wall clock, `(ms, µs)`, ascending. From each one every delay
+    /// reading is off by the step until a re-sync measures the offset again.
+    pub clock_steps: Vec<(u64, i64)>,
+    /// The periodic re-sync batches that land in the run, ms, ascending.
+    pub resyncs_ms: Vec<u64>,
+    /// A swing of up to this much on every frame's decode time, re-drawn every
+    /// `decode_swing_ms`: window means that wander whatever the rate. `0` = none.
+    pub decode_swing_us: u32,
+    pub decode_swing_ms: u64,
+    /// `(ms, µs)`: for this long after the first decoded frame, every frame takes this
+    /// long, as a hardware decoder warming up does. `(0, 0)` = none.
+    pub decode_warmup: (u64, u32),
 }
 
 impl Default for ClientCfg {
@@ -118,6 +143,14 @@ impl Default for ClientCfg {
             repair: Repair::Rfi,
             ports: None,
             dead_every_ms: 0,
+            starved_from_ms: None,
+            probe_hold_ms: 0,
+            decoder_rebuilds: Vec::new(),
+            clock_steps: Vec::new(),
+            resyncs_ms: Vec::new(),
+            decode_swing_us: 0,
+            decode_swing_ms: 0,
+            decode_warmup: (0, 0),
         }
     }
 }
@@ -148,6 +181,8 @@ pub(super) struct WindowRec {
     pub dropped: u64,
     /// Keyframe asks this window — the recovery signal.
     pub recovery_kf: u32,
+    /// A starved decoder's asks this window, which nothing judges.
+    pub starved_kf: u32,
     pub request_kbps: Option<u32>,
     pub cut_from_kbps: Option<u32>,
     pub discarded: bool,
@@ -180,11 +215,12 @@ impl WindowRec {
 
 struct InFlight {
     id: u32,
-    capture_ms: u64,
+    capture_us: u64,
     remaining: u64,
     refused: u64,
     shape: FrameShape,
     encode_us: u32,
+    pace_us: u32,
     repeat: bool,
     idr: bool,
     /// Some of this frame has arrived: its first shard is already timed.
@@ -215,10 +251,24 @@ pub(super) struct Client {
     loss_seen_ms: Option<u64>,
     /// The client's own jump-to-live rule.
     jump: JumpToLive,
+    /// What every delay reading is off by, µs: the clock steps since the last re-sync.
+    clock_err_us: i64,
+    /// The re-sync a no-op clock flush asked for, due one report after the ask.
+    resync_due_ms: Option<u64>,
     decode_free_at_ms: u64,
+    /// The decode swing in force, and when it is drawn again.
+    decode_swing: u32,
+    decode_swing_until_ms: u64,
+    /// When the first frame was decoded.
+    first_decode_ms: Option<u64>,
     /// Keyframe throttle: asking until an IDR lands.
     awaiting_idr: bool,
     kf_next_ms: u64,
+    /// The starved decoder's next ask.
+    starved_next_ms: u64,
+    /// The core's loss recovery, which books a rebuilt decoder's asks.
+    recovery: RecoveryDriver,
+    rebuilding: bool,
     force_loss_at_ms: Option<u64>,
     /// A burst is in flight, how long it lasts, and what its filler
     /// delivered while it was.
@@ -277,6 +327,7 @@ impl Client {
                 ramp: cfg.ramp,
                 probe_only: false,
                 pin_kbps: cfg.pin_kbps,
+                fixed_kbps: (!cfg.automatic && cfg.pin_kbps.is_none()).then_some(cfg.start_kbps),
                 floor_kbps: cfg.floor_kbps,
             },
             joined,
@@ -299,9 +350,17 @@ impl Client {
             resent_bytes: 0,
             loss_seen_ms: None,
             jump: JumpToLive::new(),
+            clock_err_us: 0,
+            resync_due_ms: None,
             decode_free_at_ms: 0,
+            decode_swing: 0,
+            decode_swing_until_ms: 0,
+            first_decode_ms: None,
             awaiting_idr: false,
             kf_next_ms: 0,
+            starved_next_ms: 0,
+            recovery: RecoveryDriver::default(),
+            rebuilding: false,
             force_loss_at_ms: None,
             probing: false,
             probe_duration_ms: 0,
@@ -364,11 +423,12 @@ impl Client {
         }
         self.flight.push_back(InFlight {
             id: f.id,
-            capture_ms: f.capture_ms,
+            capture_us: f.capture_us,
             remaining: f.wire_bytes,
             refused: 0,
             shape: f.shape,
             encode_us: f.encode_us,
+            pace_us: f.pace_us,
             repeat: f.repeat,
             idr: f.idr,
             seen: false,
@@ -389,30 +449,58 @@ impl Client {
     /// link owes it a loss draw.
     ///
     /// The first bytes of a frame are its first shard, which the reassembler
-    /// times whatever becomes of the rest.
+    /// times from capture whatever becomes of the rest, in the clock the pump reads it with.
     pub(super) fn deliver(&mut self, frame: u32, bytes: u64, now_ms: u64) -> Option<u32> {
         let f = self.flight.iter_mut().find(|f| f.id == frame)?;
         let first = !std::mem::replace(&mut f.seen, true);
-        let capture_ms = f.capture_ms;
+        let capture_us = f.capture_us;
         f.remaining = f.remaining.saturating_sub(bytes);
         let tail = (f.remaining == 0).then(|| f.shape.shards());
         if first {
-            self.abr
-                .on_shard_owd(i128::from(now_ms.saturating_sub(capture_ms)) * 1_000_000);
+            let true_us = (now_ms * 1_000).saturating_sub(capture_us);
+            if let Some(us) = self.reading_us(true_us) {
+                self.abr
+                    .on_shard_owd(capture_us * 1_000, i128::from(us) * 1_000);
+            }
         }
         tail
     }
 
-    /// Close one frame: repair what parity covers, then what [`Repair`] can,
-    /// and count the rest. `rtt_ms` is the link's round trip right now.
-    ///
-    /// The NACK model resends only what closes the gap, and neither loses the
-    /// resend nor holds the frames behind it: an upper bound on what a NACK buys.
+    /// A delay of `true_us` as the pump reads it: off by the clock's error, and dropped
+    /// where that leaves it negative. Under a microsecond reads 0 here and is positive on
+    /// the wire, so 0 stays a reading.
+    fn reading_us(&self, true_us: u64) -> Option<i64> {
+        Some(true_us as i64 + self.clock_err_us).filter(|&us| us >= 0)
+    }
+
+    /// Close one frame, then hand the driver the host's timing for it, which
+    /// leaves after the frame's last shard. `rtt_ms` is the link's round trip
+    /// right now. Its delay reaches the driver as the pump reads it; the queue
+    /// metric keeps the true one.
     pub(super) fn complete(&mut self, frame: u32, draw: LossDraw, now_ms: u64, rtt_ms: u64) {
         let Some(pos) = self.flight.iter().position(|f| f.id == frame) else {
             return;
         };
         let f = self.flight.remove(pos).expect("position just found");
+        let timing = crate::quic::HostTiming {
+            pts_ns: f.capture_us * 1_000,
+            host_us: f.encode_us + f.pace_us,
+            stages: Some(crate::quic::HostStages {
+                queue_us: 0,
+                encode_us: f.encode_us,
+                pace_us: f.pace_us,
+            }),
+        };
+        self.close_frame(f, draw, now_ms, rtt_ms);
+        self.abr.on_host_timing(&timing);
+    }
+
+    /// Repair what parity covers, then what [`Repair`] can, and count the rest.
+    /// A completed frame's delay runs from its capture, as the pump's does.
+    ///
+    /// The NACK model resends only what closes the gap, and neither loses the
+    /// resend nor holds the frames behind it: an upper bound on what a NACK buys.
+    fn close_frame(&mut self, f: InFlight, draw: LossDraw, now_ms: u64, rtt_ms: u64) {
         let shards = f.shape.shards();
         let shard_wire = self.cfg.shard_payload as u64 + SHARD_WIRE_OVERHEAD;
         // The depth drops the frame's tail, and the tail on the wire is
@@ -424,13 +512,16 @@ impl Client {
         let mut lost = 0u32;
         // Where each lost shard sat, as the reassembler counts it: parity is the tail.
         let mut places = [0u64; 3];
+        let mut data_lost = vec![0u32; f.shape.blocks as usize];
         let mut mark = |shape: &FrameShape, blocks: &mut [u32], idx: u32| {
-            blocks[shape.block_of(idx) as usize] += 1;
-            places[if idx < shape.data {
-                crate::packet::loss_position(idx, shape.data)
+            let b = shape.block_of(idx) as usize;
+            blocks[b] += 1;
+            if idx < shape.data {
+                data_lost[b] += 1;
+                places[crate::packet::loss_position(idx, shape.data)] += 1;
             } else {
-                2
-            }] += 1;
+                places[2] += 1;
+            }
         };
         for i in 0..refused_shards {
             mark(&f.shape, &mut self.lost_blocks, shards - 1 - i);
@@ -469,6 +560,7 @@ impl Client {
         });
         let mut repaired = 0u32;
         let mut beyond = 0u32;
+        let mut holes = 0u32;
         let mut unrecoverable = f.forced;
         for (b, &lost_b) in self.lost_blocks.iter().enumerate() {
             if lost_b == 0 {
@@ -480,6 +572,7 @@ impl Client {
             } else {
                 unrecoverable = true;
                 beyond += lost_b - parity;
+                holes += data_lost[b];
             }
         }
         let mut arrived = shards.saturating_sub(lost.min(shards));
@@ -513,6 +606,7 @@ impl Client {
         self.stats.fec_recovered_shards += u64::from(repaired);
         if unrecoverable {
             self.stats.frames_dropped += 1;
+            self.stats.dead_shards_lost += u64::from(holes);
             self.lost_frames += 1;
             self.awaiting_idr |= !skipped;
             return;
@@ -522,18 +616,74 @@ impl Client {
         if f.idr {
             self.awaiting_idr = false;
         }
-        let owd_us = (now_ms.saturating_sub(f.capture_ms) * 1_000) as i64;
-        self.abr.on_owd(i128::from(owd_us) * 1_000);
-        self.owd_samples.push((owd_us / 1_000) as u32);
+        // The queue metric is the link's alone: it runs from the send; the
+        // driver reads the delay as the pump would, off by the clock's error.
+        let owd_us = (now_ms * 1_000).saturating_sub(f.capture_us) as i64;
+        if let Some(us) = self.reading_us(owd_us as u64) {
+            self.abr
+                .on_owd(f.capture_us * 1_000, i128::from(us) * 1_000);
+        }
+        self.owd_samples
+            .push(((owd_us - i64::from(f.encode_us)).max(0) / 1_000) as u32);
+        let owd_ms = (owd_us.max(0) / 1_000) as u64;
         self.abr.on_encode_latency(u64::from(f.encode_us), 1);
-        let decode_us = self.decode_us();
-        self.abr.on_decode_latency(u64::from(decode_us), 1);
-        self.decode_free_at_ms =
-            self.decode_free_at_ms.max(now_ms) + u64::from(decode_us).div_ceil(1_000);
-        self.note_latency(owd_us / 1_000, now_ms);
+        // A starved or rebuilding decoder takes the frame and shows nothing: no time, no queue.
+        if !self.starved(now_ms) && !self.in_rebuild(now_ms) {
+            let decode_us = self.decode_us(now_ms);
+            self.abr.on_decode_latency(u64::from(decode_us), 1);
+            self.decode_free_at_ms =
+                self.decode_free_at_ms.max(now_ms) + u64::from(decode_us).div_ceil(1_000);
+        }
+        self.note_latency(owd_ms, now_ms);
     }
 
-    fn decode_us(&mut self) -> u32 {
+    fn starved(&self, now_ms: u64) -> bool {
+        self.cfg.starved_from_ms.is_some_and(|t| now_ms >= t)
+    }
+
+    fn in_rebuild(&self, now_ms: u64) -> bool {
+        self.cfg
+            .decoder_rebuilds
+            .iter()
+            .any(|&(at, len)| (at..at + len).contains(&now_ms))
+    }
+
+    /// A decoder rebuild as Apple's intake runs one: the freeze starts over, the next report
+    /// engages it, and every pass asks for a keyframe. The recovery driver throttles the asks
+    /// and books each as recovery's or the client's own.
+    fn rebuild_asks(&mut self, now_ms: u64, now: Instant, out: &mut Vec<Action>) {
+        let rebuilding = self.in_rebuild(now_ms);
+        if rebuilding != self.rebuilding {
+            self.rebuilding = rebuilding;
+            self.recovery.reset();
+            if rebuilding {
+                self.recovery.engage(self.stats.frames_dropped);
+            }
+        }
+        if !rebuilding {
+            return;
+        }
+        let tick = RecoveryEvent::Tick {
+            frames_dropped: self.stats.frames_dropped,
+        };
+        for ev in [RecoveryEvent::NeedKeyframe, tick] {
+            match self.recovery.step(ev, now).ask {
+                RecoveryAsk::Keyframe => self.abr.on_keyframe_asks(1),
+                RecoveryAsk::StarvedKeyframe => self.abr.on_starved_keyframe_asks(1),
+                RecoveryAsk::Rfi(..) | RecoveryAsk::None => continue,
+            }
+            out.push(Action::Keyframe);
+        }
+    }
+
+    /// One frame's decode time: the warm-up's, then the floor, the jitter, the swing and
+    /// what the rate costs past the knee.
+    fn decode_us(&mut self, now_ms: u64) -> u32 {
+        let first = *self.first_decode_ms.get_or_insert(now_ms);
+        let (warm_ms, warm_us) = self.cfg.decode_warmup;
+        if now_ms < first + warm_ms {
+            return warm_us;
+        }
         let d = self.cfg.decode;
         let over = self.abr.abr.current_kbps.saturating_sub(d.knee_kbps) / 1_000;
         let jitter = if d.jitter_us == 0 {
@@ -541,20 +691,27 @@ impl Client {
         } else {
             self.rng.below(u64::from(d.jitter_us) + 1) as u32
         };
-        d.base_us + jitter + over * d.us_per_mbps
+        if self.cfg.decode_swing_us > 0 && now_ms >= self.decode_swing_until_ms {
+            self.decode_swing = self.rng.below(u64::from(self.cfg.decode_swing_us) + 1) as u32;
+            self.decode_swing_until_ms = now_ms + self.cfg.decode_swing_ms;
+        }
+        d.base_us + jitter + self.decode_swing + over * d.us_per_mbps
     }
 
-    /// The client's jump-to-live over this frame's delay and the decode
-    /// backlog, in frames at the refresh rate. A flush is ABR's severe `flushed`.
-    fn note_latency(&mut self, owd_ms: i64, now_ms: u64) {
+    /// The client's jump-to-live over this frame's delay as the pump reads it and the
+    /// decode backlog, in frames at the refresh rate, routed as the pump routes it. The
+    /// decoder's queue is the only local backlog a flush can find here.
+    fn note_latency(&mut self, owd_ms: u64, now_ms: u64) {
         let backlog = (self.decode_free_at_ms.saturating_sub(now_ms)
             * u64::from(self.cfg.refresh_hz.max(1))
             / 1_000) as usize;
         let now = self.base + Duration::from_millis(now_ms);
-        let lat_ns = i128::from(owd_ms) * 1_000_000;
-        if self.jump.observe(now, lat_ns, true, backlog).is_some() {
+        let lat_ns = (i128::from(owd_ms) * 1_000 + i128::from(self.clock_err_us)) * 1_000;
+        if let Some(trip) = self.jump.observe(now, lat_ns, true, backlog) {
             self.decode_free_at_ms = now_ms;
-            self.abr.on_flush();
+            self.jump
+                .after_flush(trip, 0, backlog)
+                .tell(trip, &mut self.abr);
             self.awaiting_idr = true;
         }
     }
@@ -591,10 +748,11 @@ impl Client {
     /// bottleneck queue drains.
     fn probe_report(&self, done: ProbeDone) -> ProbeReport {
         let packets = self.probe_packets;
-        // Client receive interval: first to last filler arrival. Under two
-        // packets there is no interval and the host's window stands.
+        // Client receive interval: first to last filler arrival, plus what the
+        // path holds the tail back by. Under two packets there is no interval
+        // and the host's window stands.
         let client_interval_ms = if packets >= 2 && self.probe_last_ms > self.probe_first_ms {
-            (self.probe_last_ms - self.probe_first_ms) as u32
+            (self.probe_last_ms - self.probe_first_ms) as u32 + self.cfg.probe_hold_ms
         } else {
             0
         };
@@ -628,10 +786,36 @@ impl Client {
         self.probe_done = Some(done);
     }
 
-    /// One millisecond of client: the host rebuild and the keyframe throttle,
-    /// then the driver, which closes the report window when it comes due.
+    /// The wall clock's steps due by now, then a re-sync landing: it measures the offset
+    /// again, so the readings are right from here and the clock run re-arms. The driver
+    /// hears the frame the readings are in, as the pump's iteration hands it over.
+    fn tick_clock(&mut self, now_ms: u64) {
+        while let Some(&(at, us)) = self.cfg.clock_steps.first() {
+            if at > now_ms {
+                break;
+            }
+            self.clock_err_us += us;
+            self.cfg.clock_steps.remove(0);
+        }
+        let scripted = self.cfg.resyncs_ms.first().is_some_and(|&at| at <= now_ms);
+        if scripted {
+            self.cfg.resyncs_ms.remove(0);
+        }
+        if scripted || self.resync_due_ms.is_some_and(|at| at <= now_ms) {
+            self.resync_due_ms = None;
+            self.clock_err_us = 0;
+            self.jump.rebase();
+        }
+        self.abr.on_clock(i128::from(self.clock_err_us) * 1_000);
+    }
+
+    /// One millisecond of client: the clock, the host rebuild, the keyframe throttle, a
+    /// starved decoder's backstop and a rebuilding decoder's asks, then the driver, which
+    /// closes the report window when it comes due. A window closing takes the re-sync a
+    /// no-op clock flush asked for, as the pump does, and it lands one report later.
     pub(super) fn tick(&mut self, now_ms: u64, base: Instant, out: &mut Vec<Action>) {
         let now = base + Duration::from_millis(now_ms);
+        self.tick_clock(now_ms);
         if self.cfg.rebuild_at_ms.is_some_and(|at| now_ms >= at) {
             self.cfg.rebuild_at_ms = None;
             self.abr.on_pipeline_gap(REBUILD_GAP_MS);
@@ -644,6 +828,12 @@ impl Client {
             self.abr.on_keyframe_asks(1);
             out.push(Action::Keyframe);
         }
+        if self.starved(now_ms) && now_ms >= self.starved_next_ms {
+            self.starved_next_ms = now_ms + STARVED_ASK_MS;
+            self.abr.on_starved_keyframe_asks(1);
+            out.push(Action::Keyframe);
+        }
+        self.rebuild_asks(now_ms, now, out);
         if let Some((at, kbps)) = self.cfg.ceiling_at {
             if now_ms >= at {
                 self.cfg.ceiling_at = None;
@@ -724,6 +914,9 @@ impl Client {
             }
         }
         let Some(w) = tick.window else { return };
+        if self.jump.take_resync() {
+            self.resync_due_ms = Some(now_ms + crate::abr::WINDOW.as_millis() as u64);
+        }
         self.lost_frames = 0;
         let was = self.rate_kbps();
         self.windows.push(WindowRec {
@@ -732,6 +925,7 @@ impl Client {
             actual_kbps: w.sample.actual_kbps,
             dropped: w.sample.dropped,
             recovery_kf: w.sample.recovery_kf,
+            starved_kf: w.sample.starved_kf,
             request_kbps: request,
             cut_from_kbps: request.filter(|&k| k < was).map(|_| was),
             discarded: w.discarded,
@@ -753,10 +947,11 @@ mod tests {
     fn frame(id: u32, bytes: u64, fec: u8) -> Frame {
         Frame {
             id,
-            capture_ms: 0,
+            capture_us: 0,
             wire_bytes: 0,
             shape: FrameShape::of(bytes, 1408, fec),
             encode_us: 1_000,
+            pace_us: 0,
             repeat: false,
             idr: false,
         }
@@ -766,15 +961,21 @@ mod tests {
         Client::new(ClientCfg::default(), 11, base, base)
     }
 
+    /// The report's loss, as the window builds it from these counters.
     fn loss_ppm(c: &Client) -> u32 {
-        crate::quic::window_loss_ppm(c.stats.fec_recovered_shards, 0, c.stats.packets_received)
+        let s = &c.stats;
+        crate::quic::window_loss_ppm(
+            s.fec_recovered_shards,
+            0,
+            s.dead_shards_lost,
+            s.packets_received,
+        )
     }
 
-    /// Parity covers its block's losses or the frame dies; either way
-    /// `loss_ppm` counts only what was repaired, which is why the field sees
-    /// `loss_ppm=0` beside a lost frame.
+    /// Parity covers its block's losses or the frame dies; either way the
+    /// report counts each data shard that never arrived once.
     #[test]
-    fn parity_repairs_its_block_and_an_unrecoverable_frame_reports_no_loss() {
+    fn parity_repairs_its_block_and_an_unrecoverable_frame_reports_its_holes() {
         let mut c = client(Instant::now());
         // 45 000 bytes = 32 data shards, 4 parity at 10 %.
         let f = frame(1, 45_000, 10);
@@ -794,7 +995,7 @@ mod tests {
         );
         assert_eq!(c.stats.frames_dropped, 0, "four shards, four parity");
         assert_eq!(c.stats.fec_recovered_shards, 4);
-        assert!(loss_ppm(&c) > 0);
+        assert_eq!(loss_ppm(&c), 4 * 1_000_000 / 36);
 
         let mut c = client(Instant::now());
         c.expect(&frame(2, 45_000, 10), 0);
@@ -813,10 +1014,11 @@ mod tests {
             c.stats.frames_dropped, 1,
             "one shard past the parity loses the frame"
         );
+        assert_eq!(c.stats.fec_recovered_shards, 0);
         assert_eq!(
             loss_ppm(&c),
-            0,
-            "an unrecoverable frame teaches loss_ppm nothing"
+            5 * 1_000_000 / 36,
+            "the dead block's five holes"
         );
     }
 

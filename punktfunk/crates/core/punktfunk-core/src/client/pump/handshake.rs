@@ -50,6 +50,36 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
     }
 }
 
+/// What this client offers. A format epoch is the embedder's promise to rebuild its decoder,
+/// screens its promise to show more than one picture, asked for at Hello or later, and studio
+/// range its report that the display mishandles full range, so core offers each only when the
+/// embedder made it.
+fn client_features(p: &ConnectParams) -> crate::quic::v2::features::FeatureSet {
+    use crate::quic::v2::registry;
+    let mut set = crate::quic::v2::features::FeatureSet::default()
+        .with(registry::FEATURE_STREAM_CONFIG)
+        .with(registry::FEATURE_PAD_WRITES)
+        .with(registry::FEATURE_PROFILES)
+        .with(registry::FEATURE_CLEAR_PLACEMENT)
+        .with(registry::FEATURE_SCROLL_AXIS_UNITS);
+    if p.rebuilds_decoder {
+        set = set.with(registry::FEATURE_FORMAT_EPOCH);
+    }
+    if p.reopens_audio {
+        set = set.with(registry::FEATURE_AUDIO_EPOCH);
+    }
+    if p.shows_screens || !p.screens.is_empty() {
+        set = set.with(registry::FEATURE_SCREENS);
+    }
+    if p.studio_range {
+        set = set.with(registry::FEATURE_STUDIO_RANGE);
+    }
+    if p.studio_range_hdr {
+        set = set.with(registry::FEATURE_STUDIO_RANGE_HDR);
+    }
+    set
+}
+
 /// Take a `Redirect` once: the next dial goes to its address and port with the same
 /// `ClientHello`, pinned to the certificate it names; an empty pin keeps the one dialed with.
 /// A second one on the same connect is a host that can't place this client, not a seat.
@@ -94,7 +124,12 @@ async fn dial(
     let io_err = |e: endpoint::anyhow_result::Error| {
         PunktfunkError::Io(std::io::Error::other(e.to_string()))
     };
-    let (r, observed) = endpoint::client_shared(pin, identity, &[crate::quic::v2::registry::ALPN]);
+    let (r, observed) = endpoint::client_shared(
+        pin,
+        identity,
+        &[crate::quic::v2::registry::ALPN],
+        Some(remote.ip()),
+    );
     let (ep, media) = r.map_err(io_err)?;
     // Retry silence across the connect budget. One quinn dial dies after the ~8 s idle
     // window, shorter than a suspend-to-RAM resume, and per-attempt retransmits back
@@ -126,6 +161,7 @@ async fn dial(
                 if endpoint::refused_alpn(&e) {
                     return Err(PunktfunkError::Rejected(
                         crate::reject::RejectReason::WireVersionMismatch,
+                        String::new(),
                     ));
                 }
                 // Only TimedOut (host never answered) is retryable.
@@ -150,7 +186,8 @@ async fn dial(
     tracing::info!("connected");
     // The host streams as soon as it has `Start`, so its address is whitelisted for media
     // before the handshake. Later is the opening IDR.
-    media.stats().set_host(conn.remote_address());
+    media.set_host(conn.remote_address());
+    let _ = args.shared.reconnect.set(Box::new(media.reconnector()));
     // Inner future so a failure can read `conn.close_reason()`: a typed application
     // close is `Rejected`, not the generic transport error the failed read produces.
     let handshake = async {
@@ -163,7 +200,6 @@ async fn dial(
             .local_ip()
             .map(crate::transport::ifinfo::link_facts)
             .unwrap_or_default();
-        use crate::quic::v2::features::FeatureSet;
         use crate::quic::v2::hello::{ClientHello, Ready, ServerHello};
         use crate::quic::v2::{io as v2io, msg::V2Message, registry};
         v2io::write_stream_type(&mut send, registry::STREAM_CONTROL).await?;
@@ -208,6 +244,7 @@ async fn dial(
                 audio_layout: p.audio_layout.wire(),
                 // How this client fills its view; a host framing for another device reframes to it.
                 video_fit: p.video_fit.wire(),
+                audio_bitstreams: p.audio_bitstreams,
             },
             client_label: Some(super::super::client_label()),
             // Core decides the ABR byte for every embedder: the controller that reads the ack's
@@ -218,18 +255,17 @@ async fn dial(
             link,
             probe_only: p.probe_only,
             pyrowave_bpp_x100: p.pyrowave_bpp_x100,
+            slices: p.slices,
             resume: crate::client::resume::peek(host, port),
             suites: if wants_chacha {
                 vec![MediaSuite::ChaCha20Poly1305, MediaSuite::Aes128Gcm]
             } else {
                 vec![MediaSuite::Aes128Gcm]
             },
-            features: FeatureSet::default()
-                .with(registry::FEATURE_STREAM_CONFIG)
-                .with(registry::FEATURE_PAD_WRITES)
-                .with(registry::FEATURE_PROFILES),
+            features: client_features(p),
             profile: p.profile.clone(),
             access_only: false,
+            screens: p.screens.clone(),
         };
         v2io::send(&mut send, &hello).await?;
         // The hello carried the resume id, so the entry is spent now, not by a dial that died.
@@ -243,6 +279,9 @@ async fn dial(
                 Redirect::TYPE => return Ok(Step::Redirected(Redirect::from_body(&body)?)),
                 registry::MSG_PENDING if !std::mem::replace(&mut waiting, true) => {
                     tracing::info!("the host is waiting for this device to be approved");
+                    args.shared
+                        .pending
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {}
             }
@@ -292,13 +331,31 @@ async fn dial(
         *args.shared.client_link.lock().unwrap() = link;
         tracing::info!(kind = link.kind, mbps = link.mbps, "this end's link facts");
         *args.shared.v2_session.lock().unwrap() = Some(server.session_id);
-        args.shared.anchor.lock().unwrap().on =
-            server.features.has(registry::FEATURE_STREAM_CONFIG);
+        {
+            let mut anchor = args.shared.anchor.lock().unwrap();
+            anchor.on = server.features.has(registry::FEATURE_STREAM_CONFIG);
+            anchor.formats = anchor.on && server.features.has(registry::FEATURE_FORMAT_EPOCH);
+            anchor.book(0, crate::quic::VideoFormat::of_welcome(&welcome));
+        }
+        *args.shared.video_format.lock().unwrap() = crate::quic::VideoFormat::of_welcome(&welcome);
+        {
+            let mut audio = args.shared.audio_anchor.lock().unwrap();
+            audio.on = server.features.has(registry::FEATURE_AUDIO_EPOCH);
+            audio.live = Some(crate::audio::plane::PlaneFormat::from_welcome(
+                welcome.audio_codec,
+                welcome.audio_rate_hz,
+                welcome.audio_bits,
+                welcome.audio_channels,
+                u32::from(welcome.audio_frame_us),
+                welcome.audio_layout,
+            ));
+        }
         let cfg = welcome.session_config(Role::Client);
         let media_v2 = crate::session::MediaV2 {
             clock_origin_ns: server.clock_origin_ns,
             keys: Some(keys),
             clock: None,
+            clear_placement: server.features.has(registry::FEATURE_CLEAR_PLACEMENT),
         };
         let mut session = Session::new(cfg, media_v2, Box::new(media))?;
         // PyroWave: aged-out lossy frames as blocks-with-holes. All-intra renders
@@ -312,6 +369,9 @@ async fn dial(
         if p.frame_parts && welcome.codec != crate::quic::CODEC_PYROWAVE {
             session.set_deliver_frame_parts(true);
         }
+        let screens = server.features.has(registry::FEATURE_SCREENS);
+        args.shared.screens.set_on(screens);
+        session.set_screens(screens);
         Ok::<_, PunktfunkError>(Step::Session(Box::new((
             session,
             send,
@@ -322,6 +382,7 @@ async fn dial(
                 clock_offset_ns,
                 clock_rtt_ns,
                 profile: server.profile.clone(),
+                scroll_axis_units: server.features.has(registry::FEATURE_SCROLL_AXIS_UNITS),
             },
         ))))
     };
@@ -369,7 +430,7 @@ async fn dial(
                     .await;
             }
             Err(match reject_from_close(&conn) {
-                Some((r, _)) => PunktfunkError::Rejected(r),
+                Some((r, said)) => PunktfunkError::Rejected(r, said),
                 None => e,
             })
         }
@@ -424,5 +485,48 @@ mod tests {
             (host.as_str(), port, pin),
             ("10.0.0.5", 9779, Some([0xab; 32]))
         );
+    }
+
+    /// Screens are offered on the embedder's promise or its Hello ask, never without either.
+    #[test]
+    fn screens_are_offered_on_the_promise() {
+        use crate::quic::v2::registry::FEATURE_SCREENS;
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        let mut p = ConnectParams::new("couch-pc", 9777, mode, Duration::from_secs(1));
+        assert!(!client_features(&p).has(FEATURE_SCREENS));
+        p.shows_screens = true;
+        assert!(
+            client_features(&p).has(FEATURE_SCREENS),
+            "a promise with no ask"
+        );
+        p.shows_screens = false;
+        p.screens = vec![crate::quic::v2::msg::Screen {
+            mode,
+            ..Default::default()
+        }];
+        assert!(client_features(&p).has(FEATURE_SCREENS), "an ask");
+    }
+
+    /// Studio range is asked for only on the embedder's report, SDR and HDR each on its own.
+    #[test]
+    fn studio_range_is_asked_on_the_report() {
+        use crate::quic::v2::registry::{FEATURE_STUDIO_RANGE, FEATURE_STUDIO_RANGE_HDR};
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        let mut p = ConnectParams::new("couch-pc", 9777, mode, Duration::from_secs(1));
+        assert!(!client_features(&p).has(FEATURE_STUDIO_RANGE));
+        assert!(!client_features(&p).has(FEATURE_STUDIO_RANGE_HDR));
+        p.studio_range = true;
+        assert!(client_features(&p).has(FEATURE_STUDIO_RANGE));
+        assert!(!client_features(&p).has(FEATURE_STUDIO_RANGE_HDR));
+        p.studio_range_hdr = true;
+        assert!(client_features(&p).has(FEATURE_STUDIO_RANGE_HDR));
     }
 }

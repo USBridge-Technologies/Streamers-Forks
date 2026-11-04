@@ -23,17 +23,17 @@ fn in_flight_frame_owns_the_raw_source_hold() {
     assert_eq!(std::sync::Arc::strong_count(&hold), 1);
 }
 
-/// BT.709 limited-range YCbCr of an 8-bit RGB fill — same math as `rgb2yuv.comp`.
+/// BT.709 full-range YCbCr of an 8-bit RGB fill — same math as `rgb2yuv.comp`.
 fn bt709(fill: [u8; 4]) -> (f64, f64, f64) {
     let (b, g, r) = (fill[0] as f64, fill[1] as f64, fill[2] as f64); // BGRA
     (
-        16.0 + 0.1826 * r + 0.6142 * g + 0.0620 * b,
-        128.0 - 0.1006 * r - 0.3386 * g + 0.4392 * b,
-        128.0 + 0.4392 * r - 0.3989 * g - 0.0403 * b,
+        0.2126 * r + 0.7152 * g + 0.0722 * b,
+        128.0 - 0.1146 * r - 0.3854 * g + 0.5000 * b,
+        128.0 + 0.5000 * r - 0.4542 * g - 0.0458 * b,
     )
 }
 
-/// 10-bit limited-range codes of an 8-bit BGRA fill, folded into the decoder's 8-bit
+/// 10-bit full-range codes of an 8-bit BGRA fill, folded into the decoder's 8-bit
 /// output domain (`code10 * 255/1024`). `hdr` picks the shader's matrix: BT.2020 NCL
 /// (`rgb2yuv*10.comp`) or BT.709 (`rgb2yuv*10_709.comp`).
 fn code10_as_u8(fill: [u8; 4], hdr: bool) -> (f64, f64, f64) {
@@ -45,15 +45,15 @@ fn code10_as_u8(fill: [u8; 4], hdr: bool) -> (f64, f64, f64) {
     let s = 255.0 / 1024.0;
     if hdr {
         (
-            (64.0 + 230.1252 * r + 593.9280 * g + 51.9468 * b) * s,
-            (512.0 - 125.1085 * r - 322.8915 * g + 448.0 * b) * s,
-            (512.0 + 448.0 * r - 411.9680 * g - 36.0320 * b) * s,
+            (268.7421 * r + 693.5940 * g + 60.6639 * b) * s,
+            (512.0 - 142.8415 * r - 368.6584 * g + 511.5 * b) * s,
+            (512.0 + 511.5 * r - 470.3603 * g - 41.1392 * b) * s,
         )
     } else {
         (
-            (64.0 + 186.2376 * r + 626.5152 * g + 63.2472 * b) * s,
-            (512.0 - 102.6564 * r - 345.3436 * g + 448.0 * b) * s,
-            (512.0 + 448.0 * r - 406.9210 * g - 41.0790 * b) * s,
+            (217.4898 * r + 731.6496 * g + 73.8606 * b) * s,
+            (512.0 - 117.2073 * r - 394.2928 * g + 511.5 * b) * s,
+            (512.0 + 511.5 * r - 464.5984 * g - 46.9016 * b) * s,
         )
     }
 }
@@ -86,9 +86,17 @@ unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8], chroma444: bool) -> (f64
 #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
 fn pyrowave_smoke() {
     let (w, h) = (256u32, 256u32);
-    let mut enc =
-        PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420, 8, false)
-            .expect("open");
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        40_000_000,
+        crate::ChromaFormat::Yuv420,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
     assert!(!enc.caps().supports_rfi);
 
     let colors = [
@@ -138,13 +146,54 @@ fn pyrowave_smoke() {
 
 /// 24-bpp CPU payloads expand 3→4, not refuse. Channel order is load-bearing: a
 /// swapped R/B or misplaced pad moves chroma means by tens of codes.
+/// A real encoder's windowed AU leads with its level-4 head: the sealer finds it short of the
+/// whole AU, and the reordered windows still decode.
+#[test]
+#[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+fn pyrowave_au_leads_with_its_head() {
+    let (w, h) = (1920u32, 1080u32);
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        200_000_000,
+        crate::ChromaFormat::Yuv420,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
+    enc.set_wire_chunking(1408);
+    enc.submit(&test_card(w, h, 3)).expect("submit");
+    let au = enc.poll().expect("poll").expect("AU");
+    assert!(au.chunk_aligned);
+    let windows = au.data.len() / 1408;
+    let head = punktfunk_core::pyrowave::head_shards(&au.data, 1408)
+        .expect("window 0 opens with the sequence header");
+    assert!(
+        head > 0 && head < windows / 2,
+        "{head} of {windows} windows"
+    );
+    let stream = unwindow(&au.data, 1408).expect("well-formed windows");
+    // SAFETY: test-only FFI with locally-owned buffers.
+    unsafe { decode_planes(w, h, &stream) };
+}
+
 #[test]
 #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
 fn pyrowave_smoke_cpu_rgb24() {
     let (w, h) = (256u32, 256u32);
-    let mut enc =
-        PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420, 8, false)
-            .expect("open");
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        40_000_000,
+        crate::ChromaFormat::Yuv420,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
     let colors: [[u8; 3]; 3] = [[200, 40, 40], [40, 200, 40], [40, 40, 200]];
     for fmt in [PixelFormat::Rgb, PixelFormat::Bgr] {
         for (i, c) in colors.iter().enumerate() {
@@ -173,7 +222,8 @@ fn slot_vram_cost_stays_bounded() {
         (3840, 2160, crate::ChromaFormat::Yuv420, "4K 4:2:0"),
         (3840, 2160, crate::ChromaFormat::Yuv444, "4K 4:4:4"),
     ] {
-        let enc = PyroWaveEncoder::open(w, h, 60, 40_000_000, chroma, 8, false).expect("open");
+        let enc = PyroWaveEncoder::open(w, h, 60, 40_000_000, chroma, 8, false, &Knobs::from_env())
+            .expect("open");
         // SAFETY: plain memory-requirement queries on images this encoder owns.
         let per_slot: u64 = unsafe {
             [
@@ -204,9 +254,17 @@ fn slot_vram_cost_stays_bounded() {
 #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
 fn pyrowave_refuses_a_frame_that_is_not_the_mode() {
     let (w, h) = (256u32, 256u32);
-    let mut enc =
-        PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420, 8, false)
-            .expect("open");
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        40_000_000,
+        crate::ChromaFormat::Yuv420,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
     for (fw, fh) in [(w - 2, h), (w, h - 2), (w + 2, h + 2)] {
         let err = enc
             .submit(&cpu_frame(fw, fh, 0, [200, 40, 40, 255]))
@@ -240,8 +298,17 @@ fn pyrowave_refuses_a_frame_that_is_not_the_mode() {
 #[test]
 #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
 fn import_failure_leaks_no_fds() {
-    let enc = PyroWaveEncoder::open(64, 64, 60, 5_000_000, crate::ChromaFormat::Yuv420, 8, false)
-        .expect("open");
+    let enc = PyroWaveEncoder::open(
+        64,
+        64,
+        60,
+        5_000_000,
+        crate::ChromaFormat::Yuv420,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
     let memfd_frame = |modifier: u64| {
         let fd = rustix::fs::memfd_create(c"pf-import-leak", rustix::fs::MemfdFlags::empty())
             .expect("memfd_create");
@@ -301,9 +368,17 @@ fn import_failure_leaks_no_fds() {
 #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
 fn pyrowave_smoke_444() {
     let (w, h) = (256u32, 256u32);
-    let mut enc =
-        PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv444, 8, false)
-            .expect("open");
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        40_000_000,
+        crate::ChromaFormat::Yuv444,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
     let colors = [
         [40u8, 40, 200, 255],
         [40, 200, 40, 255],
@@ -331,9 +406,17 @@ fn pyrowave_smoke_444() {
 
     // Busy content at ~2.6 bpp — the regime that overran 4:2:0-sized payload staging.
     let budget_bps = w as u64 * h as u64 * 60 * 26 / 10;
-    let mut enc =
-        PyroWaveEncoder::open(w, h, 60, budget_bps, crate::ChromaFormat::Yuv444, 8, false)
-            .expect("open");
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        budget_bps,
+        crate::ChromaFormat::Yuv444,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
     let mut sizes = Vec::new();
     for _ in 0..3 {
         enc.submit(&test_card(w, h, 7)).expect("busy submit");
@@ -367,8 +450,9 @@ fn pyrowave_smoke_10bit() {
         (crate::ChromaFormat::Yuv420, true, "BT.2020 PQ 4:2:0"),
         (crate::ChromaFormat::Yuv444, true, "BT.2020 PQ 4:4:4"),
     ] {
-        let mut enc = PyroWaveEncoder::open(w, h, 60, 40_000_000, chroma, 10, hdr)
-            .unwrap_or_else(|e| panic!("{label}: open: {e:#}"));
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, 40_000_000, chroma, 10, hdr, &Knobs::from_env())
+                .unwrap_or_else(|e| panic!("{label}: open: {e:#}"));
         let fill = [40u8, 40, 200, 255];
         enc.submit(&cpu_frame(w, h, 0, fill))
             .unwrap_or_else(|e| panic!("{label}: submit: {e:#}"));
@@ -377,13 +461,13 @@ fn pyrowave_smoke_10bit() {
             .unwrap_or_else(|e| panic!("{label}: poll: {e:#}"))
             .unwrap_or_else(|| panic!("{label}: no AU"));
         assert!(au.keyframe, "{label}: AU is not a keyframe");
-        // The sequence header's colour byte: LIMITED + LEFT always, the BT.2020
+        // The sequence header's colour byte: FULL + LEFT always, the BT.2020
         // primaries/PQ/matrix bits only on an HDR session (pyrowave_wire.rs).
         let stamped = au.data[7];
         assert_eq!(
             stamped & 0xC0,
-            0xC0,
-            "{label}: colour byte {stamped:#04x} misses LIMITED+LEFT"
+            0x80,
+            "{label}: colour byte {stamped:#04x} misses FULL+LEFT"
         );
         assert_eq!(
             stamped & 0x38,
@@ -447,8 +531,17 @@ fn pyrowave_dump_golden() {
 
     // Odd-block geometry: 256 aligns clean, 144 → aligned 160 exercises overhang. ~1.6 bpp.
     let (w, h) = (256u32, 144u32);
-    let mut enc = PyroWaveEncoder::open(w, h, 60, 4_000_000, crate::ChromaFormat::Yuv420, 8, false)
-        .expect("open");
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        4_000_000,
+        crate::ChromaFormat::Yuv420,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
 
     let dump = |name: &str, bytes: &[u8]| {
         std::fs::write(dir.join(name), bytes).expect("write fixture");
@@ -480,8 +573,17 @@ fn pyrowave_dump_golden() {
     dump("ref-chunked-cr.bin", &cr);
 
     // 4:4:4 dense AU + full-res chroma reference. Same odd-block geometry.
-    let mut enc = PyroWaveEncoder::open(w, h, 60, 6_500_000, crate::ChromaFormat::Yuv444, 8, false)
-        .expect("open");
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        6_500_000,
+        crate::ChromaFormat::Yuv444,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
     enc.submit(&test_card(w, h, 13)).expect("444 submit");
     let au = enc.poll().expect("poll").expect("444 AU");
     assert!(!au.chunk_aligned);
@@ -519,6 +621,7 @@ fn pyrowave_dump_bench_capture() {
         crate::ChromaFormat::Yuv420,
         bits,
         bits >= 10,
+        &Knobs::from_env(),
     )
     .expect("open");
     enc.set_wire_chunking(1408);
@@ -539,84 +642,41 @@ fn pyrowave_dump_bench_capture() {
     std::fs::write(format!("{out}.idx"), idx).expect("write index");
 }
 
-// Device-create ladder needs a real GPU. Grammar is what drifts: same env var drives
-// Windows (patch live) and Linux. Device-free: `queue_priority_candidates` takes the
-// raw string so env-var tests do not race.
-
-const AMD: u32 = 0x1002;
-const LADDER: [vk::QueueGlobalPriorityKHR; 2] = [
-    vk::QueueGlobalPriorityKHR::REALTIME,
-    vk::QueueGlobalPriorityKHR::HIGH,
-];
-
-/// Unset means the realtime ladder (REALTIME then HIGH), not a single class.
+/// The open plan spells its extension names itself; a typo enables an extension no driver has.
 #[test]
-fn unset_requests_the_realtime_ladder() {
-    assert_eq!(queue_priority_candidates(None, AMD), LADDER);
-}
-
-/// Unset on NVIDIA means HIGH alone: its REALTIME queue slows every submit.
-#[test]
-fn unset_on_nvidia_requests_high() {
-    assert_eq!(
-        queue_priority_candidates(None, VENDOR_NVIDIA),
-        vec![vk::QueueGlobalPriorityKHR::HIGH]
-    );
-    assert_eq!(
-        queue_priority_candidates(Some("junk"), VENDOR_NVIDIA),
-        vec![vk::QueueGlobalPriorityKHR::HIGH]
-    );
-}
-
-/// An explicit `realtime` wins over the NVIDIA default.
-#[test]
-fn realtime_asks_for_the_ladder_on_every_vendor() {
-    for vendor in [AMD, VENDOR_NVIDIA] {
-        assert_eq!(queue_priority_candidates(Some("REALTIME"), vendor), LADDER);
+fn the_open_plan_spells_extensions_as_ash_does() {
+    use crate::pyrowave_open as open;
+    for (ours, theirs) in [
+        (open::EXT_MEMORY_FD, ash::khr::external_memory_fd::NAME),
+        (open::EXT_DMA_BUF, ash::ext::external_memory_dma_buf::NAME),
+        (
+            open::EXT_DRM_MODIFIER,
+            ash::ext::image_drm_format_modifier::NAME,
+        ),
+        (open::EXT_FOREIGN, ash::ext::queue_family_foreign::NAME),
+        (open::EXT_PRIORITY_KHR, vk::KHR_GLOBAL_PRIORITY_NAME),
+        (open::EXT_PRIORITY_EXT, vk::EXT_GLOBAL_PRIORITY_NAME),
+        (
+            open::EXT_CALIBRATED_KHR,
+            ash::khr::calibrated_timestamps::NAME,
+        ),
+        (
+            open::EXT_CALIBRATED_EXT,
+            ash::ext::calibrated_timestamps::NAME,
+        ),
+    ] {
+        assert_eq!(ours, theirs);
     }
 }
 
-/// `off` is the only disable spelling (case-insensitive). `0` is not: the C side
-/// does not accept it either.
-#[test]
-fn only_off_disables_and_it_is_case_insensitive() {
-    for vendor in [AMD, VENDOR_NVIDIA] {
-        assert!(queue_priority_candidates(Some("off"), vendor).is_empty());
-        assert!(queue_priority_candidates(Some("OFF"), vendor).is_empty());
-        assert!(queue_priority_candidates(Some("Off"), vendor).is_empty());
-        assert!(!queue_priority_candidates(Some("0"), vendor).is_empty());
-    }
-}
-
-/// `high` is HIGH only — silently trying REALTIME first would hide "elevated, not realtime".
-#[test]
-fn high_asks_for_high_alone() {
-    assert_eq!(
-        queue_priority_candidates(Some("high"), AMD),
-        vec![vk::QueueGlobalPriorityKHR::HIGH]
-    );
-    assert_eq!(
-        queue_priority_candidates(Some("HIGH"), AMD),
-        vec![vk::QueueGlobalPriorityKHR::HIGH]
-    );
-}
-
-/// Junk falls back to the default ladder, not to off: unparseable must not disable the lever.
-#[test]
-fn junk_falls_back_to_the_default_ladder() {
-    for raw in ["", "yes", "1", "medium", "  high"] {
-        assert_eq!(queue_priority_candidates(Some(raw), AMD), LADDER, "{raw:?}");
-    }
-}
-
-/// Luma PSNR (dB) of decoded Y against BT.709 limited luma of source BGRA. Luma
+/// Luma PSNR (dB) of decoded Y against BT.709 full-range luma of source BGRA. Luma
 /// only: chroma is subsampled on 4:2:0, and luma is where wavelet quantisation shows.
 fn luma_psnr(src_bgra: &[u8], decoded_y: &[u8]) -> f64 {
     assert_eq!(src_bgra.len(), decoded_y.len() * 4);
     let mut sse = 0.0f64;
     for (px, &got) in src_bgra.chunks_exact(4).zip(decoded_y) {
         let (b, g, r) = (px[0] as f64, px[1] as f64, px[2] as f64);
-        let want = 16.0 + 0.1826 * r + 0.6142 * g + 0.0620 * b;
+        let want = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         let d = want - got as f64;
         sse += d * d;
     }
@@ -637,9 +697,17 @@ fn pyrowave_streamed_chunks_reassemble_and_keep_the_picture() {
     const WINDOW: usize = 1408;
     // 1280×720 at 60 Mb/s ≈ 125 KB/AU — several chunks, many windows.
     let (w, h) = (1280u32, 720u32);
-    let mut enc =
-        PyroWaveEncoder::open(w, h, 60, 200_000_000, crate::ChromaFormat::Yuv420, 8, false)
-            .expect("open pyrowave encoder");
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        200_000_000,
+        crate::ChromaFormat::Yuv420,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open pyrowave encoder");
     enc.set_wire_chunking(WINDOW);
 
     assert!(
@@ -721,9 +789,17 @@ fn pyrowave_streamed_chunks_reassemble_and_keep_the_picture() {
 fn wire_sequence_increments_across_alternating_handles() {
     const FRAMES: u32 = 20;
     let (w, h) = (256u32, 256u32);
-    let mut enc =
-        PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420, 8, false)
-            .expect("open");
+    let mut enc = PyroWaveEncoder::open(
+        w,
+        h,
+        60,
+        40_000_000,
+        crate::ChromaFormat::Yuv420,
+        8,
+        false,
+        &Knobs::from_env(),
+    )
+    .expect("open");
     const { assert!(SLOTS >= 2) };
 
     let mut aus: Vec<Vec<u8>> = Vec::new();
@@ -811,8 +887,17 @@ fn overlapping_two_frames_reproduces_the_synchronous_picture() {
     // Odd seeds: `test_card` starts its LCG at `seed | 1`, so 2 and 3 build the same card.
     let cards: Vec<CapturedFrame> = (0..FRAMES).map(|i| test_card(w, h, 2 * i + 1)).collect();
     let open = || {
-        PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420, 8, false)
-            .expect("open")
+        PyroWaveEncoder::open(
+            w,
+            h,
+            60,
+            40_000_000,
+            crate::ChromaFormat::Yuv420,
+            8,
+            false,
+            &Knobs::from_env(),
+        )
+        .expect("open")
     };
 
     let mut enc = open();

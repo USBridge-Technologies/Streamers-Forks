@@ -3,15 +3,18 @@
 //! single-reference, Baseline (no B-frames), bitrate RC, in-band SPS/PPS each
 //! IDR. `submit` encodes immediately and stashes the AU for `poll`.
 //!
-//! RGB→YUV is ours, BT.709 limited range. The crate `YUVBuffer` converter is
-//! BT.601; decoded-as-709 that is a constant hue error, so it is not used.
-//! [`VuiConfig::bt709`] is written in `open`: vendor TV decoders guess
-//! colorimetry from resolution when VUI is unspecified (4K SDR as BT.2020).
+//! RGB→YUV is ours, BT.709 at the session's range (full, or studio where the
+//! client asked). The crate `YUVBuffer` converter is BT.601; decoded-as-709 that
+//! is a constant hue error, so it is not used. [`VuiConfig::bt709`] is written in
+//! `open`: vendor TV decoders guess colorimetry from resolution when VUI is
+//! unspecified (4K SDR as BT.2020).
 //!
-//! Pin the VUI bits with `sps_signals_bt709_limited`. Conversion anchors live
-//! in the tests below.
+//! Pin the VUI bits with `sps_signals_bt709_at_the_session_range`. Conversion
+//! anchors live in the tests below.
 
 use super::{EncodedFrame, Encoder};
+use crate::cpu_ingest::{chroma709, luma709};
+use crate::env_knobs::Knobs;
 use anyhow::{bail, ensure, Context, Result};
 use openh264::encoder::{
     BitRate, Complexity, Encoder as Oh264, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
@@ -28,14 +31,16 @@ pub struct OpenH264Encoder {
     height: u32,
     fps: u32,
     src_format: PixelFormat,
-    /// Reused I420 planes (BT.709 limited CSC; see the module doc).
+    /// The range the planes are written at and the SPS signals; `false` is studio.
+    full_range: bool,
+    /// Reused I420 planes (BT.709 CSC; see the module doc).
     y_plane: Vec<u8>,
     u_plane: Vec<u8>,
     v_plane: Vec<u8>,
     frame_idx: i64,
     force_kf: bool,
-    /// FIFO of AUs for `poll`. A single-slot `Option` would overwrite under
-    /// `pipeline_depth()` submits-before-poll and skew pts pairing (opening IDR).
+    /// FIFO of AUs for `poll`. A single-slot `Option` would overwrite when two
+    /// submits precede a poll and skew pts pairing (opening IDR).
     pending: VecDeque<EncodedFrame>,
 }
 
@@ -60,12 +65,15 @@ fn openh264_supports_dimensions(width: u32, height: u32) -> bool {
 }
 
 impl OpenH264Encoder {
+    /// A session writing and signalling BT.709 at `full_range` (`false` is studio).
     pub fn open(
         format: PixelFormat,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_bps: u64,
+        full_range: bool,
+        knobs: &Knobs,
     ) -> Result<Self> {
         // `validate_dimensions` already passed (even, ≤ 4096). Refuse here, at
         // `open`, the 4096-wide modes this encoder cannot serve.
@@ -83,14 +91,17 @@ impl OpenH264Encoder {
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(bps))
             .skip_frames(false)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(intra_period_frames(fps)))
+            .intra_frame_period(IntraFramePeriod::from_num_frames(intra_period_frames(
+                fps,
+                knobs.oh264_gop,
+            )))
             .sps_pps_strategy(SpsPpsStrategy::ConstantId) // SPS/PPS in-band on every IDR
-            .num_threads(num_threads())
+            .num_threads(knobs.oh264_threads.unwrap_or(2)) // latency over throughput
             .scene_change_detect(false) // no surprise IDRs (bitrate spikes / freeze)
             .adaptive_quantization(true)
             .complexity(Complexity::Low) // latency over BD-rate
             .profile(Profile::Baseline) // no B-frames
-            .vui(VuiConfig::bt709());
+            .vui(VuiConfig::bt709().full_range(full_range));
         let api = OpenH264API::from_source(); // statically-bundled build (default `source` feature)
         let enc = Oh264::with_api_config(api, cfg).context("openh264 Encoder::with_api_config")?;
         let (w, h) = (width as usize, height as usize);
@@ -104,6 +115,7 @@ impl OpenH264Encoder {
             height,
             fps,
             src_format: format,
+            full_range,
             y_plane: vec![0; w * h],
             u_plane: vec![0; (w / 2) * (h / 2)],
             v_plane: vec![0; (w / 2) * (h / 2)],
@@ -113,9 +125,9 @@ impl OpenH264Encoder {
         })
     }
 
-    /// Packed full-range RGB → I420, BT.709 limited. Luma per pixel; Cb/Cr from
-    /// the 2×2 average (same box filter as the crate converter; only the matrix
-    /// changed).
+    /// Packed full-range RGB → I420, BT.709 at the session's range. Luma per pixel;
+    /// Cb/Cr from the 2×2 average (same box filter as the crate converter; only the
+    /// matrix changed).
     fn convert_bt709(&mut self, src: &[u8], bpp: usize, ri: usize, gi: usize, bi: usize) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -127,35 +139,15 @@ impl OpenH264Encoder {
                     let (px, py) = (bx * 2 + dx, by * 2 + dy);
                     let s = &src[(py * w + px) * bpp..];
                     let (r, g, b) = (f32::from(s[ri]), f32::from(s[gi]), f32::from(s[bi]));
-                    self.y_plane[py * w + px] = luma709(r, g, b);
+                    self.y_plane[py * w + px] = luma709(r, g, b, self.full_range);
                     sum = (sum.0 + r, sum.1 + g, sum.2 + b);
                 }
-                let (cb, cr) = chroma709(sum.0 / 4.0, sum.1 / 4.0, sum.2 / 4.0);
+                let (cb, cr) = chroma709(sum.0 / 4.0, sum.1 / 4.0, sum.2 / 4.0, self.full_range);
                 self.u_plane[by * cw + bx] = cb;
                 self.v_plane[by * cw + bx] = cr;
             }
         }
     }
-}
-
-/// Rec.709 Kr / Kb; Kg = 1 − Kr − Kb.
-const KR: f32 = 0.2126;
-const KB: f32 = 0.0722;
-const KG: f32 = 1.0 - KR - KB;
-
-/// Full-range RGB (0..=255) → BT.709 limited luma (16..=235). Lockstep with
-/// `pf-client-core::video::csc_rows`.
-fn luma709(r: f32, g: f32, b: f32) -> u8 {
-    let y = KR * r + KG * g + KB * b;
-    (16.0 + y * (219.0 / 255.0) + 0.5) as u8 // `as` saturates — no manual clamp needed
-}
-
-/// Averaged full-range RGB → BT.709 limited Cb/Cr (16..=240, neutral 128).
-fn chroma709(r: f32, g: f32, b: f32) -> (u8, u8) {
-    let y = KR * r + KG * g + KB * b;
-    let cb = 128.0 + (b - y) * (224.0 / 255.0) / (2.0 * (1.0 - KB));
-    let cr = 128.0 + (r - y) * (224.0 / 255.0) / (2.0 * (1.0 - KR));
-    ((cb + 0.5) as u8, (cr + 0.5) as u8)
 }
 
 impl Encoder for OpenH264Encoder {
@@ -254,23 +246,10 @@ impl Encoder for OpenH264Encoder {
     }
 }
 
-/// Rare automatic IDRs (recovery is `request_keyframe` / RFI). Env
-/// `PUNKTFUNK_OH264_GOP` overrides (0 = encoder-auto).
-fn intra_period_frames(fps: u32) -> u32 {
-    if let Ok(v) = std::env::var("PUNKTFUNK_OH264_GOP") {
-        if let Ok(n) = v.trim().parse::<u32>() {
-            return n;
-        }
-    }
-    fps.max(1).saturating_mul(600) // ~10 min between automatic IDRs
-}
-
-/// Encode threads. Env `PUNKTFUNK_OH264_THREADS` overrides; default 2 (latency over throughput).
-fn num_threads() -> u16 {
-    std::env::var("PUNKTFUNK_OH264_THREADS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .unwrap_or(2)
+/// Rare automatic IDRs (recovery is `request_keyframe` / RFI). `gop`
+/// (`PUNKTFUNK_OH264_GOP`) overrides (0 = encoder-auto).
+fn intra_period_frames(fps: u32, gop: Option<u32>) -> u32 {
+    gop.unwrap_or_else(|| fps.max(1).saturating_mul(600)) // ~10 min between automatic IDRs
 }
 
 #[cfg(test)]
@@ -278,38 +257,60 @@ mod tests {
     use super::*;
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
-    /// Red Cr = 240 because 255(1−Kr)·(224/255)/(2(1−Kr)) = 112. ±1 for float rounding.
+    /// Red Cr = 255 because 255(1−Kr)/(2(1−Kr)) = 127.5 and `as u8` saturates. ±1 for
+    /// float rounding.
     #[test]
     fn bt709_conversion_anchor_points() {
-        assert_eq!(luma709(255.0, 255.0, 255.0), 235);
-        assert_eq!(luma709(0.0, 0.0, 0.0), 16);
-        assert_eq!(chroma709(255.0, 255.0, 255.0), (128, 128));
-        assert_eq!(chroma709(0.0, 0.0, 0.0), (128, 128));
-        let (cb, cr) = chroma709(255.0, 0.0, 0.0);
-        assert_eq!(cr, 240, "pure red must reach the Cr extreme");
+        assert_eq!(luma709(255.0, 255.0, 255.0, true), 255);
+        assert_eq!(luma709(0.0, 0.0, 0.0, true), 0);
+        assert_eq!(chroma709(255.0, 255.0, 255.0, true), (128, 128));
+        assert_eq!(chroma709(0.0, 0.0, 0.0, true), (128, 128));
+        let (cb, cr) = chroma709(255.0, 0.0, 0.0, true);
+        assert_eq!(cr, 255, "pure red must reach the Cr extreme");
+        assert!((98..=100).contains(&cb), "red Cb ~99, got {cb}");
+        let (cb, _) = chroma709(0.0, 0.0, 255.0, true);
+        assert_eq!(cb, 255, "pure blue must reach the Cb extreme");
+    }
+
+    /// Studio: red Cr = 240 because 255(1−Kr)·(224/255)/(2(1−Kr)) = 112.
+    #[test]
+    fn bt709_studio_anchor_points() {
+        assert_eq!(luma709(255.0, 255.0, 255.0, false), 235);
+        assert_eq!(luma709(0.0, 0.0, 0.0, false), 16);
+        assert_eq!(chroma709(255.0, 255.0, 255.0, false), (128, 128));
+        let (cb, cr) = chroma709(255.0, 0.0, 0.0, false);
+        assert_eq!(cr, 240, "pure red must reach the studio Cr extreme");
         assert!((101..=103).contains(&cb), "red Cb ~102, got {cb}");
-        let (cb, _) = chroma709(0.0, 0.0, 255.0);
-        assert_eq!(cb, 240, "pure blue must reach the Cb extreme");
+        let (cb, _) = chroma709(0.0, 0.0, 255.0, false);
+        assert_eq!(cb, 240, "pure blue must reach the studio Cb extreme");
     }
 
     #[test]
     fn bt709_is_not_bt601() {
-        // BT.601 green luma: 16 + 219·0.587 = 144.5; BT.709: 16 + 219·0.7152 = 172.6.
-        let y = luma709(0.0, 255.0, 0.0);
-        assert!((172..=174).contains(&y), "709 green luma ~173, got {y}");
+        // BT.601 green luma: 255·0.587 = 149.7; BT.709: 255·0.7152 = 182.4.
+        let y = luma709(0.0, 255.0, 0.0, true);
+        assert!((181..=183).contains(&y), "709 green luma ~182, got {y}");
     }
 
     /// Exercises the 2×2 block loop and plane sizing, not just per-pixel math.
     #[test]
     fn converts_flat_gray_to_neutral_planes() {
         let (w, h) = (16u32, 8u32);
-        let mut enc =
-            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, 60, 1_000_000).expect("open openh264");
+        let mut enc = OpenH264Encoder::open(
+            PixelFormat::Bgrx,
+            w,
+            h,
+            60,
+            1_000_000,
+            true,
+            &Knobs::from_env(),
+        )
+        .expect("open openh264");
         let bytes = vec![0x80u8; (w * h * 4) as usize];
         enc.convert_bt709(&bytes, 4, 2, 1, 0);
-        // 16 + 128·(219/255) = 125.9 → 126.
+        // Grey stays grey at full range.
         assert!(
-            enc.y_plane.iter().all(|&y| y == 126),
+            enc.y_plane.iter().all(|&y| y == 128),
             "{:?}",
             &enc.y_plane[..4]
         );
@@ -320,8 +321,16 @@ mod tests {
     #[test]
     fn encodes_synthetic_frame_to_annexb_idr() {
         let (w, h, fps) = (1280u32, 720u32, 60u32);
-        let mut enc =
-            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000).expect("open openh264");
+        let mut enc = OpenH264Encoder::open(
+            PixelFormat::Bgrx,
+            w,
+            h,
+            fps,
+            8_000_000,
+            true,
+            &Knobs::from_env(),
+        )
+        .expect("open openh264");
         let frame = CapturedFrame {
             provenance: Default::default(),
             width: w,
@@ -452,38 +461,56 @@ mod tests {
     }
 
     /// `VuiConfig::bt709()` is a request to a C library; this asserts the
-    /// emitted SPS actually carries BT.709 limited. Unsignalled 4K SDR is
-    /// guessed as BT.2020 by vendor TV decoders.
+    /// emitted SPS actually carries BT.709 at the range the planes are written at.
+    /// Unsignalled 4K SDR is guessed as BT.2020 by vendor TV decoders.
     #[test]
-    fn sps_signals_bt709_limited() {
+    fn sps_signals_bt709_at_the_session_range() {
         let (w, h, fps) = (1280u32, 720u32, 60u32);
-        let mut enc =
-            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000).expect("open openh264");
-        let frame = CapturedFrame {
-            provenance: Default::default(),
-            width: w,
-            height: h,
-            pts_ns: 0,
-            format: PixelFormat::Bgrx,
-            payload: FramePayload::Cpu(vec![0x80u8; (w * h * 4) as usize]),
-            cursor: None,
-        };
-        enc.submit(&frame).expect("submit");
-        let au = enc.poll().expect("poll").expect("an AU");
-        let colour = sps_colour(&sps_rbsp(&au.data)).expect(
-            "the SPS must carry video_signal_type + colour_description — \
-             see EncoderConfig::vui in `open`",
-        );
-        // (video_full_range_flag, colour_primaries, transfer, matrix) — 0 = limited, 1 = BT.709.
-        assert_eq!(colour, (0, 1, 1, 1), "expected BT.709 limited signalling");
+        for full_range in [true, false] {
+            let mut enc = OpenH264Encoder::open(
+                PixelFormat::Bgrx,
+                w,
+                h,
+                fps,
+                8_000_000,
+                full_range,
+                &Knobs::from_env(),
+            )
+            .expect("open openh264");
+            let frame = CapturedFrame {
+                provenance: Default::default(),
+                width: w,
+                height: h,
+                pts_ns: 0,
+                format: PixelFormat::Bgrx,
+                payload: FramePayload::Cpu(vec![0x80u8; (w * h * 4) as usize]),
+                cursor: None,
+            };
+            enc.submit(&frame).expect("submit");
+            let au = enc.poll().expect("poll").expect("an AU");
+            let colour = sps_colour(&sps_rbsp(&au.data)).expect(
+                "the SPS must carry video_signal_type + colour_description — \
+                 see EncoderConfig::vui in `open`",
+            );
+            // (video_full_range_flag, colour_primaries, transfer, matrix) — 1 = BT.709.
+            assert_eq!(colour, (u8::from(full_range), 1, 1, 1), "full={full_range}");
+        }
     }
 
     /// The stream through the client's planner: one AU in, one picture out.
     #[test]
     fn the_client_shows_each_picture_in_its_own_au() {
         let (w, h, fps) = (640u32, 480u32, 60u32);
-        let mut enc =
-            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 2_000_000).expect("open openh264");
+        let mut enc = OpenH264Encoder::open(
+            PixelFormat::Bgrx,
+            w,
+            h,
+            fps,
+            2_000_000,
+            true,
+            &Knobs::from_env(),
+        )
+        .expect("open openh264");
         let mut planner = pf_vaapi::H264Planner::new();
         for i in 0..20u64 {
             let frame = CapturedFrame {
@@ -528,7 +555,15 @@ mod tests {
     #[test]
     fn open_refuses_a_mode_openh264_cannot_encode() {
         // Match, not `expect_err`: `OpenH264Encoder` is not `Debug` (raw C handle).
-        let err = match OpenH264Encoder::open(PixelFormat::Bgra, 4096, 2160, 60, 20_000_000) {
+        let err = match OpenH264Encoder::open(
+            PixelFormat::Bgra,
+            4096,
+            2160,
+            60,
+            20_000_000,
+            true,
+            &Knobs::from_env(),
+        ) {
             Ok(_) => panic!("4096x2160 exceeds openh264's long-edge ceiling and must be refused"),
             Err(e) => e,
         };

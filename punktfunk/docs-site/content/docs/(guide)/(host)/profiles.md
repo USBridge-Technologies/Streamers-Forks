@@ -14,34 +14,74 @@ profile, the owner, named after you; while it is the only one, nothing changes f
 3. Under **Where this profile plays**, pick one:
    - **Shares Alex's desktop**, with your name: the same desktop, Steam and games, under another
      name.
-   - **Own desktop**: a desktop of its own, with its own Steam and controllers, on
-     [Windows Server](#on-windows-server) or [Linux](#on-linux).
+   - **Own account (take turns)** (Windows): its own Windows account, Steam and saves, one person
+     at a time — see [On Windows](#on-windows). Any edition of Windows.
+   - **Own desktop**: a desktop of its own that plays at the same time as the others, with its own
+     Steam and controllers, on [Windows Server](#on-windows-server) or [Linux](#on-linux). On
+     Windows Server it gets a new account, or one of this PC's accounts under **Existing account**.
 
 On Linux, **Own desktop** needs [**Reachable without logging in**](#on-linux) and stays greyed until
 it is on. A host holds up to 8 profiles, and two can't share a name.
+
+## On Windows
+
+**Own account (take turns)** binds a profile to a Windows account on this PC. When someone picks it,
+punktfunk brings that account to the screen and streams it, so each person has their own desktop,
+Steam and saves. One person streams at a time — picking another profile switches the PC to that
+account, the way Windows' own **Switch user** does. This needs no Windows Server, no Remote Desktop
+and no extra licence: it works on Windows 11 and every other edition, because nobody is playing at
+the same time. To play at the same time instead, see [On Windows Server](#on-windows-server).
+
+Set it up:
+
+1. In Windows, make an account for each person (**Settings → Accounts → Other users**) and sign in
+   to each one once, so Windows has it ready. You don't have to stay signed in.
+2. In the console, **Add profile** → **Own account (take turns)**, and pick that person's Windows
+   account. Repeat for each person.
+
+A player who picks a profile whose account isn't on the screen sees `Switching to Kid…` while the PC
+changes over; the stream lands once it does. A card's **Start**, **Stop** and **End session** do the
+same by hand. The owner profile is **this desktop as it is**: picking it streams whoever is signed in
+now and switches nobody, which is what you want for playing at the PC itself.
+
+Each person needs their own Steam account; [Steam Families](https://store.steampowered.com/families)
+shares the games. Because only one account is on the screen at a time, Steam opens cleanly for
+whoever is playing — no second copy to collide with.
+
+An account has to have been signed in since the PC last started before a profile can switch to it;
+until then its card reads `Sign Kid in on the PC once`. Signing in from a cold start, with nobody at
+the keyboard, is not built yet.
 
 ## On Windows Server
 
 An **Own desktop** profile signs in to a Windows account of its own, so two people play at once
 without sharing a desktop. [Seats on Windows](/docs/windows-seats) has what it needs, the setup
 and Steam on a seat. In short: open **Profiles** → **Seats**, press **Set up Remote Desktop** if
-the list asks for it, tick **Seats are on**, then **Add profile** → **Own desktop**.
+the list asks for it, tick **Seats are on**, then **Add profile** → **Own desktop**. To sign the
+seat in to a standard account this PC already has, pick **Existing account** and enter its
+password; see [Seats on Windows](/docs/windows-seats#what-you-need).
 
-A player who picks a stopped seat sees `Getting Kid's desk ready…` while it starts. A card's
+A player who picks a stopped seat sees `Getting Kid's desk ready…` while it starts. With
+**Browser streaming** on, a browser plays on a seat too, on the seat's own port, UDP 9783–9786.
+A card's
 **Start**, **Stop** and **End session** do the same by hand; **End session** keeps the seat
-running. **Remove** deletes the profile's Windows account and its files too.
+running. **Remove** deletes the Windows account punktfunk made and its files too. An existing
+account stays, with its files.
 
 ### What a seat can do
 
 A seat's desktop is one virtual screen at its player's resolution. It never shows, turns off or
-powers down a monitor of this machine, and a second device on the same seat shares the screen.
-Only the owner's desktop follows **Displays**; of a device's display settings, only **Largest
-screen this device gets** and the scale follow it onto a seat.
+powers down a monitor of this machine. A second device on the same seat shares the screen when
+its **A second device connects** is **Shares the screen**, and is told the seat is busy
+otherwise. Only the owner's desktop follows **Displays**; of a device's display settings, only
+**Largest screen this device gets**, the scale and **A second device connects** follow it onto a
+seat.
 
 Every seat shares one set of **Seats** settings on **Host**, shown while seats are on:
 
 - **Seats kept warm**: the seats of the most recent players start with the host.
-- **Stop an idle seat after**: 240 minutes by default; 0 never stops one.
+- **Stop an idle seat after**: 240 minutes by default; 0 never stops one. Your own seat never
+  stops for this: it runs your plugins.
 - **End a seat's stream when its game exits**: off keeps streaming the seat's desktop.
 - **Highest mode per seat**, such as `2560x1440@120`: a device's own cap outranks it.
 - **Seats update your games** (Linux): off, seats play the games you installed but can't update
@@ -74,25 +114,33 @@ yours included.
 
 What turning it on does:
 
-- **Files move.** The host's identity, pairings, profiles, display and hook settings, and the
-  console password are copied to `/var/lib/punktfunk`, owned by a `punktfunk` system user that
-  runs the host from then on. Paired clients keep working: the fingerprint is the same.
+- **Files move.** The host's identity, pairings, profiles and the console password are copied
+  to `/var/lib/punktfunk`, owned by a `punktfunk` system user that runs the host from then on.
+  Display settings and hooks stay yours. Paired clients keep working: the fingerprint is the same.
 - **You become a seat.** Your own `punktfunk-host` moves to the first seat's ports and serves
   your library, plugins and Steam from your own home. The console reaches it from **Library**,
   **Game sources** and **Plugins**; the page's title, **Anna's library ▾**, picks another seat's.
 - **The monitor wins.** When you log in at the machine, the background session ends within a few
   seconds and your own session hosts you. Streams on the background session end, and the client
   reconnects. Nothing on your monitor is closed.
-- **The console is the door's.** It listens on the same port with the same password.
+- **Browsers play on seats too.** With **Browser streaming** on, a browser lands on its profile's
+  desktop as an app does: each seat streams to browsers on its own port, UDP 9783–9786. A seat
+  that is already running follows the switch within a few seconds.
+- **The console is the door's.** It listens on the same port with the same password. Host
+  settings, Displays, Automation, Plugins and Health checks show your own host, which streams.
 - **Seats see your games.** Every seat shows your Steam libraries: its Steam plays, updates and
   runs Proton from them while the files stay yours. A library on a filesystem other than btrfs,
   ext4, xfs or f2fs stays hidden from seats. New games a seat installs go to
   `/var/lib/punktfunk-seats/games`, and you join its group, `punktfunk-games`, at your next login. Each
   seat keeps its own Proton prefixes and shader cache.
 - **Your library is the box's.** Every profile's apps list the games your own host found. A
-  profile with a desktop of its own plays your Steam games with its own Steam; games from other
-  launchers play on your desktop only. Change the library on your own **Library** page; another
-  seat's is read only. Covers that Steam keeps in your home show while your host runs.
+  profile with a desktop of its own plays your Steam games with its own Steam, and ROM Manager
+  games with the box's emulators and its own saves. RPCS3, shadPS4, Supermodel, Vita3K and Xenia
+  Canary play on your desktop only. So does an emulator installed while seats were off or by an
+  earlier version, until you reinstall it under **Library** → **Sources** → **Emulators**. Your
+  own custom emulators and games from other launchers play on your desktop only.
+  Change the library on your own **Library** page; another seat's is read only. Covers that Steam
+  keeps in your home show while your host runs.
 - **A seat has Game Mode too.** **Return to Gaming Mode** on a seat's desktop opens Steam's Game
   Mode on that seat, and Steam's **Switch to Desktop** goes back. The stream carries on, and
   neither touches the box's own session. The desktop's apps keep running underneath, and Steam

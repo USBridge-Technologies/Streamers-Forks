@@ -62,16 +62,17 @@
          direct-BLE pad — both optional (the feature quietly disengages without them). -->
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <!-- ChromeOS turns off its input translation for an app declaring this, so a touchpad's
+         scroll, right click and hover reach MouseForwarder as mouse events, not taps. -->
+    <uses-feature android:name="android.hardware.type.pc" android:required="false" />
 
-    <!-- appCategory="game": a game-streaming client IS a game as far as the SoC is concerned.
-         On Snapdragon devices (and other OEMs with a Game Mode / Game Dashboard) this makes the app
-         eligible for the vendor's game performance profile — the aggressive CPU/GPU governor and
-         scheduler treatment games get — which, together with the ADPF hints in the native decode
-         path, is what keeps clocks up for low, consistent decode latency. Also groups it correctly
-         under Games in battery/data usage. Advisory: devices without Game Mode ignore it. -->
+    <!-- A game: isGame for the TV launcher's Games row, appCategory for GameManager (game power
+         mode, setGameState). Android 15+ renders a game's unvoted layer at 60 Hz, so the stream
+         and console surfaces vote their own rate. ADPF carries the decode hints. -->
     <application
         android:allowBackup="false"
         android:appCategory="game"
+        android:isGame="true"
         android:banner="@drawable/tv_banner"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -79,10 +80,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.PunktfunkAndroid">
 
-        <!-- Game Mode config (Android 13+): declare we support Performance mode and opt OUT of the
-             OEM interventions that would fight the negotiated stream — resolution downscaling and
-             FPS overrides. A game-streaming client renders exactly the host's mode; a platform
-             downscale/FPS-cap corrupts that. Ignored below API 33. -->
+        <!-- Android 13+: no platform downscale or FPS cap on the host's exact mode. -->
         <meta-data
             android:name="android.game_mode_config"
             android:resource="@xml/game_mode_config" />

@@ -3,15 +3,15 @@
 //! starts the session worker and drives navigation from its events, and the "request access"
 //! (delegated-approval) flow parks an identified connect until the operator approves it.
 
-use super::lucide;
 use super::profiles;
 use super::style::*;
-use super::{AppCtx, Screen, Svc, Target};
+use super::{AppCtx, AsyncSetState, Screen, Svc, Target};
 use crate::trust::{self, KnownHosts};
 use pf_client_core::orchestrate::{
     self, trust_route, wake_parked_line, CancelHandle, ConnectAttempt, ExitRoute, HostTarget,
     TrustRoute, WakeOutcome, WakeWait, FINGERPRINT_CHANGED, WAKE_PARKED_HINT,
 };
+use pf_fluent::Palette;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -314,6 +314,9 @@ fn connect_spawn(
                 crate::shell_window::restore();
             }
             match event {
+                // A plain connect the host parked for its operator: the same waiting screen
+                // request-access shows, whose Cancel kills the child.
+                SpawnEvent::AwaitingApproval => ss.call(Screen::RequestAccess),
                 SpawnEvent::Ready => {
                     // A pin trusted on first use is saved unpaired. A failed save waits on the
                     // status line, which a clean exit leaves for the host list.
@@ -403,6 +406,8 @@ pub(crate) fn open_console(
                 ss.call(Screen::Stream);
             }
             SpawnEvent::Stats(s) => *shared.stats.lock().unwrap() = Some(*s),
+            // The console's own window shows the approval wait.
+            SpawnEvent::AwaitingApproval => {}
             SpawnEvent::Exited(outcome) => {
                 crate::shell_window::restore();
                 // A quit from the library or Disconnect returns silently.
@@ -433,10 +438,11 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
     *ctx.shared.target.lock().unwrap() = target.clone();
     props.set_status.call(String::new());
     props.set_screen.call(Screen::RequestAccess);
-    let (ctx, ss, st, target) = (
+    let (ctx, ss, st, svc, target) = (
         ctx.clone(),
         props.set_screen.clone(),
         props.set_status.clone(),
+        props.clone(),
         target.clone(),
     );
     std::thread::spawn(move || {
@@ -475,9 +481,9 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
             }
             return;
         }
-        st.call(match paired.saved {
-            Ok(()) => format!("Paired with {}", target.host.name),
-            Err(e) => format!("Paired, but couldn't save — {e:#}"),
+        svc.report(match paired.saved {
+            Ok(()) => Ok(format!("Paired with {}", target.host.name)),
+            Err(e) => Err(format!("Paired, but couldn't save — {e:#}")),
         });
         ss.call(Screen::Hosts);
     });
@@ -553,8 +559,8 @@ fn wake_and_connect(
     });
 }
 
-/// The plain "Connecting…" screen shown while the session worker handshakes. No hooks.
-pub(crate) fn connecting_page(ctx: &Arc<AppCtx>, status: &str) -> Element {
+/// The plain "Connecting…" screen shown while the session worker handshakes.
+pub(crate) fn connecting_page(pal: &Palette, ctx: &Arc<AppCtx>, status: &str) -> View {
     let target_name = ctx.shared.target.lock().unwrap().host.name.clone();
     let headline = if target_name.is_empty() {
         "Connecting\u{2026}".to_string()
@@ -566,16 +572,17 @@ pub(crate) fn connecting_page(ctx: &Arc<AppCtx>, status: &str) -> Element {
     } else {
         status
     };
-    busy_page(&headline, detail, Vec::new())
+    busy_page(pal, &headline, detail, Vec::new())
 }
 
 /// The cancelable "waiting for approval" screen (request-access flow): a spinner + guidance while
 /// the request sits parked on the host, plus a Cancel that returns to the host list and trips the
-/// shared cancel flag, which withdraws the request. No hooks.
+/// shared cancel flag, which withdraws the request.
 pub(crate) fn request_access_page(
+    pal: &Palette,
     ctx: &Arc<AppCtx>,
     set_screen: &AsyncSetState<Screen>,
-) -> Element {
+) -> View {
     let target_name = ctx.shared.target.lock().unwrap().host.name.clone();
     let headline = if target_name.is_empty() {
         "Waiting for approval\u{2026}".to_string()
@@ -584,17 +591,22 @@ pub(crate) fn request_access_page(
     };
     let cancel_btn = {
         let (ctx, ss) = (ctx.clone(), set_screen.clone());
-        button("Cancel")
-            .icon(lucide::icon("x"))
+        icon_button("x", "Cancel")
             .on_click(move || {
                 if let Some(c) = ctx.shared.cancel.lock().unwrap().as_ref() {
                     c.store(true, Ordering::SeqCst);
+                }
+                // A plain connect the host parked waits here too; its child ends with it.
+                let session = ctx.shared.session.lock().unwrap();
+                if session.is_running() {
+                    session.kill();
                 }
                 ss.call(Screen::Hosts);
             })
             .horizontal_alignment(HorizontalAlignment::Center)
     };
     busy_page(
+        pal,
         &headline,
         "Approve this device in the host's console or web UI \u{2014} it is paired once you \
          approve it. No PIN needed.",
@@ -604,8 +616,12 @@ pub(crate) fn request_access_page(
 
 /// The cancelable "Waking…" screen (Wake-on-LAN wait-until-up flow): a spinner + guidance while the
 /// poll loop waits for the woken host to reappear on mDNS, plus a Cancel that returns to the host
-/// list and trips the shared cancel flag so the poll loop stops re-sending and tears down. No hooks.
-pub(crate) fn waking_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Element {
+/// list and trips the shared cancel flag so the poll loop stops re-sending and tears down.
+pub(crate) fn waking_page(
+    pal: &Palette,
+    ctx: &Arc<AppCtx>,
+    set_screen: &AsyncSetState<Screen>,
+) -> View {
     let target_name = ctx.shared.target.lock().unwrap().host.name.clone();
     let headline = if target_name.is_empty() {
         "Waking the host\u{2026}".to_string()
@@ -614,8 +630,7 @@ pub(crate) fn waking_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>)
     };
     let cancel_btn = {
         let (ctx, ss) = (ctx.clone(), set_screen.clone());
-        button("Cancel")
-            .icon(lucide::icon("x"))
+        icon_button("x", "Cancel")
             .on_click(move || {
                 // Return the UI immediately and trip the flag the poll loop is watching so it stops
                 // re-sending and exits without touching a screen a later action may already own.
@@ -627,6 +642,7 @@ pub(crate) fn waking_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>)
             .horizontal_alignment(HorizontalAlignment::Center)
     };
     busy_page(
+        pal,
         &headline,
         "Sent a wake signal and waiting for the host to come online \u{2014} this can take up to a \
          minute for a sleeping or powered-off machine.",
@@ -635,12 +651,13 @@ pub(crate) fn waking_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>)
 }
 
 /// The parked wake: the host didn't come online in budget. Try again is a fresh wake of the
-/// shared target; Cancel returns to the host list. No hooks.
+/// shared target; Cancel returns to the host list.
 pub(crate) fn wake_parked_page(
+    pal: &Palette,
     ctx: &Arc<AppCtx>,
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
-) -> Element {
+) -> View {
     let target = ctx.shared.target.lock().unwrap().clone();
     let retry_btn = {
         let (ctx, ss, st, target) = (
@@ -649,21 +666,19 @@ pub(crate) fn wake_parked_page(
             set_status.clone(),
             target.clone(),
         );
-        button("Try again")
-            .accent()
-            .icon(lucide::icon("rotate-cw"))
+        icon_button("rotate-cw", "Try again")
+            .style(ButtonStyle::Accent)
             .on_click(move || wake_and_connect(&ctx, target.clone(), &ss, &st))
     };
     let cancel_btn = {
         let ss = set_screen.clone();
-        button("Cancel")
-            .icon(lucide::icon("x"))
-            .on_click(move || ss.call(Screen::Hosts))
+        icon_button("x", "Cancel").on_click(move || ss.call(Screen::Hosts))
     };
     let actions = hstack((retry_btn, cancel_btn))
         .spacing(8.0)
         .horizontal_alignment(HorizontalAlignment::Center);
     notice_page(
+        pal,
         None,
         &wake_parked_line(&target.host.name),
         WAKE_PARKED_HINT,

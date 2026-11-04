@@ -59,6 +59,13 @@ let
 
   hostSettingsFile = pkgs.writeText "punktfunk-host.env" (renderEnv cfg.host.settings);
 
+  # The owner's row runs the owner's host from seat-session, not from the user unit, so it takes
+  # the same settings and the `gamestream` flag as a file: seat-session sources it for the owner
+  # alone (PUNKTFUNK_OWNER_ENV), so a seat of its own never sees them.
+  ownerSettingsFile = pkgs.writeText "punktfunk-owner.env" (
+    renderEnv (cfg.host.settings // lib.optionalAttrs cfg.host.gamestream { PUNKTFUNK_GAMESTREAM = true; })
+  );
+
   # WHICH users' `systemd --user` instances may run these units — and why they need saying at all.
   #
   # `systemd.user.*` installs into EVERY user's manager; there is no per-user form of it in NixOS.
@@ -238,7 +245,9 @@ in
         example = "/run/secrets/punktfunk-host.env";
         description = ''
           Extra `EnvironmentFile` layered AFTER `settings` (its values win), for values that must
-          not reach the store. Loaded optionally (a missing file does not fail the unit). The host
+          not reach the store. Loaded optionally (a missing file does not fail the unit). With
+          seats on, the owner's background session reads it as the owner, so keep it readable by
+          them there. The host
           keeps its own credentials in `~/.config/punktfunk/`, owner-only, and takes them out of its
           environment at startup so the games and hooks it launches cannot inherit them.
         '';
@@ -251,7 +260,8 @@ in
           Open the host's inbound ports. Native punktfunk always: UDP 9777 (QUIC control and
           media), 9778 (browser streaming) + 5353 (mDNS), TCP 47990 (mgmt API). With
           `gamestream = true` also TCP 47984/47989/48010 and UDP 47998/47999/48000. With
-          `services.punktfunk.seats.enable` also UDP 9779-9782, the seats a door redirects to.
+          `services.punktfunk.seats.enable` also UDP 9779-9786, the seats a door redirects to and
+          their browser streaming.
         '';
       };
 
@@ -343,7 +353,8 @@ in
           The address the console listens on: `0.0.0.0` for every interface, `127.0.0.1` for this
           machine only, or one address such as a VPN interface. The plugin-UI origin on 47993
           follows it, always. On any bind the console answers only peers on the local network or a
-          VPN (RFC 1918, link-local, IPv6 unique-local, Tailscale's 100.64/10), never the internet.
+          VPN (RFC 1918, link-local, IPv6 unique-local, Tailscale's or NetBird's 100.64/10), never
+          the internet.
 
           This is the imperative install's `PUNKTFUNK_UI_BIND` in `host.env`; on NixOS the option
           is the source and `host.env` is not read by the console.
@@ -628,7 +639,7 @@ in
           "${cfg.host.gamescopePackage}/lib/punktfunk/vulkan/implicit_layer.d";
         serviceConfig = {
           # The store path DIRECTLY — not a capability wrapper. /proc/<pid>/exe then resolves to the
-          # very path packages.nix substituted into io.unom.Punktfunk.Host.desktop's Exec=, which is
+          # very path packages.nix substituted into io.unom.punktfunk.host.desktop's Exec=, which is
           # what lets KWin identify the host (see the note above the firewall block). The empty
           # entry clears the packaged ExecStart.
           ExecStart = mkIf cfg.host.gamestream [
@@ -670,8 +681,8 @@ in
     # --- client --------------------------------------------------------------------------------
     (mkIf cfg.client.enable {
       environment.systemPackages = [ cfg.client.package ];
-      # 70-punktfunk-client.rules: hidraw access for the seated user's DualSense (SDL HIDAPI). The
-      # rule is uaccess-tagged, so the active-seat user gets it with no group membership.
+      # 70-punktfunk-client.rules: the seated user's DualSense hidraw and Switch 2 USB nodes (SDL).
+      # The rule is uaccess-tagged, so the active-seat user gets it with no group membership.
       services.udev.packages = [ cfg.client.package ];
 
       networking.firewall = mkIf cfg.client.openFirewall {
@@ -776,13 +787,22 @@ in
         path = seatPath;
         # seat-session starts this host; the packaged default is /usr/bin/punktfunk-host.
         environment.PUNKTFUNK_HOST_BIN = "${cfg.host.package}/bin/punktfunk-host";
+        # The owner's settings and `environmentFile`, for the owner's row only (see
+        # ownerSettingsFile). An `environmentFile` the owner can't read is skipped there.
+        environment.PUNKTFUNK_OWNER_ENV = concatStringsSep " " (
+          [ "${ownerSettingsFile}" ] ++ optional (cfg.host.environmentFile != null) (toString cfg.host.environmentFile)
+        );
+        # Every seat's host encodes: the capped worker and the WSI layer, as the user unit has them.
+        environment.PUNKTFUNK_ENCODE_WORKER = "${config.security.wrapperDir}/punktfunk-encode-worker";
+        environment.PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR = mkIf cfg.host.gamescopeHdr
+          "${cfg.host.gamescopePackage}/lib/punktfunk/vulkan/implicit_layer.d";
         # A switch must not end a seat's session. Seats survive an update on every other package.
         restartIfChanged = false;
       };
 
       # The door ("Reachable without logging in"). Its host and console units name /usr/bin; the
-      # leading empty ExecStart clears the packaged one. The packaged ExecStart of both helper
-      # templates is already the store path.
+      # leading empty ExecStart clears the packaged one. The door's ExecStartPre and both helper
+      # templates already name the store path.
       systemd.services.punktfunk-door.serviceConfig.ExecStart = [
         ""
         "${cfg.host.package}/bin/punktfunk-host serve --door"
@@ -791,21 +811,51 @@ in
         ""
         "${cfg.web.package}/bin/punktfunk-web-server"
       ];
+      # The door's console binds where `web.bind` says, as the user's does. The packaged list
+      # starts with the door's host.env copy, which would beat it: the empty entry clears the
+      # list and the rest is the packaged order.
+      systemd.services.punktfunk-web-door.environment.PUNKTFUNK_UI_BIND = cfg.web.bind;
+      systemd.services.punktfunk-web-door.serviceConfig.EnvironmentFile = [
+        ""
+        "-/var/lib/punktfunk/mgmt-token"
+        "-/var/lib/punktfunk/web-password"
+        "-/var/lib/punktfunk/mgmt-endpoint"
+      ];
+      # NixOS ignores a packaged unit's [Install] and can't write its unit directory, so the
+      # helper's `systemctl enable` has no effect. The units are wanted here, and their own
+      # condition keeps them off without the owner record.
+      systemd.services.punktfunk-door.wantedBy = [ "multi-user.target" ];
+      systemd.services.punktfunk-web-door.wantedBy = [ "multi-user.target" ];
+      # The door's ports: the two `host.settings` keys that move them, and no other host knob.
+      # The host.env lines its ExecStartPre copies win over these.
+      systemd.services.punktfunk-door.path = seatPath;
+      systemd.services.punktfunk-door.environment = lib.mapAttrs (_: renderVal) (
+        lib.filterAttrs (
+          name: _:
+          builtins.elem name [
+            "PUNKTFUNK_MGMT_BIND"
+            "PUNKTFUNK_NATIVE_PORT"
+          ]
+        ) cfg.host.settings
+      );
       systemd.services."punktfunk-door-on@".path = seatPath;
       systemd.services."punktfunk-door-off@".path = seatPath;
 
       # Members of this group may start the helper templates; the helper refuses anyone else. The
       # polkit rule is the package's own file, which other distros read from /usr/share.
       users.groups.punktfunk-update = { };
+      # The door user's own group, in place of `punktfunk`, which owns the usbip attach nodes.
+      users.groups.punktfunk-door = { };
       security.polkit.enable = mkDefault true;
       environment.etc."polkit-1/rules.d/49-punktfunk-door.rules".source =
         "${cfg.seats.package}/share/polkit-1/rules.d/49-punktfunk-door.rules";
 
-      # The seats a door redirects a client to. The xml and ufw openers carry the same range.
+      # The seats a door redirects a client to, then their browser planes. The xml and ufw
+      # openers carry the same range.
       networking.firewall.allowedUDPPortRanges = mkIf cfg.host.openFirewall [
         {
           from = 9779;
-          to = 9782;
+          to = 9786;
         }
       ];
     })

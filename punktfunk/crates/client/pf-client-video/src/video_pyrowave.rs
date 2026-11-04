@@ -21,11 +21,14 @@
 //! device, which outlives the decoder; `pw_dev`, `pw_dec`, the rings, `cmds` and the
 //! timeline are this decoder's own; the shared queue is touched only under `queue_lock`.
 
+mod payload;
+
 use crate::video_color::ColorDesc;
 use crate::video_vk::{QueueLock, VulkanDecodeDevice};
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
+use punktfunk_core::au::{AuBuf, AuMemory};
 use pyrowave_sys as pw;
 use std::ffi::{c_char, c_void, CString};
 use std::sync::Arc;
@@ -297,8 +300,9 @@ struct RetiredRing {
 }
 
 /// One decode-output plane in device-local memory: STORAGE (compute decode, the native
-/// lane's chroma pass) + SAMPLED (presenter CSC), plus COLOR_ATTACHMENT when the
-/// `fragment` iDWT draws into it. No such memory type is an error.
+/// lane's chroma pass) + SAMPLED (presenter CSC) + TRANSFER_SRC (the native lane's luma
+/// copy), plus COLOR_ATTACHMENT when the `fragment` iDWT draws into it. No such memory
+/// type is an error.
 ///
 /// # Safety
 ///
@@ -311,7 +315,9 @@ unsafe fn make_plane(
     fmt: vk::Format,
     fragment: bool,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
-    let mut usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+    let mut usage = vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_SRC;
     if fragment {
         usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
     }
@@ -494,6 +500,17 @@ pub struct PyroWaveDecoder {
     split: DecodeSplit,
     /// Frames handed out: the present-turn number of the next one.
     turn: u64,
+    /// Where the reassembler writes AUs for this decoder to read in place
+    /// ([`Self::enable_in_place`]); `None` = pyrowave copies each packet.
+    payload: Option<Arc<payload::PayloadRing>>,
+    /// `payload` as the session lends it, one `Arc` so an embedder can tell a new one.
+    memory: Option<Arc<payload::RingMemory>>,
+    /// Per slot: the AU its last decode reads, held until that decode is done.
+    inflight: [Option<AuBuf>; RING],
+    /// `maxImageDimension2D`, which bounds the ring's linear images.
+    max_dim: u32,
+    /// AUs [`Self::decode_au`] found in the ring and AUs it copied in, since [`Self::take_ring_counts`].
+    ring_counts: std::cell::Cell<(u32, u32)>,
 }
 
 /// Where the last decode's wall time went, in microseconds.
@@ -566,6 +583,10 @@ impl PyroWaveDecoder {
         let pdev = vk::PhysicalDevice::from_raw(vkd.physical_device as u64);
         // SAFETY: fn contract: `pdev` is the live instance's physical device.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
+        // SAFETY: as above.
+        let max_dim = unsafe { instance.get_physical_device_properties(pdev) }
+            .limits
+            .max_image_dimension2_d;
         let plane_fmt = if hdr16 {
             vk::Format::R16_UNORM
         } else {
@@ -729,6 +750,11 @@ impl PyroWaveDecoder {
             wire_window: shard_payload.max(64),
             split: DecodeSplit::default(),
             turn: 0,
+            payload: None,
+            memory: None,
+            inflight: Default::default(),
+            max_dim,
+            ring_counts: Default::default(),
         })
     }
 
@@ -789,6 +815,15 @@ impl PyroWaveDecoder {
         // now; only the plane images wait (retired).
         unsafe { pw::pyrowave_decoder_destroy(self.pw_dec) };
         self.pw_dec = new_dec;
+        // The new decoder reads the same ring, or a bigger one when the mode outgrew it. The
+        // old ring stays alive while a frame still holds one of its slots.
+        if let Some(keepalive) = self.payload.as_ref().map(|r| r.keepalive()) {
+            if let Err(e) = self.attach_payload(width, height, keepalive) {
+                tracing::warn!(error = %format!("{e:#}"), "PyroWave payload ring lost: packets are copied from here");
+                self.payload = None;
+                self.memory = None;
+            }
+        }
         let old = std::mem::replace(&mut self.ring, new_ring);
         self.retired.push(RetiredRing {
             _ring: old,
@@ -916,6 +951,134 @@ impl PyroWaveDecoder {
         lines
     }
 
+    /// Read AUs where the reassembler wrote them from here on: a payload ring this decoder lends
+    /// through [`Self::au_memory`]. `keepalive` holds the device alive while a ring slot is still
+    /// lent after the decoder is gone. On error the decoder keeps copying.
+    pub fn enable_in_place(
+        &mut self,
+        keepalive: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<()> {
+        self.attach_payload(self.width, self.height, keepalive)
+            .inspect_err(|_| {
+                self.payload = None;
+                self.memory = None;
+            })
+    }
+
+    /// `(found in the ring, copied in)` since the last call.
+    pub fn take_ring_counts(&self) -> (u32, u32) {
+        self.ring_counts.take()
+    }
+
+    /// The memory to assemble AUs in, while [`Self::enable_in_place`] holds. A new `Arc` after a
+    /// resize outgrew the old ring.
+    pub fn au_memory(&self) -> Option<Arc<dyn AuMemory>> {
+        self.memory.clone().map(|m| m as Arc<dyn AuMemory>)
+    }
+
+    /// Point pyrowave at a ring big enough for `width`×`height`: the current one, or a new one
+    /// when the mode outgrew it.
+    fn attach_payload(
+        &mut self,
+        width: u32,
+        height: u32,
+        keepalive: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<()> {
+        let cap = payload::au_capacity(width, height, self.chroma444);
+        let ring = match &self.payload {
+            Some(r) if r.au_cap >= cap => r.clone(),
+            // SAFETY: `device` is the presenter's live device and `mem_props`/`max_dim` its
+            // GPU's; `keepalive` holds it past the decoder.
+            _ => unsafe {
+                payload::PayloadRing::new(
+                    &self.device,
+                    &self.mem_props,
+                    self.max_dim,
+                    cap,
+                    keepalive,
+                )?
+            },
+        };
+        let mem = ring.as_pw();
+        // SAFETY: `pw_dec` is this decoder's; `mem` names the ring, which the decoder holds for
+        // as long as `pw_dec` lives.
+        let set = unsafe { pw::pyrowave_decoder_set_payload_memory(self.pw_dec, &mem) };
+        pw_check(set, "set_payload_memory")?;
+        if !self.payload.as_ref().is_some_and(|r| Arc::ptr_eq(r, &ring)) {
+            self.memory = Some(Arc::new(payload::RingMemory(ring.clone())));
+        }
+        self.payload = Some(ring);
+        Ok(())
+    }
+
+    /// Let go of AUs whose decode is done, so their slots go back to the reassembler early.
+    fn release_done(&mut self) {
+        // SAFETY: `sem` is this decoder's live timeline semaphore.
+        let done =
+            unsafe { self.device.get_semaphore_counter_value(self.timeline.sem) }.unwrap_or(0);
+        for (au, &turn) in self.inflight.iter_mut().zip(&self.slot_turn) {
+            if turn <= done {
+                *au = None;
+            }
+        }
+    }
+
+    /// [`Self::decode_frame`] for an AU in payload memory, read where it lies. Anything else is
+    /// copied into a ring slot first; with the ring full the frame is dropped.
+    pub fn decode_au(
+        &mut self,
+        au: AuBuf,
+        aligned: bool,
+        complete: bool,
+    ) -> Result<Option<PyroWavePlanarFrame>> {
+        if self.payload.is_none() {
+            return self.decode_frame(&au, aligned, complete);
+        }
+        if let Some(dims) = au_dims(&au, aligned, self.wire_window) {
+            if dims != (self.width, self.height) {
+                self.reconfigure(dims.0, dims.1)?;
+            }
+        }
+        let Some(ring) = self.payload.clone() else {
+            return self.decode_frame(&au, aligned, complete);
+        };
+        self.release_done();
+        let in_ring = |a: &AuBuf| {
+            (a.store() as &dyn std::any::Any)
+                .downcast_ref::<payload::RingSlot>()
+                .is_some_and(|s| s.of(&ring))
+        };
+        let parse_started = Instant::now();
+        let len = au.len();
+        let (found, copied) = self.ring_counts.get();
+        self.ring_counts.set(if in_ring(&au) {
+            (found + 1, copied)
+        } else {
+            (found, copied + 1)
+        });
+        let mut au = au;
+        if !in_ring(&au) {
+            let mut moved = AuBuf::take(&payload::RingMemory(ring.clone()), len);
+            if !in_ring(&moved) {
+                tracing::debug!(len, "payload ring full: frame dropped");
+                return Ok(None);
+            }
+            moved.copy_from_slice(&au);
+            au = moved;
+        }
+        let pw_dec = self.pw_dec;
+        let pushed = push_in_place(&mut au, aligned, self.wire_window, &mut |p| {
+            // SAFETY: `pw_dec` is this decoder's; `p` lies in its payload ring and stays put
+            // until the decode that reads it is done (`inflight`).
+            let r = unsafe {
+                pw::pyrowave_decoder_push_packet_in_place(pw_dec, p.as_ptr().cast(), p.len())
+            };
+            pw_check(r, "push_packet_in_place")
+        });
+        self.split.parse_us = parse_started.elapsed().as_micros() as u32;
+        self.submit_parsed(complete, pushed.err(), Some(au))
+    }
+
     /// One AU in → one frame out. `aligned`: shard-window chunked (each `wire_window`
     /// holds whole self-delimiting packets, zero-padded). `complete`: every shard arrived;
     /// a partial still decodes — missing blocks are localized blur for this frame only.
@@ -925,6 +1088,10 @@ impl PyroWaveDecoder {
         aligned: bool,
         complete: bool,
     ) -> Result<Option<PyroWavePlanarFrame>> {
+        // With a payload ring pyrowave copies into a head too small for an AU: go through it.
+        if self.payload.is_some() {
+            return self.decode_au(au.to_vec().into(), aligned, complete);
+        }
         // The AU's sequence header announces a host mode switch; rebuild first — a size
         // mismatch hard-errors upstream. A lost first shard sniffs `None` and decodes at
         // the current size; the next complete frame carries the header again.
@@ -947,7 +1114,25 @@ impl PyroWaveDecoder {
             push_err = Some(e);
         }
         self.split.parse_us = parse_started.elapsed().as_micros() as u32;
+        self.submit_parsed(complete, push_err, None)
+    }
+
+    /// Decode what the pushes queued. `keep` is the AU the packets lie in, held until its decode
+    /// is done; a frame not decoded clears pyrowave's offsets into it.
+    fn submit_parsed(
+        &mut self,
+        complete: bool,
+        push_err: Option<anyhow::Error>,
+        keep: Option<AuBuf>,
+    ) -> Result<Option<PyroWavePlanarFrame>> {
+        let skip = |dec: &mut Self| {
+            if keep.is_some() {
+                // SAFETY: `pw_dec` is this decoder's live decoder.
+                unsafe { pw::pyrowave_decoder_clear(dec.pw_dec) };
+            }
+        };
         if let Some(e) = push_err {
+            skip(self);
             // A partial straddling a resize can carry blocks the (possibly wrong-size)
             // decoder rejects — one lost frame, not a broken session. A complete frame
             // that fails to parse is corruption: propagate.
@@ -962,12 +1147,14 @@ impl PyroWaveDecoder {
         // for this frame only).
         // SAFETY: `pw_dec` is this decoder's live decoder.
         if complete && !unsafe { pw::pyrowave_decoder_decode_is_ready(self.pw_dec, false) } {
+            skip(self);
             return Ok(None);
         }
 
         let slot = self.next;
-        // Frame N-RING was the slot's last: its command buffer and planes are free after it.
+        // Frame N-RING was the slot's last: its command buffer, planes and AU are free after it.
         self.timeline.wait(self.slot_turn[slot], DECODE_TIMEOUT)?;
+        self.inflight[slot] = None;
         self.next = (self.next + 1) % RING;
         let turn = self.turn + 1;
         if let Err(e) = self.record_and_submit(slot, turn) {
@@ -985,6 +1172,7 @@ impl PyroWaveDecoder {
             return Err(e);
         }
         self.slot_turn[slot] = turn;
+        self.inflight[slot] = keep;
         self.initialized[slot] = true;
 
         for r in &mut self.retired {
@@ -1202,6 +1390,61 @@ impl PyroWaveDecoder {
     }
 }
 
+/// Hand `push` each packet of an AU that lies in payload memory, where it lies. A body off
+/// 4-byte alignment slides back into its own window prefix, and a FRAG chain closes up over the
+/// prefixes it spans: every push stays inside the AU, past every earlier one. Window framing as
+/// [`PyroWaveDecoder::push_window`]: a lost window breaks the chain it interrupts.
+fn push_in_place(
+    au: &mut [u8],
+    aligned: bool,
+    window: usize,
+    push: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    if !aligned {
+        return push(au);
+    }
+    let addr = au.as_ptr() as usize;
+    // The open FRAG chain: where it starts and where its next body goes.
+    let mut chain: Option<(usize, usize)> = None;
+    for start in (0..au.len()).step_by(window) {
+        let win = &au[start..au.len().min(start + window)];
+        if win.len() < 4 {
+            continue;
+        }
+        let len = u16::from_le_bytes([win[0], win[1]]) as usize;
+        let kind = u16::from_le_bytes([win[2], win[3]]);
+        if len == 0 || 4 + len > win.len() {
+            chain = None;
+            continue;
+        }
+        let body = start + 4;
+        let low = body - (addr + body) % 4;
+        let slide = |au: &mut [u8], to: usize| {
+            if to != body {
+                au.copy_within(body..body + len, to);
+            }
+            to + len
+        };
+        match kind {
+            0 => {
+                chain = None;
+                let end = slide(au, low);
+                push(&au[low..end])?;
+            }
+            1 => chain = Some((low, slide(au, low))),
+            2 => chain = chain.map(|(at, end)| (at, slide(au, end))),
+            3 => {
+                if let Some((at, end)) = chain.take() {
+                    let end = slide(au, end);
+                    push(&au[at..end])?;
+                }
+            }
+            _ => chain = None,
+        }
+    }
+    Ok(())
+}
+
 impl Drop for PyroWaveDecoder {
     fn drop(&mut self) {
         // SAFETY: owned handles on the presenter's device. Idling the shared queue under the
@@ -1211,6 +1454,8 @@ impl Drop for PyroWaveDecoder {
                 let _guard = self.queue_lock.guard();
                 let _ = self.device.queue_wait_idle(self.queue);
             }
+            // Their decodes are done: the slots go back before pyrowave lets go of the ring.
+            self.inflight = Default::default();
             pw::pyrowave_decoder_destroy(self.pw_dec);
             pw::pyrowave_device_destroy(self.pw_dev);
             self.device.destroy_command_pool(self.cmd_pool, None);
@@ -1221,7 +1466,7 @@ impl Drop for PyroWaveDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{au_dims, seq_header_dims};
+    use super::{au_dims, push_in_place, seq_header_dims};
 
     /// LE encoding of `BitstreamSequenceHeader` (pyrowave_common.hpp): word 0 =
     /// width_minus_1:14 | height_minus_1:14 | sequence:3 | extended:1; word 1 =
@@ -1313,5 +1558,82 @@ mod tests {
         garbage[0] = 0xFF;
         garbage[1] = 0xFF;
         assert_eq!(au_dims(&garbage, true, WIN), None);
+    }
+
+    /// Runs `push_in_place` on a copy of `au` and records each push, which must lie in that
+    /// copy, 4-byte aligned.
+    fn pushes(au: &[u8], aligned: bool, win: usize) -> Vec<Vec<u8>> {
+        let mut au = au.to_vec();
+        let range = au.as_ptr_range();
+        let mut got = Vec::new();
+        push_in_place(&mut au, aligned, win, &mut |p| {
+            assert!(range.contains(&p.as_ptr()), "pushed from outside the AU");
+            assert_eq!(p.as_ptr() as usize % 4, 0, "pushed off alignment");
+            got.push(p.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        got
+    }
+
+    /// Packed packets go up where they lie; a FRAG chain goes up once, closed up.
+    #[test]
+    fn packets_are_pushed_where_they_lie() {
+        const WIN: usize = 16;
+        let mut au = window(&[1; 8], 0, WIN);
+        au.extend(window(&[2; 4], 1, WIN));
+        au.extend(window(&[3; 4], 2, WIN));
+        au.extend(window(&[4; 4], 3, WIN));
+        au.extend(window(&[5; 12], 0, WIN));
+        let mut chained = vec![2u8; 4];
+        chained.extend([3; 4]);
+        chained.extend([4; 4]);
+        assert_eq!(
+            pushes(&au, true, WIN),
+            vec![vec![1; 8], chained, vec![5; 12]]
+        );
+    }
+
+    /// A lost window drops the chain it interrupts; the window after it still goes up.
+    #[test]
+    fn a_lost_window_breaks_its_chain() {
+        const WIN: usize = 16;
+        let mut au = window(&[2; 4], 1, WIN);
+        au.extend(vec![0u8; WIN]);
+        au.extend(window(&[4; 4], 3, WIN));
+        au.extend(window(&[6; 8], 0, WIN));
+        assert_eq!(pushes(&au, true, WIN), vec![vec![6; 8]]);
+    }
+
+    /// A window size off 4-byte alignment slides the misaligned bodies; an unaligned AU is one
+    /// push of itself.
+    #[test]
+    fn misaligned_windows_slide_into_their_prefix() {
+        const WIN: usize = 14;
+        let mut au = window(&[1; 8], 0, WIN);
+        au.extend(window(&[2; 8], 0, WIN));
+        assert_eq!(pushes(&au, true, WIN), vec![vec![1; 8], vec![2; 8]]);
+        assert_eq!(pushes(&au, false, WIN), vec![au.clone()]);
+    }
+
+    /// A 4K frame in 1322-byte windows, half of them off alignment, with a FRAG chain among
+    /// them: every packet goes up intact, however big the frame.
+    #[test]
+    fn a_big_frame_of_odd_windows_goes_up_whole() {
+        const WIN: usize = 1322;
+        let body = |i: usize| vec![i as u8; 1280];
+        let piece = |b: u8| vec![b; WIN - 4];
+        let mut au = Vec::new();
+        for i in 0..400 {
+            au.extend(window(&body(i), 0, WIN));
+        }
+        au.extend(window(&piece(1), 1, WIN));
+        au.extend(window(&piece(2), 2, WIN));
+        au.extend(window(&[3; 100], 3, WIN));
+        au.extend(window(&body(7), 0, WIN));
+        let mut want: Vec<Vec<u8>> = (0..400).map(body).collect();
+        want.push([piece(1), piece(2), vec![3; 100]].concat());
+        want.push(body(7));
+        assert_eq!(pushes(&au, true, WIN), want);
     }
 }

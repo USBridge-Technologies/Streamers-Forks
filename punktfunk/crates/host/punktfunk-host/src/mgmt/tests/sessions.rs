@@ -365,7 +365,7 @@ async fn local_summary_takes_the_tray_token_from_loopback_only_and_is_non_sensit
     let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-summary-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-summary.json")),
             None,
             false,
         )
@@ -481,6 +481,40 @@ async fn stop_session_clears_runtime_state() {
     assert!(!state.streaming.load(Ordering::SeqCst));
     assert!(!state.audio_streaming.load(Ordering::SeqCst));
     assert!(state.launch.lock().unwrap().is_none());
+}
+
+/// A seat host closes its sessions as a power action's when the door says why, and a plain
+/// stop leaves the close untyped. Nothing else in this binary sends the flag.
+#[tokio::test]
+async fn stop_session_for_power_closes_as_power() {
+    let _registry = crate::session_status::tests::REGISTRY.lock().await;
+    let app = test_app(test_state(), None);
+    let mut closing = crate::power::closing_rx();
+    let stop = |query: &str| {
+        axum::http::Request::delete(format!("/api/v1/session{query}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    for plain in ["", "?reason=other"] {
+        assert_eq!(send(&app, stop(plain)).await.0, StatusCode::NO_CONTENT);
+        assert!(!closing.has_changed().unwrap(), "{plain:?} is a plain stop");
+    }
+    assert_eq!(
+        send(&app, stop("?reason=power")).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(*closing.borrow_and_update(), "the sessions close as power");
+    // Nothing resets the flag on a seat host. A session that starts afterwards reads no close,
+    // and a second power stop still reaches every session.
+    let mut later = crate::power::closing_rx();
+    assert!(!later.has_changed().unwrap(), "a new session is not closed");
+    assert_eq!(
+        send(&app, stop("?reason=power")).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(closing.has_changed().unwrap() && later.has_changed().unwrap());
+    assert!(*later.borrow_and_update(), "the second stop closes typed");
+    crate::power::set_closing(false);
 }
 
 #[tokio::test]

@@ -111,9 +111,11 @@ With it off, use **Ctrl+Alt+Shift+D** or the client's own controls.
 
 The guide button (the Xbox logo, the PS button, the Deck's **Steam** button) opens menus on the
 host. Where your device keeps that button for itself, **hold Select on its own** for about a
-third of a second instead: the host sees its guide button held for as long as you hold, and a
-long hold opens a SteamOS host's **Quick Access Menu**. A quick tap of Select still reaches the
-game, a beat late.
+third of a second instead: the host sees a guide press when you let go, or when you press
+another button with it. Hold on past a second and the host sees its guide button held until you
+let go, so a long hold opens a SteamOS host's **Quick Access Menu**. A quick tap of Select still
+reaches the game, a beat late. L1, R1 or Start pressed with a held Select keep it a Select, so
+the leave chord never presses guide.
 
 Two advanced settings control this: **Guide button** and **Hold Select for guide**. **Automatic** does this:
 
@@ -199,7 +201,7 @@ Touch passthrough depends on the host:
 |---|---|
 | KDE Plasma, GNOME | Full multi-touch |
 | Windows 10 1809 and newer | Full multi-touch |
-| Sway, Hyprland, niri and other wlroots compositors | Not supported: the client uses Trackpad and says so |
+| Sway, Hyprland, niri, Umbriel and other wlroots compositors | Not supported: the client uses Trackpad and says so |
 | gamescope | One finger, as an absolute pointer ([gamescope](/docs/gamescope)) |
 
 ## The quick-action dial
@@ -212,7 +214,7 @@ presets. Pick its six buttons under **Quick actions** in settings, or edit the d
 | Linux, Windows | **Ctrl+Alt+Shift+O**, a two-finger twist on a touchscreen |
 | macOS | **⌃⌥⇧O**, **Stream → Quick Actions** |
 | Android | **Back**, a two-finger twist, **Ctrl+Alt+Shift+O** |
-| iPhone, iPad | A two-finger twist, the corner button, **⌃⌥⇧O** on a keyboard; in **Touch passthrough**, two fingers pulled in from a side edge |
+| iPhone, iPad | A two-finger twist, the corner button, **⌃⌥⇧O** on a keyboard; in **Touch passthrough**, pull two fingers in from a side edge |
 | Apple TV | A short press of the remote's **Back** |
 | Any client, with a controller | **Select + A** |
 

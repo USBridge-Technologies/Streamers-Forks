@@ -86,6 +86,7 @@ impl NativeClient {
                     .map_err(|e| match endpoint::refused_alpn(&e) {
                         true => PunktfunkError::Rejected(
                             crate::reject::RejectReason::WireVersionMismatch,
+                            String::new(),
                         ),
                         false => PunktfunkError::Io(std::io::Error::other(e.to_string())),
                     })?;
@@ -103,7 +104,7 @@ impl NativeClient {
                             .await;
                         }
                         Err(match reject_from_close(&conn) {
-                            Some((r, _)) => PunktfunkError::Rejected(r),
+                            Some((r, said)) => PunktfunkError::Rejected(r, said),
                             None => e,
                         })
                     }
@@ -160,6 +161,7 @@ impl NativeClient {
                         } else if endpoint::refused_alpn(&e) {
                             PunktfunkError::Rejected(
                                 crate::reject::RejectReason::WireVersionMismatch,
+                            String::new(),
                             )
                         } else {
                             PunktfunkError::Io(std::io::Error::other(e.to_string()))
@@ -183,7 +185,7 @@ impl NativeClient {
                             return Ok(host_fp);
                         }
                         Err(match reject_from_close(&conn) {
-                            Some((r, _)) => PunktfunkError::Rejected(r),
+                            Some((r, said)) => PunktfunkError::Rejected(r, said),
                             None => e,
                         })
                     }
@@ -244,6 +246,7 @@ async fn knock_once(conn: &quinn::Connection, name: &str) -> Result<()> {
             audio_bits: 0,
             audio_layout: 0,
             video_fit: 0,
+            audio_bitstreams: 0,
         },
         client_label: Some(super::client_label()),
         abr_features: 0,
@@ -251,11 +254,13 @@ async fn knock_once(conn: &quinn::Connection, name: &str) -> Result<()> {
         link: Default::default(),
         probe_only: false,
         pyrowave_bpp_x100: 0,
+        slices: 0,
         resume: None,
         suites: vec![crate::crypto::MediaSuite::Aes128Gcm],
         features: Default::default(),
         profile: None,
         access_only: true,
+        screens: Vec::new(),
     };
     v2io::send(&mut send, &hello).await?;
     let mut waiting = false;

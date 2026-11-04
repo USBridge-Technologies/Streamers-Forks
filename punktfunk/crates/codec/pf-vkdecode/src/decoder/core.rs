@@ -318,6 +318,15 @@ pub struct VkDecoder<C: VkCodec> {
 }
 
 impl<C: VkCodec> VkDecoder<C> {
+    /// A [`super::waiter::DoneWaiter`] on this decoder's device; `None` when its thread
+    /// did not start. The caller drops it before the decoder.
+    pub fn done_waiter(
+        &self,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Option<super::waiter::DoneWaiter> {
+        super::waiter::DoneWaiter::spawn(self.dev.ash().clone(), wake)
+    }
+
     /// Decoder over a wrapped device. Sessions and pools are built lazily from
     /// the first AU (their shape is the stream's, not the device's).
     pub(crate) fn with_codec(dev: DecodeDevice, lock: Box<dyn QueueLock>, codec: C) -> Self {
@@ -1572,6 +1581,7 @@ pub(crate) fn build_frame(
         format,
         view: picture.view,
         plane_views: picture.plane_views,
+        ycbcr_view: picture.ycbcr_view,
         layer: picture.layer,
         layout: if coincide {
             vk::ImageLayout::VIDEO_DECODE_DPB_KHR
@@ -2075,7 +2085,7 @@ mod tests {
             max_level_idc: crate::caps::MaxLevelIdc::H264(0),
             dpb_format: crate::caps::NV12,
             output_format: crate::caps::NV12,
-            plane_view_formats: [vk::Format::R8_UNORM, vk::Format::R8G8_UNORM],
+            plane_view_formats: Some([vk::Format::R8_UNORM, vk::Format::R8G8_UNORM]),
             std_header_version: vk::ExtensionProperties::default(),
         };
         let extent = |width, height| vk::Extent2D { width, height };

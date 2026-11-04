@@ -29,7 +29,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_scalar::{Scalar, Servable};
 
 mod actions;
-mod auth;
+pub(crate) mod auth;
 mod client_logs;
 mod clients;
 mod cors;
@@ -44,6 +44,7 @@ mod hooks;
 mod host;
 mod library;
 mod native;
+pub(crate) mod owner;
 #[cfg(windows)]
 mod pipes;
 mod plugin_access;
@@ -211,9 +212,11 @@ pub(crate) struct MgmtState {
     /// fingerprint a paired browser stored. `None` only if the identity could not be parsed, in
     /// which case the device lane refuses rather than binding to nothing.
     identity_fingerprint: Option<[u8; 32]>,
+    /// On a door, the seats it passes calls to ([`owner::pass_on`]). `None` on every other host.
+    door: Option<Arc<dyn owner::Seats>>,
 }
 
-/// `native` is the shared punktfunk/1 pairing handle when the unified host
+/// `native` is the shared native pairing handle when the unified host
 /// runs the native QUIC server.
 pub async fn run(
     state: Arc<AppState>,
@@ -233,6 +236,16 @@ pub async fn run(
     crate::update::reconcile_at_boot();
     crate::plugin_host::channel::remember_runtime();
     settings::write_seat_defaults();
+    #[cfg(target_os = "windows")]
+    crate::windows::background_input::start();
+    // The desk's controllers belong to the console session: the box's host, which runs there,
+    // fences them; a seat host must never claim them for its own session.
+    #[cfg(target_os = "windows")]
+    if !matches!(pf_paths::seat::role(), pf_paths::seat::HostRole::Seat(_))
+        && let Some(session) = pf_win_display::own_session_id()
+    {
+        pf_inject::desk_fence::start(session);
+    }
     // The tray has no supervisor — HKLM `Run` is a sign-in trigger — so
     // `StopTrays` and a crash leave no icon until the next logon.
     #[cfg(target_os = "windows")]
@@ -278,6 +291,9 @@ pub async fn run(
         identity_fingerprint,
         browser_plane,
         pf_paths::seat::box_library_dir().is_some(),
+        pf_paths::seat::role()
+            .is_door()
+            .then(|| Arc::new(owner::LiveSeats) as Arc<dyn owner::Seats>),
     );
     // The plane's `/mgmt` tunnel dispatches into this very router. A second `app()` would mint
     // its own `DeviceAuth`, and a token earned on one would be refused by the other.
@@ -345,6 +361,9 @@ fn app(
     // A seat host reading the box's library, which answers every library write 409. Passed in
     // rather than read per request, so a test's environment never reaches another test's app.
     box_library: bool,
+    // The seats a door passes calls to; `None` on any other host. Passed in so a test can be
+    // a door with seats of its choosing.
+    door: Option<Arc<dyn owner::Seats>>,
 ) -> Router {
     let shared = Arc::new(MgmtState {
         app: state,
@@ -363,13 +382,20 @@ fn app(
             config_dir.clone(),
         )),
         config_dir,
+        door,
     });
     let (api_routes, api) = api_router_parts();
-    // Auth wraps the library guard: a caller without a credential gets 401, never the 409.
+    // Auth, then the door's pass-on, then the library guard: a caller without a credential
+    // gets 401, only the lane auth stamped is passed on, and a library write a door passes to
+    // the owner never meets the 409 of the box copy.
     let routed = api_routes
         .route_layer(middleware::from_fn(move |req: Request, next: Next| {
             library::box_library_is_read_only(box_library, req, next)
         }))
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            owner::pass_on,
+        ))
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             auth::require_auth,
@@ -486,6 +512,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
             session::set_session_settings
         ))
         .routes(routes!(session::end_game))
+        .routes(routes!(session::release_game_hold))
         .routes(routes!(library::get_library))
         .routes(routes!(library::get_library_page))
         .routes(routes!(library::list_library_scanners))
@@ -543,6 +570,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
             client_logs::client_logs_delete
         ))
         .routes(routes!(events::stream_events))
+        .routes(routes!(events::relay_event))
         .routes(routes!(hooks::get_hooks, hooks::set_hooks))
         .routes(routes!(plugins::list_plugins))
         .routes(routes!(plugins::register_plugin, plugins::delete_plugin))
@@ -584,6 +612,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         .routes(routes!(profiles::get_seats_doctor))
         .routes(routes!(profiles::put_door))
         .routes(routes!(profiles::list_profiles, profiles::create_profile))
+        .routes(routes!(profiles::list_windows_accounts))
         .routes(routes!(profiles::set_default_profile))
         .routes(routes!(profiles::update_profile, profiles::delete_profile))
         .routes(routes!(
@@ -648,7 +677,7 @@ pub fn openapi_json() -> String {
         (name = "display", description = "Virtual-display management policy: lifecycle (keep-alive), topology (primary/exclusive), conflict handling, identity, and layout"),
         (name = "clients", description = "Paired Moonlight client management"),
         (name = "pairing", description = "Pairing PIN delivery (the out-of-band half of the GameStream pairing handshake)"),
-        (name = "native", description = "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"),
+        (name = "native", description = "Native pairing: arm a window, display the host PIN, manage paired devices"),
         (name = "session", description = "Active streaming session control"),
         (name = "library", description = "Game library: the titles each installed library plugin syncs, plus user-curated custom entries"),
         (name = "profiles", description = "The people on this box: the list a client's picker shows, their pictures, and the console's edits"),

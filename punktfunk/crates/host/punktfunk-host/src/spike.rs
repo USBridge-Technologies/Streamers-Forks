@@ -174,6 +174,7 @@ pub fn parse_spike(args: &[String]) -> Result<Options> {
 }
 
 pub fn run(opts: Options) -> Result<()> {
+    let resolved = encode::resolve();
     let hdr = opts.hdr || std::env::var("PUNKTFUNK_SPIKE_HDR").as_deref() == Ok("1");
     if hdr && matches!(opts.source, Source::Synthetic | Source::SyntheticNv12) {
         anyhow::bail!("--hdr needs a real source: --source portal or --source virtual");
@@ -181,13 +182,13 @@ pub fn run(opts: Options) -> Result<()> {
     if hdr && !opts.codec.supports_10bit() {
         anyhow::bail!("--hdr needs a 10-bit codec (h265, av1 or pyrowave)");
     }
-    if hdr && !encode::can_encode_10bit(opts.codec) {
+    if hdr && !resolved.can_encode_10bit(opts.codec) {
         anyhow::bail!(
             "--hdr asked for {:?} at 10 bits and the resolved encoder cannot do it",
             opts.codec
         );
     }
-    plat::check_virtual_source(&opts)?;
+    plat::check_virtual_source(&opts, &resolved)?;
     let bit_depth: u8 = if hdr { 10 } else { 8 };
 
     let mut capturer: Box<dyn Capturer> = match opts.source {
@@ -209,7 +210,8 @@ pub fn run(opts: Options) -> Result<()> {
                 "spike source: xdg ScreenCast portal (live monitor)"
             );
             // Encoder open passes `cursor_blend = false`, so a metadata pointer would composite nowhere.
-            capture::open_portal_monitor(want_hdr, false).context("open portal capturer")?
+            capture::open_portal_monitor(want_hdr, false, true, &resolved)
+                .context("open portal capturer")?
         }
         Source::Virtual => {
             let compositor = plat::spike_compositor()?;
@@ -233,17 +235,20 @@ pub fn run(opts: Options) -> Result<()> {
             // negotiates it). On Linux that flag is raw-dmabuf passthrough; overwrite
             // from the spike codec so `--codec pyrowave` does not encode off a
             // non-PyroWave capture.
-            let mut want = capture::OutputFormat::resolve(hdr, encode::resolved_backend_is_gpu());
+            let mut want = capture::OutputFormat::resolve(hdr, resolved.is_gpu());
             want.pyrowave = opts.codec == Codec::PyroWave;
             capture::capture_virtual_output(
                 vout,
                 capture::VirtualCaptureRequest {
                     output: want,
                     codec: Some(opts.codec),
+                    encoder: resolved.clone(),
                     capture: crate::session_plan::CaptureBackend::resolve(),
                     kwin: compositor == crate::vdisplay::Compositor::Kwin,
                     gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
                     stream_hz: opts.fps,
+                    screen: 0,
+                    gamescope_cursor: false,
                 },
             )
             .context("capture virtual output")?
@@ -251,11 +256,15 @@ pub fn run(opts: Options) -> Result<()> {
     };
 
     // Portal/PipeWire delivers frames only while `active`; idle by default so reconnects are cheap.
-    capturer.set_active(true);
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(true);
+    }
 
-    let first = capturer.next_frame().context("capture first frame")?;
+    let first = capturer
+        .next_frame(pf_capture::FirstFrame::Default)
+        .context("capture first frame")?;
     // The gate is what the display composes: the encoder follows an SDR display down to 8-bit.
-    if hdr && capturer.hdr_meta().is_none() {
+    if hdr && capturer.colour().hdr_meta.is_none() {
         anyhow::bail!("--hdr: the display composes SDR, not HDR");
     }
     let (w, h) = (first.width, first.height);
@@ -269,24 +278,28 @@ pub fn run(opts: Options) -> Result<()> {
         "opening video encoder"
     );
     let driver_encoder =
-        plat::open_driver_encoder(&opts, capturer.as_ref(), (w, h), bit_depth, hdr)?;
+        plat::open_driver_encoder(&opts, &resolved, capturer.as_ref(), (w, h), bit_depth, hdr)?;
     let driver_encode = driver_encoder.is_some();
     let mut encoder = if let Some(enc) = driver_encoder {
         enc
     } else {
         encode::open_video(
-            opts.codec,
-            first.format,
-            w,
-            h,
-            opts.fps,
-            opts.bitrate_bps,
-            first.is_cuda(),
-            bit_depth,
-            hdr,
-            encode::ChromaFormat::Yuv420,
-            false,                               // no cursor to blend
-            crate::session_plan::DEFAULT_SLICES, // no client decoder
+            &resolved,
+            encode::OpenParams {
+                codec: opts.codec,
+                format: first.format,
+                width: w,
+                height: h,
+                fps: opts.fps,
+                bitrate_bps: opts.bitrate_bps,
+                cuda: first.is_cuda(),
+                bit_depth,
+                hdr,
+                chroma: encode::ChromaFormat::Yuv420,
+                cursor_blend: false,                         // no cursor to blend
+                slices: crate::session_plan::DEFAULT_SLICES, // no client decoder
+                full_range: true,
+            },
         )
         .context("open encoder")?
     };
@@ -335,7 +348,9 @@ pub fn run(opts: Options) -> Result<()> {
         if done {
             break;
         }
-        frame = capturer.next_frame().context("capture frame")?;
+        frame = capturer
+            .next_frame(pf_capture::FirstFrame::Default)
+            .context("capture frame")?;
     }
 
     if !driver_encode {
@@ -643,8 +658,8 @@ mod plat {
 
     /// The virtual source proves a seat can stream, so a software encoder is a failure
     /// rather than a fallback: the driver is what encodes, and it needs a GPU.
-    pub(super) fn check_virtual_source(opts: &Options) -> Result<()> {
-        if opts.source == Source::Virtual && !encode::resolved_backend_is_gpu() {
+    pub(super) fn check_virtual_source(opts: &Options, resolved: &encode::Resolved) -> Result<()> {
+        if opts.source == Source::Virtual && !resolved.is_gpu() {
             anyhow::bail!(
                 "--source virtual is the Windows seat gate and needs a GPU encoder; the resolved \
                  backend is software"
@@ -676,6 +691,7 @@ mod plat {
     /// encoder is the real path, and it is what the seat gate has to exercise.
     pub(super) fn open_driver_encoder(
         opts: &Options,
+        resolved: &encode::Resolved,
         capturer: &dyn Capturer,
         size: (u32, u32),
         bit_depth: u8,
@@ -687,6 +703,7 @@ mod plat {
             return Ok(None);
         }
         let plan = crate::session_plan::SessionPlan::resolve(
+            resolved,
             bit_depth,
             hdr,
             encode::ChromaFormat::Yuv420,
@@ -713,7 +730,7 @@ mod plat {
 mod plat {
     use super::*;
 
-    pub(super) fn check_virtual_source(_opts: &Options) -> Result<()> {
+    pub(super) fn check_virtual_source(_opts: &Options, _: &encode::Resolved) -> Result<()> {
         Ok(())
     }
 
@@ -727,6 +744,7 @@ mod plat {
 
     pub(super) fn open_driver_encoder(
         _opts: &Options,
+        _resolved: &encode::Resolved,
         _capturer: &dyn Capturer,
         _size: (u32, u32),
         _bit_depth: u8,

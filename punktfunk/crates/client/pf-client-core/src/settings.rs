@@ -157,6 +157,10 @@ pub struct Settings {
     /// unknown reads as fit.
     #[serde(default = "default_video_fit")]
     pub video_fit: String,
+    /// `"this"` (default): the stream shows on the window's monitor. `"all"`: one host screen
+    /// on each of this computer's monitors, asked for again as monitors come and go.
+    #[serde(default = "default_screens")]
+    pub screens: String,
     pub gamepad: String,
     /// Forward this device's controllers. Default on.
     ///
@@ -394,6 +398,16 @@ pub const FULLSCREEN_ALWAYS_KEY: &str = "fullscreen_always";
 pub const GAMEPAD_UI_KEY: &str = "gamepad_ui_enabled";
 pub const GAMEPAD_UI_MODE_KEY: &str = "gamepad_ui_mode";
 
+/// Bitrate's hint under PyroWave, where the row offers Automatic or Fixed and the quality row
+/// stands in for the rate. Fixed stores any non-zero rate; the host pins it at the quality.
+pub const PYROWAVE_BITRATE_HINT: &str =
+    "Automatic lowers PyroWave quality while the network falls short; Fixed always streams at \
+     your quality.";
+/// The rate Fixed stores under PyroWave, kbps. The host pins the session at the quality, so
+/// only "not zero" counts. If the host picks another codec the session is Automatic
+/// ([`punktfunk_core::quic::session_bitrate_kbps`]).
+pub const PYROWAVE_FIXED_KBPS: u32 = 20_000;
+
 /// When the controller-optimized UI (the console) takes over the desktop layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GamepadUi {
@@ -416,6 +430,10 @@ fn default_auto() -> String {
 
 fn default_video_fit() -> String {
     "fit".into()
+}
+
+fn default_screens() -> String {
+    "this".into()
 }
 
 fn default_touch_mode() -> String {
@@ -577,6 +595,11 @@ impl Settings {
         MouseMode::from_name(&self.mouse_mode)
     }
 
+    /// The stream asks for a screen per monitor; any other value is this monitor.
+    pub fn all_screens(&self) -> bool {
+        self.screens == "all"
+    }
+
     pub fn present_priority(&self) -> PresentPriority {
         PresentPriority::resolve(&self.present_priority, self.smooth_buffer)
     }
@@ -626,6 +649,7 @@ impl Default for Settings {
             pyrowave_bpp: default_pyrowave_bpp(),
             render_scale: 1.0,
             video_fit: default_video_fit(),
+            screens: default_screens(),
             gamepad: "auto".into(),
             gamepad_forwarding: true,
             forward_pad: String::new(),

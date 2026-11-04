@@ -7,7 +7,9 @@
 //! inherits. That policy is the whole reason this file exists: it should be readable in one
 //! place instead of found by grepping for a `cfg`.
 
+use super::ace_plan::{self, Aces};
 use super::*;
+use crate::windows::folder_ace;
 
 /// `NT AUTHORITY\LocalService` in icacls SID form.
 pub(super) const LOCAL_SERVICE_SID: &str = "*S-1-5-19";
@@ -482,22 +484,62 @@ pub(super) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
     Ok((bun, vec![runner.to_string_lossy().into_owned()]))
 }
 
-/// The runner's account may reach one directory the operator owns. LocalService holds no ACE
-/// inside a user profile, so without this a launcher installed there reads as not installed.
-pub(super) fn grant(dir: &std::path::Path, write: bool) -> Result<()> {
-    grant_to(LOCAL_SERVICE_SID, dir, write)
+/// The runner's account, and `plugin`'s files capability with the sandbox on, may reach one
+/// directory the operator owns: both ACEs in one walk of its tree, which the next converge
+/// adopts rather than walking again. LocalService holds no ACE inside a user profile, so
+/// without this a launcher installed there reads as not installed.
+pub(super) fn grant(
+    plugin: Option<&str>,
+    dir: &std::path::Path,
+    write: bool,
+    files: bool,
+) -> Result<()> {
+    let ace = Ace::of(write, files, false);
+    let sids = decision_sids(plugin);
+    let aces: Vec<(String, Ace)> = sids.iter().map(|sid| (sid.clone(), ace)).collect();
+    grant_aces(dir, &aces, plugin)?;
+    note(dir, &sids, Some(ace));
+    Ok(())
 }
 
-/// One grantee's ACE on one directory, `icacls /grant:r` so an earlier one is replaced, never
-/// stacked. The grantee is the runner's account today and a plugin's package SID once each
-/// runs in its own AppContainer. One directory only: a service account bypasses traverse
-/// checks, so the locked parents above it stay shut.
-pub(super) fn grant_to(sid: &str, dir: &std::path::Path, write: bool) -> Result<()> {
-    grant_ace(sid, dir, if write { Ace::Modify } else { Ace::Read })
+/// The inverse of [`grant`] for a folder no plugin holds any more, in one walk.
+pub(super) fn revoke(plugin: &str, dir: &std::path::Path, files: bool) -> Result<()> {
+    let sids = decision_sids(Some(plugin));
+    let ace = Ace::of(false, files, false);
+    let aces: Vec<(String, Ace)> = sids.iter().map(|sid| (sid.clone(), ace)).collect();
+    revoke_sids(dir, &aces, Some(plugin))?;
+    note(dir, &sids, None);
+    Ok(())
 }
 
-/// [`grant_to`] with the ACE spelled out: code dirs take `(RX,WA)`, which is neither.
-fn grant_ace(sid: &str, dir: &std::path::Path, ace: Ace) -> Result<()> {
+/// The runner's SID, and `plugin`'s files capability with the sandbox on, without icacls' `*`.
+fn decision_sids(plugin: Option<&str>) -> Vec<String> {
+    let mut sids = vec![LOCAL_SERVICE_SID.trim_start_matches('*').to_string()];
+    if let Some(id) = plugin.filter(|_| !runner_sandbox_off()) {
+        sids.push(crate::windows::app_container::files_capability_sid(id));
+    }
+    sids
+}
+
+/// SIDs by how their ACE is placed: a folder's own files, a link, and the rest, which share one
+/// walk of the tree.
+fn by_reach(aces: &[(String, Ace)]) -> (Vec<&str>, Vec<&str>, Vec<&(String, Ace)>) {
+    let (mut own, mut links, mut tree) = (Vec::new(), Vec::new(), Vec::new());
+    for pair in aces {
+        match pair.1.reach() {
+            Reach::Files => own.push(pair.0.as_str()),
+            Reach::Link => links.push(pair.0.as_str()),
+            Reach::Tree => tree.push(pair),
+        }
+    }
+    (own, links, tree)
+}
+
+/// Each `(SID, ACE)` on one directory, in a single `icacls /grant:r` for what walks the tree: an
+/// earlier ACE for a SID is replaced, never stacked, and the tree below is walked once however
+/// many SIDs share it. One directory only: a service account bypasses traverse checks, so the
+/// locked parents above it stay shut. `plugin` names who the walk is listed for.
+fn grant_aces(dir: &std::path::Path, aces: &[(String, Ace)], plugin: Option<&str>) -> Result<()> {
     // A typo must not report success — the ACE would land on a name nothing ever reads.
     if !dir.is_dir() {
         bail!(
@@ -505,36 +547,69 @@ fn grant_ace(sid: &str, dir: &std::path::Path, ace: Ace) -> Result<()> {
             dir.display()
         );
     }
+    let owner = |detail: String| {
+        anyhow::anyhow!(
+            "'{}' is unchanged: a folder's permissions are changed by its OWNER or an \
+             administrator - run this as the user who owns the folder, or from an elevated \
+             prompt{detail}",
+            dir.display()
+        )
+    };
+    let (own, links, tree) = by_reach(aces);
+    if !own.is_empty() {
+        folder_ace::place(dir, &own).map_err(|e| owner(format!(": {e:#}")))?;
+    }
+    if !links.is_empty() {
+        folder_ace::place_link(dir, &links).map_err(|e| owner(format!(": {e:#}")))?;
+    }
+    if tree.is_empty() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    WALKS.with(|w| w.set(w.get() + 1));
+    let _walk = walks::begin(plugin, &dir.to_string_lossy(), false);
     let ok = Command::new(icacls_path())
         .arg(dir)
-        .args(["/grant:r", &format!("{sid}:{}", ace.icacls())])
+        .arg("/grant:r")
+        .args(
+            tree.iter()
+                .map(|(sid, ace)| format!("*{sid}:{}", ace.icacls())),
+        )
+        .stdout(std::process::Stdio::null())
         .status()
         .context("run icacls")?
         .success();
     if !ok {
-        bail!(
-            "icacls left '{}' unchanged: a folder's permissions are changed by its OWNER or \
-             an administrator - run this as the user who owns the folder, or from an elevated \
-             prompt",
-            dir.display()
-        );
+        return Err(owner(String::new()));
     }
     Ok(())
 }
 
-/// The inverse of [`grant`].
-pub(super) fn revoke(dir: &std::path::Path) -> Result<()> {
-    revoke_from(LOCAL_SERVICE_SID, dir)
-}
-
-/// Remove one grantee's ACE from one directory. A folder that is gone has nothing to remove.
-pub(super) fn revoke_from(sid: &str, dir: &std::path::Path) -> Result<()> {
-    if !dir.exists() {
+/// Every ACE of each `(SID, kind)` off one directory: what walks the tree in one walk. A folder
+/// that is gone has nothing to remove; a link whose target is gone is still a link.
+fn revoke_sids(dir: &std::path::Path, aces: &[(String, Ace)], plugin: Option<&str>) -> Result<()> {
+    if std::fs::symlink_metadata(dir).is_err() {
         return Ok(());
     }
+    let (own, links, tree) = by_reach(aces);
+    if !own.is_empty() {
+        folder_ace::take(dir, &own)
+            .with_context(|| format!("remove the runner's ACE from {}", dir.display()))?;
+    }
+    if !links.is_empty() {
+        folder_ace::take_link(dir, &links)
+            .with_context(|| format!("remove the runner's ACE from {}", dir.display()))?;
+    }
+    if tree.is_empty() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    WALKS.with(|w| w.set(w.get() + 1));
+    let _walk = walks::begin(plugin, &dir.to_string_lossy(), true);
     let ok = Command::new(icacls_path())
         .arg(dir)
-        .args(["/remove:g", sid])
+        .arg("/remove:g")
+        .args(tree.iter().map(|(sid, _)| format!("*{sid}")))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -547,28 +622,296 @@ pub(super) fn revoke_from(sid: &str, dir: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Folder ACL changes on this thread, each one walk of a folder's tree.
+    static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// A converge on this thread walked a folder itself since the last [`take_walked`].
+    static CONVERGE_WALKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a converge on this thread placed or removed a folder ACE itself since the last ask.
+pub(super) fn take_walked() -> bool {
+    CONVERGE_WALKED.with(|w| w.replace(false))
+}
+
+/// What a grant or revoke already did to a folder, for the next converge to record rather than
+/// walk again. `ace` is `None` for a removal; the path is spelled as the converge spells roots.
+struct Noted {
+    path: String,
+    sid: String,
+    ace: Option<Ace>,
+    at: std::time::Instant,
+}
+
+static NOTED: std::sync::Mutex<Vec<Noted>> = std::sync::Mutex::new(Vec::new());
+
+/// A note no converge used in this long is dropped: by then the converge has its own record.
+const NOTE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn note(dir: &std::path::Path, sids: &[String], ace: Option<Ace>) {
+    let path = dir
+        .canonicalize()
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut noted = NOTED.lock().unwrap_or_else(|poison| poison.into_inner());
+    noted.retain(|n| !(n.path == path && sids.contains(&n.sid)));
+    noted.extend(sids.iter().map(|sid| Noted {
+        path: path.clone(),
+        sid: sid.clone(),
+        ace,
+        at: std::time::Instant::now(),
+    }));
+}
+
+/// Whether `path`'s own DACL already gives `sid` what `ace` grants: one descriptor read, where
+/// placing it again would walk the whole tree. A link is read as itself, not followed.
+fn held(path: &str, sid: &str, ace: Ace) -> bool {
+    use ::windows::Win32::Security::Authorization::SE_FILE_OBJECT;
+    let rights = if ace == Ace::Link {
+        folder_ace::link_rights(std::path::Path::new(path), sid)
+    } else {
+        crate::windows::registry_ace::rights(path, SE_FILE_OBJECT, sid)
+    };
+    rights.is_ok_and(|mask| mask & ace.mask() == ace.mask())
+}
+
+#[cfg(test)]
 mod tests {
-    /// Only an `HKLM` key becomes a named key; `HKCU` and anything malformed name nothing.
+    /// An `HKLM` key names itself once, an `HKCU` key one per loaded account, anything
+    /// malformed nothing.
     #[test]
-    fn named_key_takes_hklm_only() {
+    fn named_keys_take_the_machine_and_each_account() {
+        let sids = [
+            "S-1-5-21-1-2-3-1001".to_string(),
+            "S-1-12-1-4-5".to_string(),
+        ];
+        let named = |k| super::named_keys_for(k, &sids);
         assert_eq!(
-            super::named_key(r"HKLM\SOFTWARE\Valve\Steam").as_deref(),
-            Some(r"MACHINE\SOFTWARE\Valve\Steam")
+            named(r"HKLM\SOFTWARE\Valve\Steam"),
+            [r"MACHINE\SOFTWARE\Valve\Steam"]
         );
         assert_eq!(
-            super::named_key(r"hklm\SOFTWARE\WOW6432Node\Ubisoft").as_deref(),
-            Some(r"MACHINE\SOFTWARE\WOW6432Node\Ubisoft")
+            named(r"hklm\SOFTWARE\WOW6432Node\Ubisoft"),
+            [r"MACHINE\SOFTWARE\WOW6432Node\Ubisoft"]
+        );
+        assert_eq!(
+            named(r"HKCU\System\GameConfigStore"),
+            [
+                r"USERS\S-1-5-21-1-2-3-1001\System\GameConfigStore",
+                r"USERS\S-1-12-1-4-5\System\GameConfigStore",
+            ]
         );
         for bad in [
-            r"HKCU\Software\Valve\Steam",
             r"HKLM\",
+            r"HKCU\Software\..\..\S-1-5-18",
             r"HKLM\SOFTWARE\\Valve",
             r"HKLM\SOFTWARE\..\SAM",
             "HKLM\\SOFTWARE\\a\u{7}b",
+            r"HKU\S-1-5-18\Software",
             r"SOFTWARE\Valve",
         ] {
-            assert_eq!(super::named_key(bad), None, "{bad}");
+            assert!(named(bad).is_empty(), "{bad}");
         }
+    }
+
+    /// A folder's SIDs share one walk; what a grant noted, or the folder still carries on a
+    /// recheck, costs none; an ACE an installer stripped is placed again. Writes ACLs on a
+    /// scratch tree, so it runs on a Windows box with `--ignored`.
+    #[test]
+    #[ignore = "edits ACLs with icacls; run on a Windows box"]
+    fn a_folder_takes_one_walk_and_a_recheck_none() {
+        use super::{converge_folders, held, note, Ace, Placed, PlacedAces, WALKS};
+        let tmp = tempfile::tempdir().unwrap();
+        for d in 0..20 {
+            let sub = tmp.path().join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..20 {
+                std::fs::write(sub.join(format!("f{f}")), b"x").unwrap();
+            }
+        }
+        let dir = tmp.path().canonicalize().unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        let deep = dir.join("d19").join("f19").to_string_lossy().into_owned();
+        let runner = super::LOCAL_SERVICE_SID.trim_start_matches('*').to_string();
+        // Any well-formed capability SID: an ACE needs no container that holds it.
+        let pkg = "S-1-15-3-1024-1-2-3-4-5-6-7-8".to_string();
+        let walks = || WALKS.with(std::cell::Cell::get);
+        let aces = |ace: Ace| PlacedAces {
+            grantees: [&runner, &pkg]
+                .into_iter()
+                .map(|sid| {
+                    let paths = [(path.clone(), ace)].into();
+                    let keys = Default::default();
+                    (sid.clone(), Placed { paths, keys })
+                })
+                .collect(),
+        };
+        let none = PlacedAces::default();
+        let want = aces(Ace::Read);
+        assert!(!held(&path, &pkg, Ace::Read));
+
+        let start = walks();
+        let mut placed = none.clone();
+        converge_folders(&want, &none, &mut placed, false);
+        assert_eq!(walks() - start, 1, "both SIDs in one walk");
+        assert!(placed == want);
+        assert!(held(&path, &pkg, Ace::Read) && held(&path, &runner, Ace::Read));
+        assert!(held(&deep, &pkg, Ace::Read), "the tree below inherited it");
+        assert!(!held(&path, &pkg, Ace::Modify));
+
+        let start = walks();
+        let mut again = want.clone();
+        converge_folders(&want, &want, &mut again, true);
+        assert_eq!(
+            walks() - start,
+            0,
+            "a recheck reads the folder, it does not walk it"
+        );
+        assert!(again == want);
+
+        // A grant already placed them: the converge records without a walk.
+        let start = walks();
+        note(&dir, &[runner.clone(), pkg.clone()], Some(Ace::Read));
+        let mut adopted = none.clone();
+        converge_folders(&want, &none, &mut adopted, false);
+        assert_eq!(walks() - start, 0);
+        assert!(adopted == want);
+
+        // An installer stripped the capability's ACE: the recheck sees it and walks once.
+        let strip =
+            |sid: &String| super::revoke_sids(&dir, &[(sid.clone(), Ace::Read)], None).unwrap();
+        strip(&pkg);
+        let start = walks();
+        let mut healed = want.clone();
+        converge_folders(&want, &want, &mut healed, true);
+        assert_eq!(walks() - start, 1);
+        assert!(held(&path, &pkg, Ace::Read));
+
+        // A folder on the refused list costs a verify no walk, stripped or not.
+        strip(&pkg);
+        let refused = || super::REFUSED.lock().unwrap();
+        refused().insert((pkg.clone(), path.clone()));
+        let start = walks();
+        let mut skipped = want.clone();
+        converge_folders(&want, &want, &mut skipped, true);
+        assert_eq!(walks() - start, 0);
+        assert!(!held(&path, &pkg, Ace::Read));
+        refused().clear();
+        converge_folders(&want, &want, &mut skipped, true);
+        assert!(held(&path, &pkg, Ace::Read));
+
+        // Both come off in one walk, and a noted removal costs none.
+        let start = walks();
+        let mut gone = want.clone();
+        converge_folders(&none, &want, &mut gone, false);
+        assert_eq!(walks() - start, 1);
+        assert!(!held(&path, &pkg, Ace::Read));
+        let start = walks();
+        note(&dir, &[runner.clone(), pkg.clone()], None);
+        let mut dropped = want.clone();
+        converge_folders(&none, &want, &mut dropped, false);
+        assert_eq!(walks() - start, 0);
+        assert!(dropped.grantees.values().all(|p| p.paths.is_empty()));
+    }
+
+    /// A folder's own ACE reaches its files and stops; a private folder inside keeps its DACL
+    /// through a tree grant. Writes ACLs on a scratch tree, so it runs with `--ignored`.
+    #[test]
+    #[ignore = "edits ACLs; run on a Windows box"]
+    fn a_files_ace_stops_at_the_folder_and_a_tree_ace_at_protection() {
+        use super::{converge_folders, held, Ace, Placed, PlacedAces};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let spell = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        let (path, own) = (spell(dir.clone()), spell(dir.join("appmanifest_1.acf")));
+        let (sub, deep) = (dir.join("common"), dir.join("common").join("f"));
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(&own, b"x").unwrap();
+        std::fs::write(&deep, b"x").unwrap();
+        let cut = std::process::Command::new(super::icacls_path())
+            .arg(&locked)
+            .args(["/inheritance:d", "/Q"])
+            .output()
+            .unwrap();
+        assert!(cut.status.success());
+        let (sub, deep, locked) = (spell(sub), spell(deep), spell(locked));
+        let pkg = "S-1-15-3-1024-1-2-3-4-5-6-7-9".to_string();
+        let aces = |ace: Ace| PlacedAces {
+            grantees: [(
+                pkg.clone(),
+                Placed {
+                    paths: [(path.clone(), ace)].into(),
+                    keys: Default::default(),
+                },
+            )]
+            .into(),
+        };
+        let none = PlacedAces::default();
+        let files = aces(Ace::Files);
+        let mut placed = none.clone();
+        converge_folders(&files, &none, &mut placed, false);
+        assert!(held(&path, &pkg, Ace::Read) && held(&own, &pkg, Ace::Read));
+        let late = spell(dir.join("appmanifest_2.acf"));
+        std::fs::write(&late, b"x").unwrap();
+        assert!(held(&late, &pkg, Ace::Read), "a new file inherits it");
+        assert!(!held(&sub, &pkg, Ace::Read) && !held(&deep, &pkg, Ace::Read));
+
+        // Widened to the tree: everything below takes it, except what is protected.
+        let tree = aces(Ace::Read);
+        let mut widened = files.clone();
+        converge_folders(&tree, &files, &mut widened, false);
+        assert!(held(&deep, &pkg, Ace::Read));
+        assert!(!held(&locked, &pkg, Ace::Read));
+
+        // Narrowed back, the tree loses it again.
+        let mut narrowed = tree.clone();
+        converge_folders(&files, &tree, &mut narrowed, false);
+        assert!(held(&own, &pkg, Ace::Read) && !held(&deep, &pkg, Ace::Read));
+
+        let mut gone = files.clone();
+        converge_folders(&none, &files, &mut gone, false);
+        assert!(!held(&path, &pkg, Ace::Read) && !held(&own, &pkg, Ace::Read));
+        assert!(!held(&late, &pkg, Ace::Read), "what it inherited goes too");
+    }
+
+    /// A link's ACE lands on the link object, not on what it points at, and comes off alone.
+    /// Makes a junction in a scratch tree, so `--ignored`.
+    #[test]
+    #[ignore = "edits ACLs; run on a Windows box"]
+    fn a_link_ace_lands_on_the_link_not_its_target() {
+        use super::{held, Ace};
+        use crate::windows::folder_ace;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = tmp.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let pkg = "S-1-15-3-1024-1-2-3-4-5-6-7-10";
+        let spell = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        folder_ace::place_link(&link, &[pkg]).unwrap();
+        assert!(held(&spell(&link), pkg, Ace::Link));
+        assert!(
+            !held(&spell(&target), pkg, Ace::Read),
+            "the target is untouched"
+        );
+        folder_ace::take_link(&link, &[pkg]).unwrap();
+        assert!(!held(&spell(&link), pkg, Ace::Link));
     }
 }
 
@@ -648,15 +991,61 @@ enum Ace {
     /// `(RX)` on this folder alone: the names in it, none of what they hold. `(RD)` alone
     /// does not open the folder for a listing.
     List,
+    /// `(OI)(NP)(RX)`: this folder and the files directly in it, and no folder below. Placed
+    /// with no walk; a file made here later inherits it.
+    Files,
+    /// `(RX)` on a junction or symbolic link itself, never followed: what the runner opens
+    /// through on its way to a root. Placed by handle; a link has nothing below it.
+    Link,
+}
+
+/// How an ACE is placed, which is also how far it reaches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// icacls, one walk of the tree.
+    Tree,
+    /// `SetFileSecurityW` on the folder and each file in it.
+    Files,
+    /// A handle on the link object.
+    Link,
 }
 
 impl Ace {
+    fn of(write: bool, files: bool, link: bool) -> Self {
+        match (write, files, link) {
+            (_, _, true) => Ace::Link,
+            (true, _, false) => Ace::Modify,
+            (false, true, false) => Ace::Files,
+            (false, false, false) => Ace::Read,
+        }
+    }
+
+    fn reach(self) -> Reach {
+        match self {
+            Ace::Read | Ace::Code | Ace::Modify | Ace::List => Reach::Tree,
+            Ace::Files => Reach::Files,
+            Ace::Link => Reach::Link,
+        }
+    }
+
+    /// The ACE as icacls spells it. A link never reaches icacls, see [`by_reach`].
     fn icacls(self) -> &'static str {
         match self {
             Ace::Read => "(OI)(CI)(RX)",
             Ace::Code => "(OI)(CI)(RX,WA)",
             Ace::Modify => "(OI)(CI)(M)",
-            Ace::List => "(RX)",
+            Ace::List | Ace::Link => "(RX)",
+            Ace::Files => "(OI)(NP)(RX)",
+        }
+    }
+
+    /// The access mask icacls writes for [`Ace::icacls`]: `RX` is FILE_GENERIC_READ |
+    /// FILE_GENERIC_EXECUTE, `WA` adds FILE_WRITE_ATTRIBUTES, `M` is Modify.
+    fn mask(self) -> u32 {
+        match self {
+            Ace::Read | Ace::List | Ace::Files | Ace::Link => folder_ace::READ_MASK,
+            Ace::Code => 0x0012_01A9,
+            Ace::Modify => 0x0013_01BF,
         }
     }
 }
@@ -682,25 +1071,35 @@ struct Placed {
 const RUNNER_ACES_FILE: &str = "runner-aces.json";
 
 static RECHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The `(SID, path)` grants Windows refused this run.
+/// The `(SID, path)` grants Windows refused this run, or that a placing left unseen on the folder.
+/// Neither is walked again before a recheck.
 static REFUSED: std::sync::Mutex<std::collections::BTreeSet<(String, String)>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// The next converge places every ACE again, not only the changed ones. The service asks at start:
-/// it runs as SYSTEM, which may edit a folder like `WindowsApps` that an admin's CLI may not.
+/// The next converge checks every folder ACE on the folder itself and places any it lacks, tries
+/// a refused folder again, and places every key ACE again. The service asks at start: it runs as
+/// SYSTEM, which may edit a folder like `WindowsApps` that an admin's CLI may not.
 pub(super) fn recheck_next() {
     RECHECK.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The next converge checks every folder ACE on the folder itself and places any it lacks: one
+/// descriptor read per ACE, cheap enough to run every minute.
+pub(super) fn verify_next() {
+    VERIFY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Every directory a plugin declared or was granted carries an ACE for the runner's account,
 /// read or Modify, and every `HKLM` key it declared a read; what a gone plugin placed is
-/// stripped. With the sandbox on, the plugin's package gets the same plus its code, state and
-/// inbox: a container passes only an ACE its account and its package both hold, so a root in a
-/// user profile needs both. A root under the host's own profile is nobody's `~` and gets
-/// nothing; a directory that does not exist yet waits for the next start. After
-/// [`recheck_next`] it places every ACE again: an installer that rewrites a folder or key drops
-/// the ACE while the file still lists it.
+/// stripped. With the sandbox on, the plugin's files capability gets the same plus its code,
+/// state and inbox: a container passes only an ACE its account and its capability both hold, so
+/// a root in a user profile needs both. An ACE an older host placed for the package SID is in
+/// the record and comes off here. A root under the host's own profile is nobody's `~` and gets
+/// nothing; a directory that does not exist yet waits for the next start. The record alone
+/// can't see an ACE that went from its folder, so [`verify_next`] and [`recheck_next`] read the
+/// folders: a plugin without the ACE on its own code can't start.
 pub(super) fn converge_runner_roots(
     roots: &[access::RunnerRoot],
     home: &std::path::Path,
@@ -712,7 +1111,7 @@ pub(super) fn converge_runner_roots(
         keys: manifests
             .values()
             .flat_map(|m| m.registry.iter())
-            .filter_map(|k| named_key(k))
+            .flat_map(|k| named_keys(k))
             .collect(),
     };
     let mut want = PlacedAces {
@@ -725,19 +1124,13 @@ pub(super) fn converge_runner_roots(
     if !runner_sandbox_off() {
         let store = access::AccessStore::open(pf_paths::config_dir());
         for (id, m) in manifests {
-            let sid = match crate::windows::app_container::package_sid(id) {
-                Ok(sid) => sid,
-                Err(e) => {
-                    tracing::warn!(plugin = %id, error = %format!("{e:#}"), "no package SID");
-                    continue;
-                }
-            };
+            let sid = crate::windows::app_container::files_capability_sid(id);
             let mut paths = root_aces(&store.plugin_roots(id, m), &home);
             paths.extend(package_dirs(id));
             if m.per_account() {
                 paths.extend(profiles_root());
             }
-            let keys = m.registry.iter().filter_map(|k| named_key(k)).collect();
+            let keys = m.registry.iter().flat_map(|k| named_keys(k)).collect();
             want.grantees.insert(sid, Placed { paths, keys });
         }
     }
@@ -749,28 +1142,22 @@ pub(super) fn converge_runner_roots(
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
     let recheck = RECHECK.swap(false, std::sync::atomic::Ordering::Relaxed);
-    if want == had && !recheck {
+    if recheck {
+        REFUSED
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+    }
+    let verify = VERIFY.swap(false, std::sync::atomic::Ordering::Relaxed) || recheck;
+    if want == had && !verify {
         return Ok(false);
     }
     let mut placed = had.clone();
     let empty = Placed::default();
-    // Stale first: an ACE that outlives its plugin is the leak this file exists to close.
+    converge_folders(&want, &had, &mut placed, verify);
+    // Stale keys first: an ACE that outlives its plugin is the leak this file exists to close.
     for (sid, old) in &had.grantees {
         let new = want.grantees.get(sid).unwrap_or(&empty);
-        let icacls_sid = format!("*{sid}");
-        for path in old.paths.keys().filter(|p| !new.paths.contains_key(*p)) {
-            match revoke_from(&icacls_sid, std::path::Path::new(path)) {
-                Ok(()) => {
-                    placed
-                        .grantees
-                        .entry(sid.clone())
-                        .or_default()
-                        .paths
-                        .remove(path);
-                }
-                Err(e) => tracing::warn!(%sid, %path, error = %e, "runner ACE not removed"),
-            }
-        }
         for key in old.keys.difference(&new.keys) {
             match crate::windows::registry_ace::revoke(key, sid) {
                 Ok(()) => {
@@ -781,6 +1168,11 @@ pub(super) fn converge_runner_roots(
                         .keys
                         .remove(key);
                 }
+                // A signed-out account's hive is unloaded and keeps its ACE: kept on record so
+                // the next converge after sign-in takes it, or holds it, as it should.
+                Err(e) if crate::windows::registry_ace::is_absent(&e) => {
+                    tracing::debug!(%sid, %key, "key ACE waits for its hive")
+                }
                 Err(e) => {
                     tracing::warn!(%sid, %key, error = %format!("{e:#}"), "key ACE not removed")
                 }
@@ -789,35 +1181,6 @@ pub(super) fn converge_runner_roots(
     }
     for (sid, new) in &want.grantees {
         let old = had.grantees.get(sid).unwrap_or(&empty);
-        let icacls_sid = format!("*{sid}");
-        for (path, ace) in &new.paths {
-            if !recheck && old.paths.get(path) == Some(ace) {
-                continue;
-            }
-            // A folder Windows won't let the service re-ACL stays wanted and unplaced, so every
-            // pass comes back here: one try and one line per run, more only on a recheck.
-            let refusal = (sid.clone(), path.clone());
-            let mut refused = REFUSED.lock().unwrap_or_else(|poison| poison.into_inner());
-            if !recheck && refused.contains(&refusal) {
-                continue;
-            }
-            match grant_ace(&icacls_sid, std::path::Path::new(path), *ace) {
-                Ok(()) => {
-                    refused.remove(&refusal);
-                    placed
-                        .grantees
-                        .entry(sid.clone())
-                        .or_default()
-                        .paths
-                        .insert(path.clone(), *ace);
-                }
-                Err(e) => {
-                    if refused.insert(refusal) {
-                        tracing::warn!(%sid, %path, error = %e, "runner ACE not placed");
-                    }
-                }
-            }
-        }
         let keys: Vec<&String> = if recheck {
             new.keys.iter().collect()
         } else {
@@ -854,6 +1217,138 @@ pub(super) fn converge_runner_roots(
     Ok(true)
 }
 
+/// Move every folder ACE in `placed` from `had` to `want`, one walk per folder and verb: an
+/// inheritable ACE makes Windows rewrite every file below, so a folder's SIDs share the walk.
+/// What a grant or revoke already did is recorded without one. With `verify`, a recorded ACE
+/// counts only if the folder's own DACL still carries it.
+fn converge_folders(want: &PlacedAces, had: &PlacedAces, placed: &mut PlacedAces, verify: bool) {
+    let paths = |p: &PlacedAces| -> Aces<Ace> {
+        p.grantees
+            .iter()
+            .map(|(sid, g)| (sid.clone(), g.paths.clone()))
+            .collect()
+    };
+    let (want_paths, had_paths) = (paths(want), paths(had));
+    let noted = std::mem::take(&mut *NOTED.lock().unwrap_or_else(|poison| poison.into_inner()));
+    let noted_ace = |sid: &str, path: &str| {
+        noted
+            .iter()
+            .find(|n| n.sid == sid && n.path == path)
+            .map(|n| n.ace)
+    };
+    let plan = ace_plan::plan(
+        &want_paths,
+        &had_paths,
+        |sid, path, ace| {
+            if noted_ace(sid, path) == Some(Some(ace)) {
+                return true;
+            }
+            let same = had_paths.get(sid).and_then(|p| p.get(path)) == Some(&ace);
+            same && (!verify || held(path, sid, ace))
+        },
+        |sid, path| noted_ace(sid, path) == Some(None),
+    );
+    // A note this pass had no use for may belong to a grant whose record lands after it.
+    let used = |n: &Noted| match n.ace {
+        Some(ace) => plan
+            .kept
+            .iter()
+            .any(|(s, p, a)| *s == n.sid && *p == n.path && *a == ace),
+        None => plan
+            .dropped
+            .iter()
+            .any(|(s, p)| *s == n.sid && *p == n.path),
+    };
+    let left: Vec<Noted> = noted
+        .into_iter()
+        .filter(|n| !used(n) && n.at.elapsed() < NOTE_TTL)
+        .collect();
+    NOTED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .extend(left);
+
+    for (sid, path, ace) in &plan.kept {
+        record(placed, sid, path, Some(*ace));
+    }
+    for (sid, path) in &plan.dropped {
+        record(placed, sid, path, None);
+    }
+    let had_ace = |sid: &str, path: &str| had_paths.get(sid).and_then(|p| p.get(path)).copied();
+    let mut refused = REFUSED.lock().unwrap_or_else(|poison| poison.into_inner());
+    for step in plan.steps {
+        let dir = std::path::Path::new(&step.path);
+        let was = |sid: &String| had_ace(sid, &step.path).map(|ace| (sid.clone(), ace));
+        // A folder's own files, a link and a tree are different ACEs: a change of kind undoes
+        // the old.
+        let changed = step
+            .place
+            .iter()
+            .filter_map(|(sid, ace)| was(sid).filter(|(_, old)| old.reach() != ace.reach()));
+        let gone: Vec<(String, Ace)> = step.remove.iter().filter_map(was).chain(changed).collect();
+        if !gone.is_empty() {
+            CONVERGE_WALKED.with(|w| w.set(true));
+            match revoke_sids(dir, &gone, None) {
+                Ok(()) => {
+                    for (sid, _) in &gone {
+                        record(placed, sid, &step.path, None);
+                    }
+                }
+                Err(e) => tracing::warn!(path = %step.path, error = %e, "runner ACE not removed"),
+            }
+        }
+        // A folder Windows won't let the service re-ACL stays wanted and unplaced, so every
+        // pass comes back here: one try and one line per run, more only on a recheck.
+        let place: Vec<(String, Ace)> = step
+            .place
+            .into_iter()
+            .filter(|(sid, _)| !refused.contains(&(sid.clone(), step.path.clone())))
+            .collect();
+        if place.is_empty() {
+            continue;
+        }
+        CONVERGE_WALKED.with(|w| w.set(true));
+        match grant_aces(dir, &place, None) {
+            Ok(()) => {
+                for (sid, ace) in &place {
+                    let key = (sid.clone(), step.path.clone());
+                    // Unseen after placing, it would walk this tree on every minute's verify.
+                    if verify && !held(&step.path, sid, *ace) {
+                        refused.insert(key);
+                    } else {
+                        refused.remove(&key);
+                    }
+                    if had_paths.get(sid).and_then(|p| p.get(&step.path)) == Some(ace) {
+                        tracing::warn!(%sid, path = %step.path, "runner ACE had gone, placed again");
+                    }
+                    record(placed, sid, &step.path, Some(*ace));
+                }
+            }
+            Err(e) => {
+                let mut fresh = false;
+                for (sid, _) in &place {
+                    fresh |= refused.insert((sid.clone(), step.path.clone()));
+                }
+                if fresh {
+                    tracing::warn!(path = %step.path, error = %e, "runner ACE not placed");
+                }
+            }
+        }
+    }
+}
+
+fn record(placed: &mut PlacedAces, sid: &str, path: &str, ace: Option<Ace>) {
+    let paths = &mut placed.grantees.entry(sid.to_string()).or_default().paths;
+    match ace {
+        Some(ace) => {
+            paths.insert(path.to_string(), ace);
+        }
+        None => {
+            paths.remove(path);
+        }
+    }
+}
+
 /// The roots that get an ACE: existing directories outside the host's own profile.
 fn root_aces(
     roots: &[access::RunnerRoot],
@@ -863,13 +1358,15 @@ fn root_aces(
         .iter()
         .filter(|r| !r.path.starts_with(home) && r.path.is_dir())
         .map(|r| {
-            let ace = if r.write { Ace::Modify } else { Ace::Read };
-            (r.path.to_string_lossy().into_owned(), ace)
+            (
+                r.path.to_string_lossy().into_owned(),
+                Ace::of(r.write, r.files, r.link),
+            )
         })
         .collect()
 }
 
-/// What a plugin's package needs beyond its roots: the runtime, the runner bundle and the
+/// What a plugin's container needs beyond its roots: the runtime, the runner bundle and the
 /// plugin tree it loads code from, its own state, and its inbox when it has one.
 fn package_dirs(id: &str) -> std::collections::BTreeMap<String, Ace> {
     let cfg = pf_paths::config_dir();
@@ -907,20 +1404,48 @@ fn profiles_root() -> Option<(String, Ace)> {
         .then(|| (users.to_string_lossy().into_owned(), Ace::List))
 }
 
-/// `HKLM\SOFTWARE\…` as `SetNamedSecurityInfoW` names it: `MACHINE\SOFTWARE\…`. An `HKCU` key
-/// is one account's and gets no ACE for the service; anything else is not a key.
-fn named_key(declared: &str) -> Option<String> {
+/// A declared key as `SetNamedSecurityInfoW` names it: `HKLM\…` once as `MACHINE\…`, and
+/// `HKCU\…` as `USERS\<sid>\…` under every account whose hive is loaded, as `~` names every
+/// profile. Anything else names no key.
+fn named_keys(declared: &str) -> Vec<String> {
+    named_keys_for(declared, &user_sids())
+}
+
+fn named_keys_for(declared: &str, sids: &[String]) -> Vec<String> {
+    if let Some(rest) = key_under(declared, "HKLM\\") {
+        return vec![format!("MACHINE\\{rest}")];
+    }
+    match key_under(declared, "HKCU\\") {
+        Some(rest) => sids.iter().map(|s| format!("USERS\\{s}\\{rest}")).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The path below `hive` (`HKLM\`), when `declared` is a clean key there.
+fn key_under<'a>(declared: &'a str, hive: &str) -> Option<&'a str> {
     let rest = declared
-        .get(..5)
-        .filter(|p| p.eq_ignore_ascii_case("HKLM\\"))
-        .map(|_| &declared[5..])?;
+        .get(..hive.len())
+        .filter(|p| p.eq_ignore_ascii_case(hive))
+        .map(|_| &declared[hive.len()..])?;
     let clean = !rest.is_empty()
         && rest.len() <= 255
         && !rest.chars().any(char::is_control)
         && rest
             .split('\\')
             .all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains(['/', '*', '?']));
-    clean.then(|| format!("MACHINE\\{rest}"))
+    clean.then_some(rest)
+}
+
+/// The loaded hives of real accounts: local and domain (`S-1-5-21-…`) and Entra ID
+/// (`S-1-12-1-…`). Service and `_Classes` hives hold no launcher state.
+fn user_sids() -> Vec<String> {
+    use winreg::{enums::HKEY_USERS, RegKey};
+    RegKey::predef(HKEY_USERS)
+        .enum_keys()
+        .flatten()
+        .filter(|s| s.starts_with("S-1-5-21-") || s.starts_with("S-1-12-1-"))
+        .filter(|s| !s.ends_with("_Classes"))
+        .collect()
 }
 
 /// Stop then start: there is no `Restart-ScheduledTask`, and Start on a running task is a no-op.

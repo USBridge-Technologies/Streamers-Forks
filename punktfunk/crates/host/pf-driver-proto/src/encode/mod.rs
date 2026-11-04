@@ -20,6 +20,9 @@ use bytemuck::{Pod, Zeroable};
 pub mod au;
 pub mod backend;
 pub mod codec;
+pub mod slots;
+
+pub use slots::{offer_slot, republish_slot, BypassHold, OfferSlot};
 
 /// The publish cell of [`au::AuHeader::latest`]: `(generation << 40) | (seq << 8) | slot`,
 /// with `generation` 24-bit, `seq` 32-bit and `slot` 8-bit. `generation` is bumped on every
@@ -123,6 +126,11 @@ pub struct SetEncodeRequest {
 /// stream is BT.709 SDR. Sent only to a driver that declared wide colour, so an older one, which
 /// would read BGRA from an FP16 surface, never sees it.
 pub const SET_ENCODE_FLAG_SDR_FP16: u32 = 1;
+
+/// [`SetEncodeRequest::flags`]: encode and signal studio range, because the host advertised
+/// studio for this session. The GPU's own RGB conversion writes studio whatever is asked (AMF
+/// on RDNA4); the YUV this side converts follows it. A driver older than the bit ignores it.
+pub const SET_ENCODE_FLAG_STUDIO_RANGE: u32 = 2;
 
 /// Bytes of [`SetEncodeRequest`] before [`SetEncodeRequest::knobs`]: what a host older than
 /// the knobs sends, and what a driver older than them reads.
@@ -382,7 +390,7 @@ pub enum EncodeInput {
     /// Shader FP16 scRGB→packed `R10G10B10A2`, sRGB curve on BT.709: SDR wide colour, the
     /// desktop's own bits past 8. NVENC; it CSCs itself, at full chroma.
     Rgb10Wcg,
-    /// Shader FP16 scRGB→P010 BT.709 studio range: SDR wide colour for AMF and QSV.
+    /// Shader FP16 scRGB→P010 BT.709 at the session's range: SDR wide colour for AMF and QSV.
     P010Wcg,
     /// Shareable Y + CbCr planes plus a fence, as PyroWave's own Vulkan device imports them.
     /// `hdr` is BT.2020 PQ and `wcg` BT.709 from FP16; either writes 10-bit codes into 16-bit
@@ -396,13 +404,16 @@ pub enum EncodeInput {
 
 impl EncodeInput {
     /// The input for `backend` (the [`SetEncodeRequest::backends`] numbering) under the
-    /// request's HDR, depth and 4:4:4 flags. NVENC, AMF and QSV ingest 8-bit BGRA and convert
-    /// it themselves, which keeps the conversion off the 3D engine a game renders on. AMF does
-    /// the same for HDR from the FP16 the display composes. Only NVENC ingests packed 10-bit
-    /// RGB at full chroma; QSV takes P010 under HDR and encodes 4:2:0. `ten_bit` without
-    /// `hdr` is 10-bit SDR: NVENC still widens from `Bgra`, AMF and QSV take a BT.709 P010
-    /// (`P010Sdr`). Media Foundation takes NV12 whatever was asked for — no vendor's MFT
-    /// accepts P010, so an HDR request that reaches it encodes 8-bit rather than failing.
+    /// request's HDR, depth and 4:4:4 flags. Every input carries the session's range: full, or
+    /// studio under [`SET_ENCODE_FLAG_STUDIO_RANGE`]. NVENC and AMF ingest
+    /// BGRA (AMF also FP16 under HDR) and convert it themselves — NVENC's conversion follows
+    /// the signalled range, AMF takes it as a property — which keeps the conversion off the 3D
+    /// engine a game renders on. QSV's own RGB conversion is studio range whatever is
+    /// signalled, so it reads the host's converters: NV12, P010, or BT.709 P010 (`P010Sdr`).
+    /// Only NVENC ingests packed 10-bit RGB at full chroma; QSV takes P010 under HDR and
+    /// encodes 4:2:0. `ten_bit` without `hdr` is 10-bit SDR: NVENC widens from `Bgra`, AMF and
+    /// QSV take `P010Sdr`. Media Foundation takes NV12 whatever was asked for — no vendor's
+    /// MFT accepts P010, so an HDR request that reaches it encodes 8-bit rather than failing.
     ///
     /// `sdr_fp16` ([`SET_ENCODE_FLAG_SDR_FP16`]) means the surface is FP16 under an SDR
     /// transfer: every input then converts from it, and `None` is a backend that cannot read
@@ -431,19 +442,18 @@ impl EncodeInput {
             (_, true, _) => Self::P010,
             (backend::NVENC, false, _) => Self::Bgra,
             (backend::AMF | backend::QSV, false, _) if ten_bit => Self::P010Sdr,
-            (backend::AMF | backend::QSV, false, _) => Self::Bgra,
+            (backend::AMF, false, _) => Self::Bgra,
             _ if wcg => return None,
             _ => Self::Nv12,
         })
     }
 
-    /// What `backend` opens with after it refused `self`. Only AMF's and QSV's RGB inputs
-    /// have a second choice: an encoder that declines one still encodes the YUV converted
-    /// for it.
+    /// What `backend` opens with after it refused `self`. Only AMF's RGB inputs have a
+    /// second choice: an encoder that declines one still encodes the YUV converted for it.
     #[must_use]
     pub const fn fallback(self, backend: u32) -> Option<Self> {
         match (backend, self) {
-            (backend::AMF | backend::QSV, Self::Bgra) => Some(Self::Nv12),
+            (backend::AMF, Self::Bgra) => Some(Self::Nv12),
             (backend::AMF, Self::Fp16) => Some(Self::P010),
             _ => None,
         }
@@ -579,49 +589,12 @@ impl core::fmt::Display for ReplyTooShort {
 
 impl core::error::Error for ReplyTooShort {}
 
-/// Which pool slot a keyframe request re-encodes when the desktop composed nothing:
-/// `stash`, the newest slot the encode thread took, but only while `queued` is 0 — a
-/// composed frame already carries the IDR — and the slot sits in `idle`, so no drain pass
-/// can be writing the pixels the encoder is about to read. `None` means do nothing.
-///
-/// The driver's pool is Windows-only; the rule lives here so it is covered everywhere.
-#[must_use]
-pub fn republish_slot(stash: Option<usize>, queued: usize, idle: &[usize]) -> Option<usize> {
-    stash.filter(|s| queued == 0 && idle.contains(s))
-}
-
-/// Where the drain worker's pass writes. A free slot always wins; with none left the
-/// oldest queued frame is overwritten, so the encoder takes the freshest composed picture
-/// under back-pressure rather than the incoming one being thrown away. `lost` is whether a
-/// consumer was there to miss the recycled frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OfferSlot {
-    Free(usize),
-    Recycle { slot: usize, lost: bool },
-}
-
-/// [`OfferSlot`] for a pool with `free` (any free slot) and `oldest_full` (the front of the
-/// queue), `live` while an encode thread is consuming. `None` means no slot at all.
-///
-/// The driver's pool is Windows-only; the rule lives here so it is covered everywhere.
-#[must_use]
-pub fn offer_slot(
-    free: Option<usize>,
-    oldest_full: Option<usize>,
-    live: bool,
-) -> Option<OfferSlot> {
-    match (free, oldest_full) {
-        (Some(slot), _) => Some(OfferSlot::Free(slot)),
-        (None, Some(slot)) => Some(OfferSlot::Recycle { slot, lost: live }),
-        (None, None) => None,
-    }
-}
-
 /// Whether a session's encoder reads the acquired surface itself instead of a copy of it.
 /// Only a `composed` input ([`EncodeInput::composed`]) can: every other kind needs its
-/// converter. On by default for AMF and QSV, where the copy runs on the 3D engine a game
-/// renders on. `knob` is `PFVD_POOL_BYPASS`: `0` turns it off, any other value turns it on
-/// for every backend.
+/// converter. On by default for AMF, QSV and NVENC: the copy runs on the 3D engine a game
+/// renders on, and on an RTX 4090 at 4K120 under full load it held the frame 2.7 ms longer
+/// before the encoder saw it. `knob` is `PFVD_POOL_BYPASS`: `0` turns it off, any other
+/// value turns it on for every backend.
 ///
 /// The driver's pool is Windows-only; the rule lives here so it is covered everywhere.
 #[must_use]
@@ -630,7 +603,7 @@ pub fn zero_copy(backend: u32, composed: bool, knob: Option<&str>) -> bool {
         && match knob.map(str::trim) {
             Some("0") => false,
             Some(_) => true,
-            None => matches!(backend, backend::AMF | backend::QSV),
+            None => matches!(backend, backend::AMF | backend::QSV | backend::NVENC),
         }
 }
 
@@ -848,7 +821,7 @@ mod tests {
     /// the client's Welcome — still said 4:4:4.
     #[test]
     fn a_444_request_picks_a_full_chroma_input() {
-        use super::EncodeInput::{Bgra, Fp16, P010Sdr, Planar, Rgb10, P010};
+        use super::EncodeInput::{Bgra, Fp16, Nv12, P010Sdr, Planar, Rgb10, P010};
 
         // (backend, hdr, ten_bit, chroma444) -> input. HDR implies ten_bit; 10-bit SDR is
         // ten_bit without hdr.
@@ -863,8 +836,8 @@ mod tests {
             ((3, true, true, false), P010),
             ((2, false, true, false), P010Sdr), // AMF 10-bit SDR: BT.709 P010
             ((2, false, false, false), Bgra),   // AMF 8-bit SDR: VCN converts
-            ((3, false, false, false), Bgra),   // QSV 8-bit SDR: the encoder converts
-            ((3, false, false, true), Bgra),
+            ((3, false, false, false), Nv12),   // QSV 8-bit SDR: its own CSC is studio range
+            ((3, false, false, true), Nv12),
             ((3, false, true, true), P010Sdr), // QSV 10-bit SDR: BT.709 P010
             (
                 (4, true, true, true),
@@ -927,12 +900,13 @@ mod tests {
         }
     }
 
-    /// Only AMF's and QSV's RGB inputs have a second one: the YUV the converter kinds deliver.
+    /// Only AMF's RGB inputs have a second one: the YUV the converter kinds deliver. QSV never
+    /// opens on BGRA now.
     #[test]
-    fn only_amf_and_qsv_rgb_inputs_fall_back() {
+    fn only_amf_rgb_inputs_fall_back() {
         use super::EncodeInput::{Bgra, Fp16, Nv12, P010Sdr, P010};
         assert_eq!(Bgra.fallback(2), Some(Nv12));
-        assert_eq!(Bgra.fallback(3), Some(Nv12));
+        assert_eq!(Bgra.fallback(3), None);
         assert_eq!(P010.fallback(3), None);
         assert_eq!(Fp16.fallback(2), Some(P010));
         assert!(Bgra.composed() && Fp16.composed() && !P010.composed());
@@ -947,13 +921,17 @@ mod tests {
     }
 
     #[test]
-    fn zero_copy_defaults_to_amf_and_qsv() {
-        use super::backend::{AMF, NVENC, QSV};
+    fn zero_copy_defaults_to_amf_qsv_and_nvenc() {
+        use super::backend::{AMF, MEDIA_FOUNDATION, NVENC, QSV};
         assert!(zero_copy(AMF, true, None));
         assert!(zero_copy(QSV, true, None));
-        assert!(!zero_copy(NVENC, true, None));
+        assert!(zero_copy(NVENC, true, None));
+        assert!(
+            !zero_copy(MEDIA_FOUNDATION, true, None),
+            "unmeasured: the copy stays"
+        );
         assert!(!zero_copy(AMF, true, Some("0")));
-        assert!(zero_copy(NVENC, true, Some("1")));
+        assert!(zero_copy(MEDIA_FOUNDATION, true, Some("1")));
         assert!(!zero_copy(AMF, false, Some("1")), "a converter kind");
     }
 
@@ -1140,5 +1118,22 @@ mod tests {
         k.apply_env("PUNKTFUNK_PYROWAVE_CHUNK_KIB", "8192");
         assert_eq!(k.pyrowave_chunk_64kib, 128);
         assert!(truthy("TRUE") && truthy(" 1") && !truthy("2") && !truthy(""));
+    }
+
+    #[test]
+    fn a_timed_out_hold_is_settled_by_its_own_release() {
+        let mut h = BypassHold::default();
+        assert!(h.may_hold());
+        // Frame N was held and taken; the hold timed out and the worker took N back.
+        h.timed_out();
+        assert!(!h.may_hold(), "no new hold while a release is owed");
+        // N's release lands after N+1 would have been held: it frees nothing.
+        assert!(!h.released(), "the owed release settles the debt");
+        assert!(h.may_hold());
+        assert!(h.released(), "a release with nothing owed frees the hold");
+        h.timed_out();
+        h.clear();
+        assert!(h.may_hold(), "a detach forgets the debt");
+        assert!(h.released());
     }
 }

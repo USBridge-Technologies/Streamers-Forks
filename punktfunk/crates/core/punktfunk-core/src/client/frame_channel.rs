@@ -192,6 +192,13 @@ impl StandingLatency {
         self.window_min_ns = None;
     }
 
+    /// A re-sync batch failed the congestion guard: the offset never moved, so the
+    /// elevation has not survived a re-sync yet. The next escalation asks again; the
+    /// guard applies the best of a rejection streak by its third batch.
+    pub(crate) fn resync_rejected(&mut self) {
+        self.resync_tried = false;
+    }
+
     /// Applied mid-stream re-sync (the pump's re-sync event): OWDs shifted, so
     /// discard floor and elevation. Bleed budget survives (it caps keyframes
     /// per session).
@@ -210,6 +217,9 @@ pub(crate) struct Trip {
     pub(crate) clock: bool,
     /// The queue sat at [`QUEUE_HIGH`] for [`STANDING_TIME`] and still does.
     pub(crate) queue: bool,
+    /// The queue tripped while its frames arrived on time, as an armed clock run that has
+    /// seen delays judged them: the decoder fell behind, not the link.
+    pub(crate) decoder: bool,
 }
 
 /// What a jump-to-live's flush found.
@@ -220,6 +230,20 @@ pub(crate) enum Shed {
     Noop { disarmed: bool },
     /// A real backlog, the `sheds`-th this session.
     Real { sheds: u32 },
+}
+
+impl Shed {
+    /// What ABR hears of `trip` once its flush is judged. A clock trip that found no local
+    /// backlog is no flush: a clock step or a queue upstream, which the delay readings
+    /// already carry, and the re-sync it asks for reaches ABR as a clock step. A late link
+    /// is the rate's to answer; a queue of on-time frames is the decoder's.
+    pub(crate) fn tell(&self, trip: Trip, abr: &mut crate::abr::Driver) {
+        match self {
+            Shed::Noop { .. } => {}
+            Shed::Real { .. } if trip.decoder => abr.on_decoder_backlog(),
+            Shed::Real { .. } => abr.on_flush(),
+        }
+    }
 }
 
 /// Jump-to-live. In-order consume never catches up and an infinite GOP can't
@@ -235,6 +259,8 @@ pub(crate) struct JumpToLive {
     /// Consecutive clock-only flushes that found no local backlog.
     noop_clock_flushes: u32,
     clock_armed: bool,
+    /// An AU has carried a delay, so the clock run can tell a late link from a slow decoder.
+    clock_fed: bool,
     /// Flushes that found a real backlog. Under a pinned rate nothing else
     /// lowers the load, so this is the "can't keep up" count.
     real_sheds: u32,
@@ -251,6 +277,7 @@ impl JumpToLive {
             last_flush: None,
             noop_clock_flushes: 0,
             clock_armed: true,
+            clock_fed: false,
             real_sheds: 0,
             preroll_draining: true,
             resync_wanted: false,
@@ -281,6 +308,7 @@ impl JumpToLive {
         is_au: bool,
         depth: usize,
     ) -> Option<Trip> {
+        self.clock_fed |= lat_ns > 0;
         if self.clock_armed && lat_ns > FLUSH_LATENCY.as_nanos() as i128 {
             self.stale_since.get_or_insert(now);
         } else if is_au {
@@ -297,9 +325,12 @@ impl JumpToLive {
         };
         // Still high NOW: a run in the hysteresis band (a clump mid-drain)
         // must not fire on elapsed time alone.
+        let clock = ran(self.stale_since, FLUSH_AFTER);
+        let queue = depth >= QUEUE_HIGH && ran(self.standing_since, STANDING_TIME);
         let trip = Trip {
-            clock: ran(self.stale_since, FLUSH_AFTER),
-            queue: depth >= QUEUE_HIGH && ran(self.standing_since, STANDING_TIME),
+            clock,
+            queue,
+            decoder: queue && !clock && self.clock_armed && self.clock_fed,
         };
         if !(trip.clock || trip.queue) || !self.claim_flush(now) {
             return None;
@@ -360,16 +391,19 @@ pub(crate) struct DecodeLatAcc {
     pub(crate) count: u32,
 }
 
-/// Host encode latency — [`DecodeLatAcc`]'s mirror. Datagram task samples
-/// `HostStages::encode_us` (submit → bitstream ready); the pump drains a window
-/// mean into [`crate::abr::Driver`]. Own accumulator, not
-/// the overlay `host_timing` channel: that is a lossy `try_send` the embedder
-/// may never drain, and a fat-LAN Automatic session otherwise drives the
-/// encoder past its compute knee with nothing to stop it.
+/// Host encode latency — [`DecodeLatAcc`]'s mirror — and each AU's host timing.
+/// Datagram task samples `HostStages::encode_us` (submit → bitstream ready); the
+/// pump drains a window mean into [`crate::abr::Driver`], and the timings that
+/// net host time out of the delay. Own accumulator, not the overlay
+/// `host_timing` channel: that is a lossy `try_send` the embedder may never
+/// drain, and a fat-LAN Automatic session otherwise drives the encoder past its
+/// compute knee with nothing to stop it.
 #[derive(Default)]
 pub(crate) struct EncodeLatAcc {
     pub(crate) sum_us: u64,
     pub(crate) count: u32,
+    /// Bounded by [`super::planes::HOST_TIMING_QUEUE`], as the overlay's plane is.
+    pub(crate) timings: Vec<crate::quic::HostTiming>,
 }
 
 /// Pre-decode video hand-off from the data-plane pump to the embedder.
@@ -405,6 +439,9 @@ struct FrameQueue {
     hold: Option<Hold>,
     /// Holds released by their frame completing, since the last [`FrameChannel::take_filled`].
     filled: u32,
+    /// A [`FrameChannel::kick`] no [`FrameChannel::pop`] has consumed: the next pop returns
+    /// at once instead of waiting, so a kick between two pops is never lost.
+    kicked: bool,
 }
 
 /// [`FrameChannel::hold`]: the frame a NACK is out for, how long it may take, and the
@@ -433,10 +470,18 @@ impl FrameChannel {
                 skipped_ever: 0,
                 hold: None,
                 filled: 0,
+                kicked: false,
             }),
             ready: Condvar::new(),
             consumer_seen: AtomicBool::new(false),
         }
+    }
+
+    /// Wake a waiting [`Self::pop`] with `Timeout`, or make the next one return at once: a
+    /// hardware decode finished, and the consumer has work besides frames.
+    pub(crate) fn kick(&self) {
+        self.inner.lock().unwrap().kicked = true;
+        self.ready.notify_one();
     }
 
     /// Whether anything has ever popped. False = no decoder yet: the pump holds
@@ -476,9 +521,9 @@ impl FrameChannel {
         self.inner.lock().unwrap().skipped_ever
     }
 
-    /// Hold every frame after `frame` until it completes or `until` passes: a NACK is out
-    /// for its missing shards, and the decoder must see it before them. An all-intra stream
-    /// holds too, or a resend landing after a newer frame would show the past. One at a time.
+    /// Hold every frame after `frame` until it arrives, whole or partial, or `until` passes: a
+    /// NACK is out for its missing shards, and the decoder must see it before them. An all-intra
+    /// stream holds too, or a resend landing after a newer frame would show the past. One at a time.
     pub(crate) fn hold(&self, frame: u32, until: Instant) -> bool {
         let mut st = self.inner.lock().unwrap();
         if st.hold.is_some() {
@@ -490,6 +535,18 @@ impl FrameChannel {
             after: Vec::new(),
         });
         true
+    }
+
+    /// The frame a NACK is out for.
+    pub(crate) fn held(&self) -> Option<u32> {
+        self.inner.lock().unwrap().hold.as_ref().map(|h| h.frame)
+    }
+
+    /// The held frame once its hold expired, still holding: an all-intra stream hands that
+    /// frame up partial, and the partial releases the frames after it in order.
+    pub(crate) fn overdue_hold(&self, now: Instant) -> Option<u32> {
+        let st = self.inner.lock().unwrap();
+        st.hold.as_ref().filter(|h| now >= h.until).map(|h| h.frame)
     }
 
     /// Let the held frames go once their hold expired: the decoder then sees the gap, and
@@ -514,9 +571,11 @@ impl FrameChannel {
     pub(crate) fn push(&self, frame: Frame) {
         let mut st = self.inner.lock().unwrap();
         if let Some(h) = st.hold.as_mut() {
-            if frame.frame_index == h.frame && frame.complete {
+            // A partial of the held frame ends the hold too: what the resend did not bring,
+            // it shows as blur.
+            if frame.frame_index == h.frame && (frame.complete || frame.part.is_none()) {
                 let h = st.hold.take().expect("checked");
-                st.filled += 1;
+                st.filled += u32::from(frame.complete);
                 st.q.push_back(frame);
                 st.q.extend(h.after);
                 drop(st);
@@ -578,8 +637,9 @@ impl FrameChannel {
     pub(crate) fn pop(&self, timeout: Duration) -> FramePop {
         self.consumer_seen.store(true, Ordering::Relaxed);
         let mut st = self.inner.lock().unwrap();
-        if st.q.is_empty() && !st.closed {
+        if st.q.is_empty() && !st.closed && !std::mem::take(&mut st.kicked) {
             st = self.ready.wait_timeout(st, timeout).unwrap().0;
+            st.kicked = false;
         }
         if st.all_intra && st.q.len() > 1 {
             st.skipped_total += (st.q.len() - 1) as u64;
@@ -604,16 +664,48 @@ mod frame_channel_tests {
     use crate::session::Frame;
     use std::time::Duration;
 
+    #[test]
+    fn a_kick_returns_the_next_pop_at_once_and_wakes_a_waiting_one() {
+        let ch = FrameChannel::new();
+        ch.kick();
+        let t0 = std::time::Instant::now();
+        assert!(matches!(ch.pop(Duration::from_secs(1)), FramePop::Timeout));
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "a pending kick is consumed"
+        );
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            ch.pop(Duration::from_millis(20)),
+            FramePop::Timeout
+        ));
+        assert!(t0.elapsed() >= Duration::from_millis(20), "and only once");
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                ch.kick();
+            });
+            let t0 = std::time::Instant::now();
+            assert!(matches!(ch.pop(Duration::from_secs(5)), FramePop::Timeout));
+            assert!(
+                t0.elapsed() < Duration::from_secs(1),
+                "a kick wakes a waiting pop"
+            );
+        });
+    }
+
     fn frame(i: u32) -> Frame {
         Frame {
-            data: vec![i as u8],
+            data: vec![i as u8].into(),
             frame_index: i,
             pts_ns: i as u64,
             flags: 0,
             epoch: 0,
+            stream: 0,
             complete: true,
             part: None,
             received_ns: 0,
+            new_format: None,
         }
     }
 
@@ -868,6 +960,26 @@ mod standing_latency_tests {
     }
 
     #[test]
+    fn a_rejected_resync_asks_again_instead_of_bleeding() {
+        let mut d = StandingLatency::new();
+        learned(&mut d);
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Resync { .. }
+        ));
+        d.resync_rejected();
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Resync { .. }
+        ));
+        // A re-sync that was never rejected (lost, or applied elsewhere) still escalates.
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Bleed { .. }
+        ));
+    }
+
+    #[test]
     fn empty_windows_are_no_evidence() {
         let mut d = StandingLatency::new();
         learned(&mut d);
@@ -909,7 +1021,8 @@ mod jump_to_live_tests {
             trip,
             Some(Trip {
                 clock: true,
-                queue: false
+                queue: false,
+                decoder: false
             })
         );
         // The run restarts; a second trip waits out the shared cooldown.
@@ -944,7 +1057,8 @@ mod jump_to_live_tests {
             trip,
             Some(Trip {
                 clock: false,
-                queue: true
+                queue: true,
+                decoder: false
             })
         );
         // Back at QUEUE_LOW the run is gone.
@@ -952,6 +1066,37 @@ mod jump_to_live_tests {
         j.observe(t1, 0, true, QUEUE_HIGH);
         j.observe(t1 + MS, 0, true, QUEUE_LOW);
         assert_eq!(j.observe(t1 + STANDING_TIME, 0, true, QUEUE_HIGH), None);
+    }
+
+    /// A queue whose frames arrived on time is the decoder's, but only where the clock run
+    /// could have seen a late link: fed with delays and armed.
+    #[test]
+    fn a_queue_with_on_time_frames_is_the_decoders() {
+        let on_time = 20_000_000;
+        let trip = |j: &mut JumpToLive, lat_ns| {
+            let t0 = Instant::now();
+            j.observe(t0, lat_ns, true, QUEUE_HIGH);
+            j.observe(t0 + STANDING_TIME, lat_ns, true, QUEUE_HIGH)
+                .expect("the queue run trips")
+        };
+        assert!(trip(&mut live(), on_time).decoder);
+        assert!(
+            !trip(&mut live(), 0).decoder,
+            "no delays: a late link is invisible"
+        );
+        let mut disarmed = live();
+        let clock = Trip {
+            clock: true,
+            queue: false,
+            decoder: false,
+        };
+        disarmed.after_flush(clock, 0, 0);
+        disarmed.after_flush(clock, 0, 0);
+        disarmed.last_flush = None;
+        assert!(
+            !trip(&mut disarmed, on_time).decoder,
+            "a disarmed clock run sees nothing"
+        );
     }
 
     #[test]
@@ -971,6 +1116,7 @@ mod jump_to_live_tests {
         let clock = Trip {
             clock: true,
             queue: false,
+            decoder: false,
         };
         let mut j = live();
         assert_eq!(j.after_flush(clock, 0, 0), Shed::Noop { disarmed: false });
@@ -992,6 +1138,7 @@ mod jump_to_live_tests {
         let clock = Trip {
             clock: true,
             queue: false,
+            decoder: false,
         };
         let mut j = live();
         assert_eq!(j.after_flush(clock, 0, 0), Shed::Noop { disarmed: false });
@@ -1003,6 +1150,7 @@ mod jump_to_live_tests {
         let both = Trip {
             clock: true,
             queue: true,
+            decoder: false,
         };
         assert_eq!(j.after_flush(both, 0, 0), Shed::Real { sheds: 3 });
         // The real shed broke the no-op run: the next no-op is a first again.
@@ -1016,14 +1164,16 @@ mod hold_tests {
 
     fn frame(index: u32, complete: bool) -> Frame {
         Frame {
-            data: Vec::new(),
+            data: Vec::new().into(),
             frame_index: index,
             pts_ns: 0,
             flags: 0,
             epoch: 0,
+            stream: 0,
             complete,
             part: None,
             received_ns: 0,
+            new_format: None,
         }
     }
 
@@ -1065,5 +1215,22 @@ mod hold_tests {
         assert!(c.expire_hold(t0 + Duration::from_millis(10)));
         assert_eq!(drain(&c), [6]);
         assert_eq!(c.take_filled(), 0);
+    }
+
+    /// An overdue hold stays until its frame arrives partial, which goes ahead of the frames
+    /// after it and counts as no fill.
+    #[test]
+    fn a_partial_of_the_held_frame_ends_the_hold_in_order() {
+        let c = FrameChannel::new();
+        let t0 = Instant::now();
+        assert!(c.hold(5, t0 + Duration::from_millis(10)));
+        assert_eq!(c.held(), Some(5));
+        c.push(frame(6, true));
+        assert_eq!(c.overdue_hold(t0), None);
+        assert_eq!(c.overdue_hold(t0 + Duration::from_millis(10)), Some(5));
+        assert_eq!(drain(&c), Vec::<u32>::new(), "overdue is not expired");
+        c.push(frame(5, false));
+        assert_eq!(drain(&c), [5, 6]);
+        assert_eq!((c.take_filled(), c.held()), (0, None));
     }
 }

@@ -31,6 +31,8 @@ mod adpf;
 mod apply_margin;
 #[cfg(target_os = "android")]
 mod audio;
+#[cfg(target_os = "android")]
+mod audio_track;
 // `decode`'s AU intake rules, `test`-gated like `input_stall` so their table runs off-device.
 #[cfg(any(target_os = "android", test))]
 mod au_intake;
@@ -38,8 +40,11 @@ mod au_intake;
 // shell over EGL/GLES, on every ABI (the armv7 Skia archive is self-hosted — see Cargo.toml).
 #[cfg(target_os = "android")]
 mod console;
-// "Send logs to host": the log-ring upload. Android-only, like the logcat tee that fills the ring.
-#[cfg(target_os = "android")]
+// "Send logs to host" and the log file behind it, `test`-gated on top of Android like
+// `audio_format`. `crash` turns the previous run's exit record into log lines.
+#[cfg(any(target_os = "android", test))]
+mod crash;
+#[cfg(any(target_os = "android", test))]
 mod logs;
 // AAudio callback arithmetic, `test`-gated on top of Android so its proof runs off-device.
 #[cfg(any(target_os = "android", test))]
@@ -50,6 +55,9 @@ mod decode;
 // link the JNI seam and run its tests. Kotlin only ever calls it on device.
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod discovery;
+// `decode`'s per-piece feed rules, `test`-gated like `au_intake` so their table runs off-device.
+#[cfg(any(target_os = "android", test))]
+mod feed_rules;
 mod feedback;
 // `decode`'s hung-decoder checks, `test`-gated like `audio_format` so their proof runs off-device.
 #[cfg(any(target_os = "android", test))]
@@ -58,27 +66,39 @@ mod input_stall;
 mod mic;
 /// Tier-A DualSense pad audio: the 0xD1 plane rendered on the pad's own USB endpoint.
 mod pad_audio;
+// `decode`'s present policy, `test`-gated like `input_stall` so its replays run off-device.
+#[cfg(any(target_os = "android", test))]
+pub(crate) mod present;
 // The PyroWave lane: Vulkan compute decode + swapchain present, beside `decode`'s MediaCodec
 // path (design/pyrowave-codec-plan.md). Ungated so the host build compiles the dispatch; the
 // implementation inside is 64-bit-Android-only, like `pyrowave-sys`.
 mod pyro;
+// `decode`'s rung memory, `test`-gated like `input_stall` so its rules run off-device.
+#[cfg(any(target_os = "android", test))]
+mod rung_memory;
+// `decode`'s run endings and rebuild policy, `test`-gated like `rung_memory` so their table runs
+// off-device.
+#[cfg(any(target_os = "android", test))]
+mod run_end;
 mod session;
 mod stats;
 mod sys;
 // Ungated: pure `jni` + `punktfunk_core::wol` (no Android framework), so it links
 // into the host workspace build too. Kotlin only ever calls it on device.
 mod wol;
+// Ungated like `wol`: pure `jni` + `punktfunk_core::client::mgmt`.
+mod mgmt;
 // Ungated like `wol`: pure `jni` + `punktfunk_core::client` (the reachability probe). Kotlin calls
 // it off the main thread to light saved-host "online" pips independently of mDNS.
 mod probe;
 // Ungated like `wol`: pure `jni` + `punktfunk_core::pyrowave`, so its test runs on the host.
 mod pyrowave_quality;
 
-/// Every `log` record, teed: to logcat (via [`android_logger::AndroidLogger`]) AND into
-/// `pf_client_core::logring` — the source for the console's "Send logs to host" action
-/// ([`logs`]). The ring line mirrors the desktop `ring_layer`'s shape (wallclock, level,
-/// target, message) so a bundle reads the same on the host's Logs page whichever client
-/// sent it. Both sinks share the crate's Info ceiling — the field ring gets exactly what
+/// Every `log` record, teed: to logcat (via [`android_logger::AndroidLogger`]), into
+/// `pf_client_core::logring` and into the log file ([`logs::append`]) — the sources for "Send
+/// logs to host" ([`logs`]). The line mirrors the desktop `ring_layer`'s shape (wallclock,
+/// level, target, message) so a bundle reads the same on the host's Logs page whichever client
+/// sent it. All three sinks share the crate's Info ceiling — the bundle gets exactly what
 /// logcat gets, which also keeps per-frame DEBUG chatter out of it by construction.
 #[cfg(target_os = "android")]
 struct RingTee(android_logger::AndroidLogger);
@@ -91,13 +111,15 @@ impl log::Log for RingTee {
 
     fn log(&self, record: &log::Record) {
         self.0.log(record);
-        pf_client_core::logring::note(format!(
+        let line = format!(
             "{} {:5} {} {}",
             pf_client_core::logring::wallclock(),
             record.level().as_str(),
             record.target(),
             record.args()
-        ));
+        );
+        logs::append(&line);
+        pf_client_core::logring::note(line);
     }
 
     fn flush(&self) {
@@ -106,7 +128,8 @@ impl log::Log for RingTee {
 }
 
 /// Initialize logging once when the JVM loads the library: logcat under the `punktfunk` tag,
-/// teed into the client log ring (see [`RingTee`]). Core `tracing` events (transport warnings:
+/// teed into the client log ring (see [`RingTee`]), and a panic hook that logs each panic before
+/// it unwinds. Core `tracing` events (transport warnings:
 /// socket-buffer clamp, QoS failures) arrive here too: tracing's "log" feature — declared
 /// explicitly in Cargo.toml rather than relied on via quinn's defaults — forwards them as
 /// `log` records since no tracing subscriber is ever installed. Android-only — there is no
@@ -126,6 +149,22 @@ pub extern "system" fn JNI_OnLoad(
     if log::set_boxed_logger(Box::new(RingTee(logcat))).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
     }
+    // stderr goes nowhere on Android: without this a panic's message is lost, and a panic that
+    // aborts (in a callback that cannot unwind) leaves a tombstone that never names it.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        let at = info.location().map(ToString::to_string).unwrap_or_default();
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        log::error!(target: "pf.crash", "panic on thread {name}: {payload} (at {at})");
+        default_panic(info);
+    }));
     log::info!(
         "punktfunk_android loaded (core ABI v{})",
         punktfunk_core::ABI_VERSION

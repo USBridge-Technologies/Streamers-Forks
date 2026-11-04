@@ -128,6 +128,9 @@
 // niri (the biri fork, which adds virtual outputs).
 #define PUNKTFUNK_COMPOSITOR_NIRI 7
 
+// Umbriel, Noctalia's wlroots compositor, which creates virtual outputs.
+#define PUNKTFUNK_COMPOSITOR_UMBRIEL 8
+
 // Gamepad-backend preference for [`punktfunk_connect_ex2`]: which virtual pad
 // the host creates. Precedence: client choice > `PUNKTFUNK_GAMEPAD` env > X-Box 360.
 // `AUTO` (or unrecognized) = host decides. Resolved via [`punktfunk_connection_gamepad`].
@@ -209,7 +212,7 @@
 
 #define PUNKTFUNK_GAMEPAD_BTN_MISC1 2097152
 
-// Connect to a `punktfunk/1` host at `width`x`height`@`refresh_hz`. Blocks up to
+// Connect to a `punktfunk/2` host at `width`x`height`@`refresh_hz`. Blocks up to
 // `timeout_ms`. NULL on failure. Same as [`punktfunk_connect_ex`] with
 // `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
 //
@@ -305,6 +308,19 @@
 // hosts that do not know the bit ignore it.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PunktfunkConnectOpts::reformat`]: this caller rebuilds its decoder on a frame flagged
+// [`FRAME_NEW_FORMAT`](punktfunk_core::packet::FRAME_NEW_FORMAT), from the codec, colour and
+// chroma getters read right after it.
+#define PUNKTFUNK_REFORMAT_VIDEO 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PunktfunkConnectOpts::reformat`]: this caller reopens its audio player when
+// `punktfunk_connection_next_audio_pcm` returns `PUNKTFUNK_STATUS_AUDIO_FORMAT`.
+#define PUNKTFUNK_REFORMAT_AUDIO 2
+#endif
+
 // Controller mouse is off: the pad plays. Equals `PadMouseMode::Off`.
 #define PUNKTFUNK_PAD_MOUSE_OFF 0
 
@@ -322,6 +338,11 @@
 // motor's LSB on keepalive re-emits so an SDL-class layer that no-ops identical
 // values still writes the device.
 #define PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER 1
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Most screens a session shows, screen 0 included.
+#define PUNKTFUNK_SCREENS_MAX 4
+#endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Bytes of state [`punktfunk_sc1_ble_input`] keeps per pad.
@@ -386,7 +407,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 55
+#define PUNKTFUNK_ABI_VERSION 63
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -407,6 +428,14 @@
 
 // Opus-plane sample rate, and the protocol default. Lossless negotiates via [`pcm`].
 #define PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ 48000
+
+// [`Hello::audio_bitstreams`](crate::quic::Hello::audio_bitstreams): the sink plays AC-3
+// through unchanged.
+#define PUNKTFUNK_AUDIO_BITSTREAM_AC3 1
+
+// [`Hello::audio_bitstreams`](crate::quic::Hello::audio_bitstreams): the sink plays E-AC-3
+// through unchanged.
+#define PUNKTFUNK_AUDIO_BITSTREAM_EAC3 2
 
 // Tag + `u32` seq + `u64` pts_ns. Same shape as `0xC9` so the gap tracker and
 // A/V-sync plumbing stay shared. `quic::datagram` asserts this against its encoder.
@@ -532,6 +561,9 @@
 // Misc / capture — Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
 #define PUNKTFUNK_BTN_MISC1 2097152
 
+// SDL `Misc2`: the Switch 2 pads' C button. GameStream has no such bit.
+#define PUNKTFUNK_BTN_MISC2 4194304
+
 #define PUNKTFUNK_AXIS_LS_X 0
 
 #define PUNKTFUNK_AXIS_LS_Y 1
@@ -603,6 +635,12 @@
 // [`HOST_CAP2_REPEAT_MARK`](crate::quic::HOST_CAP2_REPEAT_MARK) — against an
 // older host, zero means unknown, not all-active.
 #define PUNKTFUNK_USER_FLAG_REPEAT 256
+
+// Frame `flags` bit core sets on a frame it hands out, never on the wire (v2 masks user flags
+// to `0x7FFF`): the stream's format changed at this frame
+// ([`Frame::new_format`](crate::session::Frame::new_format)). Rebuild the decoder from the
+// connection's codec, colour and chroma before decoding it.
+#define PUNKTFUNK_FRAME_NEW_FORMAT 65536
 
 // Widest lost-frame range (`last - first`, wrapping) RFI may repair; wider
 // goes to the keyframe path on both ends. 256 frames is >1 s even at 240 Hz,
@@ -784,10 +822,6 @@
 // host-global wiring, so any live session that asked wins until it ends.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 
-// [`Hello::client_caps`]: every client sets it; it gates nothing on `punktfunk/2`.
-// `0x80` is the last free `client_caps` bit.
-#define PUNKTFUNK_CLIENT_CAP_EXT 64
-
 // [`Welcome::host_caps`]: the session is on the lossless audio plane
 // ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). A wire statement, not
 // an offer: the client must open from
@@ -817,7 +851,7 @@
 #define PUNKTFUNK_HOST_CAP2_EXT 4
 
 // [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
-// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is punched,
+// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is bound,
 // before its pipeline exists and without the one-per-10 s spacing, until the first video
 // frame leaves. That window is what the client's bring-up ramp measures the link in; a
 // client that does not see the bit bursts beside live video as before.
@@ -829,9 +863,9 @@
 
 // [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads
 // [`InputEdge`](super::control::InputEdge) off the control stream. Toward this bit the
-// client sends every key press and release there, where QUIC resends what the network
-// drops; a lost `KeyUp` on the datagram plane otherwise holds the key until its next edge.
-// Motion, scroll and pads stay datagrams. Without the bit every event is a datagram, as before.
+// client sends every key and mouse-button press and release there, where QUIC resends what
+// the network drops; a lost release on the datagram plane otherwise holds it until its next
+// edge. Motion, scroll and pads stay datagrams. Without the bit every event is a datagram.
 #define PUNKTFUNK_HOST_CAP2_INPUT_EDGES 64
 
 // [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
@@ -846,8 +880,8 @@
 
 // [`Hello::video_codecs`]: PyroWave (opt-in wired-LAN intra-only wavelet,
 // `design/pyrowave-codec-plan.md`). Deliberately absent from [`resolve_codec`]'s ladder:
-// selected only when the client also names it [`Hello::preferred_codec`] (or the operator
-// forces the mask). The bit means the bitstream of the vendored pin
+// selected only as the preference — the client's [`Hello::preferred_codec`], or the host's
+// Encoder pin for a client that names none. The bit means the bitstream of the vendored pin
 // (`crates/codec/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`); upstream has no version
 // field, so a bitstream-changing vendor bump bumps the punktfunk protocol instead.
 #define PUNKTFUNK_CODEC_PYROWAVE 8
@@ -977,6 +1011,24 @@
 // double the largest bitrate on the connection.
 #define PUNKTFUNK_AUDIO_PCM_MAGIC 211
 
+// AC-3 / E-AC-3 passthrough (`crate::audio::bitstream`). Header matches [`AUDIO_MAGIC`] up to
+// the pts, so the gap tracker, A/V sync and the v2 clock rewrite stay unchanged.
+//
+// `[0xD4][u32 seq LE][u64 pts_ns LE][u8 part][bytes]`, `part = index << 4 | count`, `count`
+// in 1..=15. One access unit (one AC-3 syncframe; E-AC-3 7.1's independent and dependent
+// syncframes back to back) travels in `count` datagrams that share one `seq` and one `pts`;
+// `part` orders them. They leave back to back and the receiver takes them in order: a
+// reordered or missing part costs its unit, with no hold-out buffering.
+//
+// Fragmented where `0xD3` is not: a syncframe's size is fixed by the bitrate, not by a
+// duration the host can shorten. AC-3 5.1 at 448 kbit/s is 1 792 B against a datagram ceiling
+// under 1 300 B at Welcome time; unfragmented, the plane would stop at 256 kbit/s. No
+// [`AUDIO_RED_MAGIC`] on this plane.
+#define PUNKTFUNK_AUDIO_BITSTREAM_MAGIC 212
+
+// The [`AUDIO_MAGIC`] header plus the part byte.
+#define PUNKTFUNK_AUDIO_BITSTREAM_HEADER (((1 + 4) + 8) + 1)
+
 #define PUNKTFUNK_RUMBLE_V1_LEN 7
 
 // v1 body + `[u8 seq][u16 ttl_ms LE]`. Length-tolerant: an old client reads the first 7 bytes
@@ -1048,6 +1100,11 @@
 // [`QUIT_CLOSE_CODE`]; clients that ignore it still end the session.
 #define PUNKTFUNK_APP_EXITED_CLOSE_CODE 82
 
+// QUIC application close: the client moved onto a path too small for this session's video,
+// and the session cannot re-key its shard size. A client reads it as a lost connection and
+// redials; the new session is sized for the new path.
+#define PUNKTFUNK_PATH_SHRANK_CLOSE_CODE 115
+
 // Longest [`Hello`] device name (UTF-8 bytes). Truncated on encode, rejected on decode.
 #define PUNKTFUNK_HELLO_NAME_MAX 64
 
@@ -1066,6 +1123,14 @@
 // [`Welcome::audio_codec`]: raw interleaved LE PCM on `0xD3` (`crate::audio::pcm`).
 // `2` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1`.
 #define PUNKTFUNK_AUDIO_CODEC_PCM 2
+
+// [`Welcome::audio_codec`]: an AC-3 elementary stream on `0xD4` (`crate::audio::bitstream`),
+// 48 kHz, passed through to the receiver. Core has no decoder for it.
+#define PUNKTFUNK_AUDIO_CODEC_AC3 3
+
+// [`Welcome::audio_codec`]: an E-AC-3 elementary stream on `0xD4`, 48 kHz, passed through to
+// the receiver like [`AUDIO_CODEC_AC3`]. Core has no decoder for it.
+#define PUNKTFUNK_AUDIO_CODEC_EAC3 4
 
 // Longest [`ClientHello::client_label`] in UTF-8 bytes. A log field, so short.
 #define PUNKTFUNK_EXT_CLIENT_MAX 96
@@ -1263,6 +1328,9 @@ enum PunktfunkStatus
     PUNKTFUNK_STATUS_NULL_POINTER = -8,
     PUNKTFUNK_STATUS_TIMEOUT = -9,
     PUNKTFUNK_STATUS_CLOSED = -10,
+    // `next_audio_pcm`: the host changed the audio format at the next packet. Reopen the player
+    // from the audio getters, which read the new format, then pull again.
+    PUNKTFUNK_STATUS_AUDIO_FORMAT = -11,
     PUNKTFUNK_STATUS_REJECTED_NOT_ARMED = -20,
     PUNKTFUNK_STATUS_REJECTED_BOUND_OTHER = -21,
     PUNKTFUNK_STATUS_REJECTED_RATE_LIMITED = -22,
@@ -1464,7 +1532,7 @@ typedef struct AuAdmission AuAdmission;
 
 // Per-session CICP (ITU-T H.273) the host resolved, on [`Welcome`]. Configure the
 // decoder/presenter from these; do not infer from bitstream VUI. An older host omits the
-// bytes → [`ColorInfo::SDR_BT709`]. ST.2086 + CLL can change mid-stream, so they ride
+// bytes → [`ColorInfo::SDR_BT709_STUDIO`]. ST.2086 + CLL can change mid-stream, so they ride
 // [`HDR_META_MAGIC`] rather than this fixed struct.
 typedef struct ColorInfo ColorInfo;
 
@@ -1481,7 +1549,7 @@ typedef struct JitterTuning JitterTuning;
 typedef struct LocalRecovery LocalRecovery;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Live `punktfunk/1` connection (QUIC control + UDP data, pumped on internal threads).
+// Live `punktfunk/2` connection (one QUIC connection and its media, pumped on internal threads).
 // One puller thread per plane; never two threads on the same plane.
 typedef struct PunktfunkConnection PunktfunkConnection;
 #endif
@@ -1547,6 +1615,27 @@ typedef struct {
     uint64_t bytes_sent;
     uint64_t bytes_received;
 } PunktfunkStats;
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One screen of a session: a client monitor in an ask, a screen the host built in a layout.
+typedef struct {
+    // 0 is the screen the connect's mode describes.
+    uint8_t index;
+    // The video stream it rides; `0` in an ask.
+    uint8_t stream;
+    // `1`: the client's primary monitor.
+    uint8_t primary;
+    // Always `0`.
+    uint8_t reserved;
+    uint32_t width;
+    uint32_t height;
+    uint32_t refresh_hz;
+    // In an ask, this monitor's top-left from screen 0's, in pixels of screen 0's mode. In a
+    // layout, the screen's origin on the host desktop.
+    int32_t x;
+    int32_t y;
+} PunktfunkScreen;
+#endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Growable connect options for [`punktfunk_connect_opts`]. Zero-init, set
@@ -1633,8 +1722,28 @@ typedef struct {
     // ([`punktfunk_pyrowave_kbps`]). `0`, which a shorter prefix defaults to, leaves the
     // host's own.
     uint16_t pyrowave_bpp_x100;
-    // Always `0`. Fills what would otherwise be tail padding.
-    uint8_t reserved4[6];
+    // `PUNKTFUNK_REFORMAT_*` bits: what this caller rebuilds when the host changes the stream's
+    // format mid-session. `0`, which a shorter prefix defaults to, keeps the format fixed.
+    uint8_t reformat;
+    // Always `0`. Fills what would otherwise be padding.
+    uint8_t reserved4[5];
+    // Called once, on the connecting thread, when the host answers that its operator is
+    // deciding about this device: show "waiting for approval". The connect then waits for the
+    // host's verdict, up to ten minutes, not `timeout_ms`. Null: `timeout_ms` stands.
+    void (*on_pending)(void *ctx);
+    // Handed back to `on_pending` untouched.
+    void *on_pending_ctx;
+    // The screens this caller shows, screen 0 first at the connect's mode, read for
+    // `screen_count` records during the call; null for one. Further screens' access units come
+    // from [`punktfunk_connection_next_screen_au`].
+    const PunktfunkScreen *screens;
+    // See `screens`; at most `PUNKTFUNK_SCREENS_MAX` are read.
+    uint8_t screen_count;
+    // `1`: this caller opens a picture per screen, so it may ask for screens later
+    // ([`punktfunk_connection_request_screens`]) with none asked here.
+    uint8_t shows_screens;
+    // Always `0`. Fills what would otherwise be padding.
+    uint8_t reserved5[6];
 } PunktfunkConnectOpts;
 #endif
 
@@ -1993,6 +2102,25 @@ typedef struct {
     PunktfunkHealthFinding findings[PUNKTFUNK_HEALTH_FINDINGS_MAX];
 } PunktfunkHealthReport;
 
+// One buffer the embedder lent for an AU, filled in by [`PunktfunkAuMemory::take`].
+typedef struct {
+    // Writable for `len` bytes until `release`; 4-byte aligned.
+    uint8_t *data;
+    uintptr_t len;
+    // Handed back to `release`.
+    uint64_t token;
+} PunktfunkAuStore;
+
+// How the embedder lends AU memory. `take` fills `out` with a buffer of at least `len`
+// bytes and returns true, or returns false for the heap. `release` gives a buffer back:
+// after the last [`punktfunk_connection_next_au`] pointer into it is dead, on any thread.
+// Both run on core threads and must return at once.
+typedef struct {
+    bool (*take)(void *userdata, uintptr_t len, PunktfunkAuStore *out);
+    void (*release)(void *userdata, uint64_t token);
+    void *userdata;
+} PunktfunkAuMemory;
+
 // [`punktfunk_av1_sequence_info`]'s answer: what an `av1C` record and a colour description
 // take from an AV1 sequence header. Colour codes are ITU-T H.273, 2 when none is coded.
 typedef struct {
@@ -2051,6 +2179,8 @@ typedef struct {
 // free-fall, not "no sample". Backends that use different units rescale this
 // like any other sample (`steam_remap::motion_wire_to_deck`).
 #define MOTION_NEUTRAL_ACCEL { 0, (int16_t)MOTION_ACCEL_LSB_PER_G, 0, }
+
+
 
 
 
@@ -2482,6 +2612,17 @@ PunktfunkConnection *punktfunk_connect_ex12(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// The sentence the host sent when it refused the last connect on this thread, for a caller
+// holding a `PUNKTFUNK_STATUS_REJECTED_*` status: a host can name what only it knows, such as
+// who holds the seat. Empty when it said nothing. Read on the connecting thread, right after
+// the failed connect. `INVALID_ARG` when `out` is null or `cap` too small for it and a NUL.
+//
+// # Safety
+// `out` is null or writable for `cap` bytes.
+PunktfunkStatus punktfunk_connect_refusal(char *out, uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Name the settings preset the next connect sends: its stable id and display name. The host
 // shows it and hands it to hooks; the stream is unchanged. A null `id` names none. The value
 // outlives the call, so set it before every connect. ABI v38.
@@ -2675,7 +2816,8 @@ PunktfunkStatus punktfunk_connection_audio_mute(PunktfunkConnection *c, uint8_t 
 // Host-resolved audio channel count: `2` (stereo), `6` (5.1) or `8` (7.1).
 // `*out` is filled when non-NULL. Raw `0xC9` Opus is encoded for this layout
 // ([`punktfunk_core::audio::layout_for`]); or use [`punktfunk_connection_next_audio_pcm`].
-// Fixed until a reconfigure.
+// It and the other audio getters read the newest packet's format, which moves only where
+// `next_audio_pcm` returned `PUNKTFUNK_STATUS_AUDIO_FORMAT`.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -2701,7 +2843,7 @@ PunktfunkStatus punktfunk_connection_audio_bits(PunktfunkConnection *c, uint8_t 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Resolved frame length in µs (ladder has sub-ms rungs). `0` = use
+// Resolved frame length in µs (ladder has sub-ms rungs); Opus is
 // `PUNKTFUNK_AUDIO_FRAME_MS × 1000`. On 44.1 kHz this is a nominal length, not a
 // duration — size rings from it, advance clocks from samples / rate.
 // Not derivable from `next_audio_pcm`'s `frame_count` (that includes concealment).
@@ -2721,10 +2863,40 @@ PunktfunkStatus punktfunk_connection_end_reason(PunktfunkConnection *c, uint8_t 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Milliseconds to wait before redial `attempt` (0-based) of a session that ended with
+// `end_reason` (`PUNKTFUNK_END_REASON_*`); `-1` means stay ended. Only `LOST` redials, on
+// one schedule every client shares. The redial reuses the dial that started the session.
+int64_t punktfunk_redial_delay_ms(uint8_t end_reason, uint32_t attempt);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Milliseconds to wait before dialing again a host that refused a connect with `refusal` (the
+// connect's `PUNKTFUNK_STATUS_*`), `since_first_ms` after its first such refusal (`-1`: this is
+// the first); `-1` means show the refusal. With `auto_wake` on, a setup refusal dials again for
+// 20 s from the first: a host that just woke answers before it can stream. One rule for every
+// client.
+int64_t punktfunk_wake_redial_delay_ms(bool auto_wake, int32_t refusal, int64_t since_first_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`punktfunk_wake_redial_delay_ms`] for a session that ended: its typed close counts only
+// before any frame. Writes `-1` to `out` when it stays ended. Ask after `Closed`, before free.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `i64`.
+PunktfunkStatus punktfunk_connection_wake_redial_delay_ms(const PunktfunkConnection *c,
+                                                          bool auto_wake,
+                                                          int64_t since_first_ms,
+                                                          int64_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Decode the next audio frame in-core to interleaved f32. Both planes share this
 // call; size the ring from [`punktfunk_connection_audio_sample_rate`]. Seq-gap
 // concealment is prepended in the same buffer. Quiet-wire droughts:
 // [`punktfunk_connection_audio_plc`]. Mutually exclusive with `next_audio`.
+// `PUNKTFUNK_STATUS_AUDIO_FORMAT`, only under `PUNKTFUNK_REFORMAT_AUDIO`: the next packet is
+// in a new format; reopen the player from the audio getters and call again.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable. At most one audio puller.
@@ -2993,8 +3165,8 @@ PunktfunkStatus punktfunk_connection_next_host_timing(PunktfunkConnection *c,
 // Resolved colour signalling + encode bit depth. Each out pointer is filled when
 // non-NULL: `primaries`/`transfer`/`matrix` are CICP (BT.709 = 1; BT.2020 = 9;
 // PQ = 16, HLG = 18; BT.2020-NCL = 9), `full_range` 0/1, `bit_depth` 8 or 10.
-// Transfer 16/18 is HDR — drain [`punktfunk_connection_next_hdr_meta`]. Fixed
-// until a reconfigure.
+// Transfer 16/18 is HDR — drain [`punktfunk_connection_next_hdr_meta`]. The format of the
+// newest frame `next_au` handed out: it moves on a frame flagged `PUNKTFUNK_FRAME_NEW_FORMAT`.
 //
 // # Safety
 // `c` is a valid connection handle; each out pointer is NULL or writable for its scalar.
@@ -3009,7 +3181,7 @@ PunktfunkStatus punktfunk_connection_color_info(PunktfunkConnection *c,
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Resolved chroma as HEVC `chroma_format_idc`: `1` = 4:2:0, `3` = 4:4:4.
 // `*out` is filled when non-NULL. In-band SPS is authoritative; this lets the
-// embedder pre-size the decoder. Fixed until a reconfigure.
+// embedder pre-size the decoder. Moves with [`punktfunk_connection_color_info`].
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3019,7 +3191,8 @@ PunktfunkStatus punktfunk_connection_chroma_format(PunktfunkConnection *c, uint8
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Host-resolved video codec: [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
 // [`PUNKTFUNK_CODEC_AV1`]. Build the decoder from this (never assume HEVC).
-// `*out` is filled when non-NULL. A host that did not negotiate reports HEVC.
+// `*out` is filled when non-NULL. A host that did not negotiate reports HEVC. Moves with
+// [`punktfunk_connection_color_info`].
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3035,6 +3208,57 @@ PunktfunkStatus punktfunk_connection_codec(PunktfunkConnection *c, uint8_t *out)
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
 PunktfunkStatus punktfunk_connection_shard_payload(PunktfunkConnection *c, uint32_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The screens the host built, screen 0 first, and a generation that moves with each change
+// (`0` before the host said). Writes up to `cap` records into `out` and the whole count into
+// `count`. A screen the host could not build is absent: close its window. Poll the generation.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is null or writable for `cap` records; `count` and
+// `generation` are null or writable.
+PunktfunkStatus punktfunk_connection_screen_layout(const PunktfunkConnection *c,
+                                                   PunktfunkScreen *out,
+                                                   uintptr_t cap,
+                                                   uintptr_t *count,
+                                                   uint32_t *generation);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Show these `n` screens from now on, screen 0 first, at most [`PUNKTFUNK_SCREENS_MAX`]: the
+// host adds, drops and resizes the others and answers with a new layout. Screen 0's size still
+// moves by [`punktfunk_connection_request_mode`]. A host without screens ignores it.
+//
+// # Safety
+// `c` is a valid connection handle; `screens` is null or readable for `n` records.
+PunktfunkStatus punktfunk_connection_request_screens(const PunktfunkConnection *c,
+                                                     const PunktfunkScreen *screens,
+                                                     uintptr_t n);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Screen `screen`'s decoder cannot go on, or is new: its access units wait for a keyframe,
+// which core asks the host for, and that one carries `FRAME_NEW_FORMAT`.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_request_screen_keyframe(const PunktfunkConnection *c,
+                                                             uint8_t screen);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Next whole access unit of screen `screen` (1 or more), as [`punktfunk_connection_next_au`]
+// hands screen 0's: `FRAME_NEW_FORMAT` on the first of each format, and `*out` borrowed until
+// this screen's next pull. `NoFrame` on timeout and before the host opened the screen;
+// `Closed` once the session ended or the host dropped it; `InvalidArg` for screen 0.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable. At most one thread pulls each screen.
+PunktfunkStatus punktfunk_connection_next_screen_au(PunktfunkConnection *c,
+                                                    uint8_t screen,
+                                                    PunktfunkFrame *out,
+                                                    uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -3468,6 +3692,16 @@ PunktfunkStatus punktfunk_connection_request_keyframe(const PunktfunkConnection 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// The device's network path changed: call from the platform's path monitor when an
+// interface comes up, goes down or takes over the default route. The host then follows
+// a roam within a round trip instead of the next keep-alive.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_path_changed(const PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Ask the host to recover `[first_frame, last_frame]` by RFI (P-frame tagged
 // `USER_FLAG_RECOVERY_ANCHOR`) instead of a full IDR. Throttle; keyframe is the backstop.
 //
@@ -3687,6 +3921,55 @@ void punktfunk_connection_disconnect_quit(PunktfunkConnection *c);
 // # Safety
 // `c` was returned by [`punktfunk_connect`] and is not used after this call.
 void punktfunk_connection_close(PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Assemble video AUs in memory the embedder lends, from the next frame on; a null
+// `memory`, or one without `take`, goes back to the heap. The lender outlives every buffer
+// it lent: install the heap, then close the connection, before freeing it.
+//
+// # Safety
+// `c` is a valid connection handle; `memory` is null or readable for one
+// `PunktfunkAuMemory` whose callbacks keep its contract.
+PunktfunkStatus punktfunk_connection_set_au_memory(PunktfunkConnection *c,
+                                                   const PunktfunkAuMemory *memory);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One management request over the stream port, as this device's identity, refusing any host
+// but `pin_sha256`: `method` `path` with `body`, sent as `content_type` unless that is NULL.
+// Blocks for the reply. One connection per host serves every call; a new one is dialled for at
+// most `timeout_ms`. On `OK` the reply's HTTP status is in `status_out` and its body in
+// `body_out`/`body_len_out`; free that with [`punktfunk_mgmt_body_free`]. `CRYPTO`: the host is
+// not the pinned one, so do not retry it over HTTPS. Any other failure: the host may still
+// answer on its management port.
+//
+// # Safety
+// `host`/`client_cert_pem`/`client_key_pem`/`method`/`path` are NUL-terminated UTF-8, and so
+// is `content_type` unless NULL; `pin_sha256` is valid for 32 bytes; `body` is NULL or valid
+// for `body_len` bytes; the three out-pointers are writable.
+PunktfunkStatus punktfunk_mgmt_request(const char *host,
+                                       uint16_t port,
+                                       const char *client_cert_pem,
+                                       const char *client_key_pem,
+                                       const uint8_t *pin_sha256,
+                                       const char *method,
+                                       const char *path,
+                                       const char *content_type,
+                                       const uint8_t *body,
+                                       uintptr_t body_len,
+                                       uint32_t timeout_ms,
+                                       uint16_t *status_out,
+                                       uint8_t **body_out,
+                                       uintptr_t *body_len_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Free a reply body from [`punktfunk_mgmt_request`]. NULL is a no-op.
+//
+// # Safety
+// `body`/`len` are exactly what one `punktfunk_mgmt_request` wrote, freed once.
+void punktfunk_mgmt_body_free(uint8_t *body, uintptr_t len);
 #endif
 
 // Create an HEVC reference concealer for one elementary stream (IDR first). Free with

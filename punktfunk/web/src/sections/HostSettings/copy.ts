@@ -62,6 +62,10 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_vdisplay_hz_mult,
 		hint: m.setting_vdisplay_hz_mult_hint,
 	},
+	vdisplay_resolutions: {
+		label: m.setting_vdisplay_resolutions,
+		hint: m.setting_vdisplay_resolutions_hint,
+	},
 	audio_output_mode: {
 		label: m.setting_audio_output_mode,
 		options: {
@@ -217,10 +221,6 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_dualsense_usbip,
 		hint: m.setting_dualsense_usbip_hint,
 	},
-	gamescope_attach: {
-		label: m.setting_gamescope_attach,
-		hint: m.setting_gamescope_attach_hint,
-	},
 	gamescope_hdr: {
 		label: m.setting_gamescope_hdr,
 		hint: m.setting_gamescope_hdr_hint,
@@ -298,6 +298,10 @@ export const SETTING_COPY: Record<string, Copy> = {
 	seat_library_writable: {
 		label: m.setting_seat_library_writable,
 		hint: m.setting_seat_library_writable_hint,
+	},
+	seat_background_input: {
+		label: m.setting_seat_background_input,
+		hint: m.setting_seat_background_input_hint,
 	},
 	tray_autostart: {
 		label: m.setting_tray_autostart,

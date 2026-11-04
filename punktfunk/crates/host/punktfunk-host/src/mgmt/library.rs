@@ -1208,21 +1208,25 @@ pub(crate) async fn get_library_art(
 /// door can't read: the owner's host serves them. `None` off a door, for a title the door doesn't
 /// list, and while that host is down; a cover never starts the owner's session. Blocking.
 fn owner_art(id: &str, kind: crate::library::ArtKind) -> Option<(Vec<u8>, String)> {
-    if !crate::seats::is_door() {
+    if !pf_paths::seat::role().is_door() {
         return None;
     }
     crate::library::entry_for_library_id(id)?;
-    let owner = crate::seats::list().ok()?.into_iter().find(|s| s.owner)?;
+    // The shared snapshot: a page asks for every cover at once.
+    let seats = crate::seats::snapshot();
     let path = format!("library/art/{}/{}", path_segment(id), kind.name());
-    match crate::seats::forward(&owner, "GET", &path, None, Vec::new())? {
-        (200, Some(ctype), bytes) if ctype.starts_with("image/") => Some((bytes, ctype)),
+    let owner = seats.owner().ok().flatten()?;
+    match crate::seats::forward(owner, super::owner::Forwarded::get(path))? {
+        super::owner::Answer::Reply(200, Some(ctype), bytes) if ctype.starts_with("image/") => {
+            Some((bytes, ctype))
+        }
         _ => None,
     }
 }
 
 /// `s` as one path segment: unreserved characters, `:` and `@` stay, every other byte is
 /// percent-encoded.
-fn path_segment(s: &str) -> String {
+pub(super) fn path_segment(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' | b'@' => {

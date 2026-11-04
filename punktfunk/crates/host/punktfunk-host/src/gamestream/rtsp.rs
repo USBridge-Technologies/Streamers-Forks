@@ -231,13 +231,13 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
         }
         "ANNOUNCE" => {
             // ANNOUNCE overwrites stream/audio config; gate to the launch owner.
-            if authorized_launch(state, peer).is_none() {
+            let Some(ls) = authorized_launch(state, peer) else {
                 tracing::warn!(
                     ?peer,
                     "RTSP ANNOUNCE — refused: not the paired `/launch` owner"
                 );
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
-            }
+            };
             let map = parse_announce(&req.body);
             if let Err(codec) = audio_passthrough(&map) {
                 tracing::warn!(
@@ -246,7 +246,11 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 );
                 return response_status("415 Unsupported Media Type", &req.cseq, &[], None);
             }
-            match stream_config(&map) {
+            if let Some(why) = pyrowave_refusal(&map, super::serverinfo::codec_mode_support()) {
+                tracing::warn!(why, "RTSP ANNOUNCE — refused PyroWave");
+                return response_status("400 Bad Request", &req.cseq, &[], None);
+            }
+            match stream_config(&map, super::apps::by_id(ls.appid).as_ref()) {
                 Some(cfg) => {
                     tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
                     *state.gs.stream.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
@@ -267,7 +271,12 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 tracing::warn!(?peer, "RTSP PLAY — refused: not the paired `/launch` owner");
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             };
-            let cfg = *state.gs.stream.lock().unwrap_or_else(|e| e.into_inner());
+            let cfg = state
+                .gs
+                .stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             // Ends the whole session (both planes + launch). One plane detecting a
             // dead client must not leave the other streaming or a stale launch.
             let on_lost: super::OnSessionLost = {
@@ -280,6 +289,8 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
                     let app = super::apps::by_id(ls.appid);
                     tracing::info!(app = ?app.as_ref().map(|a| &a.title), "RTSP PLAY — starting video stream");
+                    // Rikey reaches the video plane only when `SS_ENC_VIDEO` was negotiated.
+                    let video_key = cfg.encrypt_video.then_some(ls.gcm_key);
                     stream::start(
                         cfg,
                         app,
@@ -288,8 +299,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         state.rfi_range.clone(),
                         state.loss_stats.clone(),
                         state.gs.video_hdr.clone(),
-                        // Rikey reaches the video plane only when `SS_ENC_VIDEO` was negotiated.
-                        cfg.encrypt_video.then_some(ls.gcm_key),
+                        video_key,
                         state.gs.video_cap.clone(),
                         state.stats.clone(),
                         on_lost.clone(),
@@ -465,7 +475,7 @@ fn rtsp_nonce(seq: u32, direction: u8) -> [u8; 12] {
 /// One sealed frame. Pure and direction-parameterised so tests can build
 /// the client side of the wire too.
 fn seal_frame(key: &[u8; 16], seq: u32, direction: u8, pt: &[u8]) -> Vec<u8> {
-    let ct_tag = super::control::gcm_seal(key, &rtsp_nonce(seq, direction), pt, &[]);
+    let ct_tag = super::control_wire::gcm_seal(key, &rtsp_nonce(seq, direction), pt, &[]);
     let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
     let mut wire = Vec::with_capacity(ENC_RTSP_HEADER + ct.len());
     wire.extend_from_slice(&(ENCRYPTED_MESSAGE_TYPE_BIT | ct.len() as u32).to_be_bytes());
@@ -491,7 +501,7 @@ fn open_sealed_frame(key: &[u8; 16], frame: &[u8]) -> Result<Request> {
     // Wire order is tag-first; `aes-gcm` wants `ciphertext || tag`.
     let mut ct_tag = frame[ENC_RTSP_HEADER..].to_vec();
     ct_tag.extend_from_slice(&frame[8..ENC_RTSP_HEADER]);
-    let pt = super::control::gcm_open(key, &rtsp_nonce(seq, b'C'), &ct_tag, &[])
+    let pt = super::control_wire::gcm_open(key, &rtsp_nonce(seq, b'C'), &ct_tag, &[])
         .context("sealed RTSP message did not authenticate")?;
     // Ordinary RTSP inside. Frame length already bounds it; do not trust
     // Content-Length the way the plaintext path does.
@@ -556,15 +566,6 @@ fn read_sealed_message(
     Ok(Some(req))
 }
 
-/// DESCRIBE line that offers PyroWave to a USBridge client (payload type 99 is unused by
-/// GameStream).
-const PYROWAVE_RTPMAP: &str = "a=rtpmap:99 PYROWAVE/90000";
-
-/// Whether this host can encode PyroWave: the same capability bit the native plane advertises.
-pub(super) fn pyrowave_offered() -> bool {
-    crate::encode::host_wire_caps() & punktfunk_core::quic::CODEC_PYROWAVE != 0
-}
-
 /// DESCRIBE SDP: the HEVC/AV1 lines `codecs` (`ServerCodecModeSupport`) backs, surround
 /// configs, and the encryption offer. moonlight-common-c picks HEVC or AV1 from those two lines
 /// alone. Shipping modes advertise encryption as SUPPORTED, never REQUESTED.
@@ -572,19 +573,11 @@ fn describe_sdp(codecs: u32) -> String {
     // Advertise pen/touch only where we can inject. Else 0 so Moonlight keeps
     // client-side mouse emulation. gamescope gets the pen as touch (`GsPointer`).
     // `PUNKTFUNK_PEN=0` is the kill-switch inside `pen_supported`.
-    let mut feature_flags: u32 = if crate::inject::pen_supported() {
+    let feature_flags: u32 = if crate::inject::pen_supported() {
         SS_FF_PEN_TOUCH_EVENTS
     } else {
         0
     };
-    // Under the USBridge agent: its client may send a HID device over this stream.
-    if super::usbridge::raw_hid_offered() {
-        feature_flags |= super::usbridge::SS_FF_USBRIDGE_RAW_HID;
-    }
-    // Its pads take the controller touchpad, motion and battery.
-    if super::usbridge::pads_via_broker() {
-        feature_flags |= super::usbridge::SS_FF_CONTROLLER_TOUCH_EVENTS;
-    }
     let (supported, requested) = enc_flags(gs_encryption_offer());
     let mut lines: Vec<String> = vec![
         format!("a=x-ss-general.featureFlags:{feature_flags}"),
@@ -597,10 +590,13 @@ fn describe_sdp(codecs: u32) -> String {
     if codecs & super::SCM_AV1_MAIN8 != 0 {
         lines.push("a=rtpmap:98 AV1/90000".into());
     }
-    // USBridge extension: a client that decodes PyroWave reads this line and answers with
-    // `bitStreamFormat:3`. Stock Moonlight ignores a payload type it does not know.
-    if codecs & super::SCM_USBRIDGE_PYROWAVE != 0 {
-        lines.push(PYROWAVE_RTPMAP.into());
+    // Capability marker only; no RTP payload type 99 is ever sent.
+    if codecs & super::SCM_PYROWAVE != 0 {
+        lines.push("a=rtpmap:99 PYROWAVE/90000".into());
+        lines.push(format!(
+            "a=x-ss-pyrowave.bitstream:{}",
+            super::PYROWAVE_BITSTREAM_ID
+        ));
     }
     // Client takes the first `surround-params=<channelCount>` as normal and
     // a second as HQ, so normal must precede HQ. Stereo lines are Sunshine
@@ -622,8 +618,12 @@ fn describe_sdp(codecs: u32) -> String {
     lines.join("\r\n")
 }
 
-/// ANNOUNCE keys → [`StreamConfig`]. Resolution and packetSize are required.
-fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
+/// ANNOUNCE keys → [`StreamConfig`], carrying the encode resolution its HDR verdict read.
+/// `app` is the `/launch` entry, whose route decides HDR. Resolution and packetSize are required.
+fn stream_config(
+    map: &HashMap<String, String>,
+    app: Option<&super::apps::AppEntry>,
+) -> Option<StreamConfig> {
     let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
     let width = parse_u("x-nv-video[0].clientViewportWd")?;
     let height = parse_u("x-nv-video[0].clientViewportHt")?;
@@ -652,29 +652,42 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         .or_else(|| parse_u("x-nv-vqos[0].bw.maximumBitrateKbps").filter(|&b| b > 0))
         .unwrap_or(20_000)
         .min(MAX_BITRATE_KBPS);
-    // moonlight-common-c SdpGenerator.c: 0=H264, 1=HEVC, 2=AV1.
+    // moonlight-common-c SdpGenerator.c: 0=H264, 1=HEVC, 2=AV1; 3=PyroWave (Moonlight forks).
     let codec = match map.get("x-nv-vqos[0].bitStreamFormat").map(|s| s.trim()) {
         Some("1") => Codec::H265,
         Some("2") => Codec::Av1,
-        // USBridge extension, sent only after our `PYROWAVE/90000` line in DESCRIBE.
-        Some("3") if pyrowave_offered() => Codec::PyroWave,
+        Some("3") => Codec::PyroWave,
         _ => Codec::H264,
     };
+    // Stock Moonlight cannot decode 4:4:4; only PyroWave clients ask for it here, and
+    // `pyrowave_refusal` already turned away a 4:4:4 ask this host cannot serve.
+    let chroma =
+        if codec == Codec::PyroWave && parse_u("x-ss-video[0].chromaSamplingType") == Some(1) {
+            crate::encode::ChromaFormat::Yuv444
+        } else {
+            crate::encode::ChromaFormat::Yuv420
+        };
     // Moonlight sets `dynamicRangeMode != 0` when it saw Main10 and the user
-    // enabled HDR. Honor only if `host_hdr_capable`; otherwise 8-bit SDR.
+    // enabled HDR. Honor only if this launch's route can carry it; otherwise 8-bit SDR.
     let hdr_requested = parse_u("x-nv-video[0].dynamicRangeMode").unwrap_or(0) != 0;
     // `mut` is load-bearing on Linux (probe below clears it). Allow only
     // off-Linux so `unused_mut` still fires if that probe goes away.
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut hdr = hdr_requested && crate::gamestream::host_hdr_capable();
+    let encoder = crate::encode::resolve();
+    let mut hdr = hdr_requested
+        && crate::gamestream::launch_hdr_capable(
+            app.and_then(|a| a.compositor),
+            app.is_some_and(super::apps::AppEntry::launches),
+            &encoder,
+        );
     if hdr_requested && !hdr {
         tracing::warn!(
-            "client requested HDR (dynamicRangeMode != 0) but host is not HDR-capable — streaming 8-bit SDR"
+            "client requested HDR (dynamicRangeMode != 0) but this launch's display can't be HDR — streaming 8-bit SDR"
         );
     }
-    // `host_hdr_capable` is host-wide; this session's codec must also be
-    // 10-bit. Else a PQ label over an 8-bit stream. H.264 always degrades.
-    if hdr && !crate::encode::can_encode_10bit(codec) {
+    // `launch_hdr_capable` asks for any 10-bit codec; this session's must be
+    // 10-bit too. Else a PQ label over an 8-bit stream. H.264 always degrades.
+    if hdr && !encoder.can_encode_10bit(codec) {
         tracing::warn!(
             ?codec,
             "client requested HDR but this host cannot encode 10-bit with the codec it \
@@ -683,7 +696,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         hdr = false;
     }
     // Colour-mode probe is portal-monitor only: HDR needs a monitor in
-    // BT.2100 now. Gamescope has no monitor; `host_hdr_capable` already
+    // BT.2100 now. Gamescope has no monitor; `launch_hdr_capable` already
     // settled it. Probing would refuse every headless gamescope HDR session.
     #[cfg(target_os = "linux")]
     let portal_source = pf_host_config::config().video_source.as_deref() == Some("portal");
@@ -714,53 +727,23 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         );
         hdr = false;
     }
-    // `encoderCscMode = (colorspace << 1) | fullRange` (0=Rec601, 1=Rec709,
-    // 2=Rec2020). We encode BT.709 limited (SDR) or BT.2020 PQ (HDR) and do
-    // not honor this. Warn only when the request is honorable in principle
-    // and unmet. HDR10 *is* BT.2020 PQ, so an HDR mismatch is not actionable.
-    if let Some(csc) = parse_u("x-nv-video[0].encoderCscMode") {
-        let (space, range) = (
-            match csc >> 1 {
-                0 => "Rec601",
-                1 => "Rec709",
-                2 => "Rec2020",
-                _ => "unknown",
-            },
-            if csc & 1 != 0 { "full" } else { "limited" },
-        );
-        let ours = if hdr {
-            "Rec2020 limited (PQ)"
-        } else {
-            "Rec709 limited"
-        };
-        let matches_ours = (hdr && csc >> 1 == 2 || !hdr && csc >> 1 == 1) && csc & 1 == 0;
-        if matches_ours {
-            tracing::debug!(
-                csc,
-                space,
-                range,
-                "GameStream client requested CSC — matches ours"
-            );
-        } else if hdr {
-            // HDR10 settles colour space; the request is not actionable.
-            tracing::debug!(
-                csc,
-                requested = format!("{space} {range}"),
-                encoding = ours,
-                "GameStream client requested a CSC that HDR overrides — HDR10 is BT.2020 PQ by \
-                 definition, and the stream's VUI says so"
-            );
-        } else {
-            tracing::warn!(
-                csc,
-                requested = format!("{space} {range}"),
-                encoding = ours,
-                "GameStream client requested an SDR CSC we don't encode — we signal what we \
-                 encode in the VUI, so a VUI-driven client is still correct; a client that \
-                 renders from its own request would see shifted colours (unverified — honoring \
-                 the request needs the CSC + VUI threaded per session)"
-            );
-        }
+    // `encoderCscMode = (colorspace << 1) | fullRange` (0=Rec601, 1=Rec709, 2=Rec2020). The
+    // range is the client's, SDR and HDR alike; an absent mode asks full. The colour space is
+    // HDR's: SDR is Rec709 and HDR10 BT.2020 PQ, and the VUI says which.
+    let csc = parse_u("x-nv-video[0].encoderCscMode");
+    let studio = csc.is_some_and(|c| c & 1 == 0);
+    let studio_asked = crate::session_plan::StudioAsk {
+        sdr: studio,
+        hdr: studio,
+    };
+    match csc {
+        Some(c) if !hdr && c >> 1 != 1 => tracing::warn!(
+            csc = c,
+            studio,
+            "GameStream client asked for an SDR colour space other than Rec709 — encoding Rec709, \
+             which the VUI states"
+        ),
+        _ => tracing::debug!(?csc, studio, "GameStream client colour request"),
     }
     // Client parity floor (small frames); clamp to a sane max.
     let min_fec = parse_u("x-nv-vqos[0].fec.minRequiredFecPackets")
@@ -794,11 +777,50 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         packet_size,
         bitrate_kbps,
         codec,
+        chroma,
         min_fec,
         hdr,
         slices,
         encrypt_video,
+        studio_asked,
+        encoder,
     })
+}
+
+/// Why a PyroWave ANNOUNCE (`bitStreamFormat=3`) cannot be served, or `None`. The driver
+/// emits record-framed AUs only, so a client must parse record framing; length-prefixed
+/// clients and the retired compression/Hybrid transports are refused. The client's decoder
+/// is fixed at the chroma it asked for, so a 4:4:4 ask the host cannot serve is refused too:
+/// 4:2:0 in its place would decode nothing.
+fn pyrowave_refusal(map: &HashMap<String, String>, host_codecs: u32) -> Option<&'static str> {
+    if map.get("x-nv-vqos[0].bitStreamFormat").map(|s| s.trim()) != Some("3") {
+        return None;
+    }
+    let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
+    if host_codecs & super::SCM_PYROWAVE == 0 {
+        return Some("this host does not encode PyroWave");
+    }
+    let record_framing = map.contains_key("x-ss-video[0].pyrowaveAdaptiveFec")
+        || parse_u("x-ss-video[0].pyrowaveFeatures").unwrap_or(0) & 0x1 != 0;
+    if !record_framing {
+        return Some("client does not parse PyroWave record framing");
+    }
+    if parse_u("x-ss-video[0].pyrowaveCompression").unwrap_or(0) != 0
+        || parse_u("x-ss-video[0].pyrowaveHybrid").unwrap_or(0) != 0
+    {
+        return Some("PyroWave compression/Hybrid transports are not supported");
+    }
+    if parse_u("x-ss-video[0].chromaSamplingType") == Some(1) {
+        if host_codecs & super::SCM_PYROWAVE_444 == 0 {
+            return Some("4:4:4 is off on this host");
+        }
+        let width = parse_u("x-nv-video[0].clientViewportWd").unwrap_or(0);
+        let height = parse_u("x-nv-video[0].clientViewportHt").unwrap_or(0);
+        if !crate::encode::pyrowave_mode_fits_rdo(width, height, true) {
+            return Some("this mode is too large for PyroWave 4:4:4");
+        }
+    }
+    None
 }
 
 /// ANNOUNCE → [`audio::AudioParams`]. moonlight-common-c `SdpGenerator.c`:
@@ -907,17 +929,112 @@ mod tests {
             (Some("0"), Codec::H264),
             (Some("1"), Codec::H265),
             (Some("2"), Codec::Av1),
+            (Some("3"), Codec::PyroWave),
             (None, Codec::H264),
         ] {
             let map = match fmt {
                 Some(f) => announce(&[("x-nv-vqos[0].bitStreamFormat", f)]),
                 None => announce(&[]),
             };
-            let cfg = stream_config(&map).expect("required keys present");
+            let cfg = stream_config(&map, None).expect("required keys present");
             assert_eq!(cfg.codec, codec, "bitStreamFormat {fmt:?}");
             assert_eq!((cfg.width, cfg.height, cfg.fps), (1920, 1080, 120));
             assert_eq!(cfg.bitrate_kbps, 40_000);
         }
+    }
+
+    /// 4:4:4 only for PyroWave; stock Moonlight HEVC stays 4:2:0 whatever it sends.
+    #[test]
+    fn announce_pyrowave_chroma() {
+        use crate::encode::ChromaFormat;
+        let pw444 = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "3"),
+            ("x-ss-video[0].chromaSamplingType", "1"),
+        ]);
+        assert_eq!(
+            stream_config(&pw444, None).unwrap().chroma,
+            ChromaFormat::Yuv444
+        );
+        let pw420 = announce(&[("x-nv-vqos[0].bitStreamFormat", "3")]);
+        assert_eq!(
+            stream_config(&pw420, None).unwrap().chroma,
+            ChromaFormat::Yuv420
+        );
+        let hevc444 = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "1"),
+            ("x-ss-video[0].chromaSamplingType", "1"),
+        ]);
+        assert_eq!(
+            stream_config(&hevc444, None).unwrap().chroma,
+            ChromaFormat::Yuv420
+        );
+    }
+
+    /// Clients reject a mismatched ID, so a vendor bump must move the advertised one.
+    #[test]
+    fn pyrowave_bitstream_id_tracks_vendored_commit() {
+        let vendor =
+            include_str!("../../../../codec/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt");
+        let commit = vendor
+            .lines()
+            .find_map(|l| l.strip_prefix("pyrowave:"))
+            .map(str::trim)
+            .expect("PUNKTFUNK-VENDOR.txt names the pyrowave commit");
+        assert!(commit.starts_with(super::super::PYROWAVE_BITSTREAM_ID));
+    }
+
+    #[test]
+    fn announce_pyrowave_refusals() {
+        use super::super::{SCM_H264, SCM_PYROWAVE, SCM_PYROWAVE_444};
+        let host = SCM_H264 | SCM_PYROWAVE;
+        let record = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "3"),
+            ("x-ss-video[0].pyrowaveFeatures", "1"),
+        ]);
+        assert_eq!(pyrowave_refusal(&record, host), None);
+        let adaptive_fec = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "3"),
+            ("x-ss-video[0].pyrowaveAdaptiveFec", "0"),
+        ]);
+        assert_eq!(pyrowave_refusal(&adaptive_fec, host), None);
+        assert!(
+            pyrowave_refusal(&record, SCM_H264).is_some(),
+            "host without PyroWave"
+        );
+        let length_prefixed = announce(&[("x-nv-vqos[0].bitStreamFormat", "3")]);
+        assert!(pyrowave_refusal(&length_prefixed, host).is_some());
+        let compressed = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "3"),
+            ("x-ss-video[0].pyrowaveFeatures", "1"),
+            ("x-ss-video[0].pyrowaveCompression", "1"),
+        ]);
+        assert!(pyrowave_refusal(&compressed, host).is_some());
+        let hevc = announce(&[("x-nv-vqos[0].bitStreamFormat", "1")]);
+        assert_eq!(pyrowave_refusal(&hevc, SCM_H264), None);
+
+        let ask_444 = |w: &str, h: &str| {
+            announce(&[
+                ("x-nv-vqos[0].bitStreamFormat", "3"),
+                ("x-ss-video[0].pyrowaveFeatures", "1"),
+                ("x-ss-video[0].chromaSamplingType", "1"),
+                ("x-nv-video[0].clientViewportWd", w),
+                ("x-nv-video[0].clientViewportHt", h),
+            ])
+        };
+        let host_444 = host | SCM_PYROWAVE_444;
+        assert!(
+            pyrowave_refusal(&ask_444("1920", "1080"), host).is_some(),
+            "4:4:4 policy off"
+        );
+        assert!(
+            pyrowave_refusal(&ask_444("7680", "4320"), host_444).is_some(),
+            "8K 4:4:4 overflows the rate controller's block index"
+        );
+        // A build without the PyroWave encoder fits no mode.
+        assert_eq!(
+            pyrowave_refusal(&ask_444("1920", "1080"), host_444).is_none(),
+            crate::encode::pyrowave_mode_fits_rdo(1920, 1080, true)
+        );
     }
 
     /// `configuredBitrateKbps` wins over the legacy max (Moonlight floors that
@@ -928,20 +1045,43 @@ mod tests {
             ("x-nv-vqos[0].bw.maximumBitrateKbps", "100000"),
             ("x-ml-video.configuredBitrateKbps", "500000"),
         ]);
-        assert_eq!(stream_config(&map).unwrap().bitrate_kbps, 500_000);
-        assert_eq!(stream_config(&announce(&[])).unwrap().bitrate_kbps, 40_000);
+        assert_eq!(stream_config(&map, None).unwrap().bitrate_kbps, 500_000);
+        assert_eq!(
+            stream_config(&announce(&[]), None).unwrap().bitrate_kbps,
+            40_000
+        );
         // Zero configured is ignored; absurd values clamp.
         let zero = announce(&[("x-ml-video.configuredBitrateKbps", "0")]);
-        assert_eq!(stream_config(&zero).unwrap().bitrate_kbps, 40_000);
+        assert_eq!(stream_config(&zero, None).unwrap().bitrate_kbps, 40_000);
         let huge = announce(&[("x-ml-video.configuredBitrateKbps", "9000000")]);
-        assert_eq!(stream_config(&huge).unwrap().bitrate_kbps, 1_000_000);
+        assert_eq!(stream_config(&huge, None).unwrap().bitrate_kbps, 1_000_000);
+    }
+
+    /// `encoderCscMode`'s low bit picks the range for SDR and HDR alike; no mode asks full.
+    #[test]
+    fn announce_takes_the_clients_range() {
+        use crate::session_plan::StudioAsk;
+        let both = StudioAsk {
+            sdr: true,
+            hdr: true,
+        };
+        for (csc, want) in [("2", both), ("4", both), ("3", StudioAsk::default())] {
+            let map = announce(&[("x-nv-video[0].encoderCscMode", csc)]);
+            assert_eq!(
+                stream_config(&map, None).unwrap().studio_asked,
+                want,
+                "{csc}"
+            );
+        }
+        let unset = stream_config(&announce(&[]), None).unwrap().studio_asked;
+        assert_eq!(unset, StudioAsk::default());
     }
 
     #[test]
     fn announce_missing_required_keys() {
         let mut map = announce(&[]);
         map.remove("x-nv-video[0].packetSize");
-        assert!(stream_config(&map).is_none());
+        assert!(stream_config(&map, None).is_none());
     }
 
     /// Out-of-range packetSize must reject here: ≤16 div-by-zeros the video
@@ -951,14 +1091,14 @@ mod tests {
         for bad in ["0", "16", "63", "4096", "999999"] {
             let map = announce(&[("x-nv-video[0].packetSize", bad)]);
             assert!(
-                stream_config(&map).is_none(),
+                stream_config(&map, None).is_none(),
                 "out-of-range packetSize {bad} must be rejected"
             );
         }
         for ok in ["64", "1024", "1392", "2048"] {
             let map = announce(&[("x-nv-video[0].packetSize", ok)]);
             assert!(
-                stream_config(&map).is_some(),
+                stream_config(&map, None).is_some(),
                 "in-range packetSize {ok} must be accepted"
             );
         }
@@ -968,17 +1108,17 @@ mod tests {
     /// range must fall back to 1, never reject the session.
     #[test]
     fn announce_slices_per_frame() {
-        assert_eq!(stream_config(&announce(&[])).unwrap().slices, 1);
+        assert_eq!(stream_config(&announce(&[]), None).unwrap().slices, 1);
         for want in ["1", "4"] {
             let map = announce(&[("x-nv-video[0].videoEncoderSlicesPerFrame", want)]);
             assert_eq!(
-                stream_config(&map).unwrap().slices,
+                stream_config(&map, None).unwrap().slices,
                 want.parse::<u32>().unwrap()
             );
         }
         for bad in ["0", "33", "999999", "-1", "x"] {
             let map = announce(&[("x-nv-video[0].videoEncoderSlicesPerFrame", bad)]);
-            let cfg = stream_config(&map).expect("session must still negotiate");
+            let cfg = stream_config(&map, None).expect("session must still negotiate");
             assert_eq!(cfg.slices, 1, "slicesPerFrame {bad} must degrade to 1");
         }
     }
@@ -1198,12 +1338,13 @@ mod tests {
         // Wire order is tag-first; `aes-gcm` wants tag last.
         let mut ct_tag = wire[ENC_RTSP_HEADER..].to_vec();
         ct_tag.extend_from_slice(&wire[8..ENC_RTSP_HEADER]);
-        let pt = super::super::control::gcm_open(&key, &rtsp_nonce(seq, b'H'), &ct_tag, &[])
+        let pt = super::super::control_wire::gcm_open(&key, &rtsp_nonce(seq, b'H'), &ct_tag, &[])
             .expect("host-sealed RTSP must open under the H/R nonce");
         assert_eq!(pt, msg);
         // Direction byte: the client nonce must not open a host message.
         assert!(
-            super::super::control::gcm_open(&key, &rtsp_nonce(seq, b'C'), &ct_tag, &[]).is_none(),
+            super::super::control_wire::gcm_open(&key, &rtsp_nonce(seq, b'C'), &ct_tag, &[])
+                .is_none(),
             "a host message must not authenticate under the client direction"
         );
     }
@@ -1254,9 +1395,6 @@ mod tests {
     fn describe_advertises_codecs_and_surround() {
         let h264_only = describe_sdp(super::super::SCM_H264);
         assert!(!h264_only.contains("AAAAAU") && !h264_only.contains("AV1/90000"));
-        assert!(!h264_only.contains("PYROWAVE/90000"), "PyroWave only when the bit is set");
-        let pyrowave = describe_sdp(super::super::SCM_H264 | super::super::SCM_USBRIDGE_PYROWAVE);
-        assert!(pyrowave.contains("a=rtpmap:99 PYROWAVE/90000"), "PyroWave indicator");
         let sdp = describe_sdp(
             super::super::SCM_H264 | super::super::SCM_HEVC | super::super::SCM_AV1_MAIN8,
         );
@@ -1270,6 +1408,13 @@ mod tests {
             "HEVC indicator"
         );
         assert!(sdp.contains("a=rtpmap:98 AV1/90000"), "AV1 indicator");
+        assert!(!sdp.contains("PYROWAVE"), "no PyroWave without its bit");
+        let pw = describe_sdp(super::super::SCM_H264 | super::super::SCM_PYROWAVE);
+        assert!(pw.contains("a=rtpmap:99 PYROWAVE/90000"));
+        assert!(pw.contains(&format!(
+            "a=x-ss-pyrowave.bitstream:{}",
+            super::super::PYROWAVE_BITSTREAM_ID
+        )));
         for params in [
             "21101",       // stereo; 2-channel clients hardcode this
             "642012453",   // 5.1 normal, pre-rotated for GFE-order swap

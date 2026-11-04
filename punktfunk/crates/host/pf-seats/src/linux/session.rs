@@ -14,7 +14,6 @@ use crate::backend::BackendError;
 use crate::model::{RuntimeState, RuntimeStatus, Seat, SeatId};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// Where each seat's environment file lives.
 pub(super) const ENV_DIR: &str = "/run/punktfunk/seats";
@@ -72,10 +71,24 @@ fn quoted(key: &str, value: &str) -> String {
     format!("{key}=\"{escaped}\"\n")
 }
 
+const TOKEN_KEY: &str = "PUNKTFUNK_MGMT_TOKEN=";
+
 /// The management token as the one `KEY=value` line the box's client and `EnvironmentFile=` both
 /// read. Hex, so it needs no quoting.
 pub(super) fn token_line(token: &str) -> String {
-    format!("PUNKTFUNK_MGMT_TOKEN={token}\n")
+    format!("{TOKEN_KEY}{token}\n")
+}
+
+/// The token `account`'s environment file holds. The owner can edit that file, so only a token
+/// [`mint_token`] could have made counts.
+pub(super) fn env_token(account: &str) -> Option<String> {
+    token_in(&std::fs::read_to_string(env_path(account)).ok()?).map(str::to_owned)
+}
+
+fn token_in(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(TOKEN_KEY))
+        .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A fresh 32-byte token, hex-encoded.
@@ -92,7 +105,13 @@ pub(super) fn mint_token() -> String {
 /// The owner's row keeps the owner's own config directory, library, host name and GameStream
 /// setting: it is the owner's host, behind the door. `PUNKTFUNK_SEAT_OWNER` tells the runner and
 /// the host so. Every other seat plays the box's library, from its trust copy.
-pub(super) fn render_env(seat: &Seat, home: &Path, state: &Path, token: &str) -> String {
+pub(super) fn render_env(
+    seat: &Seat,
+    home: &Path,
+    state: &Path,
+    token: &str,
+    browser: &Browser,
+) -> String {
     let trust = shared::trust_dir(state, &seat.id)
         .to_string_lossy()
         .into_owned();
@@ -128,13 +147,27 @@ pub(super) fn render_env(seat: &Seat, home: &Path, state: &Path, token: &str) ->
         rows.push(("PUNKTFUNK_GAMESTREAM", "0".to_owned()));
     }
     rows.push(("PUNKTFUNK_MDNS", "0".to_owned()));
+    // Off unless the box streams to browsers: an owner whose own setting has it on would
+    // otherwise bind the door's port.
+    let port = seat.browser_port().filter(|_| browser.on);
+    rows.push((
+        "PUNKTFUNK_WEBTRANSPORT",
+        if port.is_some() { "1" } else { "0" }.to_owned(),
+    ));
+    if let Some(port) = port {
+        rows.push(("PUNKTFUNK_WEBTRANSPORT_PORT", port.to_string()));
+        if !browser.origins.is_empty() {
+            rows.push(("PUNKTFUNK_WEBTRANSPORT_ORIGINS", browser.origins.join(",")));
+        }
+    }
     let mut out: String = rows.iter().map(|(key, value)| quoted(key, value)).collect();
     out.push_str(&token_line(token));
     out
 }
 
-/// The drop-in that gives the unit its private prefix directories, the owner's libraries
-/// ([`libraries`]), an empty `/run/media` and the supervisor's uinput proxy as `/dev/uinput`.
+/// The drop-in that gives the unit its private prefix directories, the owner's libraries and
+/// granted roots ([`libraries`]), an empty `/run/media` and the supervisor's uinput proxy as
+/// `/dev/uinput`.
 /// A SteamOS-mode Steam adopts every mounted drive holding a `steamapps` as a library, and the
 /// drive as mounted is the owner's alone. Without the proxy the unit starts all the same.
 pub(super) fn render_binds(
@@ -202,24 +235,56 @@ pub(super) fn write_if_changed(path: &Path, contents: &str, mode: u32) -> std::i
     Ok(true)
 }
 
+/// The box's browser streaming as its Seat defaults hand it on (`pf_host_config::seat_defaults`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Browser {
+    pub on: bool,
+    pub origins: Vec<String>,
+}
+
+/// [`Browser`] from the box's Seat defaults in `box_dir`. Off when the box wrote none, or one
+/// that can't be read: a browser plane is a port nobody asked to open.
+pub(super) fn browser(box_dir: &Path) -> Browser {
+    let read = || -> std::io::Result<Option<Browser>> {
+        let path = box_dir.join("seat-defaults.json");
+        let Some((bytes, _)) = super::safe_open::read(&path, super::shared::MAX_TRUST_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+        Ok(Some(Browser {
+            on: v["browser"].as_bool().unwrap_or(false),
+            origins: v["browser_origins"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o.as_str().map(str::to_string))
+                .collect(),
+        }))
+    };
+    read().ok().flatten().unwrap_or_default()
+}
+
 /// Writes the environment file for `seat`. It holds a secret: root reads it before the unit drops
 /// privileges, nobody else. The owner's user unit reads it too, so it is the owner's, `0600`.
+/// `true` when the file changed.
 pub(super) fn write_env(
     seat: &Seat,
     home: &Path,
     state: &Path,
     token: &str,
     owner: Option<(u32, u32)>,
-) -> Result<(), BackendError> {
+    browser: &Browser,
+) -> Result<bool, BackendError> {
     let io = |what: &str, error: std::io::Error| err("session_files", format!("{what}: {error}"));
     let path = env_path(&seat.account);
-    write_if_changed(&path, &render_env(seat, home, state, token), 0o600)
+    let written = write_if_changed(&path, &render_env(seat, home, state, token, browser), 0o600)
         .map_err(|e| io("write the seat environment file", e))?;
     if let Some((uid, gid)) = owner {
         std::os::unix::fs::chown(&path, Some(uid), Some(gid))
             .map_err(|e| io("hand the environment file to its owner", e))?;
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Writes the environment file and the drop-ins for `seat`, then reloads systemd when a drop-in
@@ -232,9 +297,10 @@ pub(super) fn write_unit_files(
     token: &str,
     owner: Option<(u32, u32)>,
     shares: Option<&libraries::Shares>,
+    browser: &Browser,
 ) -> Result<(), BackendError> {
     let io = |what: &str, error: std::io::Error| err("session_files", format!("{what}: {error}"));
-    write_env(seat, home, state, token, owner)?;
+    write_env(seat, home, state, token, owner, browser)?;
     let (name, contents) = if seat.owner {
         ("class.conf", render_class().to_owned())
     } else {
@@ -334,10 +400,63 @@ pub(super) fn state(account: &str) -> Result<UnitState, BackendError> {
     Ok(parse_show(&shown))
 }
 
-/// Whether something accepts TCP connections on loopback `port`: the seat host's management API.
-pub(super) fn port_open(port: u16) -> bool {
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
+/// The users that own a TCP listener that answers `127.0.0.1:port`, from the kernel's tables:
+/// one entry per socket. A table that can't be read counts as empty, and is logged unless it is
+/// the IPv6 one on a kernel without IPv6.
+fn listeners(port: u16) -> Vec<u32> {
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .into_iter()
+        .filter_map(|path| match std::fs::read_to_string(path) {
+            Ok(table) => Some(table),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!(%error, path, "listening sockets not readable");
+                None
+            }
+        })
+        .flat_map(|table| listener_uids(&table, port))
+        .collect()
+}
+
+/// Local addresses a connect to `127.0.0.1` can reach, as `/proc/net/tcp` prints them on a
+/// little-endian machine: loopback and the wildcard, and the same two behind an IPv6 socket.
+const LOOPBACK_REACHED: [&str; 4] = [
+    "0100007F",
+    "00000000",
+    "0000000000000000FFFF00000100007F",
+    "00000000000000000000000000000000",
+];
+
+/// The owners of the `LISTEN` rows on `port` in one `/proc/net/tcp` table that answer
+/// `127.0.0.1`: the local address and port are field 1, the state field 3 (`0A`) and the owner's
+/// uid field 7. A listener on another address, `::1` included, is not in the way.
+fn listener_uids(table: &str, port: u16) -> Vec<u32> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|row| {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            let (address, local_port) = fields.get(1)?.rsplit_once(':')?;
+            let listening = fields.get(3) == Some(&"0A");
+            let wanted = LOOPBACK_REACHED.contains(&address)
+                && u16::from_str_radix(local_port, 16).ok()? == port;
+            if !listening || !wanted {
+                return None;
+            }
+            fields.get(7)?.parse().ok()
+        })
+        .collect()
+}
+
+/// Whether anything listens on `port`, whoever it is: the seat's host could not bind it.
+pub(super) fn port_taken(port: u16) -> bool {
+    !listeners(port).is_empty()
+}
+
+/// Whether `uid` listens on `port` and nobody else does: the seat's host, not a squatter's.
+pub(super) fn port_held_by(port: u16, uid: u32) -> bool {
+    let owners = listeners(port);
+    !owners.is_empty() && owners.iter().all(|&owner| owner == uid)
 }
 
 #[cfg(test)]
@@ -357,6 +476,8 @@ mod tests {
             runtime: RuntimeStatus::stopped(),
             owner: false,
             fingerprint: None,
+            adopted_sid: None,
+            rdp_granted: false,
         }
     }
 
@@ -379,6 +500,7 @@ mod tests {
             Path::new("/home/enrico"),
             Path::new("/var/lib/punktfunk-seats"),
             "ab12",
+            &Browser::default(),
         );
         assert_eq!(
             text,
@@ -390,6 +512,7 @@ mod tests {
              PUNKTFUNK_NATIVE_PORT=\"9779\"\n\
              PUNKTFUNK_MGMT_BIND=\"127.0.0.1:47995\"\n\
              PUNKTFUNK_MDNS=\"0\"\n\
+             PUNKTFUNK_WEBTRANSPORT=\"0\"\n\
              PUNKTFUNK_MGMT_TOKEN=ab12\n"
         );
         assert!(!text.contains("CONFIG_DIR"));
@@ -405,6 +528,7 @@ mod tests {
             Path::new("/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/home"),
             Path::new("/var/lib/punktfunk-seats"),
             "ab12",
+            &Browser::default(),
         );
         assert_eq!(
             text,
@@ -419,7 +543,85 @@ mod tests {
              PUNKTFUNK_HOST_NAME=\"Mara\"\n\
              PUNKTFUNK_GAMESTREAM=\"0\"\n\
              PUNKTFUNK_MDNS=\"0\"\n\
+             PUNKTFUNK_WEBTRANSPORT=\"0\"\n\
              PUNKTFUNK_MGMT_TOKEN=ab12\n"
+        );
+    }
+
+    /// With the box streaming to browsers each seat runs its own plane on its own port, under the
+    /// box's origins.
+    #[test]
+    fn a_seat_streams_to_browsers_on_its_own_port_when_the_box_does() {
+        let browser = Browser {
+            on: true,
+            origins: vec!["https://box:47992".into(), "https://web.example".into()],
+        };
+        let text = render_env(
+            &seat("Mara"),
+            Path::new("/h"),
+            Path::new("/b"),
+            "ab12",
+            &browser,
+        );
+        assert!(text.contains("PUNKTFUNK_WEBTRANSPORT=\"1\"\n"));
+        assert!(text.contains("PUNKTFUNK_WEBTRANSPORT_PORT=\"9783\"\n"));
+        assert!(text.contains(
+            "PUNKTFUNK_WEBTRANSPORT_ORIGINS=\"https://box:47992,https://web.example\"\n"
+        ));
+        let off = render_env(
+            &seat("Mara"),
+            Path::new("/h"),
+            Path::new("/b"),
+            "ab12",
+            &Browser::default(),
+        );
+        assert!(off.contains("PUNKTFUNK_WEBTRANSPORT=\"0\"\n"));
+        assert!(!off.contains("PUNKTFUNK_WEBTRANSPORT_PORT"));
+    }
+
+    /// A minted token reads back from the file it was rendered into; any other doesn't.
+    #[test]
+    fn only_a_minted_token_reads_back_from_an_environment_file() {
+        let token = mint_token();
+        let text = render_env(
+            &seat("Mara"),
+            Path::new("/h"),
+            Path::new("/b"),
+            &token,
+            &Browser::default(),
+        );
+        assert_eq!(token_in(&text), Some(token.as_str()));
+        assert_eq!(token_in("PUNKTFUNK_MGMT_TOKEN=ab12\n"), None);
+        let not_hex = format!("PUNKTFUNK_MGMT_TOKEN={}\n", "z".repeat(64));
+        assert_eq!(token_in(&not_hex), None);
+        assert_eq!(token_in("PUNKTFUNK_SEAT_ID=\"x\"\n"), None);
+    }
+
+    /// The box's Seat defaults name its browser plane; a box that wrote none streams to none.
+    #[test]
+    fn the_box_s_browser_plane_reads_from_its_seat_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(browser(dir.path()), Browser::default());
+        let defaults = pf_host_config::seat_defaults::SeatDefaults {
+            end_on_game_exit: true,
+            max_mode: None,
+            library_writable: true,
+            dualsense_usbip: false,
+            browser: true,
+            browser_origins: vec!["https://box:47992".into()],
+            background_input: false,
+        };
+        std::fs::write(
+            dir.path().join(pf_host_config::seat_defaults::FILE),
+            defaults.to_json().to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            browser(dir.path()),
+            Browser {
+                on: true,
+                origins: vec!["https://box:47992".into()],
+            }
         );
     }
 
@@ -432,13 +634,14 @@ mod tests {
             Path::new("/h"),
             Path::new("/b"),
             "ab12",
+            &Browser::default(),
         );
         let line = text
             .lines()
             .find(|l| l.starts_with("PUNKTFUNK_HOST_NAME="))
             .unwrap();
         assert_eq!(line, r#"PUNKTFUNK_HOST_NAME="A \"B\" \\ $HOME 100%""#);
-        assert_eq!(text.lines().count(), 12);
+        assert_eq!(text.lines().count(), 13);
     }
 
     /// The token line is the exact form the box's client parses, and every mint differs.
@@ -534,6 +737,39 @@ mod tests {
         assert_eq!(status("").state, RuntimeState::Unknown);
         assert!(parse_show("ActiveState=activating\n").live());
         assert!(!parse_show("ActiveState=failed\n").live());
+    }
+
+    /// Only a socket in `LISTEN` on the port that answers `127.0.0.1` counts, whatever its family
+    /// or owner; a listener on another address is not in the way.
+    #[test]
+    fn the_listeners_on_a_port_are_the_listen_rows_with_that_port() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+            0: 0100007F:B8B3 00000000:0000 0A 00000000:00000000 00:00000000 00000000   975        0 111 1 0 100 0 0 10 0\n\
+            1: 0100007F:B8B4 00000000:0000 0A 00000000:00000000 00:00000000 00000000   976        0 112 1 0 100 0 0 10 0\n\
+            2: 0100007F:B8B3 0100007F:9C40 01 00000000:00000000 00:00000000 00000000   975        0 113 1 0 100 0 0 10 0\n\
+            3: 00000000:B8B3 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 114 1 0 100 0 0 10 0\n\
+            4: 00000000000000000000000000000000:B8B3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  0 0 115 1 0 100 0 0 10 0\n\
+            5: 0000000000000000FFFF00000100007F:B8B3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  977 0 116 1 0 100 0 0 10 0\n\
+            6: 00000000000000000000000001000000:B8B3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  978 0 117 1 0 100 0 0 10 0\n\
+            7: 0501A8C0:B8B3 00000000:0000 0A 00000000:00000000 00:00000000 00000000   979        0 118 1 0 100 0 0 10 0\n";
+        assert_eq!(listener_uids(table, 0xB8B3), [975, 1000, 0, 977]);
+        assert_eq!(listener_uids(table, 0xB8B4), [976]);
+        assert!(listener_uids(table, 0xB8B5).is_empty());
+        assert!(listener_uids("", 1).is_empty());
+        assert!(listener_uids("header\nshort row\n", 1).is_empty());
+    }
+
+    /// A listener this process owns is found by its port and held by its user, not by another.
+    /// The table is the kernel's, so this runs on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_listener_is_held_by_its_owner_alone() {
+        let socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let me = rustix::process::getuid().as_raw();
+        assert!(port_taken(port));
+        assert!(port_held_by(port, me));
+        assert!(!port_held_by(port, me + 1));
     }
 
     #[test]

@@ -46,6 +46,10 @@ sessions as they are.
 
 Closing the client removes the screen at once. A dropped connection is noticed after the
 **Disconnect timeout** (8 s, an advanced setting in **Host**), then the window starts.
+
+**Keep for** counts while the host sleeps. A stream the host went to sleep under counts from that
+moment, so a host that sleeps past the window removes the screen a few seconds after it wakes,
+unless a device reconnects first. **Keep until released** ignores sleep.
 On gamescope the game keeps running as long as its screen does.
 
 > **Keeping a screen with Turn off keeps your monitors dark after you disconnect**, until the
@@ -58,19 +62,21 @@ On gamescope the game keeps running as long as its screen does.
 - **Turn off**: the stream is the only screen until streaming ends.
 - **Automatic**: **Turn off**, or **Stay on** when `PUNKTFUNK_COMPOSITOR` pins a compositor.
 
-| | KWin | GNOME | Sway · Hyprland · niri | Windows |
+| | KWin | GNOME | Sway · Hyprland · niri · Umbriel | Windows |
 |---|---|---|---|---|
 | Stay on | ✅ | ✅ | ✅ | ✅ |
 | Stay on, stream is main | ✅ | ✅ | acts as Stay on | ✅ |
 | Turn off | ✅ | ✅ | ✅ | ✅ |
 
-- **Sway, Hyprland and niri** have no main screen. The host focuses the streamed screen at session start
+- **Sway, Hyprland, niri and Umbriel** have no main screen. The host focuses the streamed screen at session start
   and before each library launch; a window that opens later follows whatever has focus then.
 - **Hyprland** turns monitors back on with `hyprctl reload` when the screen is removed. That
   re-reads your config: changes made with `hyprctl keyword` are lost, and `exec =` lines run again.
 - **niri** switches monitors off and on over its IPC when the screen is created and removed. If the
   host dies first, its next start lights them again.
-- **KWin, Sway, Hyprland and niri** can keep chosen monitors lit under **Turn off**: set each to
+- **Umbriel** switches monitors off and on over its IPC. Saving an output change in its config
+  lights them mid-stream: see [Umbriel](/docs/umbriel#config-save).
+- **KWin, Sway, Hyprland, niri and Umbriel** can keep chosen monitors lit under **Turn off**: set each to
   **Stay on** on its row in **Screens**.
 - Punktfunk never turns off a screen it created, so a second device never goes dark.
 
@@ -106,7 +112,8 @@ host** or an answer for this device only:
 
 - the keep-alive (including **Keep for** a number of seconds), second-device and remember
   questions above;
-- **Your monitors while streaming** (Linux hosts);
+- **Your monitors while streaming**. On a Windows host the first device to connect decides it for
+  every device that joins;
 - **Largest screen this device gets**, such as `2560x1440@60`. The device is told the smaller mode
   when it asks for more;
 - **Scale its screen at** (GNOME and niri hosts): the starting scale, until you change the scale in the
@@ -125,7 +132,7 @@ its own screen.
   apply.
 - The resolution is the monitor's; the client scales the picture.
 - Absolute mouse and pen input lands on that monitor.
-- Works on KWin, GNOME, Sway, Hyprland, niri (stock niri too) and gamescope Game Mode, with no
+- Works on KWin, GNOME, Sway, Hyprland, niri (stock niri too), Umbriel and gamescope Game Mode, with no
   chooser dialog. A nested or
   headless gamescope has no monitor to list.
 - On Windows the pointer is part of the picture, and Windows permission prompts and the lock
@@ -184,6 +191,7 @@ exactly as long as its screen:
 | **Stop** on the client or in the console | ends with the screen at once, even on **Leave it running** |
 | a dropped connection | ends when the keep-alive window runs out |
 | a dropped connection, **Keep until released** | keeps running; **Always close it** still ends it after the reconnect window |
+| the host going to sleep | as a dropped connection, and the sleep counts against the window |
 
 To leave a game running on a gamescope box, keep its screen until released. On a desktop session
 (KWin, GNOME, Sway) the settings above apply as written.
@@ -224,6 +232,7 @@ Set scaling once while streaming and each device gets it back on the next connec
 | **GNOME** | Set it in Settings while streaming; the host saves it per device and reapplies it. |
 | **niri** | Pick **Scale its screen at** in the device's **Display settings…**; the screen starts at it. |
 | **Sway** | Not supported; set the scale in your sway config. |
+| **Umbriel** | Not supported; the streamed screen is always at scale 1. |
 
 ## Troubleshooting
 

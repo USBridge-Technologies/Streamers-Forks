@@ -2,27 +2,23 @@
 //!
 //! Audio, input state and the host's events keep their encodings: the payload is one datagram
 //! of the existing vocabulary, its own tag byte included, and the kind must agree with that tag.
-//! Feedback and clock samples are tagged fields. Feedback is the client's whole receive state:
-//! it numbers its report window and its ask, and a host acts on each once however often the
-//! client repeats it.
+//! Feedback is tagged fields: the client's whole receive state. It numbers its report window
+//! and its ask, and a host acts on each once however often the client repeats it.
 
 use super::field::*;
 use super::registry::*;
 use crate::error::Result;
-use crate::quic::{ClockEcho, ClockProbe};
 
 /// One received datagram. Payloads borrow the buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dgram<'a> {
     /// A media packet, on a carrier with no raw UDP path.
     Media(&'a [u8]),
-    /// One audio datagram: desktop, redundant, PCM, pad or mic.
+    /// One audio datagram: desktop, redundant, PCM, bitstream, pad or mic.
     Audio(&'a [u8]),
     /// One input event or rich-input datagram.
     InputState(&'a [u8]),
     Feedback(Feedback),
-    ClockProbe(ClockProbe),
-    ClockEcho(ClockEcho),
     /// Rumble, HID output, cursor state, host timing or HDR metadata, as its own datagram.
     HostEvent(&'a [u8]),
 }
@@ -35,6 +31,7 @@ fn inner_tags(kind: u64) -> &'static [u8] {
             q::AUDIO_MAGIC,
             q::AUDIO_RED_MAGIC,
             q::AUDIO_PCM_MAGIC,
+            q::AUDIO_BITSTREAM_MAGIC,
             q::PAD_AUDIO_MAGIC,
             q::MIC_MAGIC,
         ],
@@ -85,7 +82,6 @@ pub fn decode(b: &[u8]) -> Option<Dgram<'_>> {
     match kind {
         DGRAM_MEDIA => Some(Dgram::Media(payload)),
         DGRAM_FEEDBACK => Feedback::from_fields(payload).ok().map(Dgram::Feedback),
-        DGRAM_CLOCK => clock_from_fields(payload).ok().flatten(),
         _ => {
             if !inner_tags(kind).contains(payload.first()?) {
                 return None;
@@ -153,8 +149,13 @@ pub struct Feedback {
     /// The last closed report window's number, from 1; `0` before the first. It and its
     /// fields ride every datagram until the next window closes. A host reads each once.
     pub window: u32,
-    /// Shards parity repaired over the window, ppm.
+    /// Shards parity repaired over the window, and the holes partial frames went up with, ppm.
     pub loss_ppm: u32,
+    /// What the window's dead frames add to `loss_ppm`: `loss_ppm + dead_ppm` is every data
+    /// shard that never arrived. Dead-frame holes inform the report, link health and the
+    /// operator; the host's automatic responses read `loss_ppm` alone, parity-repairable
+    /// loss, until the FEC policy says otherwise. A client before it sends `0`.
+    pub dead_ppm: u32,
     /// Media packets received this session.
     pub packets_received: u64,
     /// The window's lost shards by their place in the frame: the first twelve data shards,
@@ -182,19 +183,27 @@ pub struct Feedback {
     /// The newest frame the client completed, and the sixteen before it as bits (bit `i`
     /// is frame `last − 1 − i`). Rides with the levels, without an ask.
     pub acked: Option<(u32, u16)>,
+    /// The video stream the ask names frames of; `0` the first screen's. Another screen's
+    /// datagram carries its keyframe ask only: the window and levels are the first screen's.
+    pub stream: u8,
 }
 
 impl Feedback {
     pub fn encode(&self) -> Vec<u8> {
         let nz = |f: Fields, tag, v: u32| f.when(v != 0, |f| f.u32(tag, v));
         let f = Fields::new()
+            .when(self.stream != 0, |f| f.u8(18, self.stream))
             .when(self.window != 0, |f| {
                 let f = f
                     .u32(1, self.window)
                     .u32(2, self.loss_ppm)
                     .u64(3, self.packets_received);
                 let f = nz(nz(f, 9, self.head), 10, self.mid);
-                nz(nz(f, 11, self.tail), 12, self.sock_drops)
+                nz(
+                    nz(nz(f, 11, self.tail), 12, self.sock_drops),
+                    19,
+                    self.dead_ppm,
+                )
             })
             .when(self.link_kbps != 0, |f| f.u32(8, self.link_kbps))
             .when(self.shape != 0, |f| f.u8(16, self.shape))
@@ -242,6 +251,8 @@ impl Feedback {
                 15 => set_once(&mut acked_mask, u16_of(v)?)?,
                 16 => fb.shape = u8_of(v)?,
                 17 => set_once(&mut nack_frame, u32_of(v)?)?,
+                18 => fb.stream = u8_of(v)?,
+                19 => fb.dead_ppm = u32_of(v)?,
                 _ => {}
             }
         }
@@ -337,41 +348,6 @@ impl RetiredFeedback {
     }
 }
 
-/// A probe carries `t1` (1); an echo adds the host's receive and send times (2, 3).
-pub fn encode_clock_probe(p: &ClockProbe) -> Vec<u8> {
-    encode(DGRAM_CLOCK, &Fields::new().u64(1, p.t1_ns).into_body())
-}
-
-pub fn encode_clock_echo(e: &ClockEcho) -> Vec<u8> {
-    let f = Fields::new()
-        .u64(1, e.t1_ns)
-        .u64(2, e.t2_ns)
-        .u64(3, e.t3_ns);
-    encode(DGRAM_CLOCK, &f.into_body())
-}
-
-fn clock_from_fields(body: &[u8]) -> Result<Option<Dgram<'static>>> {
-    let (mut t1, mut t2, mut t3) = (None, None, None);
-    let mut r = FieldReader::new(body);
-    while let Some((tag, v)) = r.next_field()? {
-        match tag {
-            1 => set_once(&mut t1, u64_of(v)?)?,
-            2 => set_once(&mut t2, u64_of(v)?)?,
-            3 => set_once(&mut t3, u64_of(v)?)?,
-            _ => {}
-        }
-    }
-    Ok(match (t1, t2, t3) {
-        (Some(t1_ns), None, None) => Some(Dgram::ClockProbe(ClockProbe { t1_ns })),
-        (Some(t1_ns), Some(t2_ns), Some(t3_ns)) => Some(Dgram::ClockEcho(ClockEcho {
-            t1_ns,
-            t2_ns,
-            t3_ns,
-        })),
-        _ => None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,8 +357,13 @@ mod tests {
     #[test]
     fn existing_datagrams_ride_under_their_kind() {
         let audio = q::encode_audio_datagram(7, 1_000, &[1, 2, 3]);
+        let bitstream = q::encode_audio_bitstream_datagram(7, 1_000, 0, 2, &[1, 2, 3]);
         let rumble = q::encode_rumble_datagram(1, 2, 3);
-        for (v1, kind) in [(&audio[..], DGRAM_AUDIO), (&rumble[..], DGRAM_RUMBLE)] {
+        for (v1, kind) in [
+            (&audio[..], DGRAM_AUDIO),
+            (&bitstream[..], DGRAM_AUDIO),
+            (&rumble[..], DGRAM_RUMBLE),
+        ] {
             let w = wrap(v1).unwrap();
             assert_eq!(get_varint(&w).unwrap().0, kind);
             let back = decode(&w).unwrap();
@@ -507,8 +488,15 @@ mod tests {
                 ..Default::default()
             },
             Feedback {
+                stream: 2,
+                ask: 3,
+                keyframe: true,
+                ..Default::default()
+            },
+            Feedback {
                 window: 6,
                 loss_ppm: 40,
+                dead_ppm: 52_000,
                 packets_received: 90_000,
                 tail: 2,
                 link_kbps: 940_000,
@@ -531,16 +519,9 @@ mod tests {
         assert!(ask(NACK_MAX, true).is_some());
         assert_eq!(ask(NACK_MAX + 1, true), None);
         assert_eq!(ask(2, false), None);
-        let p = ClockProbe { t1_ns: 5 };
-        assert_eq!(decode(&encode_clock_probe(&p)), Some(Dgram::ClockProbe(p)));
-        let e = ClockEcho {
-            t1_ns: 5,
-            t2_ns: 6,
-            t3_ns: 7,
-        };
-        assert_eq!(decode(&encode_clock_echo(&e)), Some(Dgram::ClockEcho(e)));
-        let half = encode(DGRAM_CLOCK, &Fields::new().u64(2, 1).into_body());
-        assert_eq!(decode(&half), None);
+        // The clock kind stays reserved and nothing reads it.
+        let probe = encode(DGRAM_CLOCK, &Fields::new().u64(1, 5).into_body());
+        assert_eq!(decode(&probe), None);
     }
 
     proptest! {

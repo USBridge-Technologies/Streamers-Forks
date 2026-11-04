@@ -25,7 +25,7 @@ pub struct SpawnOpts {
     pub redial: bool,
 }
 
-pub use orchestrate::{session_binary, CancelHandle};
+pub use orchestrate::{session_process, CancelHandle};
 
 /// The plan one card click resolves to. `for_target` does ALL of the resolving — this
 /// device's settings with the host's bound preset (or the "Connect with ▸" one-off) overlaid,
@@ -74,6 +74,9 @@ pub fn spawn_session(
     let plan = plan_for(&req, &fp_hex, tofu, &opts);
     let (mut error, mut ended) = (None::<orchestrate::SessionError>, None::<String>);
     orchestrate::spawn_session(&plan, None, move |ev| match ev {
+        SessionEvent::AwaitingApproval => {
+            let _ = sender.send(AppMsg::AwaitingApproval(req.clone()));
+        }
         SessionEvent::Ready => {
             let _ = sender.send(AppMsg::SessionReady {
                 req: req.clone(),
@@ -112,9 +115,12 @@ pub fn spawn_console(
             let banner = outcome.console_banner("the client log");
             let _ = sender.send(AppMsg::ConsoleExited(banner));
         }
-        // This shell draws nothing for a ready or a stats line, and `spawn_child` saves the
-        // window size.
-        SessionEvent::Ready | SessionEvent::Window { .. } | SessionEvent::Stats(_) => {}
+        // This shell draws nothing for a ready, an approval wait or a stats line (the console
+        // draws its own wait), and `spawn_child` saves the window size.
+        SessionEvent::Ready
+        | SessionEvent::AwaitingApproval
+        | SessionEvent::Window { .. }
+        | SessionEvent::Stats(_) => {}
     };
     orchestrate::spawn_child(cmd, None, None, std::io::stderr(), on_event)
         .map(drop)
@@ -189,6 +195,7 @@ mod tests {
                     id: "saved".into(),
                     display_name: "Kid".into(),
                     remember: false,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }],

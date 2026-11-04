@@ -32,6 +32,9 @@ public enum DefaultsKey {
     /// How a frame whose shape differs from the view fills it: a `VideoFit` raw value, `"fit"`
     /// (default, bars), `"crop"` or `"stretch"`. The cross-client `video_fit` key.
     public static let videoFit = "punktfunk.videoFit"
+    /// `"this"` (default) or `"all"`: a host screen on each of this Mac's displays. The
+    /// cross-client `screens` key.
+    public static let screens = "punktfunk.screens"
     public static let compositor = "punktfunk.compositor"
     public static let gamepadType = "punktfunk.gamepadType"
     public static let gamepadID = "punktfunk.gamepadID"
@@ -103,6 +106,11 @@ public enum DefaultsKey {
     /// sends. The row shows it as the rate it needs, never as bits per pixel.
     public static let pyrowaveBpp = "punktfunk.pyrowaveBpp"
     public static let micEnabled = "punktfunk.micEnabled"
+    /// visionOS: the room places the stream's audio at its window (on, the platform's own
+    /// default); off plays the game's mix straight to the ears. This device's, never a preset's.
+    public static let spatialAudio = "punktfunk.spatialAudio"
+    /// visionOS: how the screen bends (`ScreenCurve`). This device's, never a preset's.
+    public static let screen = "punktfunk.screen"
     /// Echo cancellation for the mic uplink (on by default): playback + capture share ONE
     /// audio engine so the system voice processor can subtract what this device is playing
     /// from what its mic hears — without it a loudspeaker client feeds the game audio straight
@@ -286,6 +294,8 @@ public enum DefaultsKey {
     /// Show how to leave for a few seconds when a stream starts (cross-client `exit_hint`).
     /// Default on.
     public static let exitHint = "punktfunk.exitHint"
+    /// The player answered the macOS 26 variable-refresh stutter notice with "Don't warn again".
+    public static let vrrWarningMuted = "punktfunk.vrrWarningMuted"
     /// Settings show their advanced rows (cross-client `show_advanced`). Default off; hiding a
     /// row keeps its value.
     public static let showAdvanced = "punktfunk.showAdvanced"
@@ -362,12 +372,15 @@ public enum SettingDefault {
     public static let pyrowaveBpp = 1.6
     public static let renderScale = 1.0
     public static let videoFit = VideoFit.fit.rawValue
+    public static let screens = "this"
     public static let codec = "auto"
     public static let hdrEnabled = true
     public static let compositor = 0
     public static let audioChannels = 2
     public static let audioFormat = AudioFormatChoice.opus.rawValue
     public static let micEnabled = false
+    public static let spatialAudio = true
+    public static let screen = ScreenCurve.flat.rawValue
     public static let echoCancel = true
     public static let keepHostAudio = false
     public static let touchMode = "trackpad"
@@ -409,6 +422,7 @@ public enum SettingDefault {
     public static let hudPlacement = "topTrailing"
     public static let statsScalePct = 100
     public static let exitHint = true
+    public static let vrrWarningMuted = false
     public static let showAdvanced = false
     public static let hostSort = HostSort.added.rawValue
     public static let hostGrouping = HostGrouping.none.rawValue

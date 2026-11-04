@@ -50,6 +50,7 @@ export const compositors: AvailableCompositor[] = [
 	{ id: "gamescope", label: "gamescope", available: true, default: false },
 	{ id: "mutter", label: "Mutter (GNOME)", available: false, default: false },
 	{ id: "niri", label: "niri", available: false, default: false },
+	{ id: "umbriel", label: "Umbriel", available: false, default: false },
 	{ id: "wlroots", label: "Sway / wlroots", available: false, default: false },
 ];
 
@@ -617,7 +618,7 @@ export const profilesEvery: ProfileAdmin[] = [
 	},
 ];
 
-/** A Windows Server host: the owner, a desktop sharer and a seat in each seat state. */
+/** A Windows Server host: the owner, a sharer, and a seat in each state; Oma's on her own account. */
 export const profilesWindows: ProfileAdmin[] = [
 	...profilesOne,
 	{
@@ -670,7 +671,7 @@ export const profilesWindows: ProfileAdmin[] = [
 		accent: "#14b8a6",
 		owner: false,
 		home: "desktop",
-		seat: { state: "stopped", port: 9777, kind: "desktop" },
+		seat: { state: "stopped", port: 9777, kind: "desktop", account: "Oma" },
 		last_used_unix: accessNowUnix - 7 * 86_400,
 		default: false,
 	},

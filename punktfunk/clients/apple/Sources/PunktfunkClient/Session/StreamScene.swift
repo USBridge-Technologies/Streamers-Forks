@@ -2,6 +2,9 @@
 // virtual controller and the quick-action ring. ContentView mounts one per connection under the
 // trust prompt; the ring's slots reach the session through `SessionModel.ringActions`.
 
+#if os(visionOS)
+import GameController
+#endif
 import PunktfunkKit
 import SwiftUI
 
@@ -18,6 +21,13 @@ struct StreamScene: View {
     @Binding var showTouchExit: Bool
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.statsScalePct) private var statsScalePct = 100
+    #if os(visionOS)
+    @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    /// The session's picture: the presenter draws here from the first frame, flat or curved.
+    @State private var picture = CurveTarget()
+    #endif
 
     /// The ring this platform draws. macOS takes the DESKTOP default (no soft keyboard, no
     /// on-screen pad), tvOS the TV one (no touch, keyboard or microphone slot), iOS the touch
@@ -67,7 +77,8 @@ struct StreamScene: View {
     }
 
     /// The live stream and everything drawn over it. `padOverPicture` is false while the virtual
-    /// controller has the flat half of a fold to itself.
+    /// controller has the flat half of a fold to itself. On visionOS a pad press goes to the game,
+    /// or to the ring through GamepadCapture, wherever the eyes rest; it never pinches the window.
     @ViewBuilder
     private func picture(_ conn: PunktfunkConnection, padOverPicture: Bool) -> some View {
         let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
@@ -87,7 +98,7 @@ struct StreamScene: View {
             },
             onDial: dialSink,
             onFrame: { [meter = model.meter, queue = model.clientQueue] au in
-                meter.note(byteCount: au.data.count)
+                meter.note(byteCount: au.byteCount)
                 // Receipt and the host split are the core's; the client-queue wait
                 // (receipt → pull, both client-local) is Apple's own overlay line.
                 queue.record(
@@ -110,7 +121,40 @@ struct StreamScene: View {
             endToEndMeter: model.endToEnd
         )
         #if os(visionOS)
-        .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+        // One path for the whole session: the presenter always draws the texture, which shows
+        // flat here or bent on the curve. The stream view under it keeps the window's input.
+        .curve(picture)
+        .overlay {
+            if CurveStage.shared.curved(conn) {
+                ScreenPlaceholder(endStream: { [weak model] in model?.disconnect() })
+            } else {
+                FlatScreen(target: picture)
+            }
+        }
+        // A streaming session follows the stored stop: a curved one moves the picture to the
+        // curve, Flat brings it back here.
+        .onChange(
+            of: model.phase == .streaming ? ScreenCurve(name: screen) : nil, initial: true
+        ) { _, wanted in
+            CurveStage.shared.register(conn, model: model, ring: ring, target: picture)
+            if wanted?.radius != nil {
+                CurveStage.shared.enter(conn)
+            } else {
+                CurveStage.shared.leave(conn)
+            }
+        }
+        // The curve has its own volume, opened and closed with it.
+        .onChange(of: CurveStage.shared.curved(conn)) { _, curved in
+            guard let id = CurveStage.shared.session(for: conn)?.id else { return }
+            if curved {
+                openWindow(id: CurveScene.sceneID, value: id)
+            } else {
+                dismissWindow(id: CurveScene.sceneID, value: id)
+            }
+        }
+        .onDisappear { CurveStage.shared.ended(conn) }
+        // Above the window, where the curve's volume hangs its controls too.
+        .ornament(attachmentAnchor: .scene(.top), contentAlignment: .bottom) {
             StreamOrnament(quickActions: { ring.toggleCentred() })
         }
         #endif
@@ -119,7 +163,7 @@ struct StreamScene: View {
             // morphs to the new tier. The `.transition` fires only on off↔on, a scale-up
             // from the HUD's corner. The ZStack is the stable host `.animation` watches.
             ZStack {
-                if captureEnabled && statsVerbosity != .off {
+                if captureEnabled && statsVerbosity != .off && overlaysHere(conn) {
                     StreamHUDView(
                         model: model, connection: conn, placement: placement,
                         verbosity: statsVerbosity,
@@ -130,32 +174,33 @@ struct StreamScene: View {
                 }
             }
             .animation(.smooth(duration: 0.28), value: statsVerbosity)
+            .overFlatPicture()
         }
         .overlay(alignment: .bottom) {
             StreamBadgeStack(
-                model: model, captureEnabled: captureEnabled, statsVerbosity: statsVerbosity)
+                model: model, captureEnabled: captureEnabled && overlaysHere(conn),
+                statsVerbosity: statsVerbosity)
+                .overFlatPicture()
         }
         #if os(iOS) || os(visionOS)
-        // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
-        // corner disc opens the ring. Off drops it after 8 s, since any overlay above the
-        // stream costs ~a refresh of latency; compact composites a pill anyway. The
-        // virtual controller carries its own ring button, so the discs leave while it is up.
-        .overlay(alignment: .topLeading) {
-            if captureEnabled, !model.virtualPadShown,
+        // A corner disc opens the ring in compact, and for 8 s in off (an overlay above the
+        // stream costs ~a refresh of latency). It takes the top corner the HUD leaves free, and
+        // leaves while the virtual controller, which carries its own ring button, is up.
+        .overlay(alignment: placement == .topLeading ? .topTrailing : .topLeading) {
+            if captureEnabled, overlaysHere(conn), !model.virtualPadShown,
                statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
                 HStack(spacing: 10) {
-                    // Opens the quick-action ring (End stream is a slot inside, behind
-                    // a two-press arm), keeping the disc's fade rules.
+                    // End stream is a slot inside, behind a two-press arm. The overlay clamps
+                    // the far x onto the trailing edge, so the ring opens at the disc.
                     Button {
                         ring.pressTick &+= 1
-                        ring.openAt(CGPoint(x: 30, y: 30))
+                        ring.openAt(CGPoint(
+                            x: placement == .topLeading ? CGFloat.greatestFiniteMagnitude : 30, y: 30))
                     } label: { touchDisc("ellipsis.circle") }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Quick actions")
-                    // The mic toggle rides the same discs, for the same reason: in these
-                    // tiers the HUD carries no buttons (compact is a stat pill, off is
-                    // nothing), so this is a touch-only user's ONLY way to mute. Absent —
-                    // not greyed — when the session sends no microphone at all.
+                    // Off and compact carry no HUD mute button, so this disc is a touch-only
+                    // user's only way to mute. Absent, not greyed, with no mic.
                     if model.micAvailable {
                         Button { model.toggleMicMute() } label: {
                             touchDisc(model.micMuted ? "mic.slash.fill" : "mic.fill")
@@ -166,6 +211,7 @@ struct StreamScene: View {
                     }
                 }
                 .padding(12)
+                .overFlatPicture()
                 .transition(.opacity)
                 .task {
                     guard statsVerbosity == .off else { return }
@@ -178,10 +224,11 @@ struct StreamScene: View {
         // their fingers first and every other finger falls through; below the ring, whose
         // scrim owns every finger while it is up. Mounted only while shown (tenet 1).
         .overlay {
-            if padOverPicture, captureEnabled, model.virtualPadShown,
+            if padOverPicture, captureEnabled, overlaysHere(conn), model.virtualPadShown,
                    let pad = model.virtualPad {
                 VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
                                 wire: pad, openRing: { [ring] at in ring.openAt(at) })
+                    .overFlatPicture()
             }
         }
         #endif
@@ -189,8 +236,9 @@ struct StreamScene: View {
         // disc, the pad's ring button, the remote's Back, the Mac's chord or the Vision
         // Pro's ornament. Mounted only while open — a closed overlay costs nothing.
         .overlay {
-            if captureEnabled, ring.visible {
+            if captureEnabled, ring.visible, overlaysHere(conn) {
                 RingOverlay(state: ring, cfg: ringConfig, actions: model.ringActions(conn, ring: ring))
+                    .overFlatPicture()
             }
         }
         .onChange(of: ring.committed) { _, open in
@@ -213,6 +261,9 @@ struct StreamScene: View {
                   note.object as AnyObject === conn else { return }
             ring.toggleCentred()
         }
+        #endif
+        #if os(visionOS)
+        .handlesGameControllerEvents(matching: .gamepad)
         #endif
     }
 
@@ -269,6 +320,16 @@ struct StreamScene: View {
     #else
     private var dialSink: ((DialEvent) -> Void)? { nil }
     #endif
+
+    /// The picture shows in this window, so its overlays draw here; on a curve they float
+    /// there instead.
+    private func overlaysHere(_ conn: PunktfunkConnection) -> Bool {
+        #if os(visionOS)
+        return !CurveStage.shared.curved(conn)
+        #else
+        return true
+        #endif
+    }
 
     #if os(iOS) || os(visionOS)
     /// One touch-control disc: an SF Symbol on a floating glass disc over the frame (26+,
@@ -335,6 +396,18 @@ extension SessionModel {
             padType: { self.padType },
             padTypeAvailable: { self.padTypeAvailable },
             cyclePadType: { [weak self] in self?.cyclePadType() })
+    }
+}
+
+extension View {
+    /// Just in front of a Vision Pro window's flat picture, which RealityKit draws a millimetre out
+    /// from the window: 2D at the window's own depth would sit behind it. Elsewhere unchanged.
+    @ViewBuilder func overFlatPicture() -> some View {
+        #if os(visionOS)
+        offset(z: FlatScreen.overlayLift)
+        #else
+        self
+        #endif
     }
 }
 

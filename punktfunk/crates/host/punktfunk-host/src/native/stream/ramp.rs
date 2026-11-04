@@ -1,6 +1,6 @@
 //! Serving the client's bring-up ramp on the idle data plane.
 //!
-//! The data `Session` is built the moment the client's punch lands and then
+//! The data `Session` is built the moment the data plane binds and then
 //! sits untouched for the two to three seconds `StreamState::new` spends on
 //! the display, the pipeline and the launch. [`RampServer`] borrows it for
 //! that gap on its own thread, answers the short `ProbeRequest`s the client's
@@ -64,55 +64,67 @@ impl RampServer {
             };
         }
         let done = Arc::new(AtomicBool::new(false));
+        // Handed over through a slot, not moved into the closure: a spawn that fails drops its
+        // closure, and the session must outlive that to stream at all.
+        let handoff = Arc::new(std::sync::Mutex::new(Some((session, probe_rx))));
         let thread = std::thread::Builder::new()
             .name("punktfunk-ramp".into())
             .spawn({
                 let done = done.clone();
                 let open = open.clone();
+                let handoff = handoff.clone();
                 move || {
+                    let (mut session, probe_rx) = handoff
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .expect("a started ramp thread is handed the session once");
                     serve(
-                        session,
-                        probe_rx,
+                        &mut session,
+                        &probe_rx,
                         &probe_result_tx,
                         &done,
                         &stop,
                         &open,
                         fit_pin,
-                    )
+                    );
+                    (session, probe_rx)
                 }
             })
             .map_err(|e| tracing::warn!(error = %e, "bring-up ramp thread not started"))
             .ok();
-        if thread.is_none() {
-            open.store(false, Ordering::SeqCst);
-        }
+        let idle = match thread {
+            Some(_) => None,
+            None => {
+                open.store(false, Ordering::SeqCst);
+                handoff.lock().unwrap_or_else(|e| e.into_inner()).take()
+            }
+        };
         RampServer {
             done,
             open,
             thread,
-            idle: None,
+            idle,
         }
     }
 
     /// The pipeline is ready: finish the step in flight, join, and give the
     /// session back for the send thread. `open` stays true until the thread is
-    /// joined, so a fit server's grace still reads the ramp as open.
-    pub(super) fn finish(mut self) -> (Session, ProbeReceiver) {
+    /// joined, so a fit server's grace still reads the ramp as open. `Err` when
+    /// the thread panicked: the session went with it, and nothing can stream.
+    pub(super) fn finish(mut self) -> anyhow::Result<(Session, ProbeReceiver)> {
         self.done.store(true, Ordering::SeqCst);
-        let pair = if let Some(t) = self.thread.take() {
-            match t.join() {
-                Ok(pair) => pair,
-                // The session went with it. Nothing below can stream, and the
-                // caller's `?` is the honest end.
-                Err(_) => panic!("the bring-up ramp thread panicked"),
-            }
-        } else {
-            self.idle
+        let pair = match self.thread.take() {
+            Some(t) => t
+                .join()
+                .map_err(|_| anyhow::anyhow!("the bring-up ramp thread panicked"))?,
+            None => self
+                .idle
                 .take()
-                .expect("a server with no thread holds both")
+                .expect("a server with no thread holds both"),
         };
         self.open.store(false, Ordering::SeqCst);
-        pair
+        Ok(pair)
     }
 }
 
@@ -135,14 +147,14 @@ impl Drop for RampServer {
 /// for [`PIN_FIT_IDLE_GRACE`] after the last result, bounded by
 /// [`PIN_FIT_MAX_GRACE`] from first ready.
 fn serve(
-    mut session: Session,
-    probe_rx: ProbeReceiver,
+    session: &mut Session,
+    probe_rx: &ProbeReceiver,
     probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     done: &AtomicBool,
     stop: &AtomicBool,
     open: &AtomicBool,
     fit_pin: bool,
-) -> (Session, ProbeReceiver) {
+) {
     let mut served = 0u32;
     let mut ready_at: Option<std::time::Instant> = None;
     let mut quiet_since: Option<std::time::Instant> = None;
@@ -171,7 +183,7 @@ fn serve(
                 let result = match ProbeBurst::begin(req, true) {
                     Some(burst) => {
                         served += 1;
-                        burst.run(&mut session, stop)
+                        burst.run(session, stop)
                     }
                     None => declined(),
                 };
@@ -191,7 +203,26 @@ fn serve(
             "served the client's bring-up ramp while the pipeline built"
         );
     }
-    (session, probe_rx)
+}
+
+/// The ramp window of a display prepared at Welcome (Windows). Start binds the plane seconds
+/// before the prepared display is ready, and `StreamState::new` opens its own window only after
+/// it, so the ramp is served from Start until `done`. `open` stays set for that second window,
+/// which closes it at the hand-over.
+pub(super) fn serve_while_prepping(common: &mut StreamCommon, done: &AtomicBool) {
+    if !common.probe_seq || !common.shared.ramp_open.load(Ordering::SeqCst) {
+        return;
+    }
+    let stop = common.life.stop_flag().clone();
+    serve(
+        &mut common.session,
+        &common.ends.probe_rx,
+        &common.ends.probe_result_tx,
+        done,
+        &stop,
+        &common.shared.ramp_open,
+        false,
+    );
 }
 
 #[cfg(test)]
@@ -249,7 +280,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let (_session, _rx) = ramp.finish();
+        let (_session, _rx) = ramp.finish().expect("joined");
         assert!(
             !open.load(Ordering::SeqCst),
             "the window closes at the hand-over, so the spacing is back"
@@ -295,7 +326,7 @@ mod tests {
             .expect("the server is listening");
         std::thread::sleep(std::time::Duration::from_millis(5)); // mid-step
         let started = std::time::Instant::now();
-        let (session, _rx) = ramp.finish();
+        let (session, _rx) = ramp.finish().expect("joined");
         let took = started.elapsed();
         assert!(
             took < std::time::Duration::from_millis(2 * u64::from(RAMP_STEP_MAX_MS)),
@@ -325,7 +356,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             false,
         );
-        let (session, _rx) = ramp.finish();
+        let (session, _rx) = ramp.finish().expect("joined");
         let took = started.elapsed();
         assert!(took < std::time::Duration::from_millis(50), "took {took:?}");
         assert_eq!(session.stats().packets_sent, 0);
@@ -349,7 +380,7 @@ mod tests {
             false,
         );
         assert!(!open.load(Ordering::SeqCst));
-        let (session, _rx) = ramp.finish();
+        let (session, _rx) = ramp.finish().expect("joined");
         assert_eq!(session.stats().packets_sent, 0);
         assert!(res_rx.try_recv().is_err());
     }
@@ -390,7 +421,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         };
-        let _ = ramp.finish();
+        let _ = ramp.finish().expect("joined");
         assert!(r.duration_ms <= 2 * RAMP_STEP_MAX_MS, "{r:?}");
     }
 
@@ -438,7 +469,7 @@ mod tests {
                 .into(),
             )
             .expect("the grace still serves");
-        let (session, _rx) = finishing.join().expect("finish returns");
+        let (session, _rx) = finishing.join().expect("finish returns").expect("joined");
         assert!(!open.load(Ordering::SeqCst));
         assert!(session.stats().packets_sent > 0);
         let mut results = Vec::new();
@@ -470,7 +501,7 @@ mod tests {
             true,
         );
         let started = std::time::Instant::now();
-        let (_session, _rx) = ramp.finish();
+        let (_session, _rx) = ramp.finish().expect("joined");
         let took = started.elapsed();
         assert!(
             took >= std::time::Duration::from_millis(70),
@@ -502,5 +533,61 @@ mod tests {
         let started = std::time::Instant::now();
         drop(ramp);
         assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    /// The Welcome-prep window borrows the plane: a step the client sent before it opened is
+    /// answered, and `open` stays set for the window `StreamState::new` opens next.
+    #[test]
+    fn a_borrowed_window_answers_a_queued_step_and_leaves_the_ramp_open() {
+        let (_client, mut session) = loopback_host();
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel();
+        req_tx
+            .send(
+                ProbeRequest {
+                    target_kbps: 5_000,
+                    duration_ms: 25,
+                }
+                .into(),
+            )
+            .expect("the receiver is alive");
+        let (open, done, stop) = (
+            AtomicBool::new(true),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        );
+        let (open_ref, done_ref, stop_ref, res_ref) = (&open, &done, &stop, &res_tx);
+        let result = std::thread::scope(|s| {
+            let window = s.spawn(move || {
+                serve(
+                    &mut session,
+                    &req_rx,
+                    res_ref,
+                    done_ref,
+                    stop_ref,
+                    open_ref,
+                    false,
+                )
+            });
+            let started = std::time::Instant::now();
+            let result = loop {
+                if let Ok(r) = res_rx.try_recv() {
+                    break Some(r);
+                }
+                if started.elapsed() > std::time::Duration::from_secs(5) {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            done.store(true, Ordering::SeqCst);
+            window.join().expect("the window returns once done");
+            result
+        });
+        let result = result.expect("the queued step is answered");
+        assert!(
+            result.bytes_sent > 0,
+            "a step that sent nothing measures nothing"
+        );
+        assert!(open.load(Ordering::SeqCst), "the next window still serves");
     }
 }

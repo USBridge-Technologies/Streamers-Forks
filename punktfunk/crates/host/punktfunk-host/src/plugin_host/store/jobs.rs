@@ -49,6 +49,9 @@ pub(crate) struct Job {
     pub started_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<u64>,
+    /// The folder a running job is opening for its plugin right now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walk: Option<crate::plugins::walks::AccessWalk>,
 }
 
 struct Jobs {
@@ -91,6 +94,7 @@ fn begin(kind: &str, target: &str) -> Result<String> {
         error: None,
         started_at: crate::clock::unix_secs_u64(),
         finished_at: None,
+        walk: None,
     };
     g.jobs.push_back(job);
     while g.jobs.len() > JOB_HISTORY {
@@ -141,7 +145,11 @@ fn finish(id: &str, result: Result<()>) {
 }
 
 pub(crate) fn get(id: &str) -> Option<Job> {
-    lock().jobs.iter().find(|j| j.id == id).cloned()
+    let mut job = lock().jobs.iter().find(|j| j.id == id).cloned()?;
+    if job.state == State::Running {
+        job.walk = crate::plugins::walks::current();
+    }
+    Some(job)
 }
 
 /// Newest last.
@@ -438,8 +446,24 @@ fn run_install(id: &str, plan: Plan, plugin_tokens: &PluginTokens) -> Result<()>
     .context("record install provenance")?;
 
     refresh_plugin_tokens(id, plugin_tokens)?;
-    restart_runner(id);
+    start_runner(id);
     Ok(())
+}
+
+/// [`restart_runner`], switching on a runner that is installed but off: an install asks for
+/// the plugin to run, and a runner left off would keep it from ever starting.
+fn start_runner(id: &str) {
+    let st = crate::plugins::runtime_status();
+    if !st.installed || st.enabled {
+        return restart_runner(id);
+    }
+    set_phase(id, "starting runner");
+    // Roots first, as a restart does: the new manifest may name paths the unit can't see yet.
+    crate::plugins::converge_runner_roots();
+    match crate::plugins::set_runtime_enabled(true) {
+        Ok(()) => log_line(id, "plugin runner switched on to start this plugin".into()),
+        Err(e) => log_line(id, format!("switch on the plugin runner: {e:#}")),
+    }
 }
 
 fn run_uninstall(
@@ -450,7 +474,7 @@ fn run_uninstall(
 ) -> Result<()> {
     let dir = super::plugins_dir();
     // Its titles leave with it: nothing would launch an exec tile of a removed plugin.
-    let provider = crate::plugins::manifest::id_of_package(pkg);
+    let provider = crate::plugins::manifest::id_of_package(&dir, pkg);
     set_phase(id, "removing");
     run_runner(
         id,

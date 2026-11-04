@@ -33,6 +33,12 @@ pub struct HostEvent {
     /// Unix milliseconds — the [`crate::log_capture::LogEntry`] convention.
     pub ts_ms: u64,
     pub schema: u32,
+    /// On a door, the profile whose host raised it: a seat's event, on the door's bus for the
+    /// console. Absent on the host's own.
+    // `value_type`: a nullable string inside the flattened union breaks the SDK generator.
+    #[schema(value_type = String, required = false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
     /// Flattened as `"kind": "stream.started"` plus payload fields.
     #[serde(flatten)]
     pub kind: EventKind,
@@ -385,7 +391,14 @@ pub enum EventKind {
     /// Fires before the host spawns a launched game, never on adopt. Plugins and hooks that
     /// hold this stage run first ([`crate::holds`]).
     #[serde(rename = "game.launching")]
-    GameLaunching { game: GameRefPayload },
+    GameLaunching {
+        game: GameRefPayload,
+        /// On a seat host, which runs no plugins: the launch also waits for the host with the
+        /// plugins to `POST /game/holds/{hold}/release`. Absent everywhere else.
+        #[schema(value_type = String, required = false)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold: Option<String>,
+    },
     /// Fires once the host has seen the game process, not merely spawned its launcher.
     #[serde(rename = "game.running")]
     GameRunning { game: GameRefPayload },
@@ -563,7 +576,7 @@ impl EventKind {
             EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
                 Some(Subject::Stream(stream))
             }
-            EventKind::GameLaunching { game }
+            EventKind::GameLaunching { game, .. }
             | EventKind::GameRunning { game }
             | EventKind::GameWindow { game, .. }
             | EventKind::GameExited { game, .. } => Some(Subject::Game(game)),
@@ -650,7 +663,7 @@ impl EventKind {
                 stream.app.as_deref()
             }
             // No library id: operator-typed command; title is the only hook-filter handle.
-            EventKind::GameLaunching { game }
+            EventKind::GameLaunching { game, .. }
             | EventKind::GameRunning { game }
             | EventKind::GameWindow { game, .. }
             | EventKind::GameExited { game, .. } => game.app.as_deref().or(Some(&game.title)),
@@ -710,12 +723,18 @@ impl EventBus {
     /// Fire-and-forget. No receivers is fine — the ring still records for later catch-up.
     /// Returns the event as sent, for a caller that hands it on.
     pub fn emit(&self, kind: EventKind) -> HostEvent {
+        self.emit_from(kind, None)
+    }
+
+    /// [`Self::emit`] of an event `seat`'s host raised ([`HostEvent::seat`]).
+    pub fn emit_from(&self, kind: EventKind, seat: Option<String>) -> HostEvent {
         let ts_ms = crate::clock::unix_ms();
         let mut ring = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let ev = HostEvent {
             seq: ring.next_seq,
             ts_ms,
             schema: SCHEMA_VERSION,
+            seat,
             kind,
         };
         ring.next_seq += 1;
@@ -884,6 +903,7 @@ mod tests {
             seq: 4182,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::StreamStarted {
                 stream: StreamRef {
                     mode: mode_str(3840, 2160, 120),
@@ -906,6 +926,7 @@ mod tests {
             seq: 1,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::ClientDisconnected {
                 client: ClientRef {
                     name: "Deck".into(),
@@ -926,6 +947,7 @@ mod tests {
             seq: 2,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::HostStopping,
         };
         assert_eq!(
@@ -937,6 +959,7 @@ mod tests {
             seq: 3,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::PluginsChanged {
                 id: "rom-manager".into(),
             },
@@ -950,6 +973,7 @@ mod tests {
             seq: 5,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::GameRunning {
                 game: GameRefPayload {
                     app: Some("steam:570".into()),
@@ -973,6 +997,7 @@ mod tests {
             seq: 5,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::GameLaunching {
                 game: GameRefPayload {
                     app: Some("steam:570".into()),
@@ -987,6 +1012,7 @@ mod tests {
                     }),
                     profile: None,
                 },
+                hold: None,
             },
         };
         assert_eq!(
@@ -994,11 +1020,40 @@ mod tests {
             r#"{"seq":5,"ts_ms":1700000000000,"schema":1,"kind":"game.launching","game":{"app":"steam:570","title":"Dota 2","store":"steam","client":"a1b2c3d4e5f6","fingerprint":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08","plane":"native","preset":{"id":"3f9a0c11e2b4","name":"Docked"}}}"#
         );
 
+        // A seat's held launch, as the plugins' host hears it: `seat` and the hold token.
+        let ev = HostEvent {
+            seq: 5,
+            ts_ms: 1_700_000_000_000,
+            schema: 1,
+            seat: Some("9a3f1c2b7e40".into()),
+            kind: EventKind::GameLaunching {
+                game: GameRefPayload {
+                    app: Some("steam:570".into()),
+                    title: "Dota 2".into(),
+                    store: None,
+                    client: "a1b2c3d4e5f6".into(),
+                    fingerprint: None,
+                    plane: Plane::Native,
+                    preset: None,
+                    profile: Some(ProfileRef {
+                        id: "9a3f1c2b7e40".into(),
+                        display_name: "Anna".into(),
+                    }),
+                },
+                hold: Some("c0ffee".into()),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"seq":5,"ts_ms":1700000000000,"schema":1,"seat":"9a3f1c2b7e40","kind":"game.launching","game":{"app":"steam:570","title":"Dota 2","client":"a1b2c3d4e5f6","plane":"native","profile":{"id":"9a3f1c2b7e40","display_name":"Anna"}},"hold":"c0ffee"}"#
+        );
+
         // Optional ids omitted, not nulled — host-ended game with no library entry.
         let ev = HostEvent {
             seq: 6,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::GameExited {
                 game: GameRefPayload {
                     app: None,
@@ -1024,6 +1079,7 @@ mod tests {
             seq: 7,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::SessionEnded {
                 session: SessionRef {
                     id: 3,
@@ -1090,6 +1146,7 @@ mod tests {
             seq: 8,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::SessionEnded {
                 session: SessionRef {
                     id: 4,
@@ -1148,6 +1205,7 @@ mod tests {
             seq: 8,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::AccessGranted {
                 device: device.clone(),
                 grants: 1, // GRANT_GAMEPAD — controller-only
@@ -1164,6 +1222,7 @@ mod tests {
             seq: 9,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::AccessChanged {
                 device: device.clone(),
                 grants: 63,
@@ -1191,6 +1250,7 @@ mod tests {
             seq: 10,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::ActionInvoked {
                 id: "power.sleep".into(),
                 device: Some(DeviceRef {
@@ -1221,6 +1281,7 @@ mod tests {
             seq: 11,
             ts_ms: 0,
             schema: 1,
+            seat: None,
             kind: EventKind::ActionInvoked {
                 id: "power.sleep".into(),
                 device: Some(DeviceRef {
@@ -1283,6 +1344,7 @@ mod tests {
             seq: 7,
             ts_ms: 3,
             schema: 1,
+            seat: None,
             kind: EventKind::PairingPending {
                 device: DeviceRef {
                     name: "iPad Pro".into(),
@@ -1422,7 +1484,10 @@ mod tests {
                 all("stream", "gamestream"),
             ),
             (
-                EventKind::GameLaunching { game: game.clone() },
+                EventKind::GameLaunching {
+                    game: game.clone(),
+                    hold: None,
+                },
                 all("game", "native"),
             ),
             (

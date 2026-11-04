@@ -26,6 +26,7 @@ Look up a `punktfunk-host` command or flag here. Most behaviour comes from
 | [`tray`](#tray-windows) | Start, stop or query the status tray. | Windows |
 | [`driver`](#driver-windows) | Check or remove the bundled drivers. | Windows |
 | [`seats`](#seats-windows) | Turn seats off without the service. | Windows |
+| [`hooks`](#hooks-windows) | Let hooks and prep steps run as administrator. | Windows |
 | [`web`](#web-windows) | Print the web-console login password. | Windows |
 
 `punktfunk-host --help` prints the common commands. `ctl`, `plugins`, `service`, `tray`, `driver`
@@ -50,7 +51,7 @@ punktfunk-host serve
 | `--webtransport-bind <IP>` | `PUNKTFUNK_WEBTRANSPORT_BIND` | Its interface (default: all). |
 | `--open` | — | Serve unpaired devices. Trusted single-user setups only. With the browser client on, it also needs `PUNKTFUNK_WEBTRANSPORT_ORIGINS`, or the host refuses to start. |
 | `--no-mdns` | `PUNKTFUNK_MDNS=0` | Skip the mDNS adverts; add the host on the client by address. |
-| `--door` | `PUNKTFUNK_DOOR=1` | Linux: the box's host as a system service. It advertises, pairs, serves the console and places every connect on a seat, and opens no display. The [**Reachable without logging in**](/docs/profiles#on-linux) switch runs it. |
+| `--door` | — | Linux: the box's host as a system service. It advertises, pairs, serves the console and places every connect on a seat, and opens no display. The [**Reachable without logging in**](/docs/profiles#on-linux) switch runs it. |
 | `--native` | — | No-op. |
 
 Pairing is required unless `--open`: arm it from the web console — see
@@ -216,6 +217,12 @@ punktfunk-host driver uninstall --audio    # the host's virtual speaker and micr
 service: Remote Desktop's listener and firewall rules and the shared Steam shortcuts go back to how
 they were before seats, and the seat listener goes. The seat accounts stay. Uninstalling runs it; while the host runs, use
 **Profiles** → **Seats** instead, which also stops the seats first.
+
+## `hooks` (Windows)
+
+`punktfunk-host hooks elevated on`, run elevated, lets hooks and prep steps marked `elevated` run
+with the signed-in administrator's full rights. `off` stops them. The host reads it on every run,
+with no restart. See [Run as administrator](/docs/automation#run-as-administrator).
 
 ## `web` (Windows)
 

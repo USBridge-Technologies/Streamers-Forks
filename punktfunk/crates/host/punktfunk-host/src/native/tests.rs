@@ -143,6 +143,31 @@ fn stock_niri_reaches_the_client_in_words() {
     assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
 }
 
+/// An Umbriel whose IPC this host can't parse tells the player what to update.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_umbriel_ipc_mismatch_reaches_the_client_in_words() {
+    let buried = anyhow::Error::new(pf_vdisplay::UmbrielIpcMismatch)
+        .context("create virtual output")
+        .context("build the session pipeline");
+    let said = setup_failed_sentence(&buried).expect("a mismatch has words for the user");
+    assert!(said.contains("Update Punktfunk"), "{said}");
+    assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
+}
+
+/// A node-less output that direct capture refused reaches the client in words.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_node_less_output_reaches_the_client_in_words() {
+    let buried = anyhow::anyhow!("no ext_image_copy_capture_manager_v1")
+        .context(pf_capture::NoPipeWireNode)
+        .context("open the session capture")
+        .context("build the session pipeline");
+    let said = setup_failed_sentence(&buried).expect("a node-less output has words for the user");
+    assert!(said.contains("GPU encoder"), "{said}");
+    assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
+}
+
 #[test]
 fn live_mode_pack_roundtrips_and_interval_recovers_hz() {
     use crate::session_status::{pack_mode, unpack_mode};
@@ -235,7 +260,13 @@ unsafe fn pull_verified(conn: *mut punktfunk_ffi::PunktfunkConnection, count: u3
     // SAFETY: `PunktfunkFrame` is `#[repr(C)]` POD; all-zero is valid (null `data`, `len == 0`).
     // Read only after `next_au` overwrites it on `Ok`.
     let mut frame = unsafe { std::mem::zeroed() };
+    // A host that stops sending fails the test instead of holding it to the job's timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while got < count {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{got} of {count} frames before the deadline"
+        );
         // SAFETY: `conn` is the live handle from `punktfunk_connect` (caller asserts non-null,
         // does not close until after return). `&mut frame` outlives this call. This thread is
         // the only video puller.
@@ -508,11 +539,44 @@ fn a_synthetic_abr_session_registers_while_it_streams() {
     );
 }
 
+/// Set on the clipboard test's child only.
+const CLIPBOARD_CHILD: &str = "PF_CLIPBOARD_TEST_CHILD";
+
 /// Clipboard over a synthetic session: host advertises the cap, acks enable with
 /// `BACKEND_UNAVAILABLE` (no compositor), declines a fetch. Live-backend paths are
-/// not covered here. `design/clipboard-and-file-transfer.md`.
+/// not covered here. `design/clipboard-and-file-transfer.md`. The operator policy is process
+/// config, so the body runs in a child of this test binary started with it on: no thread of
+/// this process writes the environment while others read it.
 #[test]
 fn clipboard_control_and_fetch_decline_over_session() {
+    if std::env::var_os(CLIPBOARD_CHILD).is_none() {
+        let module = module_path!().split_once("::").expect("crate::module").1;
+        let test = format!("{module}::clipboard_control_and_fetch_decline_over_session");
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        child.args(["--exact", &test, "--nocapture"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("PUNKTFUNK_") {
+                child.env_remove(key);
+            }
+        }
+        let out = child
+            .env(CLIPBOARD_CHILD, "1")
+            .env("PUNKTFUNK_CLIPBOARD", "1")
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran no test: {stdout}"
+        );
+        return;
+    }
     let _registry = crate::session_status::tests::registry_lock();
     let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     use punktfunk_core::client::{ConnectParams, NativeClient};
@@ -520,21 +584,6 @@ fn clipboard_control_and_fetch_decline_over_session() {
     use punktfunk_core::quic::{
         CLIP_FILE_INDEX_NONE, CLIP_FLAG_FILES, CLIP_POLICY_FILES, HOST_CAP_CLIPBOARD,
     };
-
-    // Restore the env even on panic so a leaked var cannot reach the next session test.
-    struct EnvGuard(&'static str);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: dropped while SESSION_TEST_LOCK is held; only the session path reads this.
-            unsafe { std::env::remove_var(self.0) };
-            pf_host_config::reload();
-        }
-    }
-    let _env = EnvGuard("PUNKTFUNK_CLIPBOARD");
-    // Operator policy on. Serialized on SESSION_TEST_LOCK; only the session path reads this.
-    // SAFETY: writers serialized; only this session path reads the variable.
-    unsafe { std::env::set_var("PUNKTFUNK_CLIPBOARD", "1") };
-    pf_host_config::reload();
 
     let host = std::thread::spawn(|| {
         run_ephemeral(Punktfunk1Options {
@@ -689,6 +738,46 @@ fn the_stream_config_carries_the_hosts_link_facts() {
         wait_for(|| client.host_link().sndbuf_kb > 0),
         "the data socket has a send buffer"
     );
+    drop(client);
+    host.join().unwrap().unwrap();
+}
+
+/// A client that rebuilds its decoder asks off its codec; the host answers with a new epoch and
+/// the first frame of it carries the new codec. With nothing left to move to, the ask is refused
+/// and the stream stays.
+#[test]
+fn a_codec_ask_moves_the_stream_to_another_codec_on_a_new_epoch() {
+    use punktfunk_core::quic::{CODEC_H264, CODEC_HEVC};
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (client, host) = synthetic_session(19789, Punktfunk1Source::Synthetic, |p| {
+        punktfunk_core::client::ConnectParams {
+            video_codecs: CODEC_H264 | CODEC_HEVC,
+            rebuilds_decoder: true,
+            ..p
+        }
+    });
+    let first = client.video_format().codec;
+    client
+        .request_codec_change(first)
+        .expect("format epochs are in force");
+    let moved = (0..240)
+        .find_map(|_| {
+            client
+                .next_frame(std::time::Duration::from_secs(2))
+                .ok()
+                .and_then(|f| f.new_format)
+        })
+        .expect("a frame in the new format");
+    assert_ne!(moved.codec, first);
+    assert_eq!(client.video_format(), moved);
+
+    client.request_codec_change(moved.codec).unwrap();
+    assert!(
+        wait_for(|| client.codec_refused() == moved.codec),
+        "no codec is left to move to"
+    );
+    assert_eq!(client.video_format(), moved);
     drop(client);
     host.join().unwrap().unwrap();
 }
@@ -955,10 +1044,6 @@ fn the_clean_round_runs_under_the_ceiling_over_a_session() {
     host.join().unwrap().unwrap();
 }
 
-fn test_paired_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("punktfunk-paired-test-{}.json", std::process::id()))
-}
-
 /// Unpaired knock is parked; approve while waiting admits the same connection, no reconnect.
 #[test]
 fn delegated_approval_admits_after_knock() {
@@ -967,8 +1052,7 @@ fn delegated_approval_admits_after_knock() {
     use punktfunk_core::client::{ConnectParams, NativeClient};
     use punktfunk_core::quic::endpoint;
 
-    let store = std::env::temp_dir().join(format!("pf-approval-test-{}.json", std::process::id()));
-    let _ = std::fs::remove_file(&store);
+    let store = crate::test_support::scratch().join("pf-approval-test.json");
     let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
     let np_host = np.clone();
     let host = std::thread::spawn(move || {
@@ -1035,6 +1119,8 @@ fn delegated_approval_admits_after_knock() {
             "no Hello name → fingerprint-derived label, got {:?}",
             pend.name
         );
+        // Past the client's own 2 s dial timeout.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
         np_approve
             .approve_pending(pend.id, Some("Approved Device"), None)
             .unwrap()
@@ -1042,15 +1128,24 @@ fn delegated_approval_admits_after_knock() {
             .expect("pending id must approve");
     });
 
-    // One connect that parks until approved, then streams. Timeout covers park + approver poll.
-    // No Hello name: assert the fingerprint-derived label. TOFU: approval, not a PIN,
-    // authorizes this client.
+    // One connect that parks until approved, then streams. The client hears the host's
+    // `Pending` and waits past its own 2 s dial timeout for the verdict. No Hello name: assert
+    // the fingerprint-derived label. TOFU: approval, not a PIN, authorizes this client.
+    let told = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let told_hook = told.clone();
     let client = NativeClient::connect(ConnectParams {
         identity: Some((cert, key)),
-        ..ConnectParams::new("127.0.0.1", 19779, mode, std::time::Duration::from_secs(15))
+        on_pending: Some(std::sync::Arc::new(move || {
+            told_hook.store(true, std::sync::atomic::Ordering::SeqCst)
+        })),
+        ..ConnectParams::new("127.0.0.1", 19779, mode, std::time::Duration::from_secs(2))
     })
     .expect("approved mid-park → session admitted with no reconnect");
     approver.join().unwrap();
+    assert!(
+        told.load(std::sync::atomic::Ordering::SeqCst),
+        "the client heard the host's Pending"
+    );
     assert!(
         np.is_paired(&expected_fp),
         "approval must pin the knocking fingerprint"
@@ -1095,8 +1190,7 @@ fn access_request_pairs_without_a_session() {
     use punktfunk_core::client::NativeClient;
     use punktfunk_core::quic::endpoint;
 
-    let store = std::env::temp_dir().join(format!("pf-access-test-{}.json", std::process::id()));
-    let _ = std::fs::remove_file(&store);
+    let store = crate::test_support::scratch().join("pf-access-test.json");
     let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
     let np_host = np.clone();
     let host = std::thread::spawn(move || {
@@ -1179,6 +1273,8 @@ fn access_request_pairs_without_a_session() {
     assert_eq!(ask().expect("an approved device is answered"), host_fp);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
+    // A session started after the answer would connect a moment later: give it the time.
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let connected = crate::events::bus()
         .subscribe(0)
         .catch_up
@@ -1202,7 +1298,9 @@ fn pairing_ceremony_and_gate() {
     use punktfunk_core::client::{ConnectParams, NativeClient};
     use punktfunk_core::quic::endpoint;
 
-    let host = std::thread::spawn(|| {
+    let store = crate::test_support::scratch().join("punktfunk-paired-test.json");
+    let paired_store = Some(store.clone());
+    let host = std::thread::spawn(move || {
         run_ephemeral(Punktfunk1Options {
             port: 19778,
             source: Punktfunk1Source::Synthetic,
@@ -1213,7 +1311,7 @@ fn pairing_ceremony_and_gate() {
             require_pairing: true,
             allow_pairing: false,
             pairing_pin: Some("4321".into()),
-            paired_store: Some(test_paired_path()),
+            paired_store,
             idle_timeout: None,
             mdns: false,
         })
@@ -1237,7 +1335,7 @@ fn pairing_ceremony_and_gate() {
     // 2: correct PIN → paired. The one online attempt consumes the window (step 4).
     let host_fp = NativeClient::pair("127.0.0.1", 19778, identity, "4321", "test-client", timeout)
         .expect("pairing with the right PIN");
-    assert!(test_paired_path().exists());
+    assert!(store.exists());
 
     // 3: paired identity gets a session, pinned to the ceremony fingerprint.
     let client = NativeClient::connect(ConnectParams {
@@ -1257,7 +1355,6 @@ fn pairing_ceremony_and_gate() {
         NativeClient::pair("127.0.0.1", 19778, identity, "4321", "too-late", timeout).is_err(),
         "the PIN window must be single-use (one online guess)"
     );
-    let _ = std::fs::remove_file(test_paired_path());
 
     host.join().unwrap().unwrap();
 }
@@ -1345,7 +1442,7 @@ fn spawn_profile_host(
 
 /// Paired-store temp path; the shared-`np` hosts persist through it.
 fn access_store_path(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("pf-access-{tag}-{}.json", std::process::id()))
+    crate::test_support::scratch().join(format!("pf-access-{tag}.json"))
 }
 
 /// `ClientHello` → `ServerHello` → `Ready`, returning streams so a test can read
@@ -1362,7 +1459,7 @@ async fn raw_session(
 ) {
     use punktfunk_core::quic::v2::hello::{ClientHello, Ready, ServerHello};
     use punktfunk_core::quic::v2::{io as v2io, msg, registry};
-    let (ep, _observed) = endpoint::client_shared(None, Some(identity), &[registry::ALPN]);
+    let (ep, _observed) = endpoint::client_shared(None, Some(identity), &[registry::ALPN], None);
     let (ep, media) = ep.expect("client endpoint");
     let conn = ep
         .connect(format!("127.0.0.1:{port}").parse().unwrap(), "punktfunk")
@@ -1396,6 +1493,7 @@ async fn raw_session(
         audio_bits: punktfunk_core::audio::pcm::BITS_16,
         audio_layout: 0,
         video_fit: 0,
+        audio_bitstreams: 0,
     };
     let hello = ClientHello {
         hello,
@@ -1405,11 +1503,13 @@ async fn raw_session(
         link: Default::default(),
         probe_only: false,
         pyrowave_bpp_x100: 0,
+        slices: 0,
         resume: None,
         suites: Vec::new(),
         features: Default::default(),
         profile: None,
         access_only: false,
+        screens: Vec::new(),
     };
     v2io::send(&mut send, &hello).await.expect("ClientHello");
     let welcome = loop {
@@ -1532,18 +1632,20 @@ fn access_expiry_advertises_and_closes_typed() {
     let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
     let (cert, key) = endpoint::generate_identity().unwrap();
     let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
+    let host = spawn_access_host(19782, 1, np.clone());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Granted once the host is up: a handshake that reaches the pairing gate after expiry is
+    // parked as an unpaired knock. 4 s leaves at least 3 s for it on a loaded runner.
     np.add_with_access(
         "Evening Guest",
         &fp_hex,
         Some(crate::native_pairing::Access {
             grants: GRANT_ALL,
-            expires_unix: Some(crate::clock::unix_secs() + 2),
+            expires_unix: Some(crate::clock::unix_secs() + 4),
             until_disconnect: false,
         }),
     )
     .unwrap();
-    let host = spawn_access_host(19782, 1, np.clone());
-    std::thread::sleep(std::time::Duration::from_millis(500));
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1554,8 +1656,8 @@ fn access_expiry_advertises_and_closes_typed() {
             raw_session(19782, (cert.as_str(), key.as_str())).await;
         assert_eq!(welcome.grants, GRANT_ALL, "the Welcome advertises the mask");
         assert!(
-            (1..=2).contains(&welcome.expires_in_secs),
-            "a 2 s grant must advertise 1–2 remaining secs, got {}",
+            (1..=4).contains(&welcome.expires_in_secs),
+            "a 4 s grant must advertise 1–4 remaining secs, got {}",
             welcome.expires_in_secs
         );
         let code = tokio::time::timeout(std::time::Duration::from_secs(10), closed_app_code(&conn))
@@ -1712,7 +1814,7 @@ fn launch_refused_without_grant_but_session_admitted() {
     });
     match refused {
         Ok(_) => panic!("a launch without the grant must be refused"),
-        Err(punktfunk_core::PunktfunkError::Rejected(r)) => assert_eq!(
+        Err(punktfunk_core::PunktfunkError::Rejected(r, _)) => assert_eq!(
             r,
             punktfunk_core::reject::RejectReason::LaunchNotPermitted,
             "the refusal must carry the typed launch reason"
@@ -1747,8 +1849,7 @@ fn a_profile_is_resolved_in_the_handshake() {
     let (cert, key) = endpoint::generate_identity().unwrap();
     let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
     np.add_with_access("Couch", &fp_hex, None).unwrap();
-    let file =
-        std::env::temp_dir().join(format!("pf-handshake-profiles-{}.json", std::process::id()));
+    let file = crate::test_support::scratch().join("pf-handshake-profiles.json");
     std::fs::write(
         &file,
         br#"{"version":1,"profiles":[
@@ -1788,7 +1889,7 @@ fn a_profile_is_resolved_in_the_handshake() {
     drop(owner);
     match dial(Some("ffffffffffff")) {
         Ok(_) => panic!("an unknown profile must be refused"),
-        Err(punktfunk_core::PunktfunkError::Rejected(r)) => {
+        Err(punktfunk_core::PunktfunkError::Rejected(r, _)) => {
             assert_eq!(r, punktfunk_core::reject::RejectReason::ProfileUnknown)
         }
         Err(other) => panic!("expected a typed rejection, got {other:?}"),
@@ -1937,4 +2038,92 @@ fn expired_record_knocks_into_pending_and_reapproval_regrants() {
     drop(client);
     let _ = std::fs::remove_file(&store);
     host.join().unwrap().unwrap();
+}
+
+/// A redirected "this session" guest keeps its record while it plays on the seat. The hold
+/// outlasts the dial and the picture bring-up, and ends when the guest has left, or never came,
+/// or the seats have said nothing for too long.
+#[test]
+fn a_redirected_guest_is_held_until_it_leaves_the_seat() {
+    let s = std::time::Duration::from_secs;
+    let over = |here, landed, waited, silent| hold_over(here, landed, s(waited), s(silent));
+    assert!(!over(Some(false), false, 10, 0), "still dialing in");
+    assert!(!over(Some(true), true, 600, 0), "playing");
+    assert!(over(Some(false), true, 600, 0), "left after playing");
+    assert!(over(Some(false), false, 121, 0), "never came");
+    assert!(!over(None, true, 600, 5), "a seat that blinked");
+    assert!(over(None, true, 600, 61), "a seat that hangs");
+}
+
+/// The device whose next session fails at its launch, and that session's lifecycle once it did.
+type Armed = Option<([u8; 32], Option<crate::lifecycle::Lifecycle>)>;
+static FAIL_AT_LAUNCH: std::sync::Mutex<Armed> = std::sync::Mutex::new(None);
+
+/// The session's injected failure: the armed device's session fails here, after its planes
+/// started. Keyed by fingerprint, so no other test's session is touched.
+pub(super) fn fail_at_launch(
+    conn: &link::SessionLink,
+    life: &crate::lifecycle::Lifecycle,
+) -> Result<()> {
+    let mut armed = FAIL_AT_LAUNCH.lock().unwrap_or_else(|p| p.into_inner());
+    match armed.as_mut() {
+        Some((fp, seen)) if conn.peer_fingerprint() == Some(*fp) => {
+            *seen = Some(life.clone());
+            anyhow::bail!("injected launch failure")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A session that fails once its input thread and watchers run is torn down like any other:
+/// ended as the host's error, its threads joined, and the client hears a typed setup failure.
+#[test]
+fn a_session_that_fails_after_its_planes_start() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use crate::events::SessionEndReason;
+    use crate::lifecycle::Phase;
+    use punktfunk_core::quic::endpoint;
+
+    let (cert, key) = endpoint::generate_identity().unwrap();
+    let fp = endpoint::fingerprint_of_pem(&cert).unwrap();
+    *FAIL_AT_LAUNCH.lock().unwrap_or_else(|p| p.into_inner()) = Some((fp, None));
+    let host = std::thread::spawn(|| {
+        run_ephemeral(Punktfunk1Options {
+            port: 19796,
+            source: Punktfunk1Source::Synthetic,
+            seconds: 0,
+            frames: 600,
+            max_sessions: 1,
+            max_concurrent: 1,
+            require_pairing: false,
+            allow_pairing: false,
+            pairing_pin: None,
+            paired_store: None,
+            idle_timeout: None,
+            mdns: false,
+        })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let code = rt.block_on(async {
+        let (conn, _send, _recv, _welcome, _media) =
+            raw_session(19796, (cert.as_str(), key.as_str())).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), closed_app_code(&conn))
+            .await
+            .expect("the host closes the failed session")
+    });
+    host.join().unwrap().unwrap();
+    let life = FAIL_AT_LAUNCH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+        .and_then(|(_, life)| life)
+        .expect("the session reached its launch");
+    assert_eq!(code, punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE);
+    assert_eq!(life.reason(), Some(SessionEndReason::HostError));
+    assert_eq!(life.phase(), Phase::Done, "the teardown joined its threads");
 }

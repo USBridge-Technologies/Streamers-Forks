@@ -1,5 +1,5 @@
-//! Does ingest produce the NV12 the encoder expects? RGB in, BT.709 limited range
-//! out, read straight back from the surface — no encoder, no decoder, just the
+//! Does ingest produce the NV12 the encoder expects? RGB in, BT.709 at the session's
+//! range out (full, or studio where a client asked), read straight back from the surface — no encoder, no decoder, just the
 //! numbers. Then the same through a dmabuf, exported and re-imported on this
 //! display: a capture buffer with no compositor in the way. And a source twice
 //! the size, scaled on the same pass: what a mirrored 4K head becomes.
@@ -79,14 +79,14 @@ fn near(got: (u8, u8, u8), want: (u8, u8, u8), what: &str) {
     }
 }
 
-/// BT.709, limited range: red is Y 63 / Cb 102 / Cr 240 and white is Y 235.
-/// BT.601 would put red's Y at 82 and full range at 54 — a different, wrong picture
+/// BT.709, full range: red is Y 54 / Cb 99 / Cr 255 and white is Y 255.
+/// BT.601 would put red's Y at 76 and studio range at 63 — a different, wrong picture
 /// that decodes fine.
 #[test]
 #[ignore = "needs a VAAPI device"]
-fn rgb_becomes_limited_range_bt709_nv12() {
+fn rgb_becomes_full_range_bt709_nv12() {
     let display = display();
-    let vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), W, H)
         .expect("a BGRA surface");
@@ -107,7 +107,7 @@ fn rgb_becomes_limited_range_bt709_nv12() {
         dst,
     )
     .expect("convert red");
-    near(centre_yuv(&display, dst), (63, 102, 240), "red");
+    near(centre_yuv(&display, dst), (54, 99, 255), "red");
 
     display
         .write_packed(src, &bgra(255, 255, 255), row)
@@ -121,7 +121,7 @@ fn rgb_becomes_limited_range_bt709_nv12() {
         dst,
     )
     .expect("convert white");
-    near(centre_yuv(&display, dst), (235, 128, 128), "white");
+    near(centre_yuv(&display, dst), (255, 128, 128), "white");
 
     // The same red through a dmabuf, exported here and imported back as `XR24`
     // (the everyday capture format) and as `AR24`.
@@ -174,10 +174,46 @@ fn rgb_becomes_limited_range_bt709_nv12() {
             dst,
         )
         .expect("convert the import");
-        near(centre_yuv(&display, dst), (63, 102, 240), "red via dmabuf");
+        near(centre_yuv(&display, dst), (54, 99, 255), "red via dmabuf");
         display.destroy_surface(imported);
     }
     drop(fds);
+    display.destroy_surface(src);
+    display.destroy_surface(dst);
+    vpp.destroy(&display);
+}
+
+/// A studio session: red is Y 63 / Cb 102 / Cr 240, white Y 235, black Y 16.
+#[test]
+#[ignore = "needs a VAAPI device"]
+fn a_studio_session_writes_studio_range_nv12() {
+    let display = display();
+    let vpp = Vpp::new(&display, W, H, false).expect("VideoProc");
+    let src = display
+        .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), W, H)
+        .expect("a BGRA surface");
+    let dst = display
+        .create_surface(VA_RT_FORMAT_YUV420, Some(VA_FOURCC_NV12), W, H)
+        .expect("an NV12 surface");
+    for (fill, want, what) in [
+        (bgra(0, 0, 255), (63, 102, 240), "red"),
+        (bgra(255, 255, 255), (235, 128, 128), "white"),
+        (bgra(0, 0, 0), (16, 128, 128), "black"),
+    ] {
+        display
+            .write_packed(src, &fill, W as usize * 4)
+            .expect("upload");
+        vpp.convert(
+            &display,
+            src,
+            (W, H),
+            true,
+            pf_vaapi::hevc::COLOUR_BT709,
+            dst,
+        )
+        .expect("convert");
+        near(centre_yuv(&display, dst), want, what);
+    }
     display.destroy_surface(src);
     display.destroy_surface(dst);
     vpp.destroy(&display);
@@ -214,7 +250,7 @@ fn centre_yuv10(display: &Display, p010: VaSurfaceId) -> (u16, u16, u16) {
 #[ignore = "needs a VAAPI device"]
 fn a_larger_source_is_scaled_into_the_picture() {
     let display = display();
-    let vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let (sw, sh) = (W * 2, H * 2);
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), sw, sh)
@@ -241,12 +277,12 @@ fn a_larger_source_is_scaled_into_the_picture() {
     .expect("scale and convert");
     near(
         yuv_at(&display, dst, W as usize / 4, H as usize / 2),
-        (63, 102, 240),
+        (54, 99, 255),
         "left, red",
     );
     near(
         yuv_at(&display, dst, W as usize * 3 / 4, H as usize / 2),
-        (235, 128, 128),
+        (255, 128, 128),
         "right, white",
     );
     display.destroy_surface(src);
@@ -260,7 +296,7 @@ fn a_larger_source_is_scaled_into_the_picture() {
 #[ignore = "needs a VAAPI device"]
 fn a_cropped_source_keeps_only_its_rectangle() {
     let display = display();
-    let mut vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let mut vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let (sw, sh) = (W * 4, H * 2);
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), sw, sh)
@@ -290,12 +326,12 @@ fn a_cropped_source_keeps_only_its_rectangle() {
     .expect("crop, scale and convert");
     near(
         yuv_at(&display, dst, 4, H as usize / 2),
-        (63, 102, 240),
+        (54, 99, 255),
         "left edge, red",
     );
     near(
         yuv_at(&display, dst, W as usize - 4, H as usize / 2),
-        (235, 128, 128),
+        (255, 128, 128),
         "right edge, white",
     );
     display.destroy_surface(src);
@@ -303,14 +339,14 @@ fn a_cropped_source_keeps_only_its_rectangle() {
     vpp.destroy(&display);
 }
 
-/// Ten bits: BT.2020 limited range puts red at Y 294 / Cb 387 / Cr 960. BT.709
+/// Ten bits: BT.2020 full range puts red at Y 269 / Cb 369 / Cr 1023. BT.709
 /// coefficients in a stream tagged BT.2020 would show as Y 250 — a picture that
 /// decodes fine and is the wrong red.
 #[test]
 #[ignore = "needs a VAAPI device"]
-fn ten_bit_rgb_becomes_limited_range_bt2020_p010() {
+fn ten_bit_rgb_becomes_full_range_bt2020_p010() {
     let display = display();
-    let vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32_10, Some(VA_FOURCC_X2R10G10B10), W, H)
         .expect("an XR30 surface");
@@ -332,10 +368,10 @@ fn ten_bit_rgb_becomes_limited_range_bt2020_p010() {
     .expect("convert red");
     let (y, cb, cr) = centre_yuv10(&display, dst);
     println!("ten-bit red: Y {y} Cb {cb} Cr {cr}");
-    for (got, want, name) in [(y, 294u16, "Y"), (cb, 387, "Cb"), (cr, 960, "Cr")] {
+    for (got, want, name) in [(y, 269u16, "Y"), (cb, 369, "Cb"), (cr, 1023, "Cr")] {
         assert!(
             (i32::from(got) - i32::from(want)).abs() <= 8,
-            "red: {name} = {got}, want {want} (BT.2020 limited)"
+            "red: {name} = {got}, want {want} (BT.2020 full range)"
         );
     }
     display.destroy_surface(src);
@@ -359,6 +395,7 @@ fn the_session_encodes_what_ingest_gives_it() {
         max_num_reorder_frames: 0,
         initial_qp: 26,
         vbv_frames: 1.0,
+        full_range: true,
     };
     let mut enc = open(params, CodecParams::H264).expect("an encoder");
     let mut stream = Vec::new();
@@ -402,6 +439,7 @@ fn a_larger_picture_encodes_at_the_session_size() {
         max_num_reorder_frames: 0,
         initial_qp: 26,
         vbv_frames: 1.0,
+        full_range: true,
     };
     let mut enc = open(params, CodecParams::H264).expect("an encoder");
     let (sw, sh) = (W * 2, H * 2);
@@ -430,7 +468,7 @@ fn a_larger_picture_encodes_at_the_session_size() {
 #[ignore = "needs a VAAPI device"]
 fn chroma_is_sited_on_the_left_column() {
     let display = display();
-    let vpp = Vpp::new(&display, W, H).expect("VideoProc");
+    let vpp = Vpp::new(&display, W, H, true).expect("VideoProc");
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), W, H)
         .expect("a BGRA surface");
@@ -459,7 +497,7 @@ fn chroma_is_sited_on_the_left_column() {
     )
     .expect("convert");
     let (_, _, cr) = yuv_at(&display, dst, 160, H as usize / 2);
-    let red = (f64::from(cr) - 128.0) / (240.0 - 128.0);
+    let red = (f64::from(cr) - 128.0) / (255.0 - 128.0);
     println!("chroma at column 160: Cr {cr}, {:.0}% red", red * 100.0);
     assert!(
         red > 0.65,
@@ -478,7 +516,7 @@ fn chroma_is_sited_on_the_left_column() {
 fn padding_rows_below_the_picture_are_written() {
     let (w, h, coded_h) = (320u32, 250u32, 256u32);
     let display = display();
-    let vpp = Vpp::new(&display, w, h).expect("VideoProc");
+    let vpp = Vpp::new(&display, w, h, true).expect("VideoProc");
     let src = display
         .create_surface(VA_RT_FORMAT_RGB32, Some(VA_FOURCC_BGRA), w, h)
         .expect("a BGRA surface");
@@ -523,7 +561,7 @@ fn padding_rows_below_the_picture_are_written() {
     }
     near(
         yuv_at(&display, dst, w as usize / 2, h as usize - 1),
-        (235, 128, 128),
+        (255, 128, 128),
         "last row",
     );
     for y in h as usize..coded_h as usize {
