@@ -130,7 +130,18 @@ jobs:
       - name: Package DMG
         run: |
           cd build
-          cpack -G DragNDrop --config CPackConfig.cmake
+          # hdiutil on the hosted runners now and then fails to detach the temporary image
+          # ("resource busy"); the package itself is fine on the next try.
+          for attempt in 1 2 3; do
+            if cpack -G DragNDrop --config CPackConfig.cmake; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            hdiutil detach -force /Volumes/Sunshine 2>/dev/null || true
+            sleep 10
+          done
           mkdir -p ../artifacts
           cp cpack_artifacts/Sunshine.dmg ../artifacts/Sunshine-macOS-arm64.dmg
 
