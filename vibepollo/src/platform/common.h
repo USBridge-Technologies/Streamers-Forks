@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 #include <thread>
 
 // lib includes
@@ -129,6 +130,7 @@ namespace platf {
     steam_haptic,  ///< A Steam Controller (2026) haptic output report, verbatim (Vibepollo extension)
     steam_settings,  ///< A Steam Controller (2026) settings write, verbatim (Vibepollo extension)
     speaker_pcm,  ///< Independent 5 ms controller speaker samples
+    usbridge_packet,  ///< usbridge: a ready control packet of a pad's sound (see src/usbridge.h)
   };
 
   struct gamepad_feedback_msg_t {
@@ -203,12 +205,25 @@ namespace platf {
       return msg;
     }
 
+    /**
+     * @brief usbridge: a control packet the USB broker made of a pad's sound, sent unreliably.
+     */
+    static gamepad_feedback_msg_t make_usbridge_packet(std::uint16_t id, std::uint8_t channel, std::uint16_t packet_type, std::vector<std::uint8_t> payload) {
+      gamepad_feedback_msg_t msg;
+      msg.type = gamepad_feedback_e::usbridge_packet;
+      msg.id = id;
+      msg.data.usbridge_packet = {channel, packet_type};
+      msg.usbridge_payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(payload));
+      return msg;
+    }
+
     gamepad_feedback_e type;
     std::uint16_t id;
     // Internal provenance for bounded host-side ViGEm send-result diagnostics.
     bool from_vigem {false};
     // Invalidated on detach/rebind/reset, including messages already popped.
     std::weak_ptr<controller_speaker_pcm::producer_epoch> speaker_epoch;
+    std::shared_ptr<const std::vector<std::uint8_t>> usbridge_payload;  ///< usbridge_packet's payload.
 
     union {
       controller_speaker_pcm::block speaker;
@@ -257,6 +272,9 @@ namespace platf {
         std::uint8_t count;
         std::array<std::uint8_t, 27> triples;
       } steam_settings;
+        std::uint8_t channel;
+        std::uint16_t packet_type;
+      } usbridge_packet;
     } data;
   };
 

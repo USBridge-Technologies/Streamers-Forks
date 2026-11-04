@@ -31,6 +31,7 @@ extern "C" {
 #include "mouse_input.h"
 #include "platform/common.h"
 #include "thread_pool.h"
+#include "usbridge.h"
 #include "utility.h"
 
 using namespace std::literals;
@@ -250,6 +251,25 @@ namespace input {
         touch_port {{0, 0, 0, 0}, 0, 0, 1.0f, 1.0f, 0, 0},
         accumulated_vscroll_delta {},
         accumulated_hscroll_delta {} {
+      // usbridge: rumble of a pad the USB broker built goes to this client's feedback queue.
+      usbridge::session_t::feedback_t fb;
+      fb.rumble = [queue = this->feedback_queue](std::uint8_t slot, std::uint16_t low, std::uint16_t high) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_rumble(slot, low, high));
+      };
+      fb.light = [queue = this->feedback_queue](std::uint8_t slot, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_rgb_led(slot, r, g, b));
+      };
+      fb.motion = [queue = this->feedback_queue](std::uint8_t slot, std::uint16_t rate) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_motion_event_state(slot, LI_MOTION_TYPE_ACCEL, rate));
+        queue->raise(platf::gamepad_feedback_msg_t::make_motion_event_state(slot, LI_MOTION_TYPE_GYRO, rate));
+      };
+      fb.triggers = [queue = this->feedback_queue](std::uint8_t slot, std::uint8_t flags, std::uint8_t type_left, std::uint8_t type_right, const std::array<std::uint8_t, 10> &left, const std::array<std::uint8_t, 10> &right) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_adaptive_triggers(slot, flags, type_left, type_right, left, right));
+      };
+      fb.packet = [queue = this->feedback_queue](std::uint8_t slot, std::uint8_t channel, std::uint16_t type, std::vector<std::uint8_t> payload) {
+        queue->raise(platf::gamepad_feedback_msg_t::make_usbridge_packet(slot, channel, type, std::move(payload)));
+      };
+      usb_broker.set_feedback(std::move(fb));
     }
 
     // Keep track of alt+ctrl+shift key combo
@@ -272,6 +292,7 @@ namespace input {
 
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;
     platf::feedback_queue_t feedback_queue;
+    usbridge::session_t usb_broker;  ///< This client's raw HID devices and gamepads on the USBridge USB broker.
     bool persist_gamepads = false;
 
     // Low bit permits synthetic Guide; upper bits identify permission changes.
@@ -339,6 +360,9 @@ namespace input {
         return packet_size_bounds_t {sizeof(SS_CONTROLLER_BATTERY_PACKET), sizeof(SS_CONTROLLER_BATTERY_PACKET)};
       case SS_STEAM_CONTROLLER_ATTRIBUTES_MAGIC:
         return packet_size_bounds_t {sizeof(SS_STEAM_CONTROLLER_ATTRIBUTES_PACKET), sizeof(SS_STEAM_CONTROLLER_ATTRIBUTES_PACKET)};
+      case usbridge::RAW_HID_MAGIC:
+        // usbridge: header + one broker frame (10-byte frame header, up to 64 KiB of data).
+        return packet_size_bounds_t {sizeof(NV_INPUT_HEADER) + 10, sizeof(NV_INPUT_HEADER) + 10 + 0xFFFF};
       default:
         return std::nullopt;
     }
@@ -1248,6 +1272,11 @@ namespace input {
    * @param packet The controller arrival packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_ARRIVAL_PACKET packet) {
+    // usbridge: the arrival tells the broker which pad to build; it appears with its first state.
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_arrival(packet->controllerNumber, packet->type, util::endian::little(packet->capabilities), util::endian::little(packet->supportedButtonFlags));
+      return;
+    }
     if (!config::input.controller) {
       return;
     }
@@ -1537,6 +1566,10 @@ namespace input {
    * @param packet The controller touch packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_TOUCH_PACKET packet) {
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_touch(packet->controllerNumber, packet->eventType, util::endian::little(packet->pointerId), from_clamped_netfloat(packet->x, 0.0f, 1.0f), from_clamped_netfloat(packet->y, 0.0f, 1.0f));
+      return;
+    }
     if (!config::input.controller) {
       return;
     }
@@ -1571,6 +1604,10 @@ namespace input {
    * @param packet The controller motion packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_MOTION_PACKET packet) {
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_motion(packet->controllerNumber, packet->motionType, from_netfloat(packet->x), from_netfloat(packet->y), from_netfloat(packet->z));
+      return;
+    }
     if (!config::input.controller) {
       return;
     }
@@ -1603,6 +1640,10 @@ namespace input {
    * @param packet The controller battery packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_BATTERY_PACKET packet) {
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      input->usb_broker.pad_battery(packet->controllerNumber, packet->batteryState, packet->batteryPercentage);
+      return;
+    }
     if (!config::input.controller) {
       return;
     }
@@ -1628,6 +1669,30 @@ namespace input {
   }
 
   void passthrough(std::shared_ptr<input_t> &input, PNV_MULTI_CONTROLLER_PACKET packet) {
+    // usbridge: under the USBridge agent the pad is the USB broker's, a virtual Xbox 360
+    // controller on a USB/IP port, not one of the platform injectors below.
+    if (config::input.controller && usbridge::pads_via_broker()) {
+      for (int slot = 0; slot < usbridge::MAX_PADS; ++slot) {
+        if (!(packet->activeGamepadMask & (1 << slot))) {
+          input->usb_broker.pad_gone(static_cast<std::uint8_t>(slot));
+        }
+      }
+      const int slot = packet->controllerNumber;
+      if (slot >= 0 && slot < usbridge::MAX_PADS && (packet->activeGamepadMask & (1 << slot))) {
+        input->usb_broker.pad_state(
+          static_cast<std::uint8_t>(slot),
+          static_cast<std::uint32_t>(packet->buttonFlags) | (static_cast<std::uint32_t>(packet->buttonFlags2) << 16),
+          packet->leftTrigger,
+          packet->rightTrigger,
+          packet->leftStickX,
+          packet->leftStickY,
+          packet->rightStickX,
+          packet->rightStickY
+        );
+      }
+      return;
+    }
+
     if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
 
@@ -2185,6 +2250,17 @@ namespace input {
         case SS_STEAM_CONTROLLER_ATTRIBUTES_MAGIC:
           passthrough(input, (PSS_STEAM_CONTROLLER_ATTRIBUTES_PACKET) payload);
           break;
+        case usbridge::RAW_HID_MAGIC:
+          // usbridge: a chunk of the client's HID device (sent only after our feature flag in
+          // rtsp.cpp). The body goes to the USB broker as it is; the broker rebuilds the device.
+          {
+            const auto *body = entry.data.data() + sizeof(NV_INPUT_HEADER);
+            const auto size = usbridge::raw_hid_frame_size(body, entry.data.size() - sizeof(NV_INPUT_HEADER));
+            if (size != 0) {
+              input->usb_broker.raw_hid(body, size);
+            }
+          }
+          break;
       }
     }
 
@@ -2309,6 +2385,13 @@ namespace input {
           } else {
             break;
           }
+        case usbridge::RAW_HID_MAGIC:
+          // usbridge: a tablet or pad built by the USB broker.
+          if (!(permission & crypto::PERM::input_pen) && !(permission & crypto::PERM::input_controller)) {
+            return;
+          } else {
+            break;
+          }
         case SS_PEN_MAGIC:
           if (!(permission & crypto::PERM::input_pen)) {
             return;
@@ -2397,6 +2480,8 @@ namespace input {
       }
       input->accumulated_vscroll_delta = 0;
       input->accumulated_hscroll_delta = 0;
+      // usbridge: the client is gone; closing the connection unplugs its devices on the broker.
+      input->usb_broker.close();
       BOOST_LOG(debug) << "Released disconnected client's keyboard, mouse, controllers, touch and pen input";
     });
   }
