@@ -441,3 +441,8 @@ if(SUNSHINE_ENABLE_PYROWAVE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 list(APPEND PLATFORM_TARGET_FILES "${CMAKE_SOURCE_DIR}/src/platform/linux/managed_app_focus.cpp")
+
+# usbridge: confighttp's Playnite export deflates with zlib. Arch pulls libz in transitively;
+# Ubuntu's linker (--as-needed) does not, so name it.
+find_package(ZLIB REQUIRED)
+list(APPEND PLATFORM_LIBRARIES ZLIB::ZLIB)
