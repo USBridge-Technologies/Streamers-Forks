@@ -36,7 +36,6 @@ extern "C" {
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
-#include "usbridge.h"
 #include "utility.h"
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
@@ -460,22 +459,6 @@ namespace stream {
     }
 
     /**
-     * @brief usbridge: send a packet unreliably on `channel` (a pad's sound: late is worse than lost).
-     */
-    int send_unreliable(const std::string_view &payload, net::peer_t peer, std::uint8_t channel) {
-      if (channel >= peer->channelCount) {
-        return 0;
-      }
-      if (auto packet = enet_packet_create(payload.data(), payload.size(), 0); enet_peer_send(peer, channel, packet)) {
-        enet_packet_destroy(packet);
-
-        return -1;
-      }
-
-      return 0;
-    }
-
-    /**
      * @brief Flush pending packets to the stream socket.
      */
     void flush() {
@@ -820,6 +803,24 @@ namespace stream {
 
   namespace fec {
     /**
+     * @brief Limit data shards so data and parity fit in an 8-bit Reed-Solomon block.
+     *
+     * @param percentage Recovery-shard percentage between 0 and 100.
+     * @return Maximum data shards with room for the requested parity shards.
+     */
+    int max_data_shards(int percentage) {
+      // The 8-bit Reed-Solomon encoder allows 255 data and parity shards combined.
+      // The max number of data shards per block is found by solving this system of equations for D:
+      // D = 255 - P
+      // P = D * F
+      // which results in the solution:
+      // D = 255 / (1 + F)
+      // multiplied by 100 since F is the percentage as an integer:
+      // D = (255 * 100) / (100 + F)
+      return (RS8_DATA_SHARDS_MAX * 100) / (100 + percentage);
+    }
+
+    /**
      * @brief Owning pointer for a Reed-Solomon encoder instance.
      */
     using rs_t = util::safe_ptr<reed_solomon, [](reed_solomon *rs) {
@@ -1135,25 +1136,6 @@ namespace stream {
         encrypted_payload;
 
       payload = encode_control(session, util::view(plaintext), encrypted_payload);
-    } else if (msg.type == platf::gamepad_feedback_e::usbridge_packet) {
-      // usbridge: the USB broker's ready packet of a pad's sound (haptics, speaker).
-      constexpr std::size_t max_payload = 1024;
-      if (!msg.usbridge_payload || msg.usbridge_payload->size() > max_payload) {
-        return -1;
-      }
-      std::array<std::uint8_t, sizeof(control_header_v2) + max_payload> plaintext;
-      const auto size = msg.usbridge_payload->size();
-      auto header = (control_header_v2 *) plaintext.data();
-      header->type = util::endian::little(msg.data.usbridge_packet.packet_type);
-      header->payloadLength = util::endian::little(static_cast<std::uint16_t>(size));
-      std::copy_n(msg.usbridge_payload->data(), size, plaintext.data() + sizeof(control_header_v2));
-      std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
-        encrypted_payload;
-      auto packet = encode_control(session, std::string_view((const char *) plaintext.data(), sizeof(control_header_v2) + size), encrypted_payload);
-      if (session->broadcast_ref->control_server.send_unreliable(packet, session->control.peer, msg.data.usbridge_packet.channel)) {
-        return -1;
-      }
-      return 0;
     } else {
       BOOST_LOG(error) << "Unknown gamepad feedback message type"sv;
       return -1;
@@ -1269,17 +1251,11 @@ namespace stream {
       auto &cipher = session->control.cipher;
       auto &iv = session->control.legacy_input_enc_iv;
       if (cipher.decrypt(tagged_cipher, plaintext, &iv)) {
-        // A tag failure here almost always means this is a stray/reordered
-        // UDP packet from a *previous* session's control stream, encrypted
-        // with that session's key, arriving just after a fast reconnect
-        // (e.g. a client-initiated codec switch) -- not an attack against
-        // this session, which is already authenticated via the paired RTSP
-        // launch flow. Ending the whole session (and, downstream, the video
-        // pipeline that hasn't even started encoding yet) over one
-        // undecryptable control packet is disproportionate: drop it and
-        // keep going, the same way a single lost/corrupt packet on any
-        // other channel wouldn't take down the stream.
-        BOOST_LOG(warning) << "Failed to verify tag on legacy input packet, dropping it"sv;
+        // something went wrong :(
+
+        BOOST_LOG(error) << "Failed to verify tag"sv;
+
+        session::stop(*session);
         return;
       }
 
@@ -1330,16 +1306,11 @@ namespace stream {
 
       std::vector<uint8_t> plaintext;
       if (cipher.decrypt(tagged_cipher, plaintext, &iv)) {
-        // See the identical comment in the IDX_INPUT_DATA handler above --
-        // this fires reliably on a fast client-initiated reconnect (e.g.
-        // switching codec) when a control packet from the just-torn-down
-        // previous session's ENet stream is still in flight and lands here
-        // encrypted with the old session's key. Previously this killed the
-        // brand new session via session::stop() before its video pipeline
-        // had even created an encoder, turning a single stray packet into a
-        // full "video never starts" outage. Drop it and keep the session
-        // alive instead.
-        BOOST_LOG(warning) << "Failed to verify tag on control packet, dropping it"sv;
+        // something went wrong :(
+
+        BOOST_LOG(error) << "Failed to verify tag"sv;
+
+        session::stop(*session);
         return;
       }
 
@@ -1439,8 +1410,7 @@ namespace stream {
         break;
       }
 
-      // usbridge: a pad's sound goes out as it comes, not in 150 ms bursts.
-      server->iterate(usbridge::sound_active() ? 5ms : 150ms);
+      server->iterate(150ms);
     }
 
     // Let all remaining connections know the server is shutting down
@@ -1493,7 +1463,8 @@ namespace stream {
 
     auto &io = ctx.io_context;
 
-    udp::endpoint peer;
+    // Pending audio and video receives must not write into the same endpoint.
+    std::array<udp::endpoint, 2> peers;
 
     std::array<std::array<char, 2048>, 2> buf;
     std::array<std::function<void(const boost::system::error_code, size_t)>, 2> recv_func;
@@ -1526,6 +1497,7 @@ namespace stream {
 
     auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session) {
       recv_func[buf_elem] = [&, buf_elem](const boost::system::error_code &ec, size_t bytes) {
+        auto &peer = peers[buf_elem];
         auto fg = util::fail_guard([&sock, &buf, &peer, &recv_func, &buf_elem]() {
           sock.async_receive_from(asio::buffer(buf[buf_elem]), peer, 0, recv_func[buf_elem]);
         });
@@ -1568,13 +1540,70 @@ namespace stream {
     recv_func_init(video_sock, 0, peer_to_video_session);
     recv_func_init(audio_sock, 1, peer_to_audio_session);
 
-    video_sock.async_receive_from(asio::buffer(buf[0]), peer, 0, recv_func[0]);
-    audio_sock.async_receive_from(asio::buffer(buf[1]), peer, 0, recv_func[1]);
+    video_sock.async_receive_from(asio::buffer(buf[0]), peers[0], 0, recv_func[0]);
+    audio_sock.async_receive_from(asio::buffer(buf[1]), peers[1], 0, recv_func[1]);
 
     while (!broadcast_shutdown_event->peek()) {
       io.run();
     }
   }
+
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Exercise production ping routing with concurrent loopback audio and video receives.
+   * @param session_id_pings Use session-ID pings instead of legacy address-based pings.
+   * @return True when every ping retains its sending channel's endpoint and payload.
+   */
+  bool test_receive_ping_endpoints(bool session_id_pings) {
+    broadcast_ctx_t ctx;
+    const auto loopback = asio::ip::address_v4::loopback();
+    ctx.video_sock.open(udp::v4());
+    ctx.audio_sock.open(udp::v4());
+    ctx.video_sock.bind(udp::endpoint {loopback, 0});
+    ctx.audio_sock.bind(udp::endpoint {loopback, 0});
+    ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(4);
+
+    udp::socket video_sender {ctx.io_context, udp::endpoint {loopback, 0}};
+    udp::socket audio_sender {ctx.io_context, udp::endpoint {loopback, 0}};
+    const std::array expected {video_sender.local_endpoint(), audio_sender.local_endpoint()};
+    const std::string token {"abcdefghijklmnop"};
+    const auto packet = session_id_pings ? token + std::string(4, '\0') : "PING"s;
+    std::array<message_queue_t, 2> queues;
+    for (std::size_t channel = 0; channel < queues.size(); ++channel) {
+      queues[channel] = std::make_shared<message_queue_t::element_type>(4);
+      const auto id = session_id_pings ? av_session_id_t {token} : av_session_id_t {asio::ip::address {loopback}};
+      ctx.message_queue_queue->raise(static_cast<socket_e>(channel), id, queues[channel]);
+    }
+
+    // Queued packets exercise both initial receives and callback rearming before the next handler runs.
+    for (int packet_index = 0; packet_index < 2; ++packet_index) {
+      video_sender.send_to(asio::buffer(packet), ctx.video_sock.local_endpoint());
+      audio_sender.send_to(asio::buffer(packet), ctx.audio_sock.local_endpoint());
+    }
+
+    auto shutdown = mail::man->event<bool>(mail::broadcast_shutdown);
+    shutdown->reset();
+    auto reset_shutdown = util::fail_guard([&shutdown]() {
+      shutdown->reset();
+    });
+    bool matched = true;
+    std::jthread observer {[&]() {
+      for (std::size_t channel = 0; channel < queues.size(); ++channel) {
+        for (int packet_index = 0; packet_index < 2; ++packet_index) {
+          auto received = queues[channel]->pop(1s);
+          if (!received || received->first != expected[channel] || received->second != packet) {
+            matched = false;
+          }
+        }
+      }
+      shutdown->raise(true);
+      ctx.io_context.stop();
+    }};
+    recvThread(ctx);
+    observer.join();
+    return matched;
+  }
+#endif
 
   /**
    * @brief Run the broadcast video sender thread.
@@ -1668,14 +1697,7 @@ namespace stream {
       // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
       constexpr auto MAX_FEC_BLOCKS = 4;
 
-      // The max number of data shards per block is found by solving this system of equations for D:
-      // D = 255 - P
-      // P = D * F
-      // which results in the solution:
-      // D = 255 / (1 + F)
-      // multiplied by 100 since F is the percentage as an integer:
-      // D = (255 * 100) / (100 + F)
-      auto max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+      auto max_data_shards_per_fec_block = fec::max_data_shards(fecPercentage);
 
       // Compute the number of FEC blocks needed for this frame using the block size and max shards
       auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;

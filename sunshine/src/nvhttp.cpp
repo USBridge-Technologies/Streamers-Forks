@@ -493,17 +493,6 @@ namespace nvhttp {
     std::copy(rikey.cbegin(), rikey.cend(), std::back_inserter(launch_session->gcm_key));
 
     launch_session->host_audio = host_audio;
-
-    // usbridge: the client's "Show Mouse" setting, sent on every /launch and
-    // /resume so a session starts with the cursor exactly as the user chose
-    // (display_cursor is otherwise process-global and only ever flipped by
-    // Ctrl+Alt+Shift+N, so a new session could inherit the last one's state).
-    // Absent from stock Moonlight clients: left unchanged then.
-    if (const auto cursor = get_arg(args, "usbridgeDisplayCursor", ""); !cursor.empty()) {
-      display_cursor = cursor == "1" || cursor == "true";
-      BOOST_LOG(info) << "Client set display cursor: "sv << (display_cursor ? "shown"sv : "hidden"sv);
-    }
-
     auto mode = std::stringstream(get_arg(args, "mode", "0x0x0"));
     // Split mode by the char "x", to populate width/height/fps
     int x = 0;
@@ -1211,11 +1200,6 @@ namespace nvhttp {
     return false;
   }
 
-  /**
-   * @brief Get codec mode flags.
-   *
-   * @return Moonlight codec capability bitmask for the currently probed encoders.
-   */
   uint32_t get_codec_mode_flags() {
     uint32_t codec_mode_flags = SCM_H264;
     if (video::last_encoder_probe_supported_yuv444_for_codec[0]) {
@@ -1227,10 +1211,10 @@ namespace nvhttp {
         codec_mode_flags |= SCM_HEVC_REXT8_444;
       }
     }
-    if (video::active_hevc_mode == 3 || video::active_hevc_mode == 5) {
+    if ((video::active_hevc_mode == 3 || video::active_hevc_mode == 5) && video::last_encoder_probe_supported_dynamic_range_for_codec[1]) {
       codec_mode_flags |= SCM_HEVC_MAIN10;
     }
-    if ((video::active_hevc_mode == 4 || video::active_hevc_mode == 5) && video::last_encoder_probe_supported_yuv444_for_codec[1]) {
+    if ((video::active_hevc_mode == 4 || video::active_hevc_mode == 5) && video::last_encoder_probe_supported_dynamic_range_yuv444_for_codec[1]) {
       codec_mode_flags |= SCM_HEVC_REXT10_444;
     }
 
@@ -1240,10 +1224,10 @@ namespace nvhttp {
         codec_mode_flags |= SCM_AV1_HIGH8_444;
       }
     }
-    if (video::active_av1_mode == 3 || video::active_av1_mode == 5) {
+    if ((video::active_av1_mode == 3 || video::active_av1_mode == 5) && video::last_encoder_probe_supported_dynamic_range_for_codec[2]) {
       codec_mode_flags |= SCM_AV1_MAIN10;
     }
-    if ((video::active_av1_mode == 4 || video::active_av1_mode == 5) && video::last_encoder_probe_supported_yuv444_for_codec[2]) {
+    if ((video::active_av1_mode == 4 || video::active_av1_mode == 5) && video::last_encoder_probe_supported_dynamic_range_yuv444_for_codec[2]) {
       codec_mode_flags |= SCM_AV1_HIGH10_444;
     }
     return codec_mode_flags;

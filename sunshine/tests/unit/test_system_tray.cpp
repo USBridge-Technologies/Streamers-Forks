@@ -5,6 +5,12 @@
 
 // test includes
 #include "../tests_common.h"
+#if defined(SUNSHINE_TRAY) && SUNSHINE_TRAY >= 1
+  #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+    #include "third-party/tray/tests/notification_utils.h"
+    #include "third-party/tray/tests/screenshot_utils.h"
+  #endif
+#endif
 
 // standard includes
 #include <atomic>
@@ -12,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <future>
 #include <optional>
 #include <string>
 #include <thread>
@@ -25,20 +32,14 @@
   #if defined(_WIN32) || defined(__APPLE__)
     #include <libvirtualhid/license.hpp>
   #endif
+  #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+    #include <lizardbyte/common/env.h>
+  #endif
 
   // local includes
   #include <src/config.h>
   #include <src/system_tray.h>
   #include <src/thread_safe.h>
-
-  #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
-    // lib includes
-    #include <lizardbyte/common/env.h>
-
-    // test includes
-    #include "third-party/tray/tests/notification_utils.h"
-    #include "third-party/tray/tests/screenshot_utils.h"
-  #endif
 
 namespace {
   using namespace std::chrono_literals;
@@ -415,29 +416,40 @@ TEST_F(SystemTrayTest, PreparesLicensedVirtualHidMenuBeforeInitialization) {
   EXPECT_STREQ(license_menu[3].text, "Machine activation limit: Not reported");
 }
 
-// usbridge: Windows has no gamepad backend to choose or license (the pads are the USB broker's).
-TEST_F(SystemTrayTest, DoesNotPromptForAGamepadBackend) {
+TEST_F(SystemTrayTest, PromptsForUnsetGamepadDriverEvenWhenLicensed) {
   lvh::LicenseStatus license;
   license.service_available = true;
   license.state = lvh::LicenseState::licensed;
   config::input.gamepad_driver.clear();
 
-  system_tray::update_tray_virtualhid_license(license, true);
+  system_tray::update_tray_virtualhid_license(license, false);
 
   const auto &tray_data = system_tray::tray_data_for_testing();
-  EXPECT_EQ(tray_data.notification_title, nullptr);
-  EXPECT_EQ(tray_data.notification_text, nullptr);
-  EXPECT_EQ(tray_data.notification_cb, nullptr);
+  EXPECT_STREQ(tray_data.notification_title, "Choose a Gamepad Backend");
+  EXPECT_STREQ(
+    tray_data.notification_text,
+    "Choose a gamepad backend in Input settings. Virtual HID Broker is a paid upgrade; ViGEmBus is limited and has reached end of life."
+  );
+  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
+  EXPECT_NE(tray_data.notification_cb, nullptr);
 }
 
-TEST_F(SystemTrayTest, DoesNotNotifyAboutTheVirtualHidDriver) {
+TEST_F(SystemTrayTest, NotifiesWhenVirtualHidDriverIsUnsupported) {
   const auto supported_versions = std::format(">= {}", LIBVIRTUALHID_MINIMUM_VERSION);
   system_tray::update_tray_virtualhid_driver(true, "2026.829.2338.54", false, supported_versions);  // NOSONAR(cpp:S1313): not an IP address
 
   const auto &tray_data = system_tray::tray_data_for_testing();
-  EXPECT_EQ(tray_data.notification_title, nullptr);
-  EXPECT_EQ(tray_data.notification_text, nullptr);
-  EXPECT_EQ(tray_data.notification_cb, nullptr);
+  const auto expected_notification = std::format(
+    "Installed Virtual HID Broker v2026.829.2338.54 is not supported by this version of Sunshine. Supported versions: {}. Restart Sunshine after updating. Click for instructions.",
+    supported_versions
+  );
+  EXPECT_STREQ(tray_data.notification_title, "Update Virtual HID Broker");
+  EXPECT_STREQ(tray_data.notification_text, expected_notification.c_str());
+  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
+  EXPECT_NE(tray_data.notification_cb, nullptr);
+
+  system_tray::resolve_tray_icon_paths_for_testing();
+  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
 }
 
 TEST_F(SystemTrayTest, PreservesExistingNotificationWhenVirtualHidDriverIsUsable) {
@@ -461,6 +473,26 @@ TEST_F(SystemTrayTest, PreservesExistingNotificationWhenVirtualHidDriverIsUsable
   EXPECT_EQ(tray_data.notification_title, notification_title);
   EXPECT_EQ(tray_data.notification_text, notification_text);
   EXPECT_EQ(tray_data.notification_cb, notification_callback);
+}
+
+TEST_F(SystemTrayTest, VigembusSelectionSuppressesVirtualHidNotifications) {
+  lvh::LicenseStatus license;
+  license.service_available = true;
+  license.state = lvh::LicenseState::invalid;
+  config::input.gamepad_driver = config::GAMEPAD_DRIVER_VIGEMBUS;
+
+  system_tray::update_tray_virtualhid_license(license, true);
+
+  const auto &tray_data = system_tray::tray_data_for_testing();
+  EXPECT_EQ(tray_data.notification_title, nullptr);
+  EXPECT_EQ(tray_data.notification_text, nullptr);
+  EXPECT_EQ(tray_data.notification_cb, nullptr);
+
+  const auto supported_versions = std::format(">= {}", LIBVIRTUALHID_MINIMUM_VERSION);
+  system_tray::update_tray_virtualhid_driver(true, "2026.829.2338.54", false, supported_versions);  // NOSONAR(cpp:S1313): not IP addresses
+  EXPECT_EQ(tray_data.notification_title, nullptr);
+  EXPECT_EQ(tray_data.notification_text, nullptr);
+  EXPECT_EQ(tray_data.notification_cb, nullptr);
 }
 
 TEST_F(SystemTrayTest, NoneSelectionSuppressesWindowsVirtualHidNotifications) {
@@ -505,8 +537,16 @@ TEST_P(UnlicensedVirtualHidTrayTest, PreparesMenuAndStartupNotification) {
   EXPECT_STREQ(license_menu[2].text, "Driver-backed keyboard, mouse, and gamepads are locked");
   EXPECT_STREQ(license_menu[3].text, service_available ? "License service: Available" : "License service: Unavailable");
   verify_virtualhid_actions_menu(license_menu);
-  // usbridge: no license notification on Windows, whatever the state.
-  EXPECT_EQ(tray_data.notification_title, nullptr);
+  EXPECT_STREQ(tray_data.notification_title, "Virtual HID Broker License");
+  EXPECT_STREQ(
+    tray_data.notification_text,
+    "Get or manage a license, or use the limited, end-of-life ViGEmBus driver."
+  );
+  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
+  EXPECT_NE(tray_data.notification_cb, nullptr);
+
+  system_tray::resolve_tray_icon_paths_for_testing();
+  EXPECT_STREQ(tray_data.notification_icon, tray_data.allIconPaths[4]);
 
   system_tray::update_tray_virtualhid_license(license, false);
   EXPECT_EQ(tray_data.notification_title, nullptr);
@@ -630,6 +670,40 @@ TEST_F(SystemTrayTest, ShowsMacBrokerLicenseAndAvailabilityWithOptionalStartupNo
   EXPECT_EQ(tray_data.notification_title, nullptr);
 }
   #endif
+
+/**
+ * @brief Verify the tray fallback waits for shutdown using an explicitly owned worker thread.
+ */
+TEST_F(SystemTrayTest, KeepsWorkersRunningWhenTrayIsUnavailable) {
+  ASSERT_FALSE(system_tray::tray_initialized_for_testing());
+  auto shutdown_event = std::make_shared<safe::event_t<bool>>();
+  std::promise<void> tray_loop_exited;
+  auto tray_loop = tray_loop_exited.get_future();
+  std::jthread tray_worker([shutdown_event, &tray_loop_exited]() {
+    system_tray::run_tray_until_exit(shutdown_event);
+    tray_loop_exited.set_value();
+  });
+
+  EXPECT_EQ(tray_loop.wait_for(100ms), std::future_status::timeout);
+  EXPECT_FALSE(shutdown_event->view(0ms));
+
+  shutdown_event->raise(true);
+  EXPECT_EQ(tray_loop.wait_for(5s), std::future_status::ready);
+  tray_worker.join();
+  EXPECT_TRUE(shutdown_event->peek());
+  EXPECT_FALSE(system_tray::tray_initialized_for_testing());
+}
+
+TEST_F(SystemTrayTest, HonorsPendingShutdownWhenTrayIsUnavailable) {
+  ASSERT_FALSE(system_tray::tray_initialized_for_testing());
+  auto shutdown_event = std::make_shared<safe::event_t<bool>>();
+  shutdown_event->raise(true);
+
+  system_tray::run_tray_until_exit(shutdown_event);
+
+  EXPECT_TRUE(shutdown_event->peek());
+  EXPECT_FALSE(system_tray::tray_initialized_for_testing());
+}
 
   #ifndef _WIN32
 TEST_F(SystemTrayTest, LifecycleMenuAndStateTransitions) {

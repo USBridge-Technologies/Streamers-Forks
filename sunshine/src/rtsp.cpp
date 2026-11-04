@@ -30,7 +30,6 @@ extern "C" {
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
-#include "usbridge.h"
 #include "video.h"
 
 namespace asio = boost::asio;
@@ -876,12 +875,7 @@ namespace rtsp_stream {
     std::stringstream ss;
 
     // Tell the client about our supported features
-    // usbridge: under the USBridge agent its client may send a HID device over this stream.
-    uint32_t feature_flags = platf::get_capabilities();
-    if (usbridge::raw_hid_offered()) {
-      feature_flags |= usbridge::FEATURE_FLAG_RAW_HID;
-    }
-    ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
+    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
@@ -934,7 +928,7 @@ namespace rtsp_stream {
        */
       if (x == audio::SURROUND51 || x == audio::SURROUND71) {
         std::copy_n(mapping_p, stream_config.channelCount, mapping.begin());
-        std::rotate(mapping.begin() + 3, mapping.begin() + 4, mapping.begin() + audio::MAX_STREAM_CONFIG);
+        std::rotate(mapping.begin() + 3, mapping.begin() + 4, mapping.begin() + stream_config.channelCount);
 
         mapping_p = mapping.data();
       }

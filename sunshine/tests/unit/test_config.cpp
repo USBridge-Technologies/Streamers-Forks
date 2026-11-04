@@ -176,10 +176,10 @@ TEST_F(ConfigPersistenceTest, AppendsMissingOptionWithoutReplacingExistingText) 
 }
 
 TEST_F(ConfigPersistenceTest, DoesNotReplaceAnExistingOption) {
-  ASSERT_EQ(file_handler::write_file(config_file().string().c_str(), "gamepad_driver = none\n"), 0);
+  ASSERT_EQ(file_handler::write_file(config_file().string().c_str(), "gamepad_driver = vigembus\n"), 0);
 
   EXPECT_FALSE(config::persist_config_option_if_missing("gamepad_driver", "all"));
-  EXPECT_EQ(file_handler::read_file(config_file().string().c_str()), "gamepad_driver = none\n");
+  EXPECT_EQ(file_handler::read_file(config_file().string().c_str()), "gamepad_driver = vigembus\n");
 }
 
 TEST_F(ConfigPersistenceTest, SelectsAllDriversOnlyForLicensedUsersWithoutAPreference) {
@@ -218,6 +218,34 @@ TEST_F(ConfigPersistenceTest, ParsesFp16SdrGammaEncodedOption) {
 
   config::apply_config_for_test("fp16_sdr_gamma_encoded = disabled\n");
   EXPECT_FALSE(config::video.fp16_sdr_gamma_encoded);
+}
+
+/**
+ * @brief Verify mixed-case boolean values update configuration correctly.
+ */
+TEST_F(ConfigPersistenceTest, ParsesBooleanOptionsCaseInsensitively) {
+  const auto original_video = config::video;
+  const auto restore_video = util::fail_guard([original_video]() {
+    config::video = original_video;
+  });
+  const auto apps_file = config_file().parent_path() / "sunshine_test_config_apps.json";
+  ASSERT_EQ(file_handler::write_file(apps_file.string().c_str(), "{}"), 0);
+  config::stream.file_apps = apps_file.string();
+
+  constexpr std::array cases {
+    std::pair {"Enabled"sv, true},
+    std::pair {"TRUE"sv, true},
+    std::pair {"On"sv, true},
+    std::pair {"Yes"sv, true},
+    std::pair {"Disabled"sv, false},
+    std::pair {"False"sv, false},
+    std::pair {"OFF"sv, false},
+  };
+  for (const auto &[setting, expected] : cases) {
+    config::video.fp16_sdr_gamma_encoded = !expected;
+    config::apply_config_for_test(std::string {"fp16_sdr_gamma_encoded = "} + std::string {setting} + "\n");
+    EXPECT_EQ(config::video.fp16_sdr_gamma_encoded, expected) << setting;
+  }
 }
 
 TEST_F(ConfigPersistenceTest, ParsesHexIntegersWiderThanAnInt) {

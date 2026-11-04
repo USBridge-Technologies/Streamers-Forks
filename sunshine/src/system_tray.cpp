@@ -187,7 +187,11 @@ namespace system_tray {
   #if defined(_WIN32) || defined(__APPLE__)
   void tray_virtualhid_license_cb([[maybe_unused]] struct tray_menu *item) {
     BOOST_LOG(info) << "Opening Virtual HID Broker license settings from system tray"sv;
+    #ifdef _WIN32
+    launch_ui(config::input.gamepad_driver == config::GAMEPAD_DRIVER_VIGEMBUS ? "/config#gamepad_driver" : "/troubleshooting#virtualhid-license");
+    #else
     launch_ui("/troubleshooting#virtualhid-license");
+    #endif
   }
 
   void tray_virtualhid_download_cb([[maybe_unused]] struct tray_menu *item) {
@@ -497,10 +501,23 @@ namespace system_tray {
     rebuild_virtualhid_license_menu(license);
 
     #ifdef _WIN32
-    // usbridge: no gamepad backend to choose or license on Windows. Pads are the USBridge USB
-    // broker's (Xbox 360 controllers on usbip-win2); the fork builds neither ViGEmBus nor
-    // libvirtualhid's Windows driver.
-    (void) notify_if_unlicensed;
+    if (config::input.controller && config::input.gamepad_driver.empty()) {
+      tray.notification_title = "Choose a Gamepad Backend";
+      tray.notification_text =
+        "Choose a gamepad backend in Input settings. Virtual HID Broker is a paid upgrade; ViGEmBus is limited and has reached end of life.";
+      tray.notification_icon = tray.allIconPaths[4];
+      tray.notification_cb = []() {
+        launch_ui("/config#gamepad_driver");
+      };
+    } else if (config::input.controller && config::input.gamepad_driver != config::GAMEPAD_DRIVER_NONE && config::input.gamepad_driver != config::GAMEPAD_DRIVER_VIGEMBUS && notify_if_unlicensed && !license.licensed()) {
+      tray.notification_title = "Virtual HID Broker License";
+      tray.notification_text =
+        "Get or manage a license, or use the limited, end-of-life ViGEmBus driver.";
+      tray.notification_icon = tray.allIconPaths[4];
+      tray.notification_cb = []() {
+        launch_ui("/troubleshooting#virtualhid-license");
+      };
+    }
     #else
     if (config::input.controller && config::input.gamepad_driver != config::GAMEPAD_DRIVER_NONE && notify_if_unlicensed && !license.licensed()) {
       if (license.service_available) {
@@ -540,8 +557,9 @@ namespace system_tray {
       return;
     }
     #ifdef _WIN32
-    // usbridge: libvirtualhid's Windows driver is never used (see update_tray_virtualhid_license).
-    return;
+    if (config::input.gamepad_driver.empty() || config::input.gamepad_driver == config::GAMEPAD_DRIVER_VIGEMBUS) {
+      return;
+    }
     #endif
 
     const std::scoped_lock lock(tray_state_mutex());
@@ -802,6 +820,12 @@ namespace system_tray {
   }
 
   void run_tray_until_exit(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) {
+    if (!tray_initialized_state().load()) {
+      BOOST_LOG(info) << "System tray is unavailable; continuing without it"sv;
+      shutdown_event->view();
+      return;
+    }
+
     while (process_tray_events() == 0);
     shutdown_event->raise(true);
   }

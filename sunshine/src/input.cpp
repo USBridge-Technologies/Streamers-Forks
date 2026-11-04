@@ -35,7 +35,6 @@ extern "C" {
 #include "platform/common.h"
 #include "platform/virtualhid_input.h"
 #include "thread_pool.h"
-#include "usbridge.h"
 #include "utility.h"
 
 // Win32 WHEEL_DELTA constant
@@ -302,32 +301,6 @@ namespace input {
     ):
         touch_port_event {std::move(touch_port_event)},
         feedback_queue {std::move(feedback_queue)} {
-      bind_usbridge_rumble();
-    }
-
-    /**
-     * @brief Send the rumble of a pad the USBridge USB broker built to the current feedback queue.
-     */
-    void bind_usbridge_rumble() {
-      usbridge::session_t::feedback_t fb;
-      fb.rumble = [queue = feedback_queue](std::uint8_t slot, std::uint16_t low, std::uint16_t high) {
-        queue->raise(platf::gamepad_feedback_msg_t::make_rumble(slot, low, high));
-      };
-      fb.light = [queue = feedback_queue](std::uint8_t slot, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
-        queue->raise(platf::gamepad_feedback_msg_t::make_rgb_led(slot, r, g, b));
-      };
-      fb.motion = [queue = feedback_queue](std::uint8_t slot, std::uint16_t rate) {
-        // Both sensors, as Sunshine asks for a virtual DualShock 4's.
-        queue->raise(platf::gamepad_feedback_msg_t::make_motion_event_state(slot, LI_MOTION_TYPE_ACCEL, rate));
-        queue->raise(platf::gamepad_feedback_msg_t::make_motion_event_state(slot, LI_MOTION_TYPE_GYRO, rate));
-      };
-      fb.triggers = [queue = feedback_queue](std::uint8_t slot, std::uint8_t flags, std::uint8_t type_left, std::uint8_t type_right, const std::array<std::uint8_t, 10> &left, const std::array<std::uint8_t, 10> &right) {
-        queue->raise(platf::gamepad_feedback_msg_t::make_adaptive_triggers(slot, flags, type_left, type_right, left, right));
-      };
-      fb.packet = [queue = feedback_queue](std::uint8_t slot, std::uint8_t channel, std::uint16_t type, std::vector<std::uint8_t> payload) {
-        queue->raise(platf::gamepad_feedback_msg_t::make_usbridge_packet(slot, channel, type, std::move(payload)));
-      };
-      usb_broker.set_feedback(std::move(fb));
     }
 
     // Keep track of alt+ctrl+shift key combo
@@ -342,7 +315,6 @@ namespace input {
 
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
-    usbridge::session_t usb_broker;  ///< This client's raw HID devices and gamepads on the USBridge USB broker.
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
     std::mutex input_queue_lock;  ///< Input queue lock.
@@ -453,7 +425,6 @@ namespace input {
   void rebind_input(const std::shared_ptr<input_t> &input, const safe::mail_t &mail) {
     input->touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     input->feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
-    input->bind_usbridge_rumble();
 
     for (int client_index = 0; client_index < input->gamepads.size(); ++client_index) {
       auto &gamepad = input->gamepads[client_index];
@@ -1348,7 +1319,7 @@ namespace input {
   }
 
   /**
-   * @brief Allocate a virtual gamepad for a client-relative controller slot.
+   * @brief Allocate a virtual gamepad or refresh feedback after a retained controller arrives.
    *
    * @param input Stream input state.
    * @param client_index Client-relative controller index.
@@ -1363,7 +1334,14 @@ namespace input {
 
     auto &gamepad = input->gamepads[client_index];
     if (gamepad.id >= 0) {
-      BOOST_LOG(warning) << "ControllerNumber already allocated ["sv << client_index << ']';
+      // Resume-time motion requests can arrive before the client assigns this
+      // controller slot. Replay them after its arrival, without recreating the
+      // virtual device, and clear feedback deduplication for the ready client.
+      if (platf::rebind_gamepad(platf_input, {gamepad.id, static_cast<std::uint8_t>(client_index)}, input->feedback_queue) != 0) {
+        BOOST_LOG(warning) << "Failed to rebind retained controller ["sv << client_index << ']';
+        return -1;
+      }
+      BOOST_LOG(info) << "Rebound retained controller feedback after arrival ["sv << client_index << ']';
       return gamepad.id;
     }
 
@@ -1387,11 +1365,6 @@ namespace input {
    * @param packet The controller arrival packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_ARRIVAL_PACKET packet) {
-    // usbridge: the arrival tells the broker which pad to build; it appears with its first state.
-    if (config::input.controller && usbridge::pads_via_broker()) {
-      input->usb_broker.pad_arrival(packet->controllerNumber, packet->type, util::endian::little(packet->capabilities), util::endian::little(packet->supportedButtonFlags));
-      return;
-    }
     if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
@@ -1542,10 +1515,6 @@ namespace input {
    * @param packet The controller touch packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_TOUCH_PACKET packet) {
-    if (config::input.controller && usbridge::pads_via_broker()) {
-      input->usb_broker.pad_touch(packet->controllerNumber, packet->eventType, util::endian::little(packet->pointerId), from_clamped_netfloat(packet->x, 0.0f, 1.0f), from_clamped_netfloat(packet->y, 0.0f, 1.0f));
-      return;
-    }
     if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
@@ -1579,10 +1548,6 @@ namespace input {
    * @param packet The controller motion packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_MOTION_PACKET packet) {
-    if (config::input.controller && usbridge::pads_via_broker()) {
-      input->usb_broker.pad_motion(packet->controllerNumber, packet->motionType, from_netfloat(packet->x), from_netfloat(packet->y), from_netfloat(packet->z));
-      return;
-    }
     if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
@@ -1615,10 +1580,6 @@ namespace input {
    * @param packet The controller battery packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_BATTERY_PACKET packet) {
-    if (config::input.controller && usbridge::pads_via_broker()) {
-      input->usb_broker.pad_battery(packet->controllerNumber, packet->batteryState, packet->batteryPercentage);
-      return;
-    }
     if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
@@ -1650,36 +1611,7 @@ namespace input {
    * @param packet Protocol packet being processed.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_MULTI_CONTROLLER_PACKET packet) {
-    if (!config::input.controller) {
-      return;
-    }
-
-    // usbridge: under the USBridge agent the pad is the USB broker's, a virtual pad on a USB/IP
-    // port, not one of the injectors below -- whatever gamepad_driver says, since that only picks
-    // among those injectors.
-    if (usbridge::pads_via_broker()) {
-      for (int slot = 0; slot < usbridge::MAX_PADS; ++slot) {
-        if (!(packet->activeGamepadMask & (1 << slot))) {
-          input->usb_broker.pad_gone(static_cast<std::uint8_t>(slot));
-        }
-      }
-      const int slot = packet->controllerNumber;
-      if (slot >= 0 && slot < usbridge::MAX_PADS && (packet->activeGamepadMask & (1 << slot))) {
-        input->usb_broker.pad_state(
-          static_cast<std::uint8_t>(slot),
-          static_cast<std::uint32_t>(packet->buttonFlags) | (static_cast<std::uint32_t>(packet->buttonFlags2) << 16),
-          packet->leftTrigger,
-          packet->rightTrigger,
-          packet->leftStickX,
-          packet->leftStickY,
-          packet->rightStickX,
-          packet->rightStickY
-        );
-      }
-      return;
-    }
-
-    if (config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -1856,9 +1788,6 @@ namespace input {
         return validate_fixed_input_packet<SS_CONTROLLER_MOTION_PACKET>(packet, declared_size);
       case SS_CONTROLLER_BATTERY_MAGIC:
         return validate_fixed_input_packet<SS_CONTROLLER_BATTERY_PACKET>(packet, declared_size);
-      case usbridge::RAW_HID_MAGIC:
-        // usbridge: the chunk's own length must fit in what the packet declares.
-        return usbridge::raw_hid_frame_size(packet.data() + sizeof(NV_INPUT_HEADER), declared_size - sizeof(header.magic)) != 0;
       default:
         return true;
     }
@@ -2275,17 +2204,6 @@ namespace input {
       case SS_CONTROLLER_BATTERY_MAGIC:
         passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
         break;
-      case usbridge::RAW_HID_MAGIC:
-        // usbridge: a chunk of the client's HID device (sent only after our feature flag in
-        // rtsp.cpp). The body goes to the USB broker as it is; the broker rebuilds the device.
-        {
-          const auto *body = entry.data() + sizeof(NV_INPUT_HEADER);
-          const auto size = usbridge::raw_hid_frame_size(body, util::endian::big(payload->size) - sizeof(payload->magic));
-          if (size != 0) {
-            input->usb_broker.raw_hid(body, size);
-          }
-        }
-        break;
     }
     return true;
   }
@@ -2408,8 +2326,6 @@ namespace input {
     reset_mouse_buttons();
     reset_keyboard_keys();
     reset_gamepads(input);
-    // usbridge: the client is gone; closing the connection unplugs its devices on the broker.
-    input->usb_broker.close();
   }
 
   /**
@@ -2503,12 +2419,9 @@ namespace input {
         key_press_repeat_id = nullptr;
         reset_mouse_buttons();
         reset_keyboard_keys();
-#ifndef _WIN32
-        // Windows has no libvirtualhid devices to recreate (src/platform/windows/input.cpp).
         auto &context = platf::virtualhid::get_input_context(platf_input);
         context.refresh_keyboard();
         context.refresh_mouse();
-#endif
       }
     });
   }

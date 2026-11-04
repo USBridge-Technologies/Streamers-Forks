@@ -436,11 +436,34 @@ namespace cuda {
       return std::tolower(c);
     });
 
-    // Look for the name of the primary node in sysfs
+    // Look for the DRM nodes in sysfs. The render node is preferred: GBM only needs
+    // rendering, and headless containers are often given renderD* without card*.
     try {
       char sysfs_path[PATH_MAX];
       std::snprintf(sysfs_path, sizeof(sysfs_path), "/sys/bus/pci/devices/%s/drm", pci_bus_id.data());
       fs::path sysfs_dir {sysfs_path};
+      fs::path dri_path {"/dev/dri"sv};
+
+      for (auto &entry : fs::directory_iterator {sysfs_dir}) {
+        auto file = entry.path().filename();
+        auto filestring = file.generic_string();
+        if (std::string_view {filestring}.substr(0, 7) != "renderD"sv) {
+          continue;
+        }
+
+        BOOST_LOG(debug) << "Found DRM render node: "sv << filestring;
+
+        auto device_path = dri_path / file;
+        int fd = open(device_path.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+          return fd;
+        }
+
+        std::array<char, 1024> message;
+        BOOST_LOG(warning) << "Couldn't open render node "sv << device_path.string() << ": "sv
+                           << strerror_r(errno, message.data(), message.size()) << ", falling back to the primary node"sv;
+      }
+
       for (auto &entry : fs::directory_iterator {sysfs_dir}) {
         auto file = entry.path().filename();
         auto filestring = file.generic_string();
@@ -450,9 +473,11 @@ namespace cuda {
 
         BOOST_LOG(debug) << "Found DRM primary node: "sv << filestring;
 
-        fs::path dri_path {"/dev/dri"sv};
         auto device_path = dri_path / file;
-        return platf::kms::privileged_open_drm_card_fd(device_path.c_str());
+        int fd = platf::kms::privileged_open_drm_card_fd(device_path.c_str());
+        if (fd >= 0) {
+          return fd;
+        }
       }
     } catch (const std::filesystem::filesystem_error &err) {
       BOOST_LOG(error) << "Failed to read sysfs: "sv << err.what();
@@ -1054,7 +1079,7 @@ namespace cuda {
             auto monitor_nr = util::from_view(display_name);
 
             if (monitor_nr < 0 || monitor_nr >= status_params->dwOutputNum) {
-              BOOST_LOG(warning) << "Can't stream monitor ["sv << monitor_nr << "], it needs to be between [0] and ["sv << status_params->dwOutputNum - 1 << "], defaulting to virtual desktop"sv;
+              BOOST_LOG(warning) << "Can't stream monitor ["sv << monitor_nr << "], valid output indices are [0, "sv << status_params->dwOutputNum << "), defaulting to virtual desktop"sv;
             } else {
               streamedMonitor = monitor_nr;
             }
@@ -1384,6 +1409,11 @@ namespace platf {
       BOOST_LOG(info) << "  Resolution: "sv << output.trackedBox.w << 'x' << output.trackedBox.h;
       BOOST_LOG(info) << "  Offset: "sv << output.trackedBox.x << 'x' << output.trackedBox.y;
       display_names.emplace_back(std::to_string(x));
+    }
+
+    if (cuda::nvfbc::should_offer_virtual_desktop(status_params->dwOutputNum, status_params->bIsCapturePossible, status_params->screenSize.w, status_params->screenSize.h)) {
+      BOOST_LOG(info) << "No NvFBC outputs, offering the virtual desktop"sv;
+      display_names.emplace_back("0");
     }
 
     return display_names;
