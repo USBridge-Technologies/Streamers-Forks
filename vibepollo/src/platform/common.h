@@ -272,6 +272,8 @@ namespace platf {
         std::uint8_t count;
         std::array<std::uint8_t, 27> triples;
       } steam_settings;
+
+      struct {
         std::uint8_t channel;
         std::uint16_t packet_type;
       } usbridge_packet;
