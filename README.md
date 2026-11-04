@@ -5,9 +5,9 @@ directory each, with the USBridge changes on top of an upstream snapshot.
 
 | Directory | Upstream | Snapshot (upstream commit date) |
 |---|---|---|
-| `punktfunk/` | https://git.unom.io/unom/punktfunk | `fda825fd79` (2026-10-15, 0.44.1) |
-| `sunshine/` | https://github.com/LizardByte/Sunshine | `3d890eadc` (2026-10-15) |
-| `vibepollo/` | https://github.com/Nonary/Vibepollo | `5cc307a3f` (2026-10-15) |
+| `punktfunk/` | https://git.unom.io/unom/punktfunk | `a1757d1b7` (2026-11-03, 0.46.0+19) |
+| `sunshine/` | https://github.com/LizardByte/Sunshine | `2efa60fb8` (2026-11-03) |
+| `vibepollo/` | https://github.com/Nonary/Vibepollo | `5e6ed8594` (2026-11-02) |
 
 Each directory keeps its upstream license. Each upstream update is a pair of
 commits: "<fork>: upstream snapshot at <hash>" holds the untouched upstream
