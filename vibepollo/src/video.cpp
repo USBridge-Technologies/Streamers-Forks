@@ -3867,7 +3867,8 @@ namespace video {
     return result;
   }
 
-#ifdef SUNSHINE_ENABLE_NV_TRUEHDR
+  // usbridge: unconditional -- pure arithmetic, and PyroWave's colourspace pick calls it
+  // in builds without the TrueHDR runtime too (the Linux tarball).
   /**
    * @brief Synthesize Rec.2020/D65 HDR10 metadata for an RTX HDR (SDR->HDR) stream.
    *
@@ -3889,7 +3890,6 @@ namespace video {
     m.maxFrameAverageLightLevel = safe_peak_nits / 4;  // nits
     return m;
   }
-#endif
 
   // Raise hdr_info unless it matches what this session last raised. Some clients
   // (moonlight-xbox) perform a full HDMI display mode-set for every HDR mode message,
