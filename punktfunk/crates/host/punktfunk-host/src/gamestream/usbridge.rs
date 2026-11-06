@@ -95,6 +95,11 @@ pub const PROBE_LINE: &str = "usbridge-bridge 1";
 /// Opens a `hid_stream`. The reply says whether the broker builds raw HID devices; which of
 /// them need a license (a Wacom tablet) is decided on its side, per device.
 fn open(addr: SocketAddr) -> std::io::Result<(TcpStream, bool)> {
+    open_reply(addr).map(|(conn, reply)| (conn, reply.contains("\"raw_hid\":true")))
+}
+
+/// `open` with the broker's whole reply line.
+fn open_reply(addr: SocketAddr) -> std::io::Result<(TcpStream, String)> {
     let mut conn = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     conn.set_nodelay(true)?;
     conn.set_read_timeout(Some(REPLY_TIMEOUT))?;
@@ -111,7 +116,7 @@ fn open(addr: SocketAddr) -> std::io::Result<(TcpStream, bool)> {
         )));
     }
     conn.set_read_timeout(None)?;
-    Ok((conn, reply.contains("\"raw_hid\":true")))
+    Ok((conn, reply))
 }
 
 /// Whether to advertise [`SS_FF_USBRIDGE_RAW_HID`]: a broker is there and builds raw HID
@@ -278,6 +283,9 @@ struct Link {
     /// waits on the socket.
     feedback: Option<Receiver<(u8, u8, Vec<u8>)>>,
     retry_at: Option<Instant>,
+    /// The broker said it types a keyboard (`"keyboard":true`); an older one
+    /// would drop key frames, so they stay with this host's injector.
+    keyboard: bool,
 }
 
 impl Link {
@@ -287,6 +295,7 @@ impl Link {
             conn: None,
             feedback: None,
             retry_at: None,
+            keyboard: false,
         }
     }
 
@@ -295,8 +304,9 @@ impl Link {
             if self.retry_at.is_some_and(|at| Instant::now() < at) {
                 return None;
             }
-            match self.broker.map(open) {
-                Some(Ok((conn, _))) => {
+            match self.broker.map(open_reply) {
+                Some(Ok((conn, reply))) => {
+                    self.keyboard = reply.contains("\"keyboard\":true");
                     self.feedback = conn.try_clone().ok().map(spawn_feedback_reader);
                     self.conn = Some(conn);
                     self.retry_at = None;
@@ -380,6 +390,9 @@ impl Keyboard {
         let Some(link) = self.link.as_mut() else {
             return events;
         };
+        if link.connect().is_none() || !link.keyboard {
+            return events;
+        }
         let mut rest = Vec::new();
         let mut text = String::new();
         let mut text_events = Vec::new();

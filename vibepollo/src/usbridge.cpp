@@ -198,8 +198,11 @@ namespace usbridge {
      * Opens a `hid_stream`. The reply says whether the broker builds raw HID devices; which of
      * them need a license (a Wacom tablet) is decided on its side, per device.
      */
-    sock_t open_stream(bool &builds_raw_hid, std::string &error) {
+    sock_t open_stream(bool &builds_raw_hid, std::string &error, bool *types_keyboard = nullptr) {
       builds_raw_hid = false;
+      if (types_keyboard) {
+        *types_keyboard = false;
+      }
       sockaddr_in addr {};
       if (!broker_addr(addr)) {
         error = "no broker address";
@@ -249,6 +252,10 @@ namespace usbridge {
         return NO_SOCK;
       }
       builds_raw_hid = reply.find("\"raw_hid\":true") != std::string::npos;
+      // An older broker drops keyboard frames: the keyboard stays here then.
+      if (types_keyboard) {
+        *types_keyboard = reply.find("\"keyboard\":true") != std::string::npos;
+      }
       // The rumble reader blocks in recv; a send still waits for room first (send_all).
       set_blocking(s, true);
       return s;
@@ -326,6 +333,7 @@ namespace usbridge {
     std::thread reader;  ///< Feedback the broker sends back, read so that sending never waits on it.
     std::chrono::steady_clock::time_point retry_at {};
     std::uint16_t live = 0;  ///< Controllers the broker holds a pad for.
+    bool types_keyboard = false;  ///< The broker said `"keyboard":true` (types key frames).
     /// Each controller's arrival, sent again on a new connection (the broker forgot it).
     std::array<std::vector<std::uint8_t>, MAX_PADS> arrivals;
 
@@ -447,7 +455,7 @@ namespace usbridge {
         }
         bool builds = false;
         std::string error;
-        sock = open_stream(builds, error);
+        sock = open_stream(builds, error, &types_keyboard);
         if (sock == NO_SOCK) {
           USBRIDGE_LOG(warning) << "usbridge: "sv << error << " -- the device does not reach this machine"sv;
           retry_at = now + RETRY_INTERVAL;
@@ -623,6 +631,13 @@ namespace usbridge {
 
   bool session_t::send_keyboard(std::uint8_t kind, const std::uint8_t *data, std::uint16_t size) {
     std::lock_guard lg {impl->mutex};
+    // Connect first (an empty write): only a broker that types the keyboard gets key frames.
+    if (impl->sock == NO_SOCK && !impl->send_locked(nullptr, 0)) {
+      return false;
+    }
+    if (!impl->types_keyboard) {
+      return false;
+    }
     return impl->send_frame_locked(kind, 0, data, size);
   }
 
