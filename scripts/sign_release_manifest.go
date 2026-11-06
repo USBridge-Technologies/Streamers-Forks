@@ -69,6 +69,7 @@ var knownAssets = []string{
 	"punktfunk-host-Linux-x86_64.tar.gz",
 	"punktfunk-host-Windows-x64.zip",
 	"Vibepollo-Windows-x86_64-portable.zip",
+	"Vibepollo-Linux-x86_64.tar.gz",
 }
 
 func main() {
