@@ -1032,6 +1032,20 @@ namespace pipewire {
       return std::make_unique<platf::avcodec_encode_device_t>();
     }
 
+    // The native Linux NVENC encoder (the `nvenc` backend) takes the same
+    // GL/DMA-BUF frames as the CUDA avcodec path above. Without this the
+    // KWin/portal capture had no native device at all and every stream
+    // ended after "native device creation failed 3 times".
+    std::unique_ptr<platf::nvenc_encode_device_t> make_nvenc_encode_device(platf::pix_fmt_e pix_fmt) override {
+#ifdef SUNSHINE_BUILD_CUDA
+      if (mem_type == platf::mem_type_e::cuda && display_is_nvidia && n_dmabuf_infos > 0) {
+        return cuda::make_nvenc_gl_encode_device(width, height, 0, 0, pix_fmt);
+      }
+      BOOST_LOG(warning) << "[pipewire] native NVENC needs NVIDIA DMA-BUF frames; use encoder = nvenc_legacy on a hybrid system"sv;
+#endif
+      return nullptr;
+    }
+
     int dummy_img(platf::img_t *img) override {
       if (!img) {
         return -1;
