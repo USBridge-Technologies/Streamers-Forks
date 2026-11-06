@@ -50,7 +50,8 @@ jobs:
     defaults:
       run:
         working-directory: sunshine
-    runs-on: macos-14
+    # macos-14 was retired: GitHub refuses it ("macos-14-arm64-us-default is not supported").
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -87,7 +88,13 @@ jobs:
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Select Xcode 16.2
-        run: sudo xcode-select --switch /Applications/Xcode_16.2.app
+        # The image's default Xcode when this one is not on it.
+        run: |
+          if [ -d /Applications/Xcode_16.2.app ]; then
+            sudo xcode-select --switch /Applications/Xcode_16.2.app
+          else
+            echo "Xcode 16.2 not on this image, keeping $(xcode-select -p)"
+          fi
 
       - name: Install dependencies
         run: |

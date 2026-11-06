@@ -14,7 +14,8 @@ on:
 
 jobs:
   test:
-    runs-on: macos-14
+    # macos-14 was retired: GitHub refuses it ("macos-14-arm64-us-default is not supported").
+    runs-on: macos-15
     steps:
       - name: Import macOS signing certificate into a temporary keychain
         env:
