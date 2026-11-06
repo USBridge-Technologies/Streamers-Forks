@@ -523,6 +523,8 @@ struct ControlPeer {
     /// Raw HID devices of a USBridge client, built by the agent's USB broker. Clients send
     /// them only after seeing `SS_FF_USBRIDGE_RAW_HID` (rtsp.rs).
     raw_hid: super::usbridge::RawHid,
+    /// The keyboard on the USB broker under the USBridge agent: keys and text typed there.
+    keyboard: super::usbridge::Keyboard,
     /// SS_PEN/SS_TOUCH → tablet / wire touch. Clients send these only after seeing
     /// `SS_FF_PEN_TOUCH_EVENTS` (rtsp.rs).
     pointer: super::pen::GsPointer,
@@ -550,6 +552,7 @@ impl ControlPeer {
             hdr_signalled: None,
             pads: SessionPads::new(),
             raw_hid: super::usbridge::RawHid::new(),
+            keyboard: super::usbridge::Keyboard::new(),
             pointer: super::pen::GsPointer::new(),
             held: Default::default(),
             repeat: super::input::KeyRepeat::for_this_host(),
@@ -566,7 +569,7 @@ impl ControlPeer {
     /// last sent, since tearing a live pad is churn.
     fn withdraw(&mut self, lost: u32, inj_tx: &Sender<InputEvent>) {
         let keys = lost & GRANT_KEYBOARD != 0;
-        for ev in self.held.release_classes(keys, lost & GRANT_POINTER != 0) {
+        for ev in self.keyboard.forward(self.held.release_classes(keys, lost & GRANT_POINTER != 0)) {
             let _ = inj_tx.send(ev);
         }
         if keys {
@@ -594,7 +597,9 @@ impl ControlPeer {
     fn pump_repeat(&mut self, inj_tx: &Sender<InputEvent>, grants: u32) {
         if let Some(ev) = self.repeat.due(std::time::Instant::now()) {
             if self.drops.permitted(grants, classify(ev.kind)) {
-                let _ = inj_tx.send(ev);
+                for ev in self.keyboard.forward(vec![ev]) {
+                    let _ = inj_tx.send(ev);
+                }
             }
         }
     }
@@ -618,9 +623,11 @@ impl ControlPeer {
         self.raw_hid = super::usbridge::RawHid::new();
         self.pointer = super::pen::GsPointer::new();
         self.repeat = super::input::KeyRepeat::for_this_host();
-        for ev in self.held.release() {
+        for ev in self.keyboard.forward(self.held.release()) {
             let _ = inj_tx.send(ev);
         }
+        // A new connection: the broker releases whatever the old one still held.
+        self.keyboard = super::usbridge::Keyboard::new();
         if let Some(totals) =
             std::mem::replace(&mut self.drops, GrantDrops::new(Plane::Gamestream)).summary()
         {
@@ -805,13 +812,17 @@ impl ControlPeer {
         crate::sleep_inhibit::note_input();
         // One mask test, then the injector thread. A closed channel means the injector
         // died at startup; input is lossy, so drop silently.
+        let mut permitted = Vec::with_capacity(events.len());
         for ev in events {
             if self.drops.permitted(grants, classify(ev.kind)) {
                 state.counters.input_events.fetch_add(1, Ordering::Relaxed);
                 self.held.note(&ev);
                 self.repeat.note(&ev, std::time::Instant::now());
-                let _ = inj_tx.send(ev);
+                permitted.push(ev);
             }
+        }
+        for ev in self.keyboard.forward(permitted) {
+            let _ = inj_tx.send(ev);
         }
     }
 }

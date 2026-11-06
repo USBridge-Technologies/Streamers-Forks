@@ -51,6 +51,15 @@ them on USB/IP ports:
   has no other way to build them there, see below; elsewhere
   `USBRIDGE_PAD_BRIDGE=1` turns this on).
 
+- the keyboard: every key event and every UTF-8 text packet, typed by the
+  broker the way RustShine types them (`bin/usb-broker/src/keyboard.rs`). On
+  Linux that is the KDE layout switching instead of the IBus Ctrl+Shift+U hex
+  most apps print as digits; on Windows a copy of the broker types from SYSTEM
+  in the console session, so the logon screen and UAC prompts take it. Keys
+  and text share one connection, so they stay in order.
+  `USBRIDGE_KEYBOARD_BRIDGE=0` turns it off; while the broker can't be
+  reached the host's own injector types.
+
 Plain USB/IP passthrough of a device needs nothing from the host: the broker
 does it alone. Without the variable both hosts behave as upstream. The agent
 tells a build that has the change from a stock one by asking it

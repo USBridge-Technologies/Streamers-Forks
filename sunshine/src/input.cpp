@@ -1151,6 +1151,11 @@ namespace input {
       return;
     }
 #endif
+    // usbridge: under the USBridge agent the keyboard is the USB broker's, typed the same way
+    // for every streamer; this host's injector only while the broker can't be reached.
+    if (usbridge::keyboard_key(key_code, !release)) {
+      return;
+    }
     platf::keyboard_update(platf_input, key_code, release, flags, extended);
   }
 
@@ -1344,6 +1349,10 @@ namespace input {
     }
 
     int size = util::endian::big(packet->header.size) - sizeof(packet->header.magic);
+    // usbridge: the broker types text as RustShine does (see emit_keyboard_update).
+    if (size > 0 && usbridge::keyboard_text(packet->text, static_cast<std::size_t>(size))) {
+      return;
+    }
     platf::unicode(platf_input, packet->text, size);
   }
 

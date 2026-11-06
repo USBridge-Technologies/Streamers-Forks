@@ -19,6 +19,13 @@
  *   What a game sends back to a pad comes from the broker as feedback (`feedback_t`); the pad's
  *   sound comes as ready control packets to encrypt and send unreliably on their ENet channel.
  *
+ * - **Keyboard**: every key event and every UTF-8 text packet (`keyboard_key`, `keyboard_text`)
+ *   goes to the broker, which types it the way RustShine does (`enet_input::keyboard_sink`; on
+ *   Linux the KDE layout switching instead of the IBus Ctrl+Shift+U hex most apps print as
+ *   digits; on Windows from SYSTEM in the console session, so the logon screen and UAC prompts
+ *   take it). One connection for both keeps keys and text in order. `USBRIDGE_KEYBOARD_BRIDGE=0`
+ *   turns it off; while the broker can't be reached the platform injector types instead.
+ *
  * Without the variable nothing here runs and nothing is advertised.
  */
 #pragma once
@@ -57,6 +64,25 @@ namespace usbridge {
    * runs every few milliseconds, so the packets go out as they come.
    */
   bool sound_active();
+
+  /**
+   * @brief Whether this host's keyboard is the broker's.
+   */
+  bool keyboard_via_broker();
+
+  /**
+   * @brief A key event for the broker's keyboard.
+   * @param vk Windows virtual-key code, as the platform injector gets it.
+   * @param pressed Down or up.
+   * @return False when it did not reach the broker: the caller types it itself.
+   */
+  bool keyboard_key(std::uint16_t vk, bool pressed);
+
+  /**
+   * @brief UTF-8 text for the broker's keyboard (a Moonlight `UTF8_TEXT` packet).
+   * @return False when it did not reach the broker: the caller types it itself.
+   */
+  bool keyboard_text(const char *utf8, std::size_t size);
 
   /**
    * @brief Length of the frame the broker takes from a raw HID packet body.
@@ -118,6 +144,9 @@ namespace usbridge {
 
     /// Drop the connection: the broker unplugs everything it carried. The next frame starts over.
     void close();
+
+    /// A keyboard frame (`keyboard_key`, `keyboard_text`). False when it did not go out.
+    bool send_keyboard(std::uint8_t kind, const std::uint8_t *data, std::uint16_t size);
 
   private:
     struct impl_t;

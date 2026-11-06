@@ -1033,10 +1033,22 @@ namespace input {
     }
   }
 
+  /**
+   * @brief One key event to the host. usbridge: under the USBridge agent the keyboard is the USB
+   * broker's, typed the same way for every streamer; this host's injector only while the broker
+   * can't be reached.
+   */
+  void emit_key(uint16_t key_code, bool release, uint8_t flags) {
+    if (usbridge::keyboard_key(key_code, !release)) {
+      return;
+    }
+    platf::keyboard_update(platf_input, key_code, release, flags);
+  }
+
   void release_key(const held_key_t &key) {
     auto it = host_keys.find(host_keycode(key.host_key));
     if (it != host_keys.end() && --it->second.owners == 0) {
-      platf::keyboard_update(platf_input, it->second.key, true, it->second.flags);
+      emit_key(it->second.key, true, it->second.flags);
       host_keys.erase(it);
     }
   }
@@ -1049,21 +1061,21 @@ namespace input {
       if ((key.modifiers & mask) && !(shortcut_flags & shortcut) &&
           !host_keys.contains(left) && !host_keys.contains(right)) {
         synthetic |= mask;
-        platf::keyboard_update(platf_input, generic, false, key.flags);
+        emit_key(generic, false, key.flags);
       }
     };
     inject(MODIFIER_SHIFT, input_t::SHIFT, VKEY_SHIFT, VKEY_LSHIFT, VKEY_RSHIFT);
     inject(MODIFIER_CTRL, input_t::CTRL, VKEY_CONTROL, VKEY_LCONTROL, VKEY_RCONTROL);
     inject(MODIFIER_ALT, input_t::ALT, VKEY_MENU, VKEY_LMENU, VKEY_RMENU);
-    platf::keyboard_update(platf_input, key.host_key, false, key.flags);
+    emit_key(key.host_key, false, key.flags);
     if (synthetic & MODIFIER_SHIFT) {
-      platf::keyboard_update(platf_input, VKEY_SHIFT, true, key.flags);
+      emit_key(VKEY_SHIFT, true, key.flags);
     }
     if (synthetic & MODIFIER_CTRL) {
-      platf::keyboard_update(platf_input, VKEY_CONTROL, true, key.flags);
+      emit_key(VKEY_CONTROL, true, key.flags);
     }
     if (synthetic & MODIFIER_ALT) {
-      platf::keyboard_update(platf_input, VKEY_MENU, true, key.flags);
+      emit_key(VKEY_MENU, true, key.flags);
     }
   }
 
@@ -1248,6 +1260,10 @@ namespace input {
     }
 
     int size = util::endian::big(packet->header.size) - sizeof(packet->header.magic);
+    // usbridge: the broker types text as RustShine does (see emit_key).
+    if (size > 0 && usbridge::keyboard_text(packet->text, static_cast<std::size_t>(size))) {
+      return;
+    }
     platf::unicode(platf_input, packet->text, size);
   }
 

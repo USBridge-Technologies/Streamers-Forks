@@ -17,9 +17,15 @@
 //!   ([`Pads::pump`]). The default on Windows, where the agent installs usbip-win2 and not this
 //!   host's pad drivers; `USBRIDGE_PAD_BRIDGE=1|0` overrides either way.
 //!
+//! - **Keyboard** ([`Keyboard`]): key events and text go to the broker, which types them the way
+//!   RustShine does (rust-shine `bin/usb-broker/src/keyboard.rs`; on Linux the KDE layout
+//!   switching, on Windows from SYSTEM in the console session, so the logon screen and UAC
+//!   prompts take it). `USBRIDGE_KEYBOARD_BRIDGE=0` turns it off; while the broker can't be
+//!   reached this host's injector types instead.
+//!
 //! Without the variable nothing here runs and nothing is advertised.
 
-use punktfunk_core::input::{GamepadEvent, GamepadFrame};
+use punktfunk_core::input::{GamepadEvent, GamepadFrame, InputEvent, InputKind};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::collections::HashMap;
@@ -28,6 +34,10 @@ use std::time::{Duration, Instant};
 
 const BROKER_ENV: &str = "USBRIDGE_USB_BROKER_CONTROL";
 const PAD_ENV: &str = "USBRIDGE_PAD_BRIDGE";
+const KEYBOARD_ENV: &str = "USBRIDGE_KEYBOARD_BRIDGE";
+/// `vk modifiers pressed` and UTF-8 text for the broker's keyboard.
+const KIND_KEY: u8 = 0x20;
+const KIND_TEXT: u8 = 0x21;
 
 /// `LI_FF_USBRIDGE_RAW_HID`: this host takes `LiSendRawHidEvent`. Stock clients ignore it.
 pub const SS_FF_USBRIDGE_RAW_HID: u32 = 0x10000;
@@ -343,6 +353,71 @@ fn spawn_feedback_reader(mut conn: TcpStream) -> Receiver<(u8, u8, Vec<u8>)> {
             }
         });
     rx
+}
+
+/// Whether this host's keyboard is the broker's.
+pub fn keyboard_via_broker() -> bool {
+    broker_addr().is_some() && std::env::var(KEYBOARD_ENV).ok().as_deref().map(str::trim) != Some("0")
+}
+
+/// The session's keyboard on the broker. Closing it releases what it holds there.
+pub struct Keyboard {
+    link: Option<Link>,
+}
+
+impl Keyboard {
+    pub fn new() -> Keyboard {
+        Keyboard {
+            link: keyboard_via_broker().then(|| Link::to(broker_addr())),
+        }
+    }
+
+    /// Sends `events` to the broker, consecutive text as one string (the decoder splits it per
+    /// character; one string per character would switch the host layout back and forth on
+    /// every one). Returns what it did not take: everything but keys and text, and all of it
+    /// while the broker can't be reached.
+    pub fn forward(&mut self, events: Vec<InputEvent>) -> Vec<InputEvent> {
+        let Some(link) = self.link.as_mut() else {
+            return events;
+        };
+        let mut rest = Vec::new();
+        let mut text = String::new();
+        let mut text_events = Vec::new();
+        let flush = |link: &mut Link, text: &mut String, text_events: &mut Vec<InputEvent>, rest: &mut Vec<InputEvent>| {
+            if text.is_empty() {
+                return;
+            }
+            if !link.send(&frame(KIND_TEXT, 0, text.as_bytes())) {
+                rest.append(text_events);
+            }
+            text.clear();
+            text_events.clear();
+        };
+        for ev in events {
+            match ev.kind {
+                InputKind::TextInput => {
+                    if let Some(c) = char::from_u32(ev.code) {
+                        text.push(c);
+                        text_events.push(ev);
+                    }
+                }
+                InputKind::KeyDown | InputKind::KeyUp => {
+                    flush(link, &mut text, &mut text_events, &mut rest);
+                    let pressed = matches!(ev.kind, InputKind::KeyDown) as u8;
+                    let key = [ev.code as u8, (ev.flags & 0xFF) as u8, pressed];
+                    if ev.code > 0xFF || !link.send(&frame(KIND_KEY, 0, &key)) {
+                        rest.push(ev);
+                    }
+                }
+                _ => {
+                    flush(link, &mut text, &mut text_events, &mut rest);
+                    rest.push(ev);
+                }
+            }
+        }
+        flush(link, &mut text, &mut text_events, &mut rest);
+        rest
+    }
 }
 
 /// The session's raw HID devices.

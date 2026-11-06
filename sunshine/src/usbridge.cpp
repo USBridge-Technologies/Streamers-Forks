@@ -60,6 +60,11 @@ namespace usbridge {
     constexpr std::uint8_t KIND_PAD_MOTION_REQUEST = 0x18;
     constexpr std::uint8_t KIND_PAD_TRIGGERS = 0x19;
     constexpr std::uint8_t KIND_PAD_PACKET = 0x1A;
+    /// `vk modifiers pressed` and UTF-8 text for the broker's keyboard (`keyboard.rs`).
+    constexpr std::uint8_t KIND_KEY = 0x20;
+    constexpr std::uint8_t KIND_TEXT = 0x21;
+    /// `USBRIDGE_KEYBOARD_BRIDGE=0` keeps the keyboard on this host's injector.
+    constexpr const char *KEYBOARD_ENV = "USBRIDGE_KEYBOARD_BRIDGE";
 
     void put16(std::uint8_t *at, std::uint16_t v) {
       at[0] = static_cast<std::uint8_t>(v & 0xFF);
@@ -280,6 +285,18 @@ namespace usbridge {
 #else
       return false;
 #endif
+    }();
+    return enabled;
+  }
+
+  bool keyboard_via_broker() {
+    static const bool enabled = [] {
+      sockaddr_in addr {};
+      if (!broker_addr(addr)) {
+        return false;
+      }
+      const char *env = std::getenv(KEYBOARD_ENV);
+      return !(env && env[0] == '0');
     }();
     return enabled;
   }
@@ -575,6 +592,33 @@ namespace usbridge {
       impl->live &= static_cast<std::uint16_t>(~bit);
       impl->send_frame_locked(KIND_PAD_GONE, slot, nullptr, 0);
     }
+  }
+
+  namespace {
+    /// The keyboard's own connection: keys and text in the order they came.
+    session_t &keyboard_session() {
+      static session_t session;
+      return session;
+    }
+  }  // namespace
+
+  bool keyboard_key(std::uint16_t vk, bool pressed) {
+    if (!keyboard_via_broker() || vk > 0xFF) {
+      return false;
+    }
+    return keyboard_session().send_keyboard(KIND_KEY, std::array<std::uint8_t, 3> {static_cast<std::uint8_t>(vk), 0, static_cast<std::uint8_t>(pressed ? 1 : 0)}.data(), 3);
+  }
+
+  bool keyboard_text(const char *utf8, std::size_t size) {
+    if (!keyboard_via_broker() || size == 0 || size > 0xFFFF) {
+      return false;
+    }
+    return keyboard_session().send_keyboard(KIND_TEXT, reinterpret_cast<const std::uint8_t *>(utf8), static_cast<std::uint16_t>(size));
+  }
+
+  bool session_t::send_keyboard(std::uint8_t kind, const std::uint8_t *data, std::uint16_t size) {
+    std::lock_guard lg {impl->mutex};
+    return impl->send_frame_locked(kind, 0, data, size);
   }
 
   void session_t::close() {
