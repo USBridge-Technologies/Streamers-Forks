@@ -9,9 +9,12 @@ use super::{AppCtx, AsyncSetState, Screen, Svc, Target};
 use crate::trust::{self, KnownHosts};
 use pf_client_core::orchestrate::{
     self, trust_route, wake_parked_line, CancelHandle, ConnectAttempt, ExitRoute, HostTarget,
-    TrustRoute, WakeOutcome, WakeWait, FINGERPRINT_CHANGED, WAKE_PARKED_HINT,
+    TrustRoute, WakeOutcome, WakeWait,
 };
+use pf_client_core::unlock::{self, Pending};
 use pf_fluent::Palette;
+use pf_l10n::{client, common, desktop};
+use punktfunk_core::quic::v2::msg::ProfileUnlock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,8 +54,8 @@ fn send_wake(ctx: &Arc<AppCtx>, target: &Target) -> bool {
 }
 
 /// Opens the surface [`trust_route`] picks: the stored pin dials, a changed fingerprint or an
-/// unpaired host gets [`Screen::Pair`], and a new `pair=optional` host is pinned on its first
-/// connect (this shell has no TOFU confirmation screen). `launch` rides the connect.
+/// unpaired host gets [`Screen::Pair`], and a new `pair=optional` host gets [`Screen::Trust`],
+/// which shows its fingerprint before anything is pinned. `launch` rides the connect.
 fn initiate_opts(
     ctx: &Arc<AppCtx>,
     target: Target,
@@ -74,9 +77,16 @@ fn initiate_opts(
         target.pair_optional,
     ) {
         TrustRoute::Pinned(fp_hex) => trust::parse_hex32(&fp_hex),
-        TrustRoute::OfferTofu(_) => None,
+        TrustRoute::OfferTofu(_) => {
+            // The page reads the target back, so the launch has to be on it.
+            if launch.is_some() {
+                ctx.shared.target.lock().unwrap().launch = launch;
+            }
+            set_screen.call(Screen::Trust);
+            return;
+        }
         TrustRoute::FingerprintChanged => {
-            set_status.call(FINGERPRINT_CHANGED.to_string());
+            set_status.call(client::dial_fingerprint_changed().to_string());
             set_screen.call(Screen::Pair);
             return;
         }
@@ -128,8 +138,12 @@ fn ask_then_connect(
         pin,
         set_screen,
         set_status,
-        move |profile| {
-            let opts = ConnectOpts { profile, ..opts };
+        move |profile, unlock| {
+            let opts = ConnectOpts {
+                profile,
+                unlock,
+                ..opts
+            };
             connect_with(&ctx2, &t, pin, &ss, &st, opts)
         },
     );
@@ -161,10 +175,11 @@ fn redial_profile(
                 st.clone(),
                 row.id.clone(),
             );
-            profiles::seat_then(&ctx, target, pin, &ss, &st, Some(row), move || {
+            profiles::seat_then(&ctx, target, pin, &ss, &st, Some(row), move |unlock| {
                 let opts = ConnectOpts {
                     profile: Some(id),
                     retried: true,
+                    unlock,
                     ..ConnectOpts::default()
                 };
                 connect_with(&ctx2, &t, pin, &ss2, &st2, opts)
@@ -213,6 +228,8 @@ pub(crate) struct ConnectOpts {
     profile: Option<String>,
     /// This dial is the one retry after the host refused the profile as unknown.
     retried: bool,
+    /// The profile's unlock, for the child's stdin only. It wipes on drop and prints lengths.
+    unlock: Option<ProfileUnlock>,
 }
 
 /// A fresh pairing's first connect: it asks who plays, as any connect to a paired host does.
@@ -248,7 +265,8 @@ fn connect_with(
 /// Spawn-mode connect: run the stream in the punktfunk-session binary and turn its events
 /// into screens. The child never connects unpinned: a stored or ceremony pin, else the
 /// advertised fingerprint (TOFU, saved once ready proves the host holds it); no fingerprint
-/// routes to the PIN ceremony. One [`ConnectAttempt`] reads its ready and its exit.
+/// routes to the PIN ceremony. One [`ConnectAttempt`] reads its ready and its exit;
+/// `opts.unlock` rides the child's stdin, and a locked profile's refusal reopens the prompt.
 fn connect_spawn(
     ctx: &Arc<AppCtx>,
     target: &Target,
@@ -298,13 +316,21 @@ fn connect_spawn(
     if opts.wake_on_fail {
         attempt.arm_wake(&host);
     }
-    attempt.dial(tofu, opts.profile.as_deref(), opts.retried);
+    attempt.dial(
+        tofu,
+        opts.profile.as_deref(),
+        opts.retried,
+        opts.unlock.is_some(),
+    );
+    // A dial with an unlock waits for its desktop on this screen, with a progress line.
+    let mut starting = false;
     let spawned = crate::spawn::spawn_session(
         host.clone(),
         orchestrate::DEFAULT_CONNECT_TIMEOUT_SECS,
         launch_arg.as_deref(),
         preset_arg.as_deref(),
         profile_arg.as_deref(),
+        opts.unlock,
         child,
         move |event| {
             use crate::spawn::SpawnEvent;
@@ -316,14 +342,24 @@ fn connect_spawn(
             match event {
                 // A plain connect the host parked for its operator: the same waiting screen
                 // request-access shows, whose Cancel kills the child.
-                SpawnEvent::AwaitingApproval => ss.call(Screen::RequestAccess),
+                SpawnEvent::AwaitingApproval => match attempt.on_pending() {
+                    Pending::Approval => ss.call(Screen::RequestAccess),
+                    Pending::Starting if !starting => {
+                        starting = true;
+                        st.call(unlock::starting_line(&host.name));
+                    }
+                    Pending::Starting => {}
+                },
                 SpawnEvent::Ready => {
+                    if std::mem::take(&mut starting) {
+                        st.call(String::new());
+                    }
                     // A pin trusted on first use is saved unpaired. A failed save waits on the
                     // status line, which a clean exit leaves for the host list.
                     if attempt.on_ready()
                         && let Err(e) = orchestrate::persist_on_ready(&target.host, &fp_hex, false)
                     {
-                        st.call(format!("Connected, but couldn't save — {e:#}"));
+                        st.call(desktop::desktop_trust_saved_failed(format!("{e:#}")));
                     }
                     // The child presented its first frame — its window is up, so the
                     // shell yields: one visible Punktfunk window at a time. Every exit
@@ -333,21 +369,24 @@ fn connect_spawn(
                 }
                 SpawnEvent::Stats(s) => *shared.stats.lock().unwrap() = Some(*s),
                 SpawnEvent::Exited(outcome) => {
+                    if std::mem::take(&mut starting) {
+                        st.call(String::new());
+                    }
                     let forget_then = |msg: String| {
                         let (host, ss, st) = (host.clone(), ss.clone(), st.clone());
                         move || {
                             profiles::save_pick(&host, None);
                             st.call(msg);
-                            ss.call(Screen::Hosts);
+                            ss.call(Screen::Home);
                         }
                     };
                     let log = crate::spawn::log_hint();
-                    match attempt.on_exit(&host, &outcome, &log) {
+                    match attempt.on_exit(&host, &outcome, Some(&log)) {
                         // The user closed the stream window, or Disconnect killed it.
-                        ExitRoute::Silent => ss.call(Screen::Hosts),
+                        ExitRoute::Silent => ss.call(Screen::Home),
                         ExitRoute::Banner(msg) => {
                             st.call(msg);
-                            ss.call(Screen::Hosts);
+                            ss.call(Screen::Home);
                         }
                         ExitRoute::Repair(msg) => {
                             st.call(msg);
@@ -363,6 +402,30 @@ fn connect_spawn(
                             redial_profile(&ctx2, target, pin, id, &ss, &st, give_up);
                         }
                         ExitRoute::ForgetProfileThen(msg) => forget_then(msg)(),
+                        ExitRoute::Unlock { id, error, sent } => {
+                            let target = Target {
+                                launch: retry_launch.clone(),
+                                ..target.clone()
+                            };
+                            let (ctx, t, ss2, st2, id2) = (
+                                ctx2.clone(),
+                                target.clone(),
+                                ss.clone(),
+                                st.clone(),
+                                id.clone(),
+                            );
+                            let go = move |unlock| {
+                                let opts = ConnectOpts {
+                                    profile: Some(id2),
+                                    unlock,
+                                    ..ConnectOpts::default()
+                                };
+                                connect_with(&ctx, &t, pin, &ss2, &st2, opts)
+                            };
+                            super::unlock::after_refusal(
+                                &ctx2, target, pin, id, error, sent, &ss, &st, go,
+                            );
+                        }
                         ExitRoute::Wake => wake_and_connect(&ctx2, target.clone(), &ss, &st),
                     }
                 }
@@ -371,7 +434,7 @@ fn connect_spawn(
     );
     if let Err(e) = spawned {
         set_status.call(e);
-        set_screen.call(Screen::Hosts);
+        set_screen.call(Screen::Home);
     }
 }
 
@@ -411,16 +474,16 @@ pub(crate) fn open_console(
             SpawnEvent::Exited(outcome) => {
                 crate::shell_window::restore();
                 // A quit from the library or Disconnect returns silently.
-                if let Some(msg) = outcome.console_banner(&crate::spawn::log_hint()) {
+                if let Some(msg) = outcome.console_banner(Some(&crate::spawn::log_hint())) {
                     st.call(msg);
                 }
-                ss.call(Screen::Hosts);
+                ss.call(Screen::Home);
             }
         }
     });
     if let Err(e) = spawned {
         set_status.call(e);
-        set_screen.call(Screen::Hosts);
+        set_screen.call(Screen::Home);
     }
 }
 
@@ -429,9 +492,15 @@ pub(crate) fn open_console(
 /// Approval saves the host as paired, so later connects are silent. It never starts a stream.
 pub(crate) fn request_access(props: &Svc, target: &Target) {
     let ctx = &props.ctx;
-    // Pin the advertised certificate for a discovered host (defence against a host impostor while
-    // we wait); a manually-typed host has no advertised fingerprint, so trust-on-first-use.
-    let pin = target.host.fp_hex.as_deref().and_then(trust::parse_hex32);
+    // The request names the advertised certificate, so an impostor cannot answer while we wait.
+    // A typed host has none and pairs by PIN; the pair page offers a request only with one.
+    let Some(pin) = target.host.fp_hex.as_deref().and_then(trust::parse_hex32) else {
+        props
+            .set_status
+            .call(desktop::desktop_pair_no_advert().to_string());
+        props.set_screen.call(Screen::Pair);
+        return;
+    };
     // A fresh cancel flag per request, where the waiting screen's Cancel button reads it.
     let cancel = Arc::new(AtomicBool::new(false));
     *ctx.shared.cancel.lock().unwrap() = Some(cancel.clone());
@@ -461,7 +530,7 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
             Ok(fp) => fp,
             Err(e) => {
                 st.call(trust::access_error_message(&e));
-                ss.call(Screen::Hosts);
+                ss.call(Screen::Home);
                 return;
             }
         };
@@ -477,15 +546,15 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
         if target.from_link {
             connect(&ctx, &target, Some(fp), &ss, &st);
             if let Err(e) = paired.saved {
-                st.call(format!("Paired, but couldn't save — {e:#}"));
+                st.call(client::pair_saved_failed(format!("{e:#}")));
             }
             return;
         }
         svc.report(match paired.saved {
-            Ok(()) => Ok(format!("Paired with {}", target.host.name)),
-            Err(e) => Err(format!("Paired, but couldn't save — {e:#}")),
+            Ok(()) => Ok(client::pair_paired(&target.host.name)),
+            Err(e) => Err(client::pair_saved_failed(format!("{e:#}"))),
         });
-        ss.call(Screen::Hosts);
+        ss.call(Screen::Home);
     });
 }
 
@@ -563,16 +632,74 @@ fn wake_and_connect(
 pub(crate) fn connecting_page(pal: &Palette, ctx: &Arc<AppCtx>, status: &str) -> View {
     let target_name = ctx.shared.target.lock().unwrap().host.name.clone();
     let headline = if target_name.is_empty() {
-        "Connecting\u{2026}".to_string()
+        client::dial_connecting().to_string()
     } else {
-        format!("Connecting to {target_name}\u{2026}")
+        client::dial_connecting_to(&target_name)
     };
     let detail = if status.is_empty() {
-        "Negotiating the session and creating the virtual display\u{2026}"
+        client::dial_connecting_detail()
     } else {
         status
     };
     busy_page(pal, &headline, detail, Vec::new())
+}
+
+/// First connect to a host that takes new devices: its advertised fingerprint, to compare with
+/// the one the host logs. Trust dials and pins it; the PIN ceremony is the other way in.
+pub(crate) fn trust_page(
+    pal: &Palette,
+    ctx: &Arc<AppCtx>,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) -> View {
+    let target = ctx.shared.target.lock().unwrap().clone();
+    let address = format!("{}:{}", target.host.addr, target.host.port);
+    let fingerprint = text(trust::grouped(
+        target.host.fp_hex.as_deref().unwrap_or_default(),
+    ))
+    .font_size(16.0)
+    .font_weight(FontWeight::SEMI_BOLD)
+    .horizontal_alignment(HorizontalAlignment::Center);
+    let trust_btn = {
+        let (ctx, ss, st, target) = (
+            ctx.clone(),
+            set_screen.clone(),
+            set_status.clone(),
+            target.clone(),
+        );
+        icon_button("check", client::trust_accept())
+            .style(ButtonStyle::Accent)
+            .on_click(move || {
+                let opts = ConnectOpts {
+                    launch: target.launch.clone(),
+                    ..ConnectOpts::default()
+                };
+                // `None`: the dial pins the advertised fingerprint.
+                ask_then_connect(&ctx, target.clone(), None, &ss, &st, opts)
+            })
+    };
+    let pair_btn = {
+        let ss = set_screen.clone();
+        icon_button("arrow-right", client::pair_use_pin()).on_click(move || ss.call(Screen::Pair))
+    };
+    let cancel_btn = {
+        let ss = set_screen.clone();
+        icon_button("x", common::common_cancel()).on_click(move || ss.call(Screen::Home))
+    };
+    let actions = hstack((trust_btn, pair_btn, cancel_btn))
+        .spacing(8.0)
+        .horizontal_alignment(HorizontalAlignment::Center);
+    notice_page(
+        pal,
+        None,
+        client::trust_title(),
+        &format!(
+            "{}\n\n{}",
+            client::trust_first_connection(&address),
+            client::trust_explain()
+        ),
+        vec![fingerprint.into(), actions.into()],
+    )
 }
 
 /// The cancelable "waiting for approval" screen (request-access flow): a spinner + guidance while
@@ -585,13 +712,13 @@ pub(crate) fn request_access_page(
 ) -> View {
     let target_name = ctx.shared.target.lock().unwrap().host.name.clone();
     let headline = if target_name.is_empty() {
-        "Waiting for approval\u{2026}".to_string()
+        client::pair_waiting_for_approval().to_string()
     } else {
-        format!("Waiting for {target_name} to approve\u{2026}")
+        desktop::desktop_pair_waiting_for_host(&target_name)
     };
     let cancel_btn = {
         let (ctx, ss) = (ctx.clone(), set_screen.clone());
-        icon_button("x", "Cancel")
+        icon_button("x", common::common_cancel())
             .on_click(move || {
                 if let Some(c) = ctx.shared.cancel.lock().unwrap().as_ref() {
                     c.store(true, Ordering::SeqCst);
@@ -601,16 +728,23 @@ pub(crate) fn request_access_page(
                 if session.is_running() {
                     session.kill();
                 }
-                ss.call(Screen::Hosts);
+                ss.call(Screen::Home);
             })
             .horizontal_alignment(HorizontalAlignment::Center)
     };
+    // The host's console shows the same code beside this request.
+    let code = trust::device_code(&ctx.identity).map(|code| {
+        text(client::pair_device_code(&code))
+            .font_size(16.0)
+            .font_weight(FontWeight::SEMI_BOLD)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .into()
+    });
     busy_page(
         pal,
         &headline,
-        "Approve this device in the host's console or web UI \u{2014} it is paired once you \
-         approve it. No PIN needed.",
-        vec![cancel_btn.into()],
+        &client::dial_approve_no_pin(&target_name),
+        code.into_iter().chain([cancel_btn.into()]).collect(),
     )
 }
 
@@ -624,28 +758,27 @@ pub(crate) fn waking_page(
 ) -> View {
     let target_name = ctx.shared.target.lock().unwrap().host.name.clone();
     let headline = if target_name.is_empty() {
-        "Waking the host\u{2026}".to_string()
+        desktop::desktop_dial_waking_unnamed().to_string()
     } else {
-        format!("Waking {target_name}\u{2026}")
+        client::dial_waking(&target_name)
     };
     let cancel_btn = {
         let (ctx, ss) = (ctx.clone(), set_screen.clone());
-        icon_button("x", "Cancel")
+        icon_button("x", common::common_cancel())
             .on_click(move || {
                 // Return the UI immediately and trip the flag the poll loop is watching so it stops
                 // re-sending and exits without touching a screen a later action may already own.
                 if let Some(c) = ctx.shared.cancel.lock().unwrap().as_ref() {
                     c.store(true, Ordering::SeqCst);
                 }
-                ss.call(Screen::Hosts);
+                ss.call(Screen::Home);
             })
             .horizontal_alignment(HorizontalAlignment::Center)
     };
     busy_page(
         pal,
         &headline,
-        "Sent a wake signal and waiting for the host to come online \u{2014} this can take up to a \
-         minute for a sleeping or powered-off machine.",
+        &desktop::desktop_dial_wake_sent(&target_name),
         vec![cancel_btn.into()],
     )
 }
@@ -666,13 +799,13 @@ pub(crate) fn wake_parked_page(
             set_status.clone(),
             target.clone(),
         );
-        icon_button("rotate-cw", "Try again")
+        icon_button("rotate-cw", common::common_retry())
             .style(ButtonStyle::Accent)
             .on_click(move || wake_and_connect(&ctx, target.clone(), &ss, &st))
     };
     let cancel_btn = {
         let ss = set_screen.clone();
-        icon_button("x", "Cancel").on_click(move || ss.call(Screen::Hosts))
+        icon_button("x", common::common_cancel()).on_click(move || ss.call(Screen::Home))
     };
     let actions = hstack((retry_btn, cancel_btn))
         .spacing(8.0)
@@ -681,7 +814,7 @@ pub(crate) fn wake_parked_page(
         pal,
         None,
         &wake_parked_line(&target.host.name),
-        WAKE_PARKED_HINT,
+        client::dial_wake_parked_hint(),
         vec![actions.into()],
     )
 }

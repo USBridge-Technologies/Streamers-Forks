@@ -15,6 +15,7 @@ import { usePasswordFailure } from "@/components/password-confirm";
 import { ROW } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { deviceCode } from "@/lib/format";
 import { fmtAge } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
 import { ApproveDialog } from "./ApproveDialog";
@@ -98,8 +99,10 @@ export const WaitingRow: FC<{
 );
 
 /**
- * A device that knocked. A knock from the internet has no Approve: the host refuses one (409),
- * because its name proves nothing. Arming a PIN bound to its fingerprint is the way in.
+ * A device that knocked, with the page it came from. A knock from the internet, through the web
+ * client or from a page the host does not know has no Approve: the host refuses one (409), because
+ * its name proves nothing. Arming a PIN bound to its fingerprint is the way in. The badge names
+ * the first of those that applies.
  */
 export const PendingRow: FC<{
 	device: PendingDevice;
@@ -116,7 +119,11 @@ export const PendingRow: FC<{
 				{p.source === "wan" && (
 					<Badge variant="outline" className="shrink-0 gap-1">
 						<Globe className="size-3" />
-						{m.pairing_pending_from_internet()}
+						{p.relayed
+							? m.pairing_pending_through_web_client()
+							: p.unfamiliar_origin
+								? m.pairing_pending_from_new_page()
+								: m.pairing_pending_from_internet()}
 					</Badge>
 				)}
 			</>
@@ -126,7 +133,8 @@ export const PendingRow: FC<{
 			p.profile
 				? m.devices_will_play_as({ name: p.profile.display_name })
 				: null,
-			`${p.fingerprint.slice(0, 16)}…`,
+			p.origin,
+			deviceCode(p.fingerprint),
 		]
 			.filter(Boolean)
 			.join(" · ")}
@@ -135,7 +143,13 @@ export const PendingRow: FC<{
 				{p.source === "wan" ? (
 					<Button
 						size="sm"
-						title={m.pairing_pending_wan_hint()}
+						title={
+							p.relayed
+								? m.pairing_pending_relayed_hint()
+								: p.unfamiliar_origin
+									? m.pairing_pending_new_page_hint()
+									: m.pairing_pending_wan_hint()
+						}
 						disabled={busy}
 						onClick={() => onArmFor(p)}
 					>

@@ -5,6 +5,7 @@
 #if canImport(Metal) && canImport(QuartzCore)
 import AVFoundation
 import Foundation
+import IOSurface
 import Metal
 import PunktfunkShared
 import QuartzCore
@@ -15,22 +16,17 @@ private let presentLog = ClientLog(category: "present")
 
 /// The deadline link's frame-latency ASK and property READBACK, published for the HUD to render.
 ///
-/// ⚠ A readback is NOT a grant. `preferredFrameLatency` is a plain read-write float
+/// A readback is NOT a grant. `preferredFrameLatency` is a plain read-write float
 /// (CAMetalDisplayLink.h carries no doc contract), so reading it returns whatever we last
-/// stored unless the system actively clamps the setter — and the 2026-08-13 field run proved
-/// how misleading that is: it read 1.00 while the measured vend lead sat at 1.95 refresh
-/// periods. The number that tells the truth about scheduling is the vend lead (the HUD's
-/// `os present` floor), never this property. The line still earns its place twice over: a
-/// readback that DIFFERS from the ask is the one clamp signal the API can give, and the ask
-/// must be visible on screen because **on tvOS no log is reachable** — `log stream --device`
-/// is gone from modern macOS, `log collect --device-name` needs root and then fails "Device
-/// not configured" because an Apple TV has no USB to fall back to, and the libimobiledevice
-/// pairing is a different database from Xcode's. Console.app is a GUI.
+/// stored unless the system clamps the setter. The number that tells the truth about scheduling
+/// is the vend lead (the HUD's `os present` floor), never this property. A readback that DIFFERS
+/// from the ask is the one clamp signal the API gives, and the ask must be visible on screen
+/// because on tvOS no log is reachable.
 ///
-/// A process-global rather than a sixth parameter threaded through SessionModel → StreamView →
+/// A process-global rather than a parameter threaded through SessionModel → StreamView →
 /// controller → SessionPresenter → Stage2Pipeline → delegate: it is write-once-per-session
-/// diagnostics, and this file already keeps `presentDebug`/`presentLog` at file scope. Reset by
-/// `clear()` at session start so a stale session's answer can never be read as this one's.
+/// diagnostics. Reset by `clear()` at session start so a stale session's answer is never read
+/// as this one's.
 public final class PresentLinkInfo: @unchecked Sendable {
     public static let shared = PresentLinkInfo()
     private let lock = NSLock()
@@ -109,15 +105,13 @@ public struct PanelInfo: Equatable, Sendable {
 /// interval (`sourceIntervalNs`) and the hosting panel. SessionPresenter pushes the stream rate from the
 /// MAIN thread (session start + every layout/Reconfigure); the link's own thread drains and
 /// applies it, so the CAMetalDisplayLink is only ever touched from the thread that runs it. The
-/// floor is PINNED at the stream rate — no idle ramp-down: with a low floor the link idles toward
+/// range is pinned (`range(hz:)`), with no idle ramp-down: a link with a low floor idles toward
 /// it on a static scene (infinite GOP ⇒ no frames), and the first damage frame after idle would
-/// wait out a slow tick before it could present. Empty wakes at stream rate are near-free; the
-/// PANEL still idles via VRR because no presents happen. Sendable; lock-guarded.
+/// wait out a slow tick before it could present. Sendable; lock-guarded.
 final class FrameRateHint: @unchecked Sendable {
     private let lock = NSLock()
     private var pending: CAFrameRateRange?
     private var streamHz: Float = 0
-    private var boosted = false
     private var panelInfo = PanelInfo(minHz: 0, maxHz: 0)
     private var paceName = "starting"
     /// The hosting panel, staged from main on start and every layout (a window can move screens).
@@ -146,21 +140,7 @@ final class FrameRateHint: @unchecked Sendable {
         guard hz > 0 else { return }
         lock.lock()
         streamHz = hz
-        pending = Self.range(hz: hz, boosted: boosted)
-        lock.unlock()
-    }
-    /// Pen-proximity boost: pin `minimum = preferred` at the range's CEILING instead of the
-    /// stream rate. UIKit delivers touch/Pencil events at the PANEL's cadence, and the panel
-    /// follows this link's vote — so a 60 fps stream on a 120 Hz iPad halves pencil sampling
-    /// unless a boost lifts the panel while the Pencil is in range. Presents still pace at
-    /// stream rate (extra link updates just vend into the newest-wins stash), so the cost is
-    /// empty wakes, scoped to pen proximity.
-    func setBoost(_ on: Bool) {
-        lock.lock()
-        if boosted != on {
-            boosted = on
-            if streamHz > 0 { pending = Self.range(hz: streamHz, boosted: on) }
-        }
+        pending = Self.range(hz: hz)
         lock.unlock()
     }
     func drain() -> CAFrameRateRange? {
@@ -175,7 +155,7 @@ final class FrameRateHint: @unchecked Sendable {
     func current() -> CAFrameRateRange? {
         lock.lock()
         defer { lock.unlock() }
-        return streamHz > 0 ? Self.range(hz: streamHz, boosted: boosted) : nil
+        return streamHz > 0 ? Self.range(hz: streamHz) : nil
     }
     /// The nominal SOURCE interval in nanoseconds — the cadence clock's cushion ceiling. Read on
     /// every pacing, not just deadline: this box is where the negotiated stream rate already
@@ -187,20 +167,123 @@ final class FrameRateHint: @unchecked Sendable {
         defer { lock.unlock() }
         return streamHz > 0 ? Int64(1_000_000_000.0 / Double(streamHz)) : 0
     }
-    private static func range(hz: Float, boosted: Bool) -> CAFrameRateRange {
+    private static func range(hz: Float) -> CAFrameRateRange {
         #if os(tvOS)
         // A TV is fixed-rate, so all three bounds pin to the stream rate: a range is a promise
         // about how variable our cadence may be, and a scheduler handed 60…120 on a 60 Hz panel
-        // keeps a refresh of slack in hand. `boosted` is for pen proximity, which tvOS lacks.
-        _ = boosted
+        // keeps a refresh of slack in hand.
         return CAFrameRateRange(minimum: hz, maximum: hz, preferred: hz)
         #else
         // Pinned at the panel's top rate: a frame shows at the first refresh after its pick, and
-        // a lower minimum lets the system drop the panel mid-stream (judder). `boosted` is moot.
-        _ = boosted
+        // a lower minimum lets the system drop the panel mid-stream (judder). UIKit samples
+        // touch and Pencil at the panel's cadence, so the pin also keeps their full rate.
         let cap = max(hz, 120)
         return CAFrameRateRange(minimum: cap, maximum: cap, preferred: cap)
         #endif
+    }
+}
+
+extension CAMetalDrawable {
+    /// The key `PresentFlight` files this drawable under: its drawable ID, or on the simulator
+    /// SDKs, which have none, the object's identity.
+    var flightID: Int {
+        #if targetEnvironment(simulator)
+        return ObjectIdentifier(self).hashValue
+        #else
+        return drawableID
+        #endif
+    }
+}
+
+/// The deadline path's last vends and what became of each, logged when the link stalls: which
+/// drawables were still out, and how each present before the stall sat against its deadline.
+/// Lock-guarded: the link, render and Metal callback threads all write.
+final class PresentFlight: @unchecked Sendable {
+    /// 1.6 s of vends at 60 Hz.
+    static let capacity = 96
+
+    private struct Vend {
+        let id: Int
+        /// The pool slot: three surfaces recur while the drawable IDs count up.
+        let surface: UInt32
+        let vendAt: CFTimeInterval, deadline: CFTimeInterval, target: CFTimeInterval
+        /// `-` untouched, `X` expired, `S` skipped, `I` issued, `F` render failed.
+        var fate: Character = "-"
+        var fateAt: CFTimeInterval = 0
+        /// The decoded frame's surface an issued present samples; 0 without one.
+        var source: UInt32 = 0
+        var gpu: (start: CFTimeInterval, end: CFTimeInterval)?
+        /// Set by the presented handler: glass past the target, or dropped.
+        var seenAt: CFTimeInterval?
+        var lateMs: Double?
+    }
+
+    private let lock = NSLock()
+    private var vends: [Vend] = []
+
+    func vend(_ v: VendedDrawable) {
+        vend(
+            id: v.drawable.flightID,
+            surface: v.drawable.texture.iosurface.map { IOSurfaceGetID($0) } ?? 0,
+            at: v.vendAt, deadline: v.deadline, target: v.target)
+    }
+
+    func vend(
+        id: Int, surface: UInt32, at vendAt: CFTimeInterval, deadline: CFTimeInterval,
+        target: CFTimeInterval
+    ) {
+        lock.lock()
+        if vends.count >= Self.capacity { vends.removeFirst() }
+        vends.append(Vend(
+            id: id, surface: surface, vendAt: vendAt, deadline: deadline, target: target))
+        lock.unlock()
+    }
+
+    func fate(_ id: Int, _ fate: Character, source: UInt32 = 0) {
+        let now = CACurrentMediaTime()
+        update(id) { $0.fate = fate; $0.fateAt = now; $0.source = source }
+    }
+
+    func gpu(_ id: Int, start: CFTimeInterval, end: CFTimeInterval) {
+        update(id) { $0.gpu = (start, end) }
+    }
+
+    /// `lateMs` nil: the system dropped the present.
+    func glass(_ id: Int, lateMs: Double?) {
+        let now = CACurrentMediaTime()
+        update(id) { $0.seenAt = now; $0.lateMs = lateMs }
+    }
+
+    private func update(_ id: Int, _ change: (inout Vend) -> Void) {
+        lock.lock()
+        if let i = vends.lastIndex(where: { $0.id == id }) { change(&vends[i]) }
+        lock.unlock()
+    }
+
+    /// One line per vend, oldest first, and the record starts over. `vendMs` and `seenMs` count
+    /// back from now, `fate` from the vend, `gpuMs` from the deadline (positive after it).
+    func drain(_ why: String) -> [String] {
+        lock.lock()
+        let all = vends
+        vends.removeAll(keepingCapacity: true)
+        lock.unlock()
+        let now = CACurrentMediaTime()
+        func ms(_ s: CFTimeInterval) -> String { String(format: "%.2f", s * 1000) }
+        return all.enumerated().map { i, v in
+            let glass: String
+            if let seenAt = v.seenAt {
+                glass = (v.lateMs.map { String(format: "%.2f", $0) } ?? "drop")
+                    + " seenMs=" + ms(seenAt - now)
+            } else {
+                glass = v.fate == "I" ? "out" : "-"
+            }
+            let gpu = v.gpu.map { ms($0.start - v.deadline) + ".." + ms($0.end - v.deadline) }
+            return "pf-flight \(why) \(i + 1)/\(all.count) id=\(v.id) surf=\(v.surface)"
+                + " vendMs=\(ms(v.vendAt - now)) dlMs=\(ms(v.deadline - v.vendAt))"
+                + " tgtMs=\(ms(v.target - v.vendAt)) src=\(v.source)"
+                + " fate=\(v.fate)@\(v.fate == "-" ? "na" : ms(v.fateAt - v.vendAt))"
+                + " gpuMs=\(gpu ?? "na") glass=\(glass)"
+        }
     }
 }
 
@@ -212,8 +295,8 @@ final class FrameRateHint: @unchecked Sendable {
 /// on a Metal callback thread, the tvOS video plane's on main.
 final class PresentDebugStats: @unchecked Sendable {
     /// The session's cadence loop, for the line's `cadence` segment — `nil` under the latency
-    /// intent. `late` is the number WP8 gates on: a due time already past when the frame became
-    /// presentable is the direct signal that the cushion is too small.
+    /// intent. `late` counts frames whose due time had already passed when they became
+    /// presentable: the direct signal that the cushion is too small.
     private let cadence: CadenceClock?
     private let lock = NSLock()
     private var last = CACurrentMediaTime()
@@ -382,7 +465,6 @@ final class PresentDebugStats: @unchecked Sendable {
         let now = CACurrentMediaTime()
         guard now - last >= 1 else { lock.unlock(); return }
         last = now
-        _ = ring.drainSubmitted() // the window's store submits; `decoded=` counts decoder output
         let smoothing = ring.drainSmoothing()
         let deltas = glassDeltasMs.sorted()
         let p50 = deltas.isEmpty ? 0 : deltas[deltas.count / 2]
@@ -405,7 +487,7 @@ final class PresentDebugStats: @unchecked Sendable {
             display.p50, display.p95, cadErr.p50, cadErr.p95, cadenceErrMs.count,
             panel.minInterval * 1000, hist, judder, glitch.repeats, glitch.skips,
             decodedRepeats, shownRepeats, panel.description)
-        // Loop health, appended only where a loop exists — `late`/`frames` is WP8's cushion
+        // Loop health, appended only where a loop exists — `late`/`frames` is the cushion
         // criterion and `reanchor` says whether the estimate is tracking at all.
         let loop = cadence?.health()
         let cadenceLine =

@@ -1,7 +1,7 @@
 //! Host config-dir and owner-private file helpers.
 //!
 //! Leaf crate so `pf-media`, `pf-vdisplay`, and the orchestrator share these
-//! without depending on `gamestream`. Std + `tracing` only.
+//! without depending on `gamestream`. Std + `tracing`; on Windows, `pf-paths-win` for ACLs.
 //!
 //! [`config_dir`] is XDG / `%ProgramData%`, overridable with `PUNKTFUNK_CONFIG_DIR`.
 //! [`seat_home`] is where a profile's Steam from Own Steam stays until it is erased.
@@ -205,11 +205,11 @@ fn private_dir_mode(door: bool, dir: &std::path::Path, config: &std::path::Path)
     }
 }
 
-/// Tightens an already-existing dir. Windows refuses a reparse point
-/// ([`reject_reparse_point`]): hardening a junction would harden the
-/// attacker-chosen target while the link stays theirs. Default
-/// `%ProgramData%` ACLs grant Users *create*. Never the shared temp root:
-/// Windows would lock its owner out, so a test keeps its files in a subdir.
+/// Create `dir` if missing and make it owner-private, tightening one that exists: 0700 on Unix,
+/// owner Administrators and SYSTEM/Administrators only on Windows ([`harden_dir`]). Windows
+/// refuses a reparse point ([`reject_reparse_point`]): hardening a junction would harden the
+/// attacker-chosen target while the link stays theirs. Never the shared temp root: Windows
+/// would lock its owner out, so a test keeps its files in a subdir.
 pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     debug_assert_ne!(dir, std::env::temp_dir(), "hardening the shared temp root");
     #[cfg(unix)]
@@ -226,18 +226,158 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
         }
         r
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        #[cfg(windows)]
-        reject_reparse_point(dir)?;
-        let r = std::fs::create_dir_all(dir);
-        #[cfg(windows)]
-        if r.is_ok() {
-            let _hold = hold_plain_directory(dir)?;
-            restrict_dir_to_system_admins(dir, first_hardening_of(dir));
-        }
-        r
+        harden_dir(dir)
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// What the first hardening of an existing directory in a process does, from what it read
+/// before changing anything.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum FirstPass {
+    /// Another account owns it, or its owner is unreadable. An owner keeps any `WRITE_DAC`
+    /// handle it opened before a lock, so the folder is not locked in place.
+    Refuse,
+    /// Its parent let others write in it: lock it, then set aside every entry they own.
+    SetAside,
+    /// It was admin-only: lock it and re-own what lies below to Administrators.
+    Reown,
+}
+
+/// [`FirstPass`] from the owner check (`Some(true)`: SYSTEM, Administrators or
+/// TrustedInstaller) and whether an inherited ACE let another account write in the folder.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn first_pass(admin_owned: Option<bool>, inherits_open: bool) -> FirstPass {
+    match (admin_owned, inherits_open) {
+        (Some(true), true) => FirstPass::SetAside,
+        (Some(true), false) => FirstPass::Reown,
+        _ => FirstPass::Refuse,
+    }
+}
+
+/// Directories whose first hardening in this process completed.
+#[cfg(windows)]
+static HARDENED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// [`create_private_dir`] on Windows. Held across a first pass, [`HARDENED`]'s lock keeps a
+/// second caller from using a folder that is locked but not yet cleared; the re-own walk runs
+/// after it, since an admin-only folder holds nothing to clear. A failed first pass is retried.
+#[cfg(windows)]
+fn harden_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    reject_reparse_point(dir)?;
+    let mut hardened = HARDENED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if hardened.iter().any(|done| done == dir) {
+        drop(hardened);
+        return relock(dir);
+    }
+    let reown = first_hardening(dir)?;
+    hardened.push(dir.to_path_buf());
+    drop(hardened);
+    if reown {
+        reown_tree(dir);
+    }
+    Ok(())
+}
+
+/// A later pass: the first one proved `dir`, so a lock that fails leaves it as it was.
+#[cfg(windows)]
+fn relock(dir: &std::path::Path) -> std::io::Result<()> {
+    if create_locked(dir)? {
+        return Ok(());
+    }
+    let _hold = hold_plain_directory(dir)?;
+    if let Err(e) = pf_paths_win::lock_admin_only(dir) {
+        tracing::warn!(dir = %dir.display(), error = %e, "config directory lock not applied");
+    }
+    Ok(())
+}
+
+/// Read `dir` before changing it, then lock it and deal with what it holds ([`FirstPass`]).
+/// `true` when its tree is still to be re-owned. A folder that was open and does not end
+/// admin-only, or keeps an entry another account owns, is an error: its contents are unproven.
+/// It holds a new marker ([`pf_paths_win::mark_unproven`]) from its lock until then, so the
+/// next pass sets aside again instead of re-owning what the failed one left.
+#[cfg(windows)]
+fn first_hardening(dir: &std::path::Path) -> std::io::Result<bool> {
+    if create_locked(dir)? {
+        return Ok(false);
+    }
+    let _hold = hold_plain_directory(dir)?;
+    let lock_failed = |e: std::io::Error| {
+        std::io::Error::new(
+            e.kind(),
+            format!("lock {} to SYSTEM and Administrators: {e}", dir.display()),
+        )
+    };
+    match first_pass(
+        pf_paths_win::is_admin_owned(dir),
+        pf_paths_win::inherits_open_acl(dir) || pf_paths_win::is_unproven(dir),
+    ) {
+        FirstPass::Refuse => Err(std::io::Error::other(format!(
+            "{} is owned by an account outside SYSTEM and Administrators",
+            dir.display()
+        ))),
+        FirstPass::SetAside => {
+            pf_paths_win::lock_admin_only(dir).map_err(lock_failed)?;
+            let marker = pf_paths_win::mark_unproven(dir)?;
+            pf_paths_win::ensure_admin_only_source(dir).map_err(lock_failed)?;
+            pf_paths_win::quarantine_planted_tree(dir).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "set aside another account's entry in {}: {e}",
+                        dir.display()
+                    ),
+                )
+            })?;
+            pf_paths_win::mark_proven(dir, &marker)?;
+            Ok(false)
+        }
+        FirstPass::Reown => {
+            if let Err(e) = pf_paths_win::lock_admin_only(dir) {
+                tracing::warn!(dir = %dir.display(), error = %e, "config directory lock not applied");
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Create `dir` admin-only from its first instant; missing parents are plain. `true` when this
+/// call made it: born locked, it holds nothing to prove.
+#[cfg(windows)]
+fn create_locked(dir: &std::path::Path) -> std::io::Result<bool> {
+    if dir.is_dir() {
+        return Ok(false);
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match pf_paths_win::create_dir_with(dir, pf_paths_win::ADMIN_ONLY) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// `icacls /setowner Administrators /T` over `dir`: an admin-only folder's entries were written by
+/// SYSTEM, an administrator or the account of a grant. Best effort.
+#[cfg(windows)]
+fn reown_tree(dir: &std::path::Path) {
+    let _ = icacls_status(
+        std::process::Command::new(system32("icacls.exe"))
+            .arg(dir.as_os_str())
+            .args(["/setowner", "*S-1-5-32-544", "/T", "/C", "/Q"]) // BUILTIN\Administrators
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
 }
 
 #[cfg(windows)]
@@ -290,22 +430,6 @@ fn hold_plain_directory(path: &std::path::Path) -> std::io::Result<std::fs::File
         ));
     }
     Ok(file)
-}
-
-/// First hardening of `dir` in this process — the pass that re-owns recursively.
-///
-/// A planted tree exists before the host starts, so one deep pass is enough.
-/// Library CRUD calls `create_private_dir` per write; repeating `/T` would
-/// re-walk recordings and the art cache.
-#[cfg(windows)]
-fn first_hardening_of(dir: &std::path::Path) -> bool {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .map(|mut s| s.insert(dir.to_path_buf()))
-        .unwrap_or(false)
 }
 
 /// Re-own to Administrators then re-ACL. A planted file's creator keeps
@@ -465,88 +589,6 @@ pub fn remove_device(instance_id: &str) -> std::io::Result<()> {
         o.status,
         String::from_utf8_lossy(msg).trim()
     )))
-}
-
-/// Default `%ProgramData%` lets `BUILTIN\Users` create and become
-/// `CREATOR OWNER`. Re-owns to Administrators, resets the dir's own ACL, strips
-/// inheritance, grants SYSTEM/Administrators `(OI)(CI)(F)` and nobody else: a
-/// file a local account may read carries its own ACE. Hard-coded SIDs; never fatal.
-#[cfg(windows)]
-fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool) {
-    if !is_under_program_data(dir) {
-        tracing::debug!(dir = %dir.display(), "config dir is outside %ProgramData% -- keeping its inherited ACL");
-        return;
-    }
-    let icacls = system32("icacls.exe");
-    // Re-own to Administrators first: an owner keeps WRITE_DAC.
-    // `deep` (once per dir per process) also re-owns contents; directory-only
-    // left planted files still writable by their creator.
-    let mut own = std::process::Command::new(&icacls);
-    own.arg(dir.as_os_str())
-        .args(["/setowner", "*S-1-5-32-544"]); // BUILTIN\Administrators
-    if deep {
-        own.args(["/T", "/C", "/Q"]); // recurse, continue on error, quiet
-    }
-    let _ = icacls_status(
-        own.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
-    );
-    // `/inheritance:r` drops inherited ACEs only. A planted dir keeps an explicit
-    // `Everyone:(F)` through it, so reset the dir's own ACL first (not `/T`: the
-    // plugin runner's grants live on children and are re-applied only by `enable`).
-    let _ = icacls_status(
-        std::process::Command::new(&icacls)
-            .arg(dir.as_os_str())
-            .args(["/reset", "/C", "/Q"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
-    );
-    // Do not grant OWNER `(OI)(CI)(F)` — WRITE_DAC comes back on every child
-    // the attacker already owned. SYSTEM and Administrators cover writers here.
-    let status = icacls_status(
-        std::process::Command::new(&icacls)
-            .arg(dir.as_os_str())
-            .args([
-                "/inheritance:r",
-                "/grant:r",
-                "*S-1-5-18:(OI)(CI)(F)", // NT AUTHORITY\SYSTEM
-                "/grant:r",
-                "*S-1-5-32-544:(OI)(CI)(F)", // BUILTIN\Administrators
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
-    );
-    match status {
-        Ok(s) if s.success() => {}
-        _ => tracing::warn!(
-            dir = %dir.display(),
-            "config-dir DACL hardening did not fully succeed — a local user may be able to plant config files"
-        ),
-    }
-}
-
-/// USBridge: whether `dir` is in `%ProgramData%`, the dir a SYSTEM service shares with the
-/// user, which is what [`restrict_dir_to_system_admins`] hardens.
-///
-/// A launcher may instead hand the host a dir in the user's own profile with
-/// `PUNKTFUNK_CONFIG_DIR` (the USBridge agent uses `%APPDATA%\usbridge-agent\punktfunk`) and
-/// run it unelevated. That dir is already private to the user through its inherited ACL.
-/// Re-ACLing it to SYSTEM/Administrators locked the user, and so the host itself, out of it:
-/// the next write (`native-key.pem`) failed with "Access is denied" and the host exited.
-/// Unknown `%ProgramData%` keeps the hardening.
-#[cfg(windows)]
-fn is_under_program_data(dir: &std::path::Path) -> bool {
-    let Some(program_data) = std::env::var_os("ProgramData").filter(|s| !s.is_empty()) else {
-        return true;
-    };
-    let norm = |p: &std::path::Path| {
-        p.components()
-            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
-            .collect::<Vec<_>>()
-    };
-    let base = norm(std::path::Path::new(&program_data));
-    let dir = norm(dir);
-    dir.len() >= base.len() && dir[..base.len()] == base[..]
 }
 
 /// Unix: create and re-chmod 0600 so it is never group/world-readable.
@@ -809,16 +851,6 @@ mod tests {
 
     use super::*;
 
-    #[cfg(windows)]
-    #[test]
-    fn only_program_data_dirs_get_the_service_dacl() {
-        let pd = std::env::var("ProgramData").expect("ProgramData is set on Windows");
-        assert!(is_under_program_data(&PathBuf::from(&pd).join("punktfunk")));
-        assert!(is_under_program_data(&PathBuf::from(pd.to_uppercase()).join("punktfunk")));
-        let appdata = std::env::var("APPDATA").expect("APPDATA is set on Windows");
-        assert!(!is_under_program_data(&PathBuf::from(appdata).join("usbridge-agent").join("punktfunk")));
-    }
-
     #[test]
     fn env_file_reads_host_env_as_the_service_does() {
         let text = "# PUNKTFUNK_MGMT_BIND=commented\n  PUNKTFUNK_MGMT_BIND = \"0.0.0.0:48123\" \n\
@@ -958,6 +990,212 @@ mod tests {
         assert!(create_private_dir(&link).is_err());
         std::fs::remove_dir(&link).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Only an admin-owned folder is locked in place; whether its parent let others write in it
+    /// decides between setting their entries aside and re-owning the tree.
+    #[test]
+    fn the_first_pass_follows_the_owner_then_the_inherited_acl() {
+        assert_eq!(first_pass(Some(true), false), FirstPass::Reown);
+        assert_eq!(first_pass(Some(true), true), FirstPass::SetAside);
+        for open in [false, true] {
+            assert_eq!(first_pass(Some(false), open), FirstPass::Refuse);
+            assert_eq!(first_pass(None, open), FirstPass::Refuse);
+        }
+    }
+
+    /// Elevated: a healthy folder keeps the exact ACL the old `icacls` sequence gave it, an open
+    /// one ends with that same ACL, and an entry another account owns goes aside while an
+    /// administrator's stays. Not elevated, the folder this test owns is refused untouched.
+    #[cfg(windows)]
+    #[test]
+    fn an_open_folder_ends_like_a_healthy_one_without_what_others_own() {
+        use std::process::{Command, Stdio};
+        let icacls = |path: &std::path::Path, args: &[&str]| {
+            Command::new(system32("icacls.exe"))
+                .arg(path)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let sddl = |path: &std::path::Path| {
+            let out = Command::new(system32(POWERSHELL))
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-Acl -LiteralPath $env:PF_ACL_PATH).Sddl",
+                ])
+                .env("PF_ACL_PATH", path)
+                // A PowerShell 7 parent leaves a module path Windows PowerShell can't load from.
+                .env_remove("PSModulePath")
+                .output()
+                .unwrap();
+            let sddl = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            assert!(!sddl.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+            sddl
+        };
+        let base = std::env::temp_dir().join(format!("pf-paths-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // Users may write below `base`, as `%ProgramData%` lets them.
+        assert!(icacls(&base, &["/grant", "*S-1-5-32-545:(OI)(CI)(M)"]));
+        let (healthy, open) = (base.join("healthy"), base.join("open"));
+        std::fs::create_dir_all(&healthy).unwrap();
+        std::fs::create_dir_all(open.join("sub")).unwrap();
+        std::fs::write(open.join("sub").join("host.env"), "x").unwrap();
+        std::fs::write(open.join("hooks.json"), "x").unwrap();
+
+        if pf_paths_win::is_admin_owned(&open) != Some(true) {
+            assert!(create_private_dir(&open).is_err());
+            assert!(open.join("hooks.json").exists());
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert!(icacls(&healthy, &["/setowner", "*S-1-5-32-544"]));
+        assert!(icacls(&healthy, &["/reset"]));
+        assert!(icacls(
+            &healthy,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)(F)",
+                "/grant:r",
+                "*S-1-5-32-544:(OI)(CI)(F)",
+            ],
+        ));
+        let before = sddl(&healthy);
+        assert!(before.starts_with("O:BA"), "{before}");
+        create_private_dir(&healthy).unwrap();
+        assert_eq!(
+            sddl(&healthy),
+            before,
+            "a healthy folder's ACL does not move"
+        );
+
+        // LocalService stands in for the standard user who planted the file.
+        assert!(icacls(
+            &open.join("hooks.json"),
+            &["/setowner", "*S-1-5-19"]
+        ));
+        create_private_dir(&open).unwrap();
+        assert_eq!(sddl(&open), before);
+        assert!(open.join("sub").join("host.env").exists());
+        assert!(!open.join("hooks.json").exists());
+        assert!(open.join("hooks.json.untrusted").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Elevated: a plant held open without share-delete fails the first pass, which leaves the
+    /// folder locked, the plant another account's and the marker in place, so the pass after
+    /// the handle closes sets it aside instead of re-owning it. Not elevated, the folder this
+    /// test owns is refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_set_aside_is_retried_not_adopted() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let icacls = |path: &std::path::Path, args: &[&str]| {
+            std::process::Command::new(system32("icacls.exe"))
+                .arg(path)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let base = std::env::temp_dir().join(format!("pf-paths-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let open = base.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        assert!(icacls(&base, &["/grant", "*S-1-5-32-545:(OI)(CI)(M)"]));
+        let plant = open.join("hooks.json");
+        std::fs::write(&plant, "x").unwrap();
+        if pf_paths_win::is_admin_owned(&open) != Some(true) {
+            assert!(create_private_dir(&open).is_err());
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        // LocalService stands in for the standard user who planted the file.
+        assert!(icacls(&plant, &["/setowner", "*S-1-5-19"]));
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1) // FILE_SHARE_READ: no rename while this is open
+            .open(&plant)
+            .unwrap();
+        let marker = open.join(pf_paths_win::UNPROVEN);
+        assert!(create_private_dir(&open).is_err());
+        assert!(
+            pf_paths_win::ensure_admin_only_source(&open).is_ok(),
+            "a failed pass reopened the folder"
+        );
+        assert!(marker.is_file(), "nothing tells the next pass");
+        assert_eq!(
+            pf_paths_win::is_admin_owned(&plant),
+            Some(false),
+            "the plant was adopted"
+        );
+        drop(held);
+        create_private_dir(&open).unwrap();
+        assert!(!plant.exists(), "the plant stayed");
+        assert!(open.join("hooks.json.untrusted").exists());
+        assert!(!marker.exists(), "a proven folder keeps its marker");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Elevated: a marker another account planted and holds without share-delete fails the
+    /// first pass, which leaves its own marker beside it, so the pass after the planter deletes
+    /// theirs sets the plant aside instead of re-owning it. Not elevated, the folder is refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_planted_marker_held_open_is_no_proof() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let icacls = |path: &std::path::Path, args: &[&str]| {
+            std::process::Command::new(system32("icacls.exe"))
+                .arg(path)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let base = std::env::temp_dir().join(format!("pf-paths-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let open = base.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        assert!(icacls(&base, &["/grant", "*S-1-5-32-545:(OI)(CI)(M)"]));
+        let (plant, marker) = (open.join("hooks.json"), open.join(pf_paths_win::UNPROVEN));
+        std::fs::write(&plant, "x").unwrap();
+        std::fs::write(&marker, "").unwrap();
+        if pf_paths_win::is_admin_owned(&open) != Some(true) {
+            assert!(create_private_dir(&open).is_err());
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        // LocalService stands in for the standard user who planted both files.
+        assert!(icacls(&plant, &["/setowner", "*S-1-5-19"]));
+        assert!(icacls(&marker, &["/setowner", "*S-1-5-19"]));
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1) // FILE_SHARE_READ: no rename while this is open
+            .open(&marker)
+            .unwrap();
+        assert!(create_private_dir(&open).is_err());
+        drop(held);
+        std::fs::remove_file(&marker).unwrap();
+        assert!(
+            pf_paths_win::is_unproven(&open),
+            "the planter's marker was the only one"
+        );
+        create_private_dir(&open).unwrap();
+        assert!(!plant.exists(), "the plant was adopted");
+        assert_eq!(
+            pf_paths_win::is_admin_owned(&open.join("hooks.json.untrusted")),
+            Some(false)
+        );
+        assert!(
+            !pf_paths_win::is_unproven(&open),
+            "a proven folder keeps a marker"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]

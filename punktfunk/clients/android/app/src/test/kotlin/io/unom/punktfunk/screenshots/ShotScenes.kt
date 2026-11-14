@@ -56,7 +56,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import io.unom.punktfunk.R
 import io.unom.punktfunk.BrandDark
 import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
@@ -66,7 +68,6 @@ import coil3.asImage
 import coil3.test.FakeImageLoaderEngine
 import io.unom.punktfunk.AddHostSheet
 import io.unom.punktfunk.ControllersScreen
-import io.unom.punktfunk.TouchGrid
 import io.unom.punktfunk.PadInfo
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.library.Artwork
@@ -86,15 +87,19 @@ import io.unom.punktfunk.SettingsOverlay
 import io.unom.punktfunk.SpeedTestPrompt
 import io.unom.punktfunk.SpeedTestPhase
 import io.unom.punktfunk.SpeedTestTarget
-import io.unom.punktfunk.components.HostCard
-import io.unom.punktfunk.components.HostMenuItem
-import io.unom.punktfunk.components.SectionLabel
 import io.unom.punktfunk.newPreset
-import io.unom.punktfunk.models.HostStatus
 
 // The CI screenshot scenes: the REAL app composables, fed embedded mock state, under the forced
 // brand palette (Material You has no wallpaper to seed from on the JVM). The stream-video surface
 // and ConnectScreen/App are intentionally absent — they require the live JNI core / a session.
+
+/** Runs every scene in `PF_SHOT_LANG` (a language tag such as `de`), English without it. */
+class ShotLanguageRule : org.junit.rules.ExternalResource() {
+    override fun before() {
+        System.getenv("PF_SHOT_LANG")?.takeIf { it.isNotEmpty() }
+            ?.let { org.robolectric.RuntimeEnvironment.setQualifiers("+$it") }
+    }
+}
 
 /** Forces the deterministic punktfunk brand scheme (see Theme.kt) instead of dynamic colour. */
 @Composable
@@ -144,105 +149,6 @@ internal fun ShotStatusFrame(content: @Composable () -> Unit) {
             }
         }
         Box(Modifier.weight(1f).fillMaxWidth()) { content() }
-    }
-}
-
-private data class MockHost(
-    val name: String,
-    val address: String,
-    val status: HostStatus,
-    val preset: String? = null,
-    val pin: String? = null,
-    val accent: Color? = null,
-    val online: Boolean = false,
-)
-
-// Ordered so an UNCHIPPED card sits beside a CHIPPED one in the same grid row, and a long trust
-// label ("Trust on first use") beside a short one ("Paired"). Both are what used to make cards in a
-// row step up and down — the grid sizes a row to its tallest item and doesn't stretch the rest — so
-// this arrangement is the regression net for it.
-private val SAVED = listOf(
-    MockHost("Office", "192.168.1.50:9777", HostStatus.TOFU),
-    MockHost(
-        "Living Room PC", "192.168.1.42:9777", HostStatus.PAIRED,
-        preset = "Game", pin = "Work", accent = Color(0xFFFF8A4C), online = true,
-    ),
-)
-private val DISCOVERED = listOf(
-    // Discovered ⇒ advertising right now, so both are online.
-    MockHost("studio-deck", "192.168.1.61:9777", HostStatus.PAIRING, online = true),
-    MockHost("HTPC", "192.168.1.70:9777", HostStatus.TOFU, online = true),
-)
-
-/** The connect screen's host grid, reconstructed from the real HostCard/SectionLabel components. */
-@Composable
-internal fun HostsScene() {
-    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        LazyVerticalGrid(
-            columns = GridCells.Adaptive(minSize = 160.dp),
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            item(span = { GridItemSpan(maxLineSpan) }) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Spacer(Modifier.height(8.dp))
-                    Text("Punktfunk", style = MaterialTheme.typography.headlineLarge)
-                    Text(
-                        "stream a remote desktop",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(24.dp))
-                }
-            }
-            item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Saved hosts") }
-            // A pinned card is its OWN grid cell right after its host — the same flat list the
-            // connect screen builds, not a second card crammed into the host's cell.
-            SAVED.forEach { h ->
-                item {
-                    HostCard(
-                        h.name, h.address, h.status, online = h.online, enabled = true,
-                        onConnect = {}, onForget = {}, onEdit = {},
-                        // The bound preset is a quiet chip: the card says what a tap will do.
-                        presetLabel = h.preset,
-                        accent = h.accent,
-                        menuItems = listOf(
-                            HostMenuItem("Connect with: Default settings", startsSection = true) {},
-                            HostMenuItem("Connect with: Game") {},
-                        ),
-                        // One card in this section has a chip, so every card reserves its space —
-                        // the shot is here to catch a row that steps.
-                        reservePresetSlot = true,
-                    )
-                }
-                if (h.pin != null) {
-                    item {
-                        HostCard(
-                            h.name, h.address, h.status, online = h.online, enabled = true,
-                            onConnect = {}, onForget = null,
-                            presetLabel = h.pin, presetProminent = true, accent = h.accent,
-                            menuItems = listOf(HostMenuItem("Unpin card", startsSection = true) {}),
-                            reservePresetSlot = true,
-                        )
-                    }
-                }
-            }
-            item(span = { GridItemSpan(maxLineSpan) }) {
-                Spacer(Modifier.height(12.dp))
-                SectionLabel("Discovered on the network")
-            }
-            items(DISCOVERED) { h ->
-                HostCard(
-                    h.name, h.address, h.status, online = h.online,
-                    enabled = true, onConnect = {}, onForget = null,
-                )
-            }
-        }
     }
 }
 
@@ -394,10 +300,10 @@ internal fun TrustDialog() {
 internal fun PairDialog() {
     AlertDialog(
         onDismissRequest = {},
-        title = { Text("Pair with PIN") },
+        title = { Text(stringResource(io.unom.punktfunk.kit.R.string.pair_title, "Living Room PC")) },
         text = {
             Column {
-                Text("Enter the 4-digit PIN shown on the host.")
+                Text(stringResource(io.unom.punktfunk.kit.R.string.pair_intro_pin_only))
                 Spacer(Modifier.height(16.dp))
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant,
@@ -413,14 +319,14 @@ internal fun PairDialog() {
                 }
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "This device: Pixel 9 Pro",
+                    stringResource(io.unom.punktfunk.kit.R.string.pair_device_name) + ": Pixel 9 Pro",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         },
-        confirmButton = { TextButton({}) { Text("Pair") } },
-        dismissButton = { TextButton({}) { Text("Cancel") } },
+        confirmButton = { TextButton({}) { Text(stringResource(io.unom.punktfunk.kit.R.string.pair_action)) } },
+        dismissButton = { TextButton({}) { Text(stringResource(io.unom.punktfunk.kit.R.string.common_cancel)) } },
     )
 }
 
@@ -636,59 +542,27 @@ internal fun shotPads() = listOf(
     ),
 )
 
-/**
- * Publish the palette locals `App` would normally provide. A scene that calls a console screen
- * directly gets the DEFAULT dark ink without this, and a pale-palette shot would then silently
- * prove nothing at all.
- */
-/**
- * The TOUCH library — the poster grid a finger reaches through a host card's "Browse library…",
- * with the same mock shelf the coverflow scene uses. Same construction as [LibraryScene]: the real
- * [TouchGrid] under a rebuilt header, because the screen around it takes its state off the network.
- */
-@Composable
-internal fun TouchLibraryScene() {
-    val context = LocalContext.current
-    val loader = remember { shotLibraryLoader(context) }
-    val games = remember { shotGames() }
-    Surface(color = MaterialTheme.colorScheme.background) {
-        Column(Modifier.fillMaxSize()) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 8.dp),
-            ) {
-                IconButton(onClick = {}) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                }
-                Text(
-                    "Living Room PC — Library",
-                    style = MaterialTheme.typography.titleLarge,
-                    modifier = Modifier.weight(1f),
-                )
-                IconButton(onClick = {}) {
-                    Icon(Icons.Filled.Refresh, contentDescription = "Reload")
-                }
-            }
-            TouchGrid(games, loader, onLaunch = {}, onLink = { _, _ -> }, modifier = Modifier.weight(1f))
-        }
-    }
-}
-
-/** A believable shelf: four titles with art plus the Steam launcher entry (brand-mark tile). */
-private fun shotGames() = listOf(
+/** A believable shelf: seven titles with art plus the Steam launcher entry (brand-mark tile). */
+internal fun shotGames() = listOf(
     GameEntry("custom:aurora", "custom", "Aurora Drift", Artwork("shot://art/aurora", null, null)),
     GameEntry("steam:starfall", "steam", "Starfall Vale", Artwork("shot://art/starfall", null, null)),
     GameEntry("heroic:neon", "heroic", "Neon Circuit", Artwork("shot://art/neon", null, null)),
     GameEntry("gog:ember", "gog", "Ember Peaks", Artwork("shot://art/ember", null, null)),
+    GameEntry("steam:tide", "steam", "Tidebound", Artwork("shot://art/tide", null, null)),
+    GameEntry("steam:glacier", "steam", "Glacier Run", Artwork("shot://art/glacier", null, null)),
+    GameEntry("steam:echo", "steam", "Echo Station", Artwork("shot://art/echo", null, null)),
     GameEntry("steam:launcher", "steam", "Steam", Artwork(null, null, null), role = "launcher", icon = "steam"),
 )
 
-private fun shotLibraryLoader(context: Context): ImageLoader {
+internal fun shotLibraryLoader(context: Context): ImageLoader {
     val engine = FakeImageLoaderEngine.Builder()
         .intercept("shot://art/aurora", poster(context, "AURORA DRIFT", ::drawAurora).asImage())
         .intercept("shot://art/starfall", poster(context, "STARFALL VALE", ::drawStarfall).asImage())
         .intercept("shot://art/neon", poster(context, "NEON CIRCUIT", ::drawNeon).asImage())
         .intercept("shot://art/ember", poster(context, "EMBER PEAKS", ::drawEmber).asImage())
+        .intercept("shot://art/tide", poster(context, "TIDEBOUND", ::drawAurora, turn = 1).asImage())
+        .intercept("shot://art/glacier", poster(context, "GLACIER RUN", ::drawStarfall, turn = 2).asImage())
+        .intercept("shot://art/echo", poster(context, "ECHO STATION", ::drawNeon, turn = 1).asImage())
         .default(ColorDrawable(0xFF221E44.toInt()).asImage())
         .build()
     return ImageLoader.Builder(context).components { add(engine) }.build()
@@ -712,10 +586,19 @@ private class ShotRand(var state: ULong) {
     fun range(lo: Float, hi: Float) = lo + next() * (hi - lo)
 }
 
-private fun poster(context: Context, title: String, draw: (Canvas) -> Unit): Drawable {
+/** [turn] swaps the colour channels round, 1 or 2 steps: a second title out of one design. */
+private fun poster(context: Context, title: String, draw: (Canvas) -> Unit, turn: Int = 0): Drawable {
+    val art = Bitmap.createBitmap(POSTER_W, POSTER_H, Bitmap.Config.ARGB_8888)
+    draw(Canvas(art))
     val bmp = Bitmap.createBitmap(POSTER_W, POSTER_H, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bmp)
-    draw(canvas)
+    val channels = when (turn) {
+        1 -> floatArrayOf(0f, 1f, 0f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 1f, 0f)
+        2 -> floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 0f, 0f, 1f, 0f)
+        else -> null
+    }
+    val paint = Paint().apply { channels?.let { colorFilter = android.graphics.ColorMatrixColorFilter(it) } }
+    canvas.drawBitmap(art, 0f, 0f, paint)
     posterTitle(canvas, title)
     return BitmapDrawable(context.resources, bmp)
 }

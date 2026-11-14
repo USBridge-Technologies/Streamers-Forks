@@ -1,6 +1,47 @@
 use super::*;
 use punktfunk_core::quic::v2::msg::V2Message;
 
+/// A dial holds on the seat its unlock started until that seat runs with its host's pin, and
+/// lets go once a seat it saw starting is down again.
+#[test]
+fn a_dial_holds_until_its_seat_runs_or_falls_back() {
+    use pf_seats::RuntimeState::{Failed, Running, Starting, Stopped};
+    let seat = |state: pf_seats::RuntimeState, pin: Option<&str>| -> pf_seats::Seat {
+        serde_json::from_value(serde_json::json!({
+            "id": "0123456789abcdef0123456789abcdef",
+            "name": "Kid",
+            "account": "pf_seat1",
+            "display_slot": 12,
+            "native_port": 9778,
+            "mgmt_port": 47991,
+            "runtime": { "state": state },
+            "fingerprint": pin,
+        }))
+        .unwrap()
+    };
+    let pin = Some("5eed5eed00000000000000000000000000000000000000000000000000005eed");
+    let mut moved = false;
+    assert!(
+        !start_settled(Some(&seat(Stopped, None)), &mut moved),
+        "not yet started"
+    );
+    assert!(
+        !start_settled(Some(&seat(Failed, None)), &mut moved),
+        "an old failure"
+    );
+    assert!(!start_settled(Some(&seat(Starting, None)), &mut moved));
+    assert!(
+        !start_settled(Some(&seat(Running, None)), &mut moved),
+        "its pin isn't listed yet"
+    );
+    assert!(start_settled(Some(&seat(Running, pin)), &mut moved));
+    assert!(
+        start_settled(Some(&seat(Failed, None)), &mut moved),
+        "down again after it moved"
+    );
+    assert!(start_settled(None, &mut false), "a row the ledger dropped");
+}
+
 /// Two sessions on one profile at once: `<seat>` then `<seat>-2`, each with its own sink,
 /// and the id frees when its session ends.
 #[cfg(target_os = "linux")]
@@ -106,7 +147,10 @@ fn a_buried_pin_miss_still_reaches_the_client_in_words() {
         .context("build the session pipeline")
         .unwrap_err();
 
-    let said = setup_failed_sentence(&buried).expect("a pin miss has words for the user");
+    let worded = setup_failed_sentence(&buried).expect("a pin miss has words for the user");
+    assert_eq!(worded.id, "close_monitor_missing");
+    assert_eq!(worded.params, [("monitor".into(), "HDMI-A-3".into())]);
+    let said = worded.text;
     assert!(
         said.contains("HDMI-A-3") && said.contains("HDMI-A-1"),
         "{said}"
@@ -119,7 +163,9 @@ fn a_buried_pin_miss_still_reaches_the_client_in_words() {
 
     let asleep = anyhow::Error::new(pf_vdisplay::DisplayAsleep)
         .context("acquire virtual output for the session (retry-hold lease)");
-    let said = setup_failed_sentence(&asleep).expect("a dark display has words for the user");
+    let said = setup_failed_sentence(&asleep)
+        .expect("a dark display has words for the user")
+        .text;
     assert!(said.starts_with("The host's screen is asleep"), "{said}");
     assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
 
@@ -138,7 +184,9 @@ fn stock_niri_reaches_the_client_in_words() {
         .context("build the session pipeline")
         .unwrap_err();
 
-    let said = setup_failed_sentence(&buried).expect("stock niri has words for the user");
+    let said = setup_failed_sentence(&buried)
+        .expect("stock niri has words for the user")
+        .text;
     assert!(said.contains("biri"), "{said}");
     assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
 }
@@ -150,8 +198,25 @@ fn an_umbriel_ipc_mismatch_reaches_the_client_in_words() {
     let buried = anyhow::Error::new(pf_vdisplay::UmbrielIpcMismatch)
         .context("create virtual output")
         .context("build the session pipeline");
-    let said = setup_failed_sentence(&buried).expect("a mismatch has words for the user");
+    let said = setup_failed_sentence(&buried)
+        .expect("a mismatch has words for the user")
+        .text;
     assert!(said.contains("Update Punktfunk"), "{said}");
+    assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
+}
+
+/// A joiner whose own stream beside the shared one got no frame is told what to change.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_shared_capture_in_another_format_reaches_the_client_in_words() {
+    let buried = anyhow::anyhow!("no PipeWire frame within 10s (node 66)")
+        .context(pf_capture::SharedCaptureTaken)
+        .context("first frame")
+        .context("build the session pipeline");
+    let said = setup_failed_sentence(&buried)
+        .expect("a taken shared capture has words for the user")
+        .text;
+    assert!(said.contains("same video codec"), "{said}");
     assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
 }
 
@@ -163,7 +228,9 @@ fn a_node_less_output_reaches_the_client_in_words() {
         .context(pf_capture::NoPipeWireNode)
         .context("open the session capture")
         .context("build the session pipeline");
-    let said = setup_failed_sentence(&buried).expect("a node-less output has words for the user");
+    let said = setup_failed_sentence(&buried)
+        .expect("a node-less output has words for the user")
+        .text;
     assert!(said.contains("GPU encoder"), "{said}");
     assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
 }
@@ -782,6 +849,28 @@ fn a_codec_ask_moves_the_stream_to_another_codec_on_a_new_epoch() {
     host.join().unwrap().unwrap();
 }
 
+/// A mode switch the host refuses moves the client's refusal count and leaves the mode.
+#[test]
+fn a_refused_mode_switch_is_counted() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (client, host) = synthetic_session(19792, Punktfunk1Source::Synthetic, |p| p);
+    let before = client.mode();
+    let odd = punktfunk_core::Mode {
+        width: 1281,
+        height: 721,
+        refresh_hz: 60,
+    };
+    client.request_mode(odd).unwrap();
+    assert!(
+        wait_for(|| client.mode_refusals() == 1),
+        "an odd size is refused"
+    );
+    assert_eq!(client.mode(), before);
+    drop(client);
+    host.join().unwrap().unwrap();
+}
+
 /// A keyframe ask leaves as a feedback datagram and the host answers it: the synthetic
 /// source's IDR is ten ordinary frames.
 #[test]
@@ -1193,6 +1282,9 @@ fn access_request_pairs_without_a_session() {
     let store = crate::test_support::scratch().join("pf-access-test.json");
     let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
     let np_host = np.clone();
+    // A request names the fingerprint the host must show, as an advert would give it.
+    let identity = crate::identity::ephemeral().unwrap();
+    let host_pin = endpoint::fingerprint_of_pem(&identity.cert_pem).unwrap();
     let host = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -1220,7 +1312,7 @@ fn access_request_pairs_without_a_session() {
             StatsRecorder::new(
                 std::env::temp_dir().join(format!("pf-access-stats-{}", std::process::id())),
             ),
-            crate::identity::ephemeral().unwrap(),
+            identity,
             None,
         ))
     });
@@ -1258,7 +1350,7 @@ fn access_request_pairs_without_a_session() {
             "127.0.0.1",
             19795,
             (&cert, &key),
-            None,
+            host_pin,
             "Access Deck",
             std::time::Duration::from_secs(15),
             None,
@@ -1266,7 +1358,7 @@ fn access_request_pairs_without_a_session() {
     };
     let host_fp = ask().expect("approval answers the parked request");
     approver.join().unwrap();
-    assert_ne!(host_fp, [0; 32]);
+    assert_eq!(host_fp, host_pin);
     assert!(np.is_paired(&expected_fp), "approval pairs the device");
 
     let started = std::time::Instant::now();
@@ -1359,6 +1451,24 @@ fn pairing_ceremony_and_gate() {
     host.join().unwrap().unwrap();
 }
 
+/// A stranger trying a PIN every second holds only the strict clock: an attempt from the home
+/// network is still answered. Both planes charge through [`PairingClocks`].
+#[test]
+fn strict_attempts_leave_the_local_pairing_clock_free() {
+    use crate::native_pairing::KnockSource;
+    let clocks = PairingClocks::default();
+    assert!(clocks.charge(KnockSource::Wan));
+    assert!(
+        !clocks.charge(KnockSource::Wan),
+        "strict attempts share a clock"
+    );
+    assert!(
+        clocks.charge(KnockSource::Lan),
+        "a local attempt runs on its own"
+    );
+    assert!(!clocks.charge(KnockSource::Lan));
+}
+
 /// Controller-only passes pads only; View-only passes nothing. Classify is pinned in core.
 #[test]
 fn input_admission_matrix() {
@@ -1407,10 +1517,29 @@ fn spawn_profile_host(
     np: Arc<NativePairing>,
     profiles: Arc<crate::profiles::Profiles>,
 ) -> std::thread::JoinHandle<Result<()>> {
+    spawn_logged_host(port, max_sessions, np, profiles, None)
+}
+
+/// [`spawn_profile_host`] whose every thread logs to `logs`, when given.
+fn spawn_logged_host(
+    port: u16,
+    max_sessions: u32,
+    np: Arc<NativePairing>,
+    profiles: Arc<crate::profiles::Profiles>,
+    logs: Option<tracing::Dispatch>,
+) -> std::thread::JoinHandle<Result<()>> {
     std::thread::spawn(move || {
+        let on_each = logs.clone();
+        let _logs = logs.map(|d| tracing::dispatcher::set_default(&d));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
+            .on_thread_start(move || {
+                if let Some(d) = &on_each {
+                    // The guard lives as long as the runtime's thread.
+                    std::mem::forget(tracing::dispatcher::set_default(d));
+                }
+            })
             .build()
             .unwrap();
         rt.block_on(serve(
@@ -1457,7 +1586,7 @@ async fn raw_session(
     Welcome,
     punktfunk_core::transport::shared::ClientMedia,
 ) {
-    use punktfunk_core::quic::v2::hello::{ClientHello, Ready, ServerHello};
+    use punktfunk_core::quic::v2::hello::{Ready, ServerHello};
     use punktfunk_core::quic::v2::{io as v2io, msg, registry};
     let (ep, _observed) = endpoint::client_shared(None, Some(identity), &[registry::ALPN], None);
     let (ep, media) = ep.expect("client endpoint");
@@ -1471,6 +1600,26 @@ async fn raw_session(
         .await
         .expect("stream type");
     let mut recv = v2io::FrameReader::new(recv);
+    v2io::send(&mut send, &plain_hello(None, Default::default()))
+        .await
+        .expect("ClientHello");
+    let welcome = loop {
+        let (ty, body) = recv.read_frame().await.expect("ServerHello read");
+        if ty != msg::Pending::TYPE {
+            break msg::decode::<ServerHello>(ty, &body)
+                .expect("ServerHello")
+                .welcome;
+        }
+    };
+    v2io::send(&mut send, &Ready {}).await.expect("Ready");
+    (conn, send, recv, welcome, media)
+}
+
+/// A 720p60 `ClientHello` asking for `profile`, with `features`.
+fn plain_hello(
+    profile: Option<&str>,
+    features: punktfunk_core::quic::v2::features::FeatureSet,
+) -> ClientHello {
     let hello = Hello {
         mode: punktfunk_core::Mode {
             width: 1280,
@@ -1495,7 +1644,7 @@ async fn raw_session(
         video_fit: 0,
         audio_bitstreams: 0,
     };
-    let hello = ClientHello {
+    ClientHello {
         hello,
         client_label: None,
         abr_features: 0,
@@ -1506,22 +1655,13 @@ async fn raw_session(
         slices: 0,
         resume: None,
         suites: Vec::new(),
-        features: Default::default(),
-        profile: None,
+        features,
+        profile: profile.map(Into::into),
         access_only: false,
         screens: Vec::new(),
-    };
-    v2io::send(&mut send, &hello).await.expect("ClientHello");
-    let welcome = loop {
-        let (ty, body) = recv.read_frame().await.expect("ServerHello read");
-        if ty != msg::Pending::TYPE {
-            break msg::decode::<ServerHello>(ty, &body)
-                .expect("ServerHello")
-                .welcome;
-        }
-    };
-    v2io::send(&mut send, &Ready {}).await.expect("Ready");
-    (conn, send, recv, welcome, media)
+        view: None,
+        screen_wish: None,
+    }
 }
 
 /// Application close code. Panics on a transport-level end — these tests expect a host close.
@@ -1899,6 +2039,55 @@ fn a_profile_is_resolved_in_the_handshake() {
     host.join().unwrap().unwrap();
 }
 
+/// A synthetic source has no monitors, so the `ServerHello` answers a wish with "no monitors
+/// here", or "not allowed" to a device without the screen choice. No wish, no role.
+#[test]
+fn the_server_hello_answers_a_screen_wish() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use punktfunk_core::client::{ConnectParams, NativeClient};
+    use punktfunk_core::quic::endpoint;
+    use punktfunk_core::quic::v2::hello::{RoleEcho, RoleReason, ScreenWish};
+
+    let store = access_store_path("screen-wish");
+    let _ = std::fs::remove_file(&store);
+    let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+    let (cert, key) = endpoint::generate_identity().unwrap();
+    let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
+    np.add_with_access("Tablet", &fp_hex, None).unwrap();
+    let host = spawn_access_host(19799, 3, np.clone());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let role = |screen_wish| {
+        let mode = punktfunk_core::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let timeout = std::time::Duration::from_secs(10);
+        let client = NativeClient::connect(ConnectParams {
+            name: Some("Tablet".into()),
+            identity: Some((cert.clone(), key.clone())),
+            screen_wish,
+            ..ConnectParams::new("127.0.0.1", 19799, mode, timeout)
+        })
+        .expect("admitted");
+        client.role()
+    };
+    let echo = |reason| Some(RoleEcho { role: None, reason });
+
+    assert_eq!(role(Some(ScreenWish::Second)), echo(RoleReason::NoMonitors));
+    assert_eq!(role(None), None);
+    let controller_only = crate::native_pairing::Access {
+        grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+        expires_unix: None,
+        until_disconnect: false,
+    };
+    assert!(np.set_access(&fp_hex, controller_only).unwrap());
+    assert_eq!(role(Some(ScreenWish::Only)), echo(RoleReason::NotAllowed));
+    let _ = std::fs::remove_file(&store);
+    host.join().unwrap().unwrap();
+}
+
 /// A launch the host cannot resolve streams on, and the client learns why from the
 /// control message.
 #[test]
@@ -1948,6 +2137,104 @@ fn unknown_launch_reaches_the_client_as_a_refusal() {
     drop(client);
     let _ = std::fs::remove_file(&store);
     host.join().unwrap().unwrap();
+}
+
+/// Set on the refused-prep test's child only.
+#[cfg(unix)]
+const PREP_CHILD: &str = "PF_REFUSED_PREP_TEST_CHILD";
+
+/// A title the session can't launch runs none of its prep: one the box hides, and one the
+/// session's profile hides, are refused before a step runs. The library is the config dir,
+/// process config, so the body runs in a child of this test binary with a config dir of its own.
+#[cfg(unix)]
+#[test]
+fn a_refused_launch_runs_none_of_its_prep() {
+    if std::env::var_os(PREP_CHILD).is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = module_path!().split_once("::").expect("crate::module").1;
+        let test = format!("{module}::a_refused_launch_runs_none_of_its_prep");
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        child.args(["--exact", &test, "--nocapture"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("PUNKTFUNK_") {
+                child.env_remove(key);
+            }
+        }
+        let out = child
+            .env(PREP_CHILD, "1")
+            .env("PUNKTFUNK_CONFIG_DIR", dir.path())
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran no test: {stdout}"
+        );
+        return;
+    }
+    use crate::library::{set_entry_hidden, Reach, View};
+    let dir = pf_paths::config_dir();
+    let marker = |title: &str| dir.join(format!("{title}.prep"));
+    let add = |title: &str| {
+        let touch = format!("touch {}", marker(title).display());
+        let input = serde_json::json!({"title": title, "prep": [{"do": touch}]});
+        let entry =
+            crate::library::add_custom(serde_json::from_value(input).unwrap(), false).unwrap();
+        format!("custom:{}", entry.id)
+    };
+    let (boxed, own, shown) = (add("boxed"), add("own"), add("shown"));
+    const KID: &str = "a1b2c3d4e5f6";
+    set_entry_hidden(&View::here(), &boxed, true).unwrap();
+    set_entry_hidden(&View::of(KID, false, Reach::default()), &own, true).unwrap();
+    let resolved = |id: &str, owner: bool| crate::profiles::Resolved {
+        id: id.into(),
+        display_name: id.into(),
+        os_account: crate::profiles::OsAccount::Operator,
+        home: Default::default(),
+        via: crate::profiles::ResolveVia::Asked,
+        owner,
+    };
+    let owner = crate::session_launch::LaunchOwner {
+        client: "prep-test".into(),
+        fingerprint: None,
+        plane: crate::events::Plane::Native,
+        preset: None,
+        profile: None,
+        pad: punktfunk_core::config::GamepadPref::Xbox360,
+        pad_slots: None,
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (id, profile) in [
+        (&boxed, resolved("0f0f0f0f0f0f", true)),
+        (&own, resolved(KID, false)),
+    ] {
+        assert!(!crate::library::prep_for(id).is_empty(), "{id} has prep");
+        let mut hello = plain_hello(None, Default::default()).hello;
+        hello.launch = Some(id.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let (target, _, prepared) = rt
+            .block_on(super::launch::prepare_launch(
+                &hello, false, &profile, &owner, &tx, &stop,
+            ))
+            .unwrap();
+        assert!(target.is_none() && prepared.prep.is_none(), "{id}");
+        let refusal = rx.try_recv().expect("a refusal");
+        assert_eq!(
+            refusal.kind,
+            punktfunk_core::quic::LaunchOutcomeKind::Refused
+        );
+    }
+    assert!(!marker("boxed").exists() && !marker("own").exists());
+    // The same step runs for a title nobody hides.
+    let _prep = crate::hooks::run_prep(&crate::library::prep_for(&shown), &[]);
+    assert!(marker("shown").exists());
 }
 
 /// Expired record knocks into pending; re-approval is the re-grant on the held connection.
@@ -2126,4 +2413,1035 @@ fn a_session_that_fails_after_its_planes_start() {
     assert_eq!(code, punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE);
     assert_eq!(life.reason(), Some(SessionEndReason::HostError));
     assert_eq!(life.phase(), Phase::Done, "the teardown joined its threads");
+}
+
+/// Makes a key proof from the host's profiles, the device's fingerprint and the host's.
+type Signer = dyn FnOnce(&crate::profiles::Profiles, &str, &[u8; 32]) -> v2msg::ProfileUnlock;
+
+/// What a raw client dialling a person's own account sends after its hello.
+enum Sends {
+    Unlock(v2msg::ProfileUnlock),
+    /// The unlock made once the host's certificate is known, from the host's profiles, the
+    /// device's fingerprint and the host's.
+    Signed(Box<Signer>),
+    /// Announces an unlock, then sends another frame in its place.
+    Garbled,
+    Nothing,
+}
+
+/// What it hears back: a redirect, the session starting here, the host's typed close and its
+/// sentence, or, from [`dial_until_held`], a `Pending`.
+#[derive(Debug, PartialEq)]
+enum Heard {
+    Redirect { port: u16, pin: String },
+    Played,
+    Closed(punktfunk_core::reject::RejectReason, String),
+    Held,
+}
+
+/// One dial for `profile`, offering `features`, then `sends`; the `Pending`s it heard and how
+/// the host ended it.
+async fn dial_person(
+    port: u16,
+    identity: (&str, &str),
+    profile: (&str, Option<&crate::profiles::Profiles>),
+    features: punktfunk_core::quic::v2::features::FeatureSet,
+    sends: Sends,
+) -> (usize, Heard) {
+    dial_until(port, identity, profile, features, sends, false).await
+}
+
+/// [`dial_person`], ended by the client at the host's first `Pending`.
+async fn dial_until_held(
+    port: u16,
+    identity: (&str, &str),
+    profile: (&str, Option<&crate::profiles::Profiles>),
+    features: punktfunk_core::quic::v2::features::FeatureSet,
+    sends: Sends,
+) -> (usize, Heard) {
+    dial_until(port, identity, profile, features, sends, true).await
+}
+
+async fn dial_until(
+    port: u16,
+    identity: (&str, &str),
+    (profile, profiles): (&str, Option<&crate::profiles::Profiles>),
+    features: punktfunk_core::quic::v2::features::FeatureSet,
+    sends: Sends,
+    held_ends: bool,
+) -> (usize, Heard) {
+    use punktfunk_core::quic::v2::{io as v2io, msg, registry};
+    let (ep, observed) = endpoint::client_shared(None, Some(identity), &[registry::ALPN], None);
+    let (ep, _media) = ep.expect("client endpoint");
+    let conn = ep
+        .connect(format!("127.0.0.1:{port}").parse().unwrap(), "punktfunk")
+        .expect("connect")
+        .await
+        .expect("QUIC handshake");
+    let (mut send, recv) = conn.open_bi().await.expect("control stream");
+    v2io::write_stream_type(&mut send, registry::STREAM_CONTROL)
+        .await
+        .unwrap();
+    let mut recv = v2io::FrameReader::new(recv);
+    let features = match sends {
+        Sends::Nothing => features,
+        _ => features.with(registry::FEATURE_UNLOCK_FOLLOWS),
+    };
+    v2io::send(&mut send, &plain_hello(Some(profile), features))
+        .await
+        .unwrap();
+    match sends {
+        Sends::Unlock(unlock) => v2io::write_frame(&mut send, &unlock.encode())
+            .await
+            .unwrap(),
+        Sends::Signed(sign) => {
+            let host = observed.lock().unwrap().expect("the host's certificate");
+            let device = hex::encode(endpoint::fingerprint_of_pem(identity.0).unwrap());
+            let unlock = sign(profiles.expect("the host's profiles"), &device, &host);
+            v2io::write_frame(&mut send, &unlock.encode())
+                .await
+                .unwrap()
+        }
+        Sends::Garbled => v2io::send(&mut send, &Ready {}).await.unwrap(),
+        Sends::Nothing => {}
+    }
+    let mut pendings = 0;
+    while let Ok((ty, body)) = recv.read_frame().await {
+        if ty == msg::Pending::TYPE {
+            pendings += 1;
+            if held_ends {
+                conn.close(0u32.into(), b"");
+                return (pendings, Heard::Held);
+            }
+            continue;
+        }
+        if ty == registry::MSG_SERVER_HELLO {
+            conn.close(0u32.into(), b"");
+            return (pendings, Heard::Played);
+        }
+        assert_eq!(
+            ty,
+            msg::Redirect::TYPE,
+            "an admission answers no other frame"
+        );
+        let to = msg::decode::<msg::Redirect>(ty, &body).unwrap();
+        conn.close(0u32.into(), b"");
+        let (port, pin) = (to.port, to.pin);
+        return (pendings, Heard::Redirect { port, pin });
+    }
+    let quinn::ConnectionError::ApplicationClosed(ac) = conn.closed().await else {
+        panic!("the host closes the connect itself");
+    };
+    let code = u32::try_from(u64::from(ac.error_code)).unwrap();
+    let reason = punktfunk_core::reject::RejectReason::from_close_code(code)
+        .unwrap_or_else(|| panic!("close code {code:#x} is no typed refusal"));
+    let sentence = String::from_utf8(ac.reason.to_vec()).unwrap();
+    (pendings, Heard::Closed(reason, sentence))
+}
+
+const PERSON_SEAT: &str = "7a11ce007a11ce007a11ce007a11ce00";
+const WINDOWS_SEAT: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+const MADE_SEAT: &str = "3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d";
+const PERSON: &str = "7a11ce00e001";
+
+/// The fake supervisor's ledger: a person's own Linux account, a Windows seat on an existing
+/// account and a made seat, each running on its own port.
+fn person_ledger() -> Vec<pf_seats::Seat> {
+    let row = |id: &str, port: u16| {
+        let mut seat = crate::native::unlock::fake::person(id, port);
+        seat.adopted_uid = None;
+        seat
+    };
+    let mut windows = row(WINDOWS_SEAT, 9781);
+    windows.adopted_sid = Some("S-1-5-21-1-2-3-1001".into());
+    vec![
+        crate::native::unlock::fake::person(PERSON_SEAT, 9780),
+        windows,
+        row(MADE_SEAT, 9782),
+    ]
+}
+
+/// A profile store with a profile on each of [`person_ledger`]'s rows.
+fn person_profiles(tag: &str) -> Arc<crate::profiles::Profiles> {
+    let file = crate::test_support::scratch().join(format!("pf-person-{tag}.json"));
+    let profile = |id: &str, name: &str, seat: &str| {
+        serde_json::json!({"id": id, "display_name": name,
+            "os_account": {"kind": "seat", "seat": seat}})
+    };
+    let body = serde_json::json!({"version": 1, "profiles": [
+        {"id": "4f1c3a9b0e27", "display_name": "Enrico", "os_account": {"kind": "operator"}},
+        profile(PERSON, "Jane", PERSON_SEAT),
+        profile("7a11ce00e002", "Sam", WINDOWS_SEAT),
+        profile("7a11ce00e003", "Kid", MADE_SEAT),
+    ]});
+    std::fs::write(&file, body.to_string()).unwrap();
+    Arc::new(crate::profiles::Profiles::load_with(Some(file), None))
+}
+
+fn password(secret: &str, stay: bool, enroll: Option<Vec<u8>>) -> v2msg::ProfileUnlock {
+    let (alg, key) = match enroll {
+        Some(key) => (v2msg::ENROLL_P256, key),
+        None => (v2msg::ENROLL_NONE, Vec::new()),
+    };
+    let secret = v2msg::Zeroizing::new(secret.as_bytes().to_vec());
+    v2msg::ProfileUnlock::new(v2msg::UNLOCK_PASSWORD, secret, stay, alg, key).unwrap()
+}
+
+/// A person's own Linux account opens only on the supervisor's word: each proof kind reaches it
+/// from the device the QUIC handshake authenticated, under its pairing name, and only `unlocked`
+/// is redirected, with `Pending` while a cold start runs. Each refusal reaches each client
+/// generation as CONTRACT §5 says, and a supervisor that is down or hangs is a plain refusal.
+/// The other rows are placed as before, with nothing asked.
+#[test]
+fn a_person_s_own_account_opens_only_on_the_supervisor_s_word() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use crate::native::unlock::fake::{self, refused, Fake};
+    use pf_seats::ipc::{ApiError, Command, CommandResult, ErrorCode, Proof};
+    use punktfunk_core::quic::v2::features::FeatureSet;
+    use punktfunk_core::quic::v2::registry::{FEATURE_PROFILES, FEATURE_PROFILE_UNLOCK};
+    use punktfunk_core::reject::RejectReason::{ProfileLocked, SeatUnavailable};
+    use std::time::Duration;
+    type Answer = Result<CommandResult, ApiError>;
+
+    let new = FeatureSet::default()
+        .with(FEATURE_PROFILES)
+        .with(FEATURE_PROFILE_UNLOCK);
+    let old = FeatureSet::default().with(FEATURE_PROFILES);
+    let unlocked = |started| -> Answer {
+        Ok(CommandResult::Unlocked {
+            seat: fake::person(PERSON_SEAT, 9780),
+            started,
+        })
+    };
+    let to = |port| Heard::Redirect {
+        port,
+        pin: "5eed".repeat(16),
+    };
+    let closed = |reason, sentence: &str| Heard::Closed(reason, sentence.to_string());
+    let pw = |secret: &str| Sends::Unlock(password(secret, false, None));
+    let p256 = [vec![4u8], vec![0x42; 64]].concat();
+    let key_proof = {
+        let secret = v2msg::Zeroizing::new(vec![0x30, 0x45, 0x01]);
+        v2msg::ProfileUnlock::new(v2msg::UNLOCK_KEY_PROOF, secret, false, 0, Vec::new()).unwrap()
+    };
+    let needs = "This profile needs its account password.";
+    let silent = "This computer's seat service didn't answer. Try again in a moment.";
+    // (what, profile, features, sends, the supervisor's answer, its ms, what the client hears)
+    let cases: Vec<(&str, &str, FeatureSet, Sends, Answer, u64, Heard)> = vec![
+        (
+            "a password on a cold start",
+            PERSON,
+            new,
+            Sends::Unlock(password("hunter2 Bärbel", true, Some(p256.clone()))),
+            unlocked(true),
+            600,
+            to(9780),
+        ),
+        (
+            "a key proof",
+            PERSON,
+            new,
+            Sends::Unlock(key_proof),
+            unlocked(false),
+            0,
+            to(9780),
+        ),
+        (
+            "a signed-in device",
+            PERSON,
+            new,
+            Sends::Nothing,
+            unlocked(false),
+            0,
+            to(9780),
+        ),
+        (
+            "no proof",
+            PERSON,
+            new,
+            Sends::Nothing,
+            Err(refused("unlock_required", needs)),
+            0,
+            closed(ProfileLocked, ""),
+        ),
+        (
+            "a wrong password",
+            PERSON,
+            new,
+            pw("wrong"),
+            Err(refused("credential_wrong", "That isn't jdoe's password.")),
+            0,
+            closed(ProfileLocked, "That isn't jdoe's password."),
+        ),
+        (
+            "too many",
+            PERSON,
+            new,
+            pw("wrong"),
+            Err(refused("unlock_locked_out", "Try again in 15 minutes.")),
+            0,
+            closed(ProfileLocked, "Try again in 15 minutes."),
+        ),
+        (
+            "a full device list",
+            PERSON,
+            new,
+            pw("pw"),
+            Err(ApiError::new(
+                ErrorCode::Capacity,
+                "Sign one out in the console.",
+            )),
+            0,
+            closed(ProfileLocked, "Sign one out in the console."),
+        ),
+        (
+            "an older client",
+            PERSON,
+            old,
+            Sends::Nothing,
+            Err(refused("unlock_required", needs)),
+            0,
+            closed(
+                SeatUnavailable,
+                "This profile needs its account password. Update Punktfunk on this device.",
+            ),
+        ),
+        (
+            "an unlock announced and not sent",
+            PERSON,
+            new,
+            Sends::Garbled,
+            unlocked(false),
+            0,
+            closed(
+                ProfileLocked,
+                "Couldn't read the password this device sent. Try again.",
+            ),
+        ),
+        (
+            "a seat that didn't start",
+            PERSON,
+            new,
+            pw("pw"),
+            Err(refused(
+                "seat_dirs",
+                "create /var/lib/punktfunk-seats/x: denied",
+            )),
+            0,
+            closed(
+                SeatUnavailable,
+                "This profile's desktop didn't start. Try again in a moment.",
+            ),
+        ),
+        (
+            "a supervisor that is down",
+            PERSON,
+            new,
+            pw("pw"),
+            Err(ApiError::new(ErrorCode::Transport, "connect: No such file")),
+            0,
+            closed(SeatUnavailable, silent),
+        ),
+        (
+            "a supervisor that hangs until the socket gives up",
+            PERSON,
+            new,
+            pw("pw"),
+            Err(ApiError::new(ErrorCode::Transport, "read: timed out")),
+            1200,
+            closed(SeatUnavailable, silent),
+        ),
+        (
+            "a Windows seat",
+            "7a11ce00e002",
+            old,
+            Sends::Nothing,
+            unlocked(false),
+            0,
+            to(9781),
+        ),
+        (
+            "a made seat, unlock and all",
+            "7a11ce00e003",
+            new,
+            pw("pw"),
+            unlocked(false),
+            0,
+            to(9782),
+        ),
+    ];
+
+    // One device throughout: a redirect holds its seat for that device alone.
+    let store = access_store_path("person");
+    let _ = std::fs::remove_file(&store);
+    let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+    let (cert, key) = endpoint::generate_identity().unwrap();
+    let fp = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
+    np.add_with_access("Jane's phone", &fp, None).unwrap();
+    let host = spawn_profile_host(19797, cases.len() as u32, np, person_profiles("cases"));
+    std::thread::sleep(Duration::from_millis(500));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (what, profile, features, sends, answer, takes, heard) in cases {
+        let kind = match &sends {
+            Sends::Unlock(u) if u.kind == v2msg::UNLOCK_PASSWORD => "password",
+            Sends::Unlock(_) => "key",
+            _ => "none",
+        };
+        let garbled = matches!(sends, Sends::Garbled);
+        let mut sup = Fake::new(person_ledger(), move |c| match c {
+            Command::Unlock { .. } => answer.clone(),
+            _ => Ok(CommandResult::Left),
+        });
+        sup.unlock_takes = Duration::from_millis(takes);
+        let sup = Arc::new(sup);
+        let _armed = fake::arm(&fp, sup.clone());
+        let dialled = dial_person(19797, (&cert, &key), (profile, None), features, sends);
+        let (pendings, got) = rt.block_on(dialled);
+        assert_eq!(got, heard, "{what}");
+        if takes > 0 {
+            assert!(pendings >= 1, "{what}: Pending while the supervisor works");
+        }
+        let asked = sup.asked();
+        let unlocks: Vec<_> = asked
+            .iter()
+            .filter(|c| matches!(c, Command::Unlock { .. }))
+            .collect();
+        if profile != PERSON || garbled {
+            assert!(unlocks.is_empty(), "{what}: nothing asked");
+            continue;
+        }
+        let [Command::Unlock { id, device, proof }] = unlocks[..] else {
+            panic!("{what}: one unlock asked, got {asked:?}");
+        };
+        assert_eq!(id.as_str(), PERSON_SEAT, "{what}");
+        assert_eq!(device.fingerprint, fp, "{what}: the certificate's own");
+        assert_eq!(device.name, "Jane's phone", "{what}: its pairing name");
+        assert_eq!(proof.kind(), kind, "{what}");
+        match proof {
+            Proof::Password {
+                password,
+                stay_signed_in: true,
+                enroll: Some(key),
+            } => {
+                assert_eq!(password.expose(), "hunter2 Bärbel");
+                assert_eq!(key.public, hex::encode(&p256));
+            }
+            Proof::Key { signature } => assert_eq!(signature, "304501"),
+            _ => {}
+        }
+    }
+    host.join().unwrap().unwrap();
+    let _ = std::fs::remove_file(&store);
+}
+
+/// A wrong password leaves no trace of itself in the host's log at any level, in its errors or
+/// in what the client reads: only that an unlock was asked and how it ended.
+#[test]
+fn a_wrong_password_never_reaches_a_log_or_an_error() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use crate::native::unlock::fake::{self, refused, Fake};
+    use punktfunk_core::quic::v2::features::FeatureSet;
+    use punktfunk_core::quic::v2::registry::{FEATURE_PROFILES, FEATURE_PROFILE_UNLOCK};
+
+    #[derive(Clone, Default)]
+    struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let logs = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let secret = "Pf-n0t-H1s-pa55word";
+    let store = access_store_path("person-logs");
+    let _ = std::fs::remove_file(&store);
+    let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+    let (cert, key) = endpoint::generate_identity().unwrap();
+    let fp = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
+    np.add_with_access("Jane's phone", &fp, None).unwrap();
+    let sup = Arc::new(Fake::new(person_ledger(), |_| {
+        Err(refused("credential_wrong", "That isn't jdoe's password."))
+    }));
+    let _armed = fake::arm(&fp, sup.clone());
+    let host = spawn_logged_host(19798, 1, np, person_profiles("logs"), Some(logs));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let features = FeatureSet::default()
+        .with(FEATURE_PROFILES)
+        .with(FEATURE_PROFILE_UNLOCK);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let unlock = Sends::Unlock(password(secret, false, None));
+    let dialled = dial_person(19798, (&cert, &key), (PERSON, None), features, unlock);
+    let (_, heard) = rt.block_on(dialled);
+    host.join().unwrap().unwrap();
+    let _ = std::fs::remove_file(&store);
+
+    let said = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        said.contains("profile unlock answered"),
+        "the log was captured: {said}"
+    );
+    assert!(
+        said.contains("credential_wrong"),
+        "the outcome code is logged"
+    );
+    for trace in [said, format!("{heard:?}"), format!("{:?}", sup.asked())] {
+        assert!(!trace.contains(secret), "{trace}");
+        assert!(!trace.contains(&hex::encode(secret)), "{trace}");
+    }
+    assert_eq!(
+        heard,
+        Heard::Closed(
+            punktfunk_core::reject::RejectReason::ProfileLocked,
+            "That isn't jdoe's password.".into()
+        )
+    );
+}
+
+const OWNER_PROFILE: &str = "4f1c3a9b0e27";
+const KID_PROFILE: &str = "c1d000000001";
+/// A profile that shares the owner's desktop.
+const SHARER_PROFILE: &str = "5a1e00000001";
+
+/// A device's dial: the profile it names, the features it offers, what it sends after its hello.
+type Dial<'a> = (
+    &'a str,
+    punktfunk_core::quic::v2::features::FeatureSet,
+    Sends,
+);
+
+/// The features of a client that follows redirects, and with `prompts` also asks for an unlock.
+fn offers(prompts: bool) -> punktfunk_core::quic::v2::features::FeatureSet {
+    use punktfunk_core::quic::v2::registry::{FEATURE_PROFILES, FEATURE_PROFILE_UNLOCK};
+    let features = punktfunk_core::quic::v2::features::FeatureSet::default().with(FEATURE_PROFILES);
+    match prompts {
+        true => features.with(FEATURE_PROFILE_UNLOCK),
+        false => features,
+    }
+}
+
+/// A box of its own on `port`: the owner on the box's own session, and [`KID_PROFILE`] on a made
+/// seat on `port + 1000` that no other test's redirect holds. `locks`, given the device's
+/// fingerprint, is the profile lock file, `null` for none. One paired device makes `dials` in
+/// turn; what it hears each time, and where the lock file is.
+fn dial_box(
+    port: u16,
+    locks: impl FnOnce(&str) -> serde_json::Value,
+    dials: Vec<Dial<'_>>,
+) -> (Vec<Heard>, std::path::PathBuf) {
+    dial_host(port, false, locks, dials)
+}
+
+/// [`dial_box`], on the kid's seat host when `seat_host`: it reads the box's files read only, as
+/// a Windows seat host reads the box's config dir.
+fn dial_host(
+    port: u16,
+    seat_host: bool,
+    locks: impl FnOnce(&str) -> serde_json::Value,
+    dials: Vec<Dial<'_>>,
+) -> (Vec<Heard>, std::path::PathBuf) {
+    use crate::native::unlock::fake::{self, Fake};
+    let dir = crate::test_support::scratch();
+    let seat_id = format!("{port:032x}");
+    let mut seat = fake::person(&seat_id, port + 1000);
+    seat.adopted_uid = None;
+    let file = serde_json::json!({"version": 1, "profiles": [
+        {"id": OWNER_PROFILE, "display_name": "Enrico", "os_account": {"kind": "operator"}},
+        {"id": KID_PROFILE, "display_name": "Kid", "os_account": {"kind": "seat", "seat": seat_id}},
+        {"id": SHARER_PROFILE, "display_name": "Guest", "os_account": {"kind": "operator"}},
+    ]});
+    std::fs::write(dir.join("profiles.json"), file.to_string()).unwrap();
+    let np = NativePairing::load_with(Some(dir.join("punktfunk1-paired.json")), None, false);
+    let np = Arc::new(np.unwrap());
+    let (cert, key) = endpoint::generate_identity().unwrap();
+    let fp = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
+    np.add_with_access("Kid's tablet", &fp, None).unwrap();
+    let lock_file = dir.join(pf_seats::locks::FILE);
+    let locks = locks(&fp);
+    if !locks.is_null() {
+        std::fs::write(&lock_file, locks.to_string()).unwrap();
+    }
+    let path = dir.join("profiles.json");
+    let profiles = match seat_host {
+        true => crate::profiles::Profiles::load_box(path, Some(seat_id)),
+        false => crate::profiles::Profiles::load_with(Some(path), None),
+    };
+    let sup = Fake::new(vec![seat], |_| Ok(pf_seats::ipc::CommandResult::Left));
+    let _armed = fake::arm(&fp, Arc::new(sup));
+    let profiles = Arc::new(profiles);
+    let host = spawn_profile_host(port, dials.len() as u32, np, Arc::clone(&profiles));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let heard = dials
+        .into_iter()
+        .map(|(profile, features, sends)| {
+            let asked = (profile, Some(&*profiles));
+            let dialled = dial_person(port, (&cert, &key), asked, features, sends);
+            rt.block_on(dialled).1
+        })
+        .collect();
+    host.join().unwrap().unwrap();
+    (heard, lock_file)
+}
+
+/// The kid's seat as a redirect from `port` names it.
+fn kid_seat(port: u16) -> Heard {
+    Heard::Redirect {
+        port: port + 1000,
+        pin: "5eed".repeat(16),
+    }
+}
+
+/// An open profile opens as it always has: the box's own session plays here and a seat's profile
+/// goes to its seat, with nothing asked of the device.
+#[test]
+fn an_open_profile_opens_on_every_session_path() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dials = vec![
+        (OWNER_PROFILE, offers(true), Sends::Nothing),
+        (KID_PROFILE, offers(false), Sends::Nothing),
+    ];
+    let (heard, _) = dial_box(19801, |_| serde_json::Value::Null, dials);
+    assert_eq!(heard, [Heard::Played, kid_seat(19801)]);
+}
+
+/// `fp` on a profile's list, signed in until signed out.
+fn listed(fp: &str) -> serde_json::Value {
+    serde_json::json!({"fingerprint": fp, "name": "Kid's tablet", "stay": true,
+        "added_unix": 1, "last_unix": 1})
+}
+
+/// The refusal a device hears for a locked profile it is not on the list of.
+fn not_allowed() -> Heard {
+    Heard::Closed(
+        punktfunk_core::reject::RejectReason::SeatUnavailable,
+        "This device can't open this profile. Ask the host's owner to add it.".into(),
+    )
+}
+
+/// A locked profile opens for the devices on its list alone, on both session paths: the box's
+/// own session, played here, and a seat's profile, refused before its redirect. A lock entry
+/// that isn't locked is an open profile.
+#[test]
+fn a_locked_profile_opens_only_for_its_devices() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dials = || {
+        vec![
+            (OWNER_PROFILE, offers(true), Sends::Nothing),
+            (KID_PROFILE, offers(false), Sends::Nothing),
+        ]
+    };
+    let other = |_: &str| {
+        let lock = serde_json::json!({"locked": true, "devices": [listed(&"ab".repeat(32))]});
+        serde_json::json!({"version": 1, "profiles": {OWNER_PROFILE: lock, KID_PROFILE: lock}})
+    };
+    let (heard, _) = dial_box(19802, other, dials());
+    assert_eq!(heard, [not_allowed(), not_allowed()]);
+
+    let mine = |fp: &str| {
+        let lock = serde_json::json!({"locked": true, "devices": [listed(fp)]});
+        let open = serde_json::json!({"locked": false});
+        serde_json::json!({"version": 1, "profiles": {OWNER_PROFILE: lock, KID_PROFILE: open}})
+    };
+    let (heard, _) = dial_box(19803, mine, dials());
+    assert_eq!(heard, [Heard::Played, kid_seat(19803)]);
+}
+
+/// A profile that shares the owner's desktop opens with the owner's lock: a device off the
+/// owner's list is refused, one on it goes on, and the owner's PIN puts a device on the owner's
+/// list. A seat host's view is `profiles::locks`' test.
+#[test]
+fn a_profile_sharing_the_owner_s_desktop_opens_with_the_owner_s_lock() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let sharer = || vec![(SHARER_PROFILE, offers(true), Sends::Nothing)];
+    let other = |_: &str| {
+        let lock = serde_json::json!({"locked": true, "devices": [listed(&"ab".repeat(32))]});
+        serde_json::json!({"version": 1, "profiles": {OWNER_PROFILE: lock}})
+    };
+    assert_eq!(dial_box(19809, other, sharer()).0, [not_allowed()]);
+    let mine = |fp: &str| {
+        let lock = serde_json::json!({"locked": true, "devices": [listed(fp)]});
+        serde_json::json!({"version": 1, "profiles": {OWNER_PROFILE: lock}})
+    };
+    assert_eq!(dial_box(19811, mine, sharer()).0, [Heard::Played]);
+
+    let pin = serde_json::to_value(pf_seats::locks::PinHash::new("2468").unwrap()).unwrap();
+    let with_pin = |_: &str| {
+        let lock = serde_json::json!({"locked": true, "pin": pin});
+        serde_json::json!({"version": 1, "profiles": {OWNER_PROFILE: lock}})
+    };
+    let dials = vec![
+        (
+            SHARER_PROFILE,
+            offers(true),
+            Sends::Unlock(password("2468", true, None)),
+        ),
+        (OWNER_PROFILE, offers(true), Sends::Nothing),
+    ];
+    let (heard, lock_file) = dial_box(19812, with_pin, dials);
+    assert_eq!(heard, [Heard::Played, Heard::Played]);
+    let file = pf_seats::locks::Locks::parse(&std::fs::read(lock_file).unwrap()).unwrap();
+    assert_eq!(file.profiles.keys().collect::<Vec<_>>(), [OWNER_PROFILE]);
+    assert_eq!(file.profiles[OWNER_PROFILE].list.entries().len(), 1);
+}
+
+/// A seat host reads the box's own lock file, as a Windows seat host reads the box's config dir:
+/// a device not on the list is refused there and never asked for the PIN only the box takes; a
+/// device on it goes on.
+#[test]
+fn a_seat_host_checks_the_box_s_lock_file() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let pin = serde_json::to_value(pf_seats::locks::PinHash::new("2468").unwrap()).unwrap();
+    let other = |_: &str| {
+        let lock = serde_json::json!({"locked": true, "pin": pin,
+            "devices": [listed(&"ab".repeat(32))]});
+        serde_json::json!({"version": 1, "profiles": {KID_PROFILE: lock}})
+    };
+    let dials = vec![(KID_PROFILE, offers(true), Sends::Nothing)];
+    let (heard, _) = dial_host(19805, true, other, dials);
+    assert_eq!(heard, [not_allowed()]);
+
+    let mine = |fp: &str| {
+        let lock = serde_json::json!({"locked": true, "devices": [listed(fp)]});
+        serde_json::json!({"version": 1, "profiles": {KID_PROFILE: lock}})
+    };
+    let dials = vec![(KID_PROFILE, offers(true), Sends::Nothing)];
+    let (heard, _) = dial_host(19806, true, mine, dials);
+    assert_eq!(heard, [kid_seat(19806)]);
+}
+
+/// A locked profile's PIN, sent as the hello's `ProfileUnlock`, opens it for a device off its
+/// list. With none the client is sent to its prompt, or told to update when it has none; a key
+/// proof from a device with no key is turned back to the prompt with the sentence that says so;
+/// a wrong PIN is refused and the device waits before the next. A right one puts the device on
+/// the list, so its next connect needs nothing.
+#[test]
+fn a_locked_profile_opens_with_its_pin() {
+    use punktfunk_core::reject::RejectReason::{ProfileLocked, SeatUnavailable};
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let pin = serde_json::to_value(pf_seats::locks::PinHash::new("2468").unwrap()).unwrap();
+    let locked = |_: &str| {
+        let lock = serde_json::json!({"locked": true, "pin": pin});
+        serde_json::json!({"version": 1, "profiles": {KID_PROFILE: lock}})
+    };
+    let key = {
+        let secret = v2msg::Zeroizing::new(vec![0x30, 0x45, 0x01]);
+        v2msg::ProfileUnlock::new(v2msg::UNLOCK_KEY_PROOF, secret, false, 0, Vec::new()).unwrap()
+    };
+    let pw = |pin: &str, stay| Sends::Unlock(password(pin, stay, None));
+    let dials = vec![
+        (KID_PROFILE, offers(true), Sends::Nothing),
+        (KID_PROFILE, offers(false), Sends::Nothing),
+        (KID_PROFILE, offers(true), Sends::Unlock(key)),
+        (KID_PROFILE, offers(true), pw("1357", false)),
+        (KID_PROFILE, offers(true), pw("2468", false)),
+    ];
+    let (heard, _) = dial_host(19807, false, locked, dials);
+    let closed = |reason, sentence: &str| Heard::Closed(reason, sentence.to_string());
+    assert_eq!(
+        heard[..4],
+        [
+            closed(ProfileLocked, ""),
+            closed(
+                SeatUnavailable,
+                "This profile needs its PIN. Update Punktfunk on this device."
+            ),
+            closed(
+                ProfileLocked,
+                "Couldn't confirm it's you on this device. Type this profile's PIN."
+            ),
+            closed(ProfileLocked, "That isn't this profile's PIN."),
+        ]
+    );
+    let Heard::Closed(ProfileLocked, wait) = &heard[4] else {
+        panic!("the device waits: {:?}", heard[4]);
+    };
+    assert!(
+        wait.starts_with("Too many wrong PINs. Try again in "),
+        "{wait}"
+    );
+
+    let dials = vec![
+        (KID_PROFILE, offers(true), pw("2468", true)),
+        (KID_PROFILE, offers(true), Sends::Nothing),
+    ];
+    let (heard, lock_file) = dial_host(19808, false, locked, dials);
+    assert_eq!(heard, [kid_seat(19808), kid_seat(19808)]);
+    let file = pf_seats::locks::Locks::parse(&std::fs::read(lock_file).unwrap()).unwrap();
+    let entries = file.profiles[KID_PROFILE].list.entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, pf_seats::ipc::DeviceKind::Stay);
+    assert_eq!(entries[0].name, "Kid's tablet", "its pairing name");
+}
+
+/// A device whose PIN enrolled a key opens the profile with the key's proof once it left: a
+/// signature over a fresh challenge for this profile, this device and the host it pinned. Then
+/// it is present and needs nothing. A proof for another profile is turned back to the PIN
+/// prompt with the sentence that says so; with no PIN to fall back on, the device is refused.
+#[test]
+fn a_locked_profile_opens_with_an_enrolled_key() {
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair as _, ECDSA_P256_SHA256_ASN1_SIGNING};
+    use punktfunk_core::reject::RejectReason::ProfileLocked;
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let pair = Arc::new(EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING).unwrap());
+    let public = hex::encode(pair.public_key().as_ref());
+    let pin = serde_json::to_value(pf_seats::locks::PinHash::new("2468").unwrap()).unwrap();
+    let keyed = |pin: serde_json::Value| {
+        let public = public.clone();
+        move |fp: &str| {
+            let device = serde_json::json!({"fingerprint": fp, "name": "Kid's tablet",
+                "key": {"alg": "p256", "public": public}, "added_unix": 1, "last_unix": 1});
+            let lock = serde_json::json!({"locked": true, "pin": pin, "devices": [device]});
+            serde_json::json!({"version": 1, "profiles": {KID_PROFILE: lock}})
+        }
+    };
+    let proof = |signed_for: &'static str| {
+        let pair = Arc::clone(&pair);
+        let sign = move |profiles: &crate::profiles::Profiles, device: &str, host: &[u8; 32]| {
+            let locks = profiles.locks();
+            let challenge = locks.challenge(KID_PROFILE, KID_PROFILE, device).unwrap();
+            let d = pf_seats::unlock::fingerprint_bytes(device).unwrap();
+            let m = v2msg::profile_unlock_signed_message(&challenge, signed_for, &d, host).unwrap();
+            let signature = pair
+                .sign(&SystemRandom::new(), &m)
+                .unwrap()
+                .as_ref()
+                .to_vec();
+            let secret = v2msg::Zeroizing::new(signature);
+            v2msg::ProfileUnlock::new(v2msg::UNLOCK_KEY_PROOF, secret, false, 0, Vec::new())
+                .unwrap()
+        };
+        Sends::Signed(Box::new(sign))
+    };
+    let dials = vec![
+        (KID_PROFILE, offers(true), proof(KID_PROFILE)),
+        (KID_PROFILE, offers(true), Sends::Nothing),
+    ];
+    let (heard, _) = dial_host(19813, false, keyed(pin.clone()), dials);
+    assert_eq!(heard, [kid_seat(19813), kid_seat(19813)]);
+
+    let failed = "Couldn't confirm it's you on this device. Type this profile's PIN.";
+    let dials = vec![(KID_PROFILE, offers(true), proof("0123456789ab"))];
+    let (heard, _) = dial_host(19814, false, keyed(pin), dials);
+    assert_eq!(heard, [Heard::Closed(ProfileLocked, failed.into())]);
+    let dials = vec![(KID_PROFILE, offers(true), proof("0123456789ab"))];
+    let (heard, _) = dial_host(19815, false, keyed(serde_json::Value::Null), dials);
+    assert_eq!(heard, [not_allowed()]);
+}
+
+/// A session on a locked profile ends once its device is signed out, with the sentence that says
+/// so.
+#[test]
+fn signing_a_device_out_ends_its_session() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = crate::test_support::scratch();
+    let owner = serde_json::json!({"id": OWNER_PROFILE, "display_name": "Enrico",
+        "os_account": {"kind": "operator"}});
+    let file = serde_json::json!({"version": 1, "profiles": [owner]});
+    std::fs::write(dir.join("profiles.json"), file.to_string()).unwrap();
+    let (cert, key) = endpoint::generate_identity().unwrap();
+    let fp = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
+    let lock = serde_json::json!({"locked": true, "devices": [listed(&fp)]});
+    let locks = serde_json::json!({"version": 1, "profiles": {OWNER_PROFILE: lock}});
+    std::fs::write(dir.join(pf_seats::locks::FILE), locks.to_string()).unwrap();
+    let profiles = Arc::new(crate::profiles::Profiles::load_with(
+        Some(dir.join("profiles.json")),
+        None,
+    ));
+    let np = NativePairing::load_with(Some(dir.join("punktfunk1-paired.json")), None, false);
+    let np = Arc::new(np.unwrap());
+    np.add_with_access("Kid's tablet", &fp, None).unwrap();
+    let host = spawn_profile_host(19804, 1, np, profiles.clone());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (code, reason) = rt.block_on(async {
+        let (conn, _send, _recv, _welcome, _media) = raw_session(19804, (&cert, &key)).await;
+        let signed_out = profiles.locks().edit(OWNER_PROFILE, |lock, _| {
+            lock.list.sign_out(None);
+        });
+        signed_out.unwrap();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), conn.closed());
+        match closed.await.expect("the host ends the session") {
+            quinn::ConnectionError::ApplicationClosed(ac) => (
+                u64::from(ac.error_code),
+                String::from_utf8(ac.reason.to_vec()).unwrap(),
+            ),
+            other => panic!("expected the host's close, got {other:?}"),
+        }
+    });
+    host.join().unwrap().unwrap();
+    let unavailable = punktfunk_core::reject::RejectReason::SeatUnavailable.close_code();
+    assert_eq!(code, u64::from(unavailable));
+    assert_eq!(reason, "This device was signed out of this profile.");
+}
+
+/// A dial that announces an unlock starts a stopped made seat only as a wake would: for a device
+/// whose unlock opened the profile's lock, or one holding the launch grant. Any other device is
+/// told the seat is down, with nothing started and no `Pending`.
+#[test]
+fn a_dial_starts_a_stopped_seat_only_as_a_wake_would() {
+    use crate::native::unlock::fake::{self, Fake};
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let port = 19821;
+    let dir = crate::test_support::scratch();
+    let (open_seat, locked_seat) = ("0a".repeat(16), "0b".repeat(16));
+    let stopped = |id: &str| {
+        let mut seat = fake::person(id, port + 1000);
+        seat.adopted_uid = None;
+        seat.fingerprint = None;
+        seat.runtime.state = pf_seats::RuntimeState::Stopped;
+        seat
+    };
+    let seat = |id: &str, name: &str, on: &str| {
+        serde_json::json!({"id": id, "display_name": name,
+            "os_account": {"kind": "seat", "seat": on}})
+    };
+    let file = serde_json::json!({"version": 1, "profiles": [
+        {"id": OWNER_PROFILE, "display_name": "Enrico", "os_account": {"kind": "operator"}},
+        seat(KID_PROFILE, "Kid", &locked_seat),
+        seat(SHARER_PROFILE, "Guest", &open_seat),
+    ]});
+    std::fs::write(dir.join("profiles.json"), file.to_string()).unwrap();
+    let pin = serde_json::to_value(pf_seats::locks::PinHash::new("2468").unwrap()).unwrap();
+    let locks = serde_json::json!({"version": 1,
+        "profiles": {KID_PROFILE: {"locked": true, "pin": pin}}});
+    std::fs::write(dir.join(pf_seats::locks::FILE), locks.to_string()).unwrap();
+    let profiles = Arc::new(crate::profiles::Profiles::load_with(
+        Some(dir.join("profiles.json")),
+        None,
+    ));
+    let np = NativePairing::load_with(Some(dir.join("punktfunk1-paired.json")), None, false);
+    let np = Arc::new(np.unwrap());
+    let pad = endpoint::generate_identity().unwrap();
+    let couch = endpoint::generate_identity().unwrap();
+    let fp =
+        |(cert, _): &(String, String)| hex::encode(endpoint::fingerprint_of_pem(cert).unwrap());
+    let controller_only = crate::native_pairing::Access {
+        grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+        expires_unix: None,
+        until_disconnect: false,
+    };
+    np.add_with_access("Pad", &fp(&pad), Some(controller_only))
+        .unwrap();
+    np.add_with_access("Couch", &fp(&couch), None).unwrap();
+    let sup = Arc::new(Fake::new(
+        vec![stopped(&open_seat), stopped(&locked_seat)],
+        |_| Ok(pf_seats::ipc::CommandResult::Left),
+    ));
+    let _armed = [
+        fake::arm(&fp(&pad), sup.clone()),
+        fake::arm(&fp(&couch), sup),
+    ];
+    let host = spawn_profile_host(port, 3, np, profiles);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // A started seat holds the dial with `Pending`s until it runs.
+    let dial = |(cert, key): &(String, String), profile, pin: &str| {
+        let sends = Sends::Unlock(password(pin, false, None));
+        let identity = (cert.as_str(), key.as_str());
+        let dialled = dial_until_held(port, identity, (profile, None), offers(true), sends);
+        let wait = std::time::Duration::from_secs(5);
+        rt.block_on(async { tokio::time::timeout(wait, dialled).await })
+            .expect("the host answers the dial")
+    };
+
+    let refused = dial(&pad, SHARER_PROFILE, "0000");
+    let unavailable = punktfunk_core::reject::RejectReason::SeatUnavailable;
+    assert!(
+        matches!(refused, (0, Heard::Closed(r, _)) if r == unavailable),
+        "{refused:?}"
+    );
+    assert_eq!(
+        dial(&pad, KID_PROFILE, "2468"),
+        (1, Heard::Held),
+        "its PIN opened the lock: the seat starts"
+    );
+    assert_eq!(
+        dial(&couch, SHARER_PROFILE, "0000"),
+        (1, Heard::Held),
+        "the launch grant starts it"
+    );
+    // The last dial's close goes out on a turn of the runtime.
+    rt.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(200)).await });
+    host.join().unwrap().unwrap();
+}
+
+/// A client that stops reading its control stream is closed once a host write has waited out
+/// the control task's bound, rather than leaving the host to queue for it.
+#[test]
+fn a_client_that_stops_reading_its_control_stream_is_closed() {
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use punktfunk_core::quic::{endpoint, v2::io as v2io};
+    let store = access_store_path("unread");
+    let _ = std::fs::remove_file(&store);
+    let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+    let (cert, key) = endpoint::generate_identity().unwrap();
+    let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
+    np.add_with_access("Stalled", &fp_hex, None).unwrap();
+    let host = spawn_access_host(19822, 1, np);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let code = rt.block_on(async {
+        let (conn, mut send, _unread, _welcome, _media) =
+            raw_session(19822, (cert.as_str(), key.as_str())).await;
+        // Each probe makes the host write an echo this client never reads.
+        let probe = ClockProbe { t1_ns: 1 };
+        let flood = async {
+            while v2io::send(&mut send, &probe).await.is_ok() {}
+            std::future::pending::<()>().await
+        };
+        let closed = async {
+            tokio::select! {
+                code = closed_app_code(&conn) => code,
+                () = flood => unreachable!(),
+            }
+        };
+        let wait = std::time::Duration::from_secs(30);
+        tokio::time::timeout(wait, closed)
+            .await
+            .expect("the host closes the session")
+    });
+    assert_eq!(code, 1, "the host's error close");
+    let _ = std::fs::remove_file(&store);
+    host.join().unwrap().unwrap();
 }

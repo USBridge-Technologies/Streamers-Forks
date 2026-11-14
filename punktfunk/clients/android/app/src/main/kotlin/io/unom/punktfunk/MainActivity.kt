@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
@@ -20,7 +21,6 @@ import android.view.KeyEvent
 import android.view.ViewConfiguration
 import android.view.MotionEvent
 import android.widget.Toast
-import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -36,15 +36,18 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.fragment.app.FragmentActivity
 import io.unom.punktfunk.kit.DsDevice
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.R
 import io.unom.punktfunk.kit.RingNav
 import io.unom.punktfunk.kit.Sc2BleLink
 import io.unom.punktfunk.kit.Sc2Device
 import io.unom.punktfunk.kit.SessionAccess
+import io.unom.punktfunk.kit.Shortcuts
 import io.unom.punktfunk.kit.isExternalDevice
 import io.unom.punktfunk.kit.ringNavForKey
 import io.unom.punktfunk.kit.discovery.HostDiscovery
@@ -103,7 +106,8 @@ private fun HoldWindowInsetsListeners() {
     remember(WindowInsets.systemBars) {}
 }
 
-class MainActivity : ComponentActivity() {
+// A FragmentActivity: BiometricPrompt hosts the unlock key's sheet in a fragment of it.
+class MainActivity : FragmentActivity() {
     /**
      * The active stream session handle (0 = not streaming). Set by [StreamScreen] while it's shown.
      * `dispatchKeyEvent` is the earliest key hook an app has — above Compose's focus system — so
@@ -212,8 +216,21 @@ class MainActivity : ComponentActivity() {
      */
     var ringKeys: ((RingNav) -> Unit)? = null
 
-    /** Opens the ring at the screen centre, for Ctrl+Alt+Shift+O. Null while not streaming. */
-    var openRing: (() -> Unit)? = null
+    /**
+     * The keyboard's shortcuts for the active session, read by [streamKey] before the ring's claim
+     * on the keys. Null while not streaming.
+     */
+    var keyShortcuts: Shortcuts.Engine? = null
+        set(value) {
+            field = value
+            hostKeys.clear()
+        }
+
+    /** What a fired keyboard shortcut does. Null while not streaming. */
+    var fireShortcut: ((Shortcuts.Action, Shortcuts.Phase) -> Unit)? = null
+
+    /** Keys down on the host, by shortcut id: the VK each went down as, for a lift. */
+    private val hostKeys = HashMap<Int, Int>()
 
     private val isTv by lazy { isTvDevice(this) }
 
@@ -330,13 +347,14 @@ class MainActivity : ComponentActivity() {
             if (!targetsHost(link, live)) {
                 Toast.makeText(
                     this,
-                    "Already streaming — end this session first.",
+                    getString(R.string.android_already_streaming),
                     Toast.LENGTH_LONG,
                 ).show()
             }
             finish()
             return
         }
+        StreamKeepAliveService.renameChannel(this)
         pendingDeepLink = link
         resolveHighRefreshMode()
         setConsoleHighRefreshRate(true) // the console UI wants max refresh; streaming manages its own
@@ -347,9 +365,9 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
-        // Dev escape hatch (mirrors the Apple client's PUNKTFUNK_FORCE_GAMEPAD_UI): force the console
-        // UI without a physical pad — `adb shell am start -n io.unom.punktfunk/.MainActivity --ez
-        // pf_force_gamepad_ui true`. Never set in normal use; real activation is a connected pad / TV.
+        // Dev escape hatch: force the console UI without a physical pad — `adb shell am start -n
+        // io.unom.punktfunk/.MainActivity --ez pf_force_gamepad_ui true`. Never set in normal use;
+        // real activation is a connected pad / TV.
         val forceGamepadUi = intent?.getBooleanExtra("pf_force_gamepad_ui", false) ?: false
         // SC2 hot-plug + the menu-time USB-permission grant both (re)start the menu capture.
         val receiver = object : BroadcastReceiver() {
@@ -421,7 +439,7 @@ class MainActivity : ComponentActivity() {
         val data = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data ?: return null
         if (data.scheme != ContentResolver.SCHEME_CONTENT) return data.toString()
         return linkFromLauncherFile(this, data) ?: run {
-            Toast.makeText(this, "Couldn't read a Punktfunk link from that file.", Toast.LENGTH_LONG)
+            Toast.makeText(this, getString(R.string.android_link_file_unreadable), Toast.LENGTH_LONG)
                 .show()
             null
         }
@@ -435,7 +453,9 @@ class MainActivity : ComponentActivity() {
             launcherFileSave = null
             if (uri == null) return@registerForActivityResult // the user backed out
             report(
-                if (writeLauncherFile(this, uri, url)) "Launcher file saved." else "Couldn't save the launcher file.",
+                getString(
+                    if (writeLauncherFile(this, uri, url)) R.string.android_launcher_saved else R.string.android_launcher_save_failed,
+                ),
             )
         }
 
@@ -447,8 +467,14 @@ class MainActivity : ComponentActivity() {
         launcherFileSave = url to report
         runCatching { launcherFilePicker.launch(launcherFileName(title)) }.onFailure {
             launcherFileSave = null
-            report("Couldn't open a save dialog on this device.")
+            report(getString(R.string.android_save_dialog_failed))
         }
+    }
+
+    // The activity handles a language change itself, so the notification channel's name follows here.
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        StreamKeepAliveService.renameChannel(this)
     }
 
     // Discovery and its Wi-Fi locks follow the app on screen, whichever shell subscribed.
@@ -768,102 +794,139 @@ class MainActivity : ComponentActivity() {
                 // device that is no pad yet (a remote's D-pad), which then goes on as a key.
                 if (bit != 0 && gamepadRouter?.onButton(event, bit) == true) return true
             }
-            // The ring is modal: its scrim owns every finger, the router masks the pad behind it,
-            // and this is the same claim for keys. Non-nav keys are swallowed, not sent — except
-            // modifiers, so the Ctrl+Alt+Shift that opened it still lift on the host.
-            ringKeys?.let { nav ->
-                if (!fromPad(event) && event.keyCode !in SYSTEM_KEYS &&
-                    !KeyEvent.isModifierKey(event.keyCode)
-                ) {
-                    if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                        ringNavForKey(event.keyCode)?.let(nav)
+            return shortcutKey(event, handle)
+        }
+        return false
+    }
+
+    /**
+     * The keyboard's shortcuts read [event] first, the ring's claim included: what they forward
+     * takes the old key path ([keyOn]), a fired key's repeat and release never reach the host, and
+     * a fire lifts on the host the modifiers it holds. Every event an id names ends in true, so
+     * the second ask of a false answer finds the engine untouched.
+     */
+    private fun shortcutKey(event: KeyEvent, handle: Long): Boolean {
+        val engine = keyShortcuts
+        val id = shortcutId(event)
+        val down = when (event.action) {
+            KeyEvent.ACTION_DOWN -> true
+            KeyEvent.ACTION_UP -> false
+            else -> null
+        }
+        if (engine == null || id == 0 || down == null) return keyOn(event, handle, id)
+        if (event.repeatCount > 0) return id !in hostKeys || keyOn(event, handle, id)
+        var ours = true
+        for (o in engine.step(id, down, event.eventTime)) {
+            when (o) {
+                is Shortcuts.Out.Forward -> ours = keyOn(event, handle, id)
+                is Shortcuts.Out.Lift -> o.ids.forEach { k ->
+                    hostKeys.remove(k)?.let { vk ->
+                        NativeBridge.nativeSendKey(handle, vk, false, 0)
+                        if (vk == repeatVk) cancelKeyRepeat()
                     }
-                    return true
                 }
+                is Shortcuts.Out.Fire -> fireShortcut?.invoke(o.action, o.phase)
             }
-            // TV remote-as-pointer sees non-gamepad keys first (SELECT long-press toggles it;
-            // while active it owns the D-pad/SELECT/PLAY-PAUSE/BACK).
-            if (!event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
-                remotePointer?.let { if (it.onKey(event)) return true }
-            }
-            // Ctrl+Alt+Shift+Q — the cross-client pointer-capture toggle chord. Swallow both
-            // edges of the Q (the modifiers already went over the wire, exactly like desktop).
-            if (event.keyCode == KeyEvent.KEYCODE_Q &&
-                event.isCtrlPressed && event.isAltPressed && event.isShiftPressed
+        }
+        return ours
+    }
+
+    /** One key past the shortcuts: the ring's, the remote pointer's, or the host's. */
+    private fun keyOn(event: KeyEvent, handle: Long, id: Int): Boolean {
+        // The ring is modal: its scrim owns every finger, the router masks the pad behind it,
+        // and this is the same claim for keys. Non-nav keys are swallowed, not sent — except
+        // modifiers, so the Ctrl+Alt+Shift that opened it still lift on the host.
+        ringKeys?.let { nav ->
+            if (!fromPad(event) && event.keyCode !in SYSTEM_KEYS &&
+                !KeyEvent.isModifierKey(event.keyCode)
             ) {
                 if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                    mouseForwarder?.toggleCapture()
+                    ringNavForKey(event.keyCode)?.let(nav)
                 }
                 return true
             }
-            // Ctrl+Alt+Shift+O — the cross-client quick-action chord. It only opens: while the
-            // ring is up it owns the keys above, and Escape closes it.
-            if (event.keyCode == KeyEvent.KEYCODE_O &&
-                event.isCtrlPressed && event.isAltPressed && event.isShiftPressed
-            ) {
-                if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) openRing?.invoke()
-                return true
-            }
-            when (event.keyCode) {
-                // What [mouseSideButton] and the pad branch left: a FALLBACK duplicate of an
-                // unconsumed BUTTON_* press, or a mouse-sourced BACK whose motion edge already went
-                // (a captured mouse stamps SOURCE_MOUSE_RELATIVE). The rest open the ring.
-                KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_FORWARD ->
-                    if (event.isFromSource(InputDevice.SOURCE_MOUSE) ||
-                        event.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE) ||
-                        event.flags and KeyEvent.FLAG_FALLBACK != 0
-                    ) {
-                        return true
+        }
+        // TV remote-as-pointer sees non-gamepad keys first (SELECT long-press toggles it;
+        // while active it owns the D-pad/SELECT/PLAY-PAUSE/BACK).
+        if (!event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
+            remotePointer?.let { if (it.onKey(event)) return true }
+        }
+        when (event.keyCode) {
+            // What [mouseSideButton] and the pad branch left: a FALLBACK duplicate of an
+            // unconsumed BUTTON_* press, or a mouse-sourced BACK whose motion edge already went
+            // (a captured mouse stamps SOURCE_MOUSE_RELATIVE). The rest open the ring.
+            KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_FORWARD ->
+                if (event.isFromSource(InputDevice.SOURCE_MOUSE) ||
+                    event.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE) ||
+                    event.flags and KeyEvent.FLAG_FALLBACK != 0
+                ) {
+                    return true
+                }
+            // Leave these to the system even while streaming.
+            in SYSTEM_KEYS -> {}
+            else -> {
+                val down = when (event.action) {
+                    KeyEvent.ACTION_DOWN -> true
+                    KeyEvent.ACTION_UP -> false
+                    else -> return false
+                }
+                // Without the KEYBOARD grant the key path is inert: consumed (so nothing
+                // drives Android navigation under the stream) but never sent — the host
+                // would drop it, and the Access chip is what says why. Courtesy gating.
+                if (streamAccess and SessionAccess.KEYBOARD == 0) return true
+                // Full-event overload: evdev scancode first (positional under ANY selected
+                // physical-keyboard layout), keycode fallback — see Keymap docs.
+                var vk = Keymap.toVk(event)
+                // Android keeps Alt+Tab for its own switcher unless the key service is on;
+                // Alt+` is the stand-in.
+                if (vk == 0xC0 && !KeyCaptureService.running) {
+                    val altOnly = event.isAltPressed && !event.isCtrlPressed && !event.isMetaPressed
+                    graveAsTab = Keymap.altTabAlias(down, event.repeatCount > 0, altOnly, graveAsTab)
+                    if (graveAsTab) vk = 0x09
+                }
+                if (vk != 0) {
+                    // Soft-keyboard events (the IME's virtual device — the stream's
+                    // KeyCaptureView path) carry Shift only as META state, where a real
+                    // keyboard sends discrete Shift transitions — so mirror the meta bit as
+                    // a VK_LSHIFT wrap or every IME capital/symbol lands unshifted on the
+                    // host. Never applied to hardware events: their Shift already went over
+                    // the wire, and a synthetic release here would un-hold a physical Shift
+                    // the user is still pressing.
+                    val imeShift = event.deviceId == KeyCharacterMap.VIRTUAL_KEYBOARD &&
+                        event.isShiftPressed && vk != 0xA0 && vk != 0xA1
+                    if (down && imeShift) NativeBridge.nativeSendKey(handle, 0xA0, true, 0)
+                    NativeBridge.nativeSendKey(handle, vk, down, 0)
+                    if (down) hostKeys[id] = vk else hostKeys.remove(id)
+                    if (!down && imeShift) NativeBridge.nativeSendKey(handle, 0xA0, false, 0)
+                    // The service path never sees a dispatcher repeat, so a held hardware
+                    // key repeats from here. Modifiers do not repeat on Android either; a
+                    // new key takes the repeat over, and its own release ends it.
+                    val hardware = event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD && !fromPad(event)
+                    if (KeyCaptureService.running && hardware && !KeyEvent.isModifierKey(event.keyCode)) {
+                        if (down && event.repeatCount == 0) armKeyRepeat(handle, vk)
+                        else if (!down && vk == repeatVk) cancelKeyRepeat()
                     }
-                // Leave these to the system even while streaming.
-                in SYSTEM_KEYS -> {}
-                else -> {
-                    val down = when (event.action) {
-                        KeyEvent.ACTION_DOWN -> true
-                        KeyEvent.ACTION_UP -> false
-                        else -> return false
-                    }
-                    // Without the KEYBOARD grant the key path is inert: consumed (so nothing
-                    // drives Android navigation under the stream) but never sent — the host
-                    // would drop it, and the Access chip is what says why. Courtesy gating.
-                    if (streamAccess and SessionAccess.KEYBOARD == 0) return true
-                    // Full-event overload: evdev scancode first (positional under ANY selected
-                    // physical-keyboard layout), keycode fallback — see Keymap docs.
-                    var vk = Keymap.toVk(event)
-                    // Android keeps Alt+Tab for its own switcher unless the key service is on;
-                    // Alt+` is the stand-in.
-                    if (vk == 0xC0 && !KeyCaptureService.running) {
-                        val altOnly = event.isAltPressed && !event.isCtrlPressed && !event.isMetaPressed
-                        graveAsTab = Keymap.altTabAlias(down, event.repeatCount > 0, altOnly, graveAsTab)
-                        if (graveAsTab) vk = 0x09
-                    }
-                    if (vk != 0) {
-                        // Soft-keyboard events (the IME's virtual device — the stream's
-                        // KeyCaptureView path) carry Shift only as META state, where a real
-                        // keyboard sends discrete Shift transitions — so mirror the meta bit as
-                        // a VK_LSHIFT wrap or every IME capital/symbol lands unshifted on the
-                        // host. Never applied to hardware events: their Shift already went over
-                        // the wire, and a synthetic release here would un-hold a physical Shift
-                        // the user is still pressing.
-                        val imeShift = event.deviceId == KeyCharacterMap.VIRTUAL_KEYBOARD &&
-                            event.isShiftPressed && vk != 0xA0 && vk != 0xA1
-                        if (down && imeShift) NativeBridge.nativeSendKey(handle, 0xA0, true, 0)
-                        NativeBridge.nativeSendKey(handle, vk, down, 0)
-                        if (!down && imeShift) NativeBridge.nativeSendKey(handle, 0xA0, false, 0)
-                        // The service path never sees a dispatcher repeat, so a held hardware
-                        // key repeats from here. Modifiers do not repeat on Android either; a
-                        // new key takes the repeat over, and its own release ends it.
-                        val hardware = event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD && !fromPad(event)
-                        if (KeyCaptureService.running && hardware && !KeyEvent.isModifierKey(event.keyCode)) {
-                            if (down && event.repeatCount == 0) armKeyRepeat(handle, vk)
-                            else if (!down && vk == repeatVk) cancelKeyRepeat()
-                        }
-                        return true // consumed — don't let the system also act on it
-                    }
+                    return true // consumed — don't let the system also act on it
                 }
             }
         }
         return false
+    }
+
+    /**
+     * The id the keyboard's shortcuts know [event] by: the VK of its label, as the old chords
+     * read `KEYCODE_Q` under AZERTY too, else its positional VK, left and right modifiers folded.
+     * 0 for a key they never see: the system's, and Back and Forward.
+     */
+    private fun shortcutId(event: KeyEvent): Int {
+        val kc = event.keyCode
+        if (kc in SYSTEM_KEYS || kc == KeyEvent.KEYCODE_BACK || kc == KeyEvent.KEYCODE_FORWARD) return 0
+        return when (val vk = Keymap.toVk(kc).takeIf { it != 0 } ?: Keymap.toVk(event)) {
+            0xA0, 0xA1 -> 0x10
+            0xA2, 0xA3 -> 0x11
+            0xA4, 0xA5 -> 0x12
+            else -> vk
+        }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -989,12 +1052,15 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Mouse clicks/drags ride the TOUCH stream (the pointer is "down"). While streaming they
-     * belong to the mouse forwarder, never to the Compose touch-gesture layer — a physical
-     * mouse click must be a real click at the cursor, not a synthesized trackpad tap.
+     * Mouse clicks/drags ride the TOUCH stream (the pointer is "down"), and so does a ChromeOS
+     * touchpad's two-finger scroll. While streaming they belong to the mouse forwarder, never to
+     * the Compose touch-gesture layer — a physical mouse click must be a real click at the cursor,
+     * not a synthesized trackpad tap. A mouse tool counts whatever source the platform stamps.
      */
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (streamHandle != 0L && ev.isFromSource(InputDevice.SOURCE_MOUSE)) {
+        if (streamHandle != 0L &&
+            (ev.isFromSource(InputDevice.SOURCE_MOUSE) || ev.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE)
+        ) {
             mouseForwarder?.let { if (it.onTouchEvent(ev)) return true }
         }
         return super.dispatchTouchEvent(ev)

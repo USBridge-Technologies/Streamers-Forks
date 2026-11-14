@@ -20,6 +20,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// SHA-256 of the peer client cert (hex). `None` on plain HTTP or a certless
@@ -86,12 +87,22 @@ pub(crate) fn bind_exclusive(addr: SocketAddr) -> std::io::Result<std::net::TcpL
 /// 256 / 32 is generous: a console browser holds a handful, a paired client a few.
 const MAX_CONNS: usize = 256;
 const MAX_CONNS_PER_IP: usize = 32;
+/// Slots a LAN peer never takes: two full per-IP buckets (127.0.0.1, ::1) stay free for the
+/// console, `ctl`, the tray and the plugin runner.
+const LOOPBACK_RESERVE: usize = 2 * MAX_CONNS_PER_IP;
 /// A LAN handshake completes in milliseconds; a peer still negotiating after
 /// this is holding a slot, not pairing.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Bounds reading each request's header block (slowloris). Response streaming
-/// is unaffected; hyper re-arms this per request on a keep-alive connection.
+/// Bounds a connection's first request head on any protocol, every later HTTP/1 head
+/// (slowloris), each wait for a frame of a request body, a body's head start on
+/// [`MIN_BODY_RATE`], and an [`idle`] connection. A streamed answer is in flight.
 const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The slowest average a request body may arrive at, or a finished answer may leave at, bytes a
+/// second. 1 KiB/s is far under bad Wi-Fi, so honest traffic never meets it; a peer holding a
+/// slot with a body or an unread answer pays this rate.
+const MIN_BODY_RATE: f64 = 1024.0;
+/// A quiet HTTP/2 peer is pinged after this, and dropped when the ack misses the same window.
+const H2_PING: std::time::Duration = std::time::Duration::from_secs(30);
 /// Requests in flight on one HTTP/2 connection. A client past it queues on that connection
 /// rather than opening another, so a library's worth of covers stays one of `MAX_CONNS_PER_IP`.
 const MAX_H2_STREAMS: u32 = 32;
@@ -191,9 +202,17 @@ async fn serve_listener(
         // Drop rather than queue when a ceiling is hit: a well-behaved client retries,
         // and queuing is the unbounded buildup the ceiling exists to prevent.
         // Both guards travel into the task so every exit path releases them.
-        let Ok(permit) = conns.clone().try_acquire_owned() else {
-            tracing::warn!(%peer, "HTTP(S) connection ceiling reached — dropping new connection");
-            continue;
+        let floor = if peer.ip().to_canonical().is_loopback() {
+            0
+        } else {
+            LOOPBACK_RESERVE
+        };
+        let permit = match conns.clone().try_acquire_owned() {
+            Ok(permit) if conns.available_permits() >= floor => permit,
+            _ => {
+                tracing::warn!(%peer, "HTTP(S) connection ceiling reached — dropping new connection");
+                continue;
+            }
         };
         let ip_guard = {
             let mut m = per_ip.lock().unwrap();
@@ -294,12 +313,75 @@ fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::r
     builder
         .http2()
         .timer(hyper_util::rt::TokioTimer::new())
-        .max_concurrent_streams(MAX_H2_STREAMS);
+        .max_concurrent_streams(MAX_H2_STREAMS)
+        .keep_alive_interval(H2_PING)
+        .keep_alive_timeout(H2_PING);
     builder
 }
 
+/// A request body that fails once its peer has sent nothing for `quiet`, or has fallen behind
+/// [`MIN_BODY_RATE`] since the first poll after a `quiet` head start. The handler's read errors,
+/// and an HTTP/1 connection closes behind the answer: a stalled or trickled upload holds no slot.
+struct QuietBody {
+    inner: hyper::body::Incoming,
+    quiet: std::time::Duration,
+    /// Armed while a read waits on the peer.
+    waiting: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// Armed at the first poll; each data frame moves it out by its length at [`MIN_BODY_RATE`].
+    due: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl hyper::body::Body for QuietBody {
+    type Data = hyper::body::Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::future::Future;
+        use std::task::Poll;
+        let this = &mut *self;
+        let quiet = this.quiet;
+        let due = this
+            .due
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(quiet)));
+        if let Poll::Ready(frame) = std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            this.waiting = None;
+            let data = frame.as_ref().and_then(|f| f.as_ref().ok()?.data_ref());
+            if let Some(data) = data {
+                let earned = std::time::Duration::from_secs_f64(data.len() as f64 / MIN_BODY_RATE);
+                let at = due.deadline() + earned;
+                due.as_mut().reset(at);
+            }
+            return Poll::Ready(frame.map(|f| f.map_err(Into::into)));
+        }
+        if due.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err("request body too slow".into())));
+        }
+        let waiting = this
+            .waiting
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(quiet)));
+        match waiting.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Some(Err("request body stalled".into()))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Drive one accepted stream — a socket, a TLS stream or a pipe — through `app`, with the
-/// peer facts the handlers read as request extensions.
+/// peer facts the handlers read as request extensions. A peer that has not sent a whole
+/// request head within [`HEADER_READ_TIMEOUT`] is dropped; a request body that goes that long
+/// without a frame, or falls behind [`MIN_BODY_RATE`], fails; a connection idle that long
+/// shuts down.
 pub(crate) async fn serve_conn<S>(
     stream: S,
     app: Router,
@@ -310,13 +392,51 @@ pub(crate) async fn serve_conn<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    serve_conn_within(
+        HEADER_READ_TIMEOUT,
+        stream,
+        app,
+        fp,
+        addr,
+        local,
+        pipe_plugin,
+    )
+    .await
+}
+
+/// [`serve_conn`] with its deadline as an argument: `quiet` bounds the first request head, a
+/// request body, and an [`idle`] connection, which then shuts down gracefully and is dropped
+/// if its drain goes idle too: HTTP/2 has no idle timer of hyper's own. Later HTTP/1 heads and
+/// pings are under hyper's timers. An HTTP/1 upgrade takes the socket out of `conn`.
+async fn serve_conn_within<S>(
+    quiet: std::time::Duration,
+    stream: S,
+    app: Router,
+    fp: PeerCertFingerprint,
+    addr: PeerAddr,
+    local: Option<LocalAddr>,
+    pipe_plugin: Option<PipePlugin>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     use tower::ServiceExt;
+    // Requests in flight. This end outlives `conn`, so `busy` never reads a closed channel.
+    let (open, mut busy) = tokio::sync::watch::channel(0usize);
+    let counted = open.clone();
     let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let held = InFlight::new(&counted);
         let app = app.clone();
         let fp = fp.clone();
         let pipe_plugin = pipe_plugin.clone();
         async move {
-            let mut req = req.map(axum::body::Body::new);
+            let mut req = req.map(|inner| {
+                axum::body::Body::new(QuietBody {
+                    inner,
+                    quiet,
+                    waiting: None,
+                    due: None,
+                })
+            });
             req.extensions_mut().insert(fp);
             req.extensions_mut().insert(addr);
             if let Some(local) = local {
@@ -325,13 +445,164 @@ pub(crate) async fn serve_conn<S>(
             if let Some(plugin) = pipe_plugin {
                 req.extensions_mut().insert(plugin);
             }
-            app.oneshot(req).await
+            let answer = app.oneshot(req).await;
+            answer.map(|res| {
+                res.map(|inner| Answer {
+                    inner,
+                    held: Some(held),
+                })
+            })
         }
     });
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let _ = connection_builder()
-        .serve_connection_with_upgrades(io, svc)
-        .await;
+    let sent = Arc::new(AtomicU64::new(0));
+    let io = hyper_util::rt::TokioIo::new(Written {
+        inner: stream,
+        sent: sent.clone(),
+    });
+    let builder = connection_builder();
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+    tokio::select! {
+        _ = &mut conn => return,
+        _ = busy.changed() => {}
+        _ = tokio::time::sleep(quiet) => return,
+    }
+    tokio::select! {
+        _ = &mut conn => return,
+        () = idle(&mut busy, &sent, quiet) => {}
+    }
+    conn.as_mut().graceful_shutdown();
+    // A drain that goes idle again is cut: an answer stuck behind a peer that grants no
+    // window would otherwise hold the connection.
+    tokio::select! {
+        _ = &mut conn => {}
+        () = idle(&mut busy, &sent, quiet) => {}
+    }
+}
+
+/// Returns once a connection has had no request in flight, and written under
+/// [`MIN_BODY_RATE`], for `quiet`. An answer still leaving at that rate keeps it busy.
+async fn idle(
+    busy: &mut tokio::sync::watch::Receiver<usize>,
+    sent: &AtomicU64,
+    quiet: std::time::Duration,
+) {
+    let floor = (MIN_BODY_RATE * quiet.as_secs_f64()) as u64;
+    loop {
+        let _ = busy.wait_for(|n| *n == 0).await;
+        let mark = sent.load(Ordering::Relaxed);
+        if tokio::time::timeout(quiet, busy.changed()).await.is_err()
+            && sent.load(Ordering::Relaxed) - mark < floor
+        {
+            return;
+        }
+    }
+}
+
+/// A connection's stream, counting the bytes written to it.
+struct Written<S> {
+    inner: S,
+    sent: Arc<AtomicU64>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Written<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Written<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let n = std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_write(cx, buf))?;
+        self.sent.fetch_add(n as u64, Ordering::Relaxed);
+        std::task::Poll::Ready(Ok(n))
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let n =
+            std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs))?;
+        self.sent.fetch_add(n as u64, Ordering::Relaxed);
+        std::task::Poll::Ready(Ok(n))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// One request on a connection, counted from its head until its answer ends or is dropped.
+struct InFlight(tokio::sync::watch::Sender<usize>);
+
+impl InFlight {
+    fn new(count: &tokio::sync::watch::Sender<usize>) -> Self {
+        count.send_modify(|n| *n += 1);
+        InFlight(count.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// An answer's body, holding its request in flight until its last frame is polled or hyper
+/// drops it. A streamed answer keeps its connection from the idle shutdown; a finished one
+/// does not, even while a peer that grants no window keeps its bytes from leaving.
+struct Answer {
+    inner: axum::body::Body,
+    held: Option<InFlight>,
+}
+
+impl hyper::body::Body for Answer {
+    type Data = hyper::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        let frame = std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_frame(cx));
+        if frame.is_none() || this.inner.is_end_stream() {
+            this.held = None;
+        }
+        std::task::Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +754,245 @@ mod governed_tests {
         .unwrap();
         served.await.unwrap();
         assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+    }
+
+    /// A peer that never sends a request is dropped at the deadline; an answer that takes
+    /// longer than the deadline still arrives.
+    #[tokio::test]
+    async fn a_silent_connection_is_dropped_but_a_slow_answer_is_not() {
+        let limit = std::time::Duration::from_millis(200);
+        let app = Router::new().route(
+            "/",
+            get(move || async move {
+                tokio::time::sleep(limit * 3).await;
+                "late"
+            }),
+        );
+        let serve = |io| {
+            let peer = PeerAddr("127.0.0.1:1".parse().unwrap());
+            tokio::spawn(serve_conn_within(
+                limit,
+                io,
+                app.clone(),
+                PeerCertFingerprint(None),
+                peer,
+                None,
+                None,
+            ))
+        };
+
+        let (mut silent, server) = tokio::io::duplex(4096);
+        let served = serve(server);
+        let mut out = Vec::new();
+        tokio::time::timeout(limit * 5, silent.read_to_end(&mut out))
+            .await
+            .expect("a silent peer is dropped")
+            .unwrap();
+        assert!(out.is_empty());
+        served.await.unwrap();
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let _served = serve(server);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).ends_with("late"));
+    }
+
+    /// A request body that stops arriving, or trickles in under [`MIN_BODY_RATE`] with each
+    /// byte inside the deadline, is refused and its connection closed. One that keeps up the
+    /// rate is read whole, however long past the deadline it takes.
+    #[tokio::test]
+    async fn a_stalled_or_trickled_request_body_frees_its_connection() {
+        let limit = std::time::Duration::from_millis(200);
+        let app = Router::new().route(
+            "/",
+            axum::routing::post(|body: axum::body::Bytes| async move { body.len().to_string() }),
+        );
+        let serve = |io| {
+            let peer = PeerAddr("127.0.0.1:1".parse().unwrap());
+            tokio::spawn(serve_conn_within(
+                limit,
+                io,
+                app.clone(),
+                PeerCertFingerprint(None),
+                peer,
+                None,
+                None,
+            ))
+        };
+        let head = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n";
+
+        let (mut stalled, server) = tokio::io::duplex(4096);
+        let served = serve(server);
+        stalled.write_all(head).await.unwrap();
+        stalled.write_all(b"a").await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(limit * 5, stalled.read_to_end(&mut out))
+            .await
+            .expect("a stalled body ends the connection")
+            .unwrap();
+        let answer = String::from_utf8_lossy(&out);
+        assert!(answer.starts_with("HTTP/1.1 4"), "{answer}");
+        served.await.unwrap();
+
+        let (trickle, server) = tokio::io::duplex(4096);
+        let served = serve(server);
+        let (mut rx, mut tx) = tokio::io::split(trickle);
+        tx.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(limit / 2).await;
+                if tx.write_all(b"a").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut out = Vec::new();
+        tokio::time::timeout(limit * 5, rx.read_to_end(&mut out))
+            .await
+            .expect("a trickled body ends the connection")
+            .unwrap();
+        let answer = String::from_utf8_lossy(&out);
+        assert!(answer.starts_with("HTTP/1.1 4"), "{answer}");
+        served.await.unwrap();
+
+        let (mut slow, server) = tokio::io::duplex(4096);
+        let _served = serve(server);
+        slow.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2048\r\n\r\n")
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            tokio::time::sleep(limit / 2).await;
+            slow.write_all(&[b'a'; 512]).await.unwrap();
+        }
+        let mut out = vec![0u8; 4096];
+        let n = slow.read(&mut out).await.unwrap();
+        let answer = String::from_utf8_lossy(&out[..n]);
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.ends_with("2048"), "{answer}");
+    }
+
+    /// An HTTP/2 connection with nothing in flight shuts down after the deadline. An answer
+    /// streamed for longer is in flight: the connection takes the next request after it.
+    #[tokio::test]
+    async fn an_idle_http2_connection_shuts_down_but_a_streamed_answer_holds_it() {
+        let limit = std::time::Duration::from_millis(200);
+        let app = Router::new().route("/", get(|| async { "ok" })).route(
+            "/stream",
+            get(move || async move {
+                let ticks = futures_util::stream::unfold(0u8, move |n| async move {
+                    if n == 6 {
+                        return None;
+                    }
+                    tokio::time::sleep(limit / 2).await;
+                    Some((Ok::<_, std::convert::Infallible>(vec![b'0' + n]), n + 1))
+                });
+                axum::body::Body::from_stream(ticks)
+            }),
+        );
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let peer = PeerAddr("127.0.0.1:1".parse().unwrap());
+        let served = tokio::spawn(serve_conn_within(
+            limit,
+            server_io,
+            app,
+            PeerCertFingerprint(None),
+            peer,
+            None,
+            None,
+        ));
+        let (h2, connection) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(connection);
+        let get = |path: &str| {
+            axum::http::Request::get(format!("http://localhost{path}"))
+                .body(())
+                .unwrap()
+        };
+
+        let mut ready = h2.clone().ready().await.unwrap();
+        let (response, _) = ready.send_request(get("/stream"), true).unwrap();
+        let mut body = response.await.unwrap().into_body();
+        let mut got = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, b"012345");
+
+        let mut ready = h2.clone().ready().await.unwrap();
+        let (response, _) = ready.send_request(get("/"), true).unwrap();
+        let status = response.await.expect("no shutdown while an answer streams");
+        assert_eq!(status.status(), axum::http::StatusCode::OK);
+
+        tokio::time::timeout(limit * 5, served)
+            .await
+            .expect("an idle connection shuts down")
+            .unwrap();
+        drop(h2);
+    }
+
+    /// A finished answer the peer takes slowly, above [`MIN_BODY_RATE`], arrives whole however
+    /// long it takes. One the peer grants no window never leaves: its connection shuts down and
+    /// is dropped when the drain goes idle too.
+    #[tokio::test]
+    async fn a_finished_answer_holds_its_http2_connection_only_while_it_leaves() {
+        let limit = std::time::Duration::from_millis(200);
+        let app = Router::new().route("/", get(|| async { vec![b'x'; 16 * 1024] }));
+        let open = |window: u32| {
+            let app = app.clone();
+            async move {
+                let (client_io, server_io) = tokio::io::duplex(1 << 16);
+                let peer = PeerAddr("127.0.0.1:1".parse().unwrap());
+                let served = tokio::spawn(serve_conn_within(
+                    limit,
+                    server_io,
+                    app,
+                    PeerCertFingerprint(None),
+                    peer,
+                    None,
+                    None,
+                ));
+                let (h2, connection) = h2::client::Builder::new()
+                    .initial_window_size(window)
+                    .handshake::<_, hyper::body::Bytes>(client_io)
+                    .await
+                    .unwrap();
+                tokio::spawn(connection);
+                let request = axum::http::Request::get("http://localhost/")
+                    .body(())
+                    .unwrap();
+                let mut ready = h2.clone().ready().await.unwrap();
+                let (response, _) = ready.send_request(request, true).unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                (served, h2, response.into_body())
+            }
+        };
+
+        // 1 KiB each limit / 4: four times the deadline, and twenty times the rate.
+        let (_served, _h2, mut body) = open(1024).await;
+        let mut got = 0;
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("a slow reader is not cut");
+            tokio::time::sleep(limit / 4).await;
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+            got += chunk.len();
+        }
+        assert_eq!(got, 16 * 1024);
+
+        let (served, h2, body) = open(0).await;
+        tokio::time::timeout(limit * 5, served)
+            .await
+            .expect("an answer the peer never takes frees its connection")
+            .unwrap();
+        drop((body, h2));
     }
 }
 

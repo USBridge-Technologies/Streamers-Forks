@@ -8,6 +8,7 @@
 //! Wake cadence lives on [`WAKE_TIMEOUT_SECS`] / [`WAKE_RESEND_SECS`].
 
 use crate::deeplink::{DeepLink, HostResolution, Route};
+use crate::library::GameOverrides;
 use crate::presets::{PresetsFile, Resolution, StreamPreset};
 use crate::session::{Dial, Probes, SessionParams};
 use crate::settings::GamepadUi;
@@ -116,9 +117,6 @@ pub fn trust_route(
     }
 }
 
-/// What a pinned dial shows when its stored pin is rejected, before or after the dial.
-pub const FINGERPRINT_CHANGED: &str = "Host fingerprint changed — re-pair with a PIN to continue";
-
 /// Where a finished connect goes. Each front-end draws its own surface per arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExitRoute {
@@ -134,21 +132,32 @@ pub enum ExitRoute {
     RedialProfile { id: String, msg: String },
     /// Drop the host's saved profile pick, then this banner.
     ForgetProfileThen(String),
+    /// The host wants profile `id`'s password or a fresh key proof. `sent`: the refused dial
+    /// carried an unlock. [`crate::unlock::after_refusal`] picks the prompt, `error` under its
+    /// field, or the device key. Never a redial on its own.
+    Unlock {
+        id: String,
+        error: Option<String>,
+        sent: bool,
+    },
     /// The dial-first attempt to a quiet host failed: wake-and-wait.
     Wake,
 }
 
 /// The post-dial half of [`trust_route`]: where a session exit leads. `tofu` = the dial
-/// pinned an advertised fingerprint. `retry_profile` = the profile the dial named, unless the
-/// dial was already the retry. `wake_armed` = a dial-first wake armed for this dial, with
-/// auto-wake read once when it armed, and no ready since. `log` names this shell's log for a
-/// session that died silently.
+/// pinned an advertised fingerprint. `profile` = the profile the dial named; `retried` = the
+/// dial was already the retry after an unknown-profile refusal; `unlock_sent` = the refused
+/// dial carried an unlock. `wake_armed` = a dial-first wake armed for this dial, with
+/// auto-wake read once when it armed, and no ready since. `log` is the path of this shell's log
+/// for a session that died silently; `None` for a shell that writes none.
 pub fn exit_route(
     outcome: &ConnectOutcome,
     tofu: bool,
-    retry_profile: Option<&str>,
+    profile: Option<&str>,
+    retried: bool,
+    unlock_sent: bool,
     wake_armed: bool,
-    log: &str,
+    log: Option<&str>,
 ) -> ExitRoute {
     use punktfunk_core::reject::RejectReason;
     match outcome {
@@ -156,7 +165,7 @@ pub fn exit_route(
         ConnectOutcome::Ended(Some(reason)) => ExitRoute::Banner(reason.clone()),
         // The host answered and refused: never a wake.
         ConnectOutcome::Refused { msg, reason } if *reason == RejectReason::ProfileUnknown => {
-            match retry_profile {
+            match profile.filter(|_| !retried) {
                 Some(id) => ExitRoute::RedialProfile {
                     id: id.to_string(),
                     msg: msg.clone(),
@@ -164,16 +173,28 @@ pub fn exit_route(
                 None => ExitRoute::ForgetProfileThen(msg.clone()),
             }
         }
+        ConnectOutcome::Refused { msg, reason } if *reason == RejectReason::ProfileLocked => {
+            match profile {
+                Some(id) => ExitRoute::Unlock {
+                    id: id.to_string(),
+                    error: crate::unlock::refusal_line(msg),
+                    sent: unlock_sent,
+                },
+                None => ExitRoute::Banner(msg.clone()),
+            }
+        }
         ConnectOutcome::Refused { msg, .. } => ExitRoute::Banner(msg.clone()),
         o if wake_armed && o.warrants_wake() => ExitRoute::Wake,
         ConnectOutcome::TrustRejected(msg) if tofu => ExitRoute::Repair(msg.clone()),
-        ConnectOutcome::TrustRejected(_) => ExitRoute::Repair(FINGERPRINT_CHANGED.into()),
-        ConnectOutcome::ConnectFailed(msg) => {
-            ExitRoute::Banner(format!("Couldn't connect — {msg}"))
+        ConnectOutcome::TrustRejected(_) => {
+            ExitRoute::Repair(pf_l10n::client::dial_fingerprint_changed().into())
         }
-        ConnectOutcome::RendererFailed { code: -1 } => ExitRoute::Banner(
-            "Stream session was killed — out of memory, or stopped by the system".into(),
-        ),
+        ConnectOutcome::ConnectFailed(msg) => {
+            ExitRoute::Banner(pf_l10n::client::dial_connect_failed(msg))
+        }
+        ConnectOutcome::RendererFailed { code: -1 } => {
+            ExitRoute::Banner(pf_l10n::client::dial_session_killed().into())
+        }
         ConnectOutcome::RendererFailed { code } => {
             ExitRoute::Banner(ConnectOutcome::died_banner(*code, log))
         }
@@ -190,8 +211,14 @@ pub struct ConnectAttempt {
     wake: Option<HostTarget>,
     /// The dial pins an advertised fingerprint, which a ready session proves.
     tofu: bool,
-    /// The profile the dial names, unless the dial is already the retry.
-    retry_profile: Option<String>,
+    /// The profile the dial names.
+    profile: Option<String>,
+    /// The dial is the one retry after an unknown-profile refusal.
+    retried: bool,
+    /// The dial carries a profile unlock, which only the session's first dial sends.
+    unlock: bool,
+    /// The session presented, so a later refusal met a redial that carried no unlock.
+    ready: bool,
 }
 
 impl ConnectAttempt {
@@ -202,29 +229,51 @@ impl ConnectAttempt {
 
     /// A session is about to dial. `tofu`: it pins an advertised fingerprint. `profile` is
     /// the one it names. `redial` marks the one retry after a `PROFILE_UNKNOWN` refusal.
-    pub fn dial(&mut self, tofu: bool, profile: Option<&str>, redial: bool) {
+    /// `unlock`: the dial carries a profile unlock.
+    pub fn dial(&mut self, tofu: bool, profile: Option<&str>, redial: bool, unlock: bool) {
         self.tofu = tofu;
-        self.retry_profile = profile.filter(|_| !redial).map(str::to_string);
+        self.profile = profile.map(str::to_string);
+        self.retried = redial;
+        self.unlock = unlock;
     }
 
     /// The session is streaming, so the host answered and no later exit is the asleep case.
     /// `true`: the dial trusted its pin on first use, and the caller saves it now.
     pub fn on_ready(&mut self) -> bool {
         self.wake = None;
+        self.ready = true;
         self.tofu
+    }
+
+    /// What the host holding this dial with `Pending` means ([`crate::unlock::pending`]).
+    pub fn on_pending(&self) -> crate::unlock::Pending {
+        crate::unlock::pending(self.unlock && !self.ready)
     }
 
     /// The session that dialed `host` is gone: where its exit leads. Every exit ends the
     /// attempt. An armed wake counts only for the host it went out to, matched by pin, or by
     /// address when either side has none.
-    pub fn on_exit(&mut self, host: &HostTarget, outcome: &ConnectOutcome, log: &str) -> ExitRoute {
+    pub fn on_exit(
+        &mut self,
+        host: &HostTarget,
+        outcome: &ConnectOutcome,
+        log: Option<&str>,
+    ) -> ExitRoute {
         let was = std::mem::take(self);
         let wake_armed = was.wake.is_some_and(|w| match (w.pin(), host.pin()) {
             (Some(a), Some(b)) => a == b,
             _ => w.addr == host.addr && w.port == host.port,
         });
-        let retry = was.retry_profile.as_deref();
-        exit_route(outcome, was.tofu, retry, wake_armed, log)
+        let (profile, sent) = (was.profile.as_deref(), was.unlock && !was.ready);
+        exit_route(
+            outcome,
+            was.tofu,
+            profile,
+            was.retried,
+            sent,
+            wake_armed,
+            log,
+        )
     }
 }
 
@@ -255,6 +304,9 @@ pub struct ConnectPlan {
     /// Both paths use the same resolver, so they cannot disagree.
     pub preset_override: Option<String>,
     pub settings: Settings,
+    /// What the host set for the launched game, from its cached library. The spec bakes the
+    /// HDR and pad into `settings`; the session fits the mode to the panel.
+    pub overrides: Option<GameOverrides>,
     /// Magic packet first; wake-and-wait if the dial fails. Off with no MAC, and when
     /// auto-wake is off — VPN hosts look offline when they aren't.
     pub wake: bool,
@@ -267,6 +319,9 @@ pub struct ConnectPlan {
     /// Per-host trust decision, not a preset setting. Resolved here so the renderer
     /// does not look it up again.
     pub clipboard: bool,
+    /// This shell asks for a profile's password and spawns again with it after a
+    /// `profile-locked` refusal ([`PROMPTS_UNLOCK_ARG`]).
+    pub prompts_unlock: bool,
 }
 
 /// Handshake budget when the plan and `--connect-timeout` both omit one.
@@ -274,21 +329,39 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 
 impl ConnectPlan {
     /// Card-click plan. `one_off_preset`: `Some("")` forces the global defaults on a
-    /// bound host; `None` honors the binding. Loads the catalog and settings; use
-    /// [`ConnectPlan::resolve`] when the caller already holds them. The binding is
-    /// `host`'s own: its address may also name the other OS of a dual-boot box.
+    /// bound host; `None` honors the binding. Loads the catalog, settings and the host's
+    /// cached library; use [`ConnectPlan::resolve`] when the caller already holds them. The
+    /// binding is `host`'s own: its address may also name the other OS of a dual-boot box.
     pub fn for_host(
         host: &KnownHost,
         launch: Option<&str>,
         one_off_preset: Option<&str>,
     ) -> ConnectPlan {
-        Self::resolve(
+        let mut plan = Self::resolve(
             host,
             launch,
             one_off_preset,
             &PresetsFile::load(),
             &Settings::load(),
+        );
+        plan.overrides = plan.cached_overrides();
+        plan
+    }
+
+    /// The launched game's overrides from the pinned host's library as cached for the profile
+    /// this plan plays as.
+    fn cached_overrides(&self) -> Option<GameOverrides> {
+        crate::library_cache::overrides(
+            self.host.fp_hex.as_deref()?,
+            self.profile.as_deref(),
+            self.launch.as_deref()?,
         )
+    }
+
+    /// Play as `profile` instead of the saved pick, with the overrides cached for it.
+    pub fn play_as(&mut self, profile: Option<String>) {
+        self.profile = profile;
+        self.overrides = self.cached_overrides();
     }
 
     /// Plan for a host the front-end already holds as values, not a stored [`KnownHost`].
@@ -319,13 +392,14 @@ impl ConnectPlan {
         // must follow this MAC, not the record's.
         plan.wake = plan.settings.auto_wake && !host.mac.is_empty();
         plan.host = host;
+        plan.overrides = plan.cached_overrides();
         plan
     }
 
     /// Same plan from stores the caller already holds — no disk, no clock, no
-    /// environment. Precedence is `trust::resolve_preset`'s, called rather than
-    /// restated: this path and [`effective_settings`] must not be able to disagree
-    /// about which preset a launch gets.
+    /// environment, so no game overrides: the callers that read disk add those. Precedence
+    /// is `trust::resolve_preset`'s, called rather than restated: this path and
+    /// [`effective_settings`] must not be able to disagree about which preset a launch gets.
     pub fn resolve(
         host: &KnownHost,
         launch: Option<&str>,
@@ -351,20 +425,23 @@ impl ConnectPlan {
             preset_override: one_off_preset.map(str::to_string),
             wake: settings.auto_wake && !host.mac.is_empty(),
             settings,
+            overrides: None,
             connect_timeout_secs: None,
             tofu: false,
             clipboard: host.clipboard_sync,
+            prompts_unlock: false,
         }
     }
 
     /// Spec for a first-party spawner so the session performs no store reads.
     pub fn spec(&self, clipboard: bool) -> ResolvedSpec {
-        ResolvedSpec {
-            settings: self.settings.clone(),
+        ResolvedSpec::new(
+            self.settings.clone(),
             clipboard,
-            preset: self.preset.as_ref().map(|p| p.name.clone()),
-            preset_id: self.preset.as_ref().map(|p| p.id.clone()),
-        }
+            self.preset.as_ref().map(|p| p.name.clone()),
+            self.preset.as_ref().map(|p| p.id.clone()),
+            self.overrides.clone(),
+        )
     }
 
     /// Session argv for this plan. Assembled once so shells cannot spawn different sessions.
@@ -397,6 +474,9 @@ impl ConnectPlan {
         }
         if self.settings.fullscreen_on_stream || self.settings.fullscreen_always() {
             args.push("--fullscreen".into());
+        }
+        if self.prompts_unlock {
+            args.push(PROMPTS_UNLOCK_ARG.into());
         }
         // No `--window-pos`: Wayland compositors own placement, so the flag is a silent
         // no-op from GTK/CLI. Windows appends its own. An X11-only special case is drift.
@@ -473,22 +553,11 @@ impl PlanError {
     /// shortcut is unactionable.
     pub fn message(&self) -> String {
         match self {
-            PlanError::AmbiguousHost(r) => {
-                format!("More than one saved host is called \"{r}\" — open Punktfunk and pick one.")
-            }
-            PlanError::UnresolvableHost(r) => {
-                format!("No saved host matches \"{r}\".")
-            }
-            PlanError::PinConflict { host } => format!(
-                "That link's fingerprint doesn't match the one saved for {host} — it's out of \
-                 date, or it isn't that host. Nothing was connected."
-            ),
-            PlanError::UnknownPreset(p) => {
-                format!("That link asks for a settings preset called \"{p}\", which doesn't exist here.")
-            }
-            PlanError::AmbiguousPreset(p) => {
-                format!("More than one settings preset is called \"{p}\" — rename one, or use its id in the link.")
-            }
+            PlanError::AmbiguousHost(r) => pf_l10n::client::link_ambiguous_host(r),
+            PlanError::UnresolvableHost(r) => pf_l10n::client::link_unknown_host(r),
+            PlanError::PinConflict { host } => pf_l10n::client::link_pin_conflict(host),
+            PlanError::UnknownPreset(p) => pf_l10n::client::link_unknown_preset(p),
+            PlanError::AmbiguousPreset(p) => pf_l10n::client::link_ambiguous_preset(p),
         }
     }
 }
@@ -537,6 +606,7 @@ pub fn plan_from_link(
                 catalog,
                 base,
             );
+            plan.overrides = plan.cached_overrides();
             // Known but never pinned: the session refuses without a pin. Hand back as
             // ConfirmUnknown so the front-end runs its trust flow.
             if plan.host.pin().is_none() {
@@ -557,7 +627,7 @@ pub fn plan_from_link(
             }
             // As typed: an id or a name. The front-end resolves a name against the box's list.
             if let Some(profile) = &link.as_profile {
-                plan.profile = Some(profile.clone());
+                plan.play_as(Some(profile.clone()));
             }
             Ok(if confirm {
                 PlanOutcome::ConfirmConnect(Box::new(plan))
@@ -616,14 +686,12 @@ pub enum WakeOutcome {
     TimedOut,
 }
 
-/// The parked headline on [`WakeOutcome::TimedOut`]: `Desk didn't wake`. The console's
-/// wake card (`pf-console-ui`, no `desktop` cfg) spells the same two lines itself.
+/// The parked headline on [`WakeOutcome::TimedOut`]: `Desk didn't wake`, above
+/// `dial_wake_parked_hint` and Try Again / Cancel. The console's wake card (`pf-console-ui`,
+/// no `desktop` cfg) reads the same two messages itself.
 pub fn wake_parked_line(name: &str) -> String {
-    format!("{name} didn't wake")
+    pf_l10n::client::dial_wake_parked(name)
 }
-
-/// The sentence under [`wake_parked_line`], above Try Again / Cancel.
-pub const WAKE_PARKED_HINT: &str = "Check its power settings, or wake it manually and try again.";
 
 impl Default for WakeWait {
     fn default() -> WakeWait {
@@ -761,10 +829,11 @@ impl ConnectOutcome {
         }
     }
 
-    /// What a console exit shows on the host list. `None` after a quit or our own kill, else
-    /// the line the console ended on. One that said nothing shows how it went, in the shape of
-    /// [`Self::died_banner`]: no exit code means a signal killed it.
-    pub fn console_banner(&self, log: &str) -> Option<String> {
+    /// What a controller-interface exit shows on the host list. `None` after a quit or our own
+    /// kill, else the line it ended on. One that said nothing shows a plain line that points at
+    /// `log`, the client log's path; its exit code goes to the log, not to the screen.
+    pub fn console_banner(&self, log: Option<&str>) -> Option<String> {
+        use pf_l10n::client as m;
         match self {
             ConnectOutcome::Ended(None) | ConnectOutcome::Cancelled => None,
             ConnectOutcome::TrustRejected(msg)
@@ -772,31 +841,49 @@ impl ConnectOutcome {
             | ConnectOutcome::Refused { msg, .. }
             | ConnectOutcome::Ended(Some(msg)) => Some(msg.clone()),
             ConnectOutcome::RendererFailed { code: -1 } => {
-                Some("The console was killed — out of memory, or stopped by the system".into())
+                Some(pf_l10n::client::dial_console_killed().into())
             }
             ConnectOutcome::RendererFailed { code } => {
-                let how = Self::exit_phrase(*code);
-                Some(format!(
-                    "The console didn't start (punktfunk-session {how}). Check {log}."
-                ))
+                tracing::warn!(code, how = ?ExitHow::of(*code), "controller interface did not start");
+                Some(match log {
+                    Some(log) => m::dial_console_not_started_log(log),
+                    None => m::dial_console_not_started().into(),
+                })
             }
         }
     }
 
     /// The banner for a session that died without a contract line: a missing runtime, a
-    /// crash, or the wrong binary. `log` names where the cause is.
-    pub fn died_banner(code: i32, log: &str) -> String {
-        let how = Self::exit_phrase(code);
-        format!("The session didn't start (punktfunk-session {how}). Check {log}.")
+    /// crash, or the wrong binary. `log` is the path of the log that holds the cause, `None`
+    /// for a shell that writes none.
+    pub fn died_banner(code: i32, log: Option<&str>) -> String {
+        use pf_l10n::client as m;
+        match (ExitHow::of(code), log) {
+            (ExitHow::AccessViolation, Some(log)) => m::dial_session_access_violation(log),
+            (ExitHow::AccessViolation, None) => m::dial_session_access_violation_no_path().into(),
+            (ExitHow::Exception(hex), Some(log)) => m::dial_session_exception(hex, log),
+            (ExitHow::Exception(hex), None) => m::dial_session_exception_no_path(hex),
+            (ExitHow::Code, Some(log)) => m::dial_session_exit_code(code, log),
+            (ExitHow::Code, None) => m::dial_session_exit_code_no_path(code),
+        }
     }
+}
 
-    /// How a session that died silently went, for a banner. An NTSTATUS crash reads in
-    /// hex, the form the Event Log and the crash filter use.
-    pub fn exit_phrase(code: i32) -> String {
+/// How a session that died silently went, for a banner. An NTSTATUS crash reads in hex, the
+/// form the Event Log and the crash filter use.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitHow {
+    AccessViolation,
+    Exception(String),
+    Code,
+}
+
+impl ExitHow {
+    fn of(code: i32) -> ExitHow {
         match code as u32 {
-            0xC000_0005 => "crashed with an access violation (0xC0000005)".to_string(),
-            c if code < 0 => format!("died with exception 0x{c:08X}"),
-            _ => format!("exited with code {code}"),
+            0xC000_0005 => ExitHow::AccessViolation,
+            c if code < 0 => ExitHow::Exception(format!("0x{c:08X}")),
+            _ => ExitHow::Code,
         }
     }
 }
@@ -818,9 +905,34 @@ pub struct ResolvedSpec {
     /// The preset's stable id, which the dial names to the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset_id: Option<String>,
+    /// What the host set for the launched game. Its HDR and pad are already in `settings`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<GameOverrides>,
 }
 
 impl ResolvedSpec {
+    /// A spec over resolved `settings`. The host's HDR and pad replace the device's here,
+    /// before any probe in the session reads them; an older session that ignores
+    /// `overrides` still streams them.
+    pub fn new(
+        mut settings: Settings,
+        clipboard: bool,
+        preset: Option<String>,
+        preset_id: Option<String>,
+        overrides: Option<GameOverrides>,
+    ) -> ResolvedSpec {
+        if let Some(o) = &overrides {
+            settings.apply_game_overrides(o);
+        }
+        ResolvedSpec {
+            settings,
+            clipboard,
+            preset,
+            preset_id,
+            overrides,
+        }
+    }
+
     /// Write the spec somewhere the child can read, returning the path. A file, not
     /// a pipe: the session already takes a path, and a crashed spawner leaves
     /// something inspectable.
@@ -862,13 +974,14 @@ impl ResolvedSpec {
 
     /// Pump parameters for a direct connect. Same fill as
     /// [`ConnectPlan::session_params`]. Host, pin, launch, and timeout come from
-    /// the command line; this spec already holds settings, clipboard, and preset.
+    /// the command line; this spec already holds settings, clipboard, preset and overrides.
     pub fn session_params(&self, dial: Dial, probes: Probes) -> SessionParams {
         SessionParams::from_plan(
             &self.settings,
             self.clipboard,
             self.preset.clone(),
             self.preset_id.clone(),
+            self.overrides.as_ref(),
             dial,
             probes,
         )
@@ -954,6 +1067,62 @@ pub mod exit {
     pub const TRUST_REJECTED: u8 = 3;
     /// The stream window or the console did not start.
     pub const RENDERER_FAILED: u8 = 4;
+}
+
+/// Session flag: read one profile unlock from stdin before dialing ([`read_unlock`]).
+pub const UNLOCK_STDIN_ARG: &str = "--unlock-stdin";
+/// Session flag: the spawning shell asks for a profile's password, so the dial offers it.
+pub const PROMPTS_UNLOCK_ARG: &str = "--prompts-unlock";
+/// Longest unlock frame on the session's stdin.
+pub const UNLOCK_STDIN_MAX: usize = 4096;
+
+/// Write `unlock` to a session's stdin as `len u32 LE ‖ ProfileUnlock frame`, then close it by
+/// dropping `to`. Every copy made here wipes.
+pub fn write_unlock(
+    mut to: impl std::io::Write,
+    unlock: punktfunk_core::quic::v2::msg::ProfileUnlock,
+) -> std::io::Result<()> {
+    let frame = unlock.encode();
+    drop(unlock);
+    to.write_all(&(frame.len() as u32).to_le_bytes())?;
+    to.write_all(&frame)?;
+    to.flush()
+}
+
+/// The one unlock [`write_unlock`] sent: a length of at most [`UNLOCK_STDIN_MAX`], one whole
+/// `ProfileUnlock` frame inside the wire's bounds, then EOF. Anything else is `InvalidData`,
+/// and no error carries a byte of the frame.
+pub fn read_unlock(
+    mut from: impl std::io::Read,
+) -> std::io::Result<punktfunk_core::quic::v2::msg::ProfileUnlock> {
+    use punktfunk_core::quic::v2::{field, msg, registry};
+    let bad = |what| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
+    let mut len = [0u8; 4];
+    from.read_exact(&mut len)?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > UNLOCK_STDIN_MAX {
+        return Err(bad("unlock frame over its bound"));
+    }
+    let mut frame = msg::Zeroizing::new(vec![0u8; len]);
+    from.read_exact(&mut frame)?;
+    if from.read(&mut [0u8; 1])? != 0 {
+        return Err(bad("more than one unlock frame"));
+    }
+    match field::split_frame(&frame, registry::max_body) {
+        Ok(Some((ty, body, n))) if n == frame.len() => {
+            msg::decode::<msg::ProfileUnlock>(ty, body).map_err(|_| bad("bad unlock frame"))
+        }
+        _ => Err(bad("bad unlock frame")),
+    }
+}
+
+/// [`read_unlock`] on this process's stdin, past std's buffer, which is never wiped.
+pub fn read_unlock_from_stdin() -> std::io::Result<punktfunk_core::quic::v2::msg::ProfileUnlock> {
+    #[cfg(unix)]
+    let raw = std::os::fd::AsFd::as_fd(&std::io::stdin()).try_clone_to_owned()?;
+    #[cfg(windows)]
+    let raw = std::os::windows::io::AsHandle::as_handle(&std::io::stdin()).try_clone_to_owned()?;
+    read_unlock(std::fs::File::from(raw))
 }
 
 /// One line the session writes on stdout; [`parse_session_line`] reads each back.
@@ -1171,10 +1340,6 @@ pub fn session_command(plan: &ConnectPlan) -> (Command, Option<std::path::PathBu
     (cmd, spec_path)
 }
 
-/// What a console that never spawned shows. [`ConnectOutcome::console_banner`] has the
-/// sentences for one that did.
-pub const CONSOLE_NOT_STARTED: &str = "The console didn't start. Check the client log.";
-
 /// The console command: `--browse` with the stdout contract on, so a shell reads its ready
 /// and its exit as it reads a stream's. `until_no_pads` hands the desk back once the last
 /// controller is gone.
@@ -1218,14 +1383,32 @@ pub fn spawn_session(
 /// exits, or at once if it never starts. `cancel` accepts cancellation before or after the
 /// child is armed; `None` creates a fresh handle. [`SessionEvent::Exited`] always arrives.
 pub fn spawn_child(
-    mut cmd: Command,
+    cmd: Command,
     spec_path: Option<std::path::PathBuf>,
     cancel: Option<CancelHandle>,
     stderr_sink: impl std::io::Write + Send + 'static,
     on_event: impl FnMut(SessionEvent) + Send + 'static,
 ) -> Result<CancelHandle, String> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
+    spawn_child_with_unlock(cmd, spec_path, cancel, stderr_sink, None, on_event)
+}
+
+/// [`spawn_child`] for a dial that carries `unlock`: the child gets [`UNLOCK_STDIN_ARG`] and
+/// reads the frame from its stdin, never argv or the environment. The frame is written, stdin
+/// closed and this copy wiped before this returns.
+pub fn spawn_child_with_unlock(
+    mut cmd: Command,
+    spec_path: Option<std::path::PathBuf>,
+    cancel: Option<CancelHandle>,
+    stderr_sink: impl std::io::Write + Send + 'static,
+    unlock: Option<punktfunk_core::quic::v2::msg::ProfileUnlock>,
+    on_event: impl FnMut(SessionEvent) + Send + 'static,
+) -> Result<CancelHandle, String> {
+    if unlock.is_some() {
+        cmd.arg(UNLOCK_STDIN_ARG).stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped())
         // Piped through the ring forwarder, not inherited: a GUI-only log export
         // otherwise holds everything except the stream it was exported about.
         .stderr(Stdio::piped());
@@ -1238,6 +1421,12 @@ pub fn spawn_child(
             return Err(format!("couldn't start {}: {e}", SESSION_BIN));
         }
     };
+    if let (Some(unlock), Some(stdin)) = (unlock, child.stdin.take()) {
+        // A child that gets a torn frame refuses to dial, so a failed write fails closed.
+        if let Err(e) = write_unlock(stdin, unlock) {
+            tracing::warn!(error = %e, "the profile unlock did not reach the session");
+        }
+    }
     if let Some(stderr) = child.stderr.take() {
         crate::logring::forward_child_stderr(stderr, stderr_sink);
     }
@@ -1367,7 +1556,7 @@ mod tests {
     }
 
     /// Every exit routes one way on every shell: a rejected pin always repairs, a profile
-    /// refusal redials once, and only an armed dial that failed wakes.
+    /// refusal redials once, a locked profile prompts, and only an armed dial that failed wakes.
     #[test]
     fn exit_route_decides_once_for_every_shell() {
         use punktfunk_core::reject::RejectReason as R;
@@ -1378,11 +1567,16 @@ mod tests {
             reason,
         };
         let banner = |s: &str| Banner(s.into());
-        let died = Banner(O::died_banner(1, "the client log"));
-        let changed = Repair(FINGERPRINT_CHANGED.into());
+        let died = Banner(O::died_banner(1, Some("the client log")));
+        let changed = Repair(pf_l10n::client::dial_fingerprint_changed().into());
         let redial = RedialProfile {
             id: "kid".into(),
             msg: "no".into(),
+        };
+        let unlock = Unlock {
+            id: "kid".into(),
+            error: Some("no".into()),
+            sent: false,
         };
         for (outcome, tofu, retry, armed, want) in [
             (O::Ended(None), false, None, true, Silent),
@@ -1411,6 +1605,14 @@ mod tests {
                 ForgetProfileThen("no".into()),
             ),
             (refused(R::Busy), false, Some("kid"), true, banner("no")),
+            (
+                refused(R::ProfileLocked),
+                false,
+                Some("kid"),
+                true,
+                unlock.clone(),
+            ),
+            (refused(R::ProfileLocked), false, None, false, banner("no")),
             (O::ConnectFailed("gone".into()), false, None, true, Wake),
             (
                 O::ConnectFailed("gone".into()),
@@ -1429,14 +1631,22 @@ mod tests {
                 banner("Stream session was killed — out of memory, or stopped by the system"),
             ),
         ] {
-            let got = exit_route(&outcome, tofu, retry, armed, "the client log");
+            let got = exit_route(
+                &outcome,
+                tofu,
+                retry,
+                false,
+                false,
+                armed,
+                Some("the client log"),
+            );
             assert_eq!(
                 got, want,
                 "{outcome:?}, tofu {tofu}, retry {retry:?}, armed {armed}"
             );
         }
         assert_eq!(
-            O::died_banner(1, "C:\\logs\\client.log"),
+            O::died_banner(1, Some("C:\\logs\\client.log")),
             "The session didn't start (punktfunk-session exited with code 1). Check C:\\logs\\client.log."
         );
     }
@@ -1471,11 +1681,11 @@ mod tests {
             if let Some(host) = armed {
                 attempt.arm_wake(host);
             }
-            attempt.dial(false, None, false);
+            attempt.dial(false, None, false, false);
             if ready {
                 assert!(!attempt.on_ready());
             }
-            let got = attempt.on_exit(&exiting, &failed, "the client log");
+            let got = attempt.on_exit(&exiting, &failed, Some("the client log"));
             assert_eq!(got, want, "armed {armed:?}, ready {ready}, {exiting:?}");
             // The wake is spent on any exit, another host's included.
             assert_eq!(attempt, ConnectAttempt::default());
@@ -1491,21 +1701,67 @@ mod tests {
             msg: "no".into(),
         };
         let (changed, forget) = (
-            Repair(FINGERPRINT_CHANGED.into()),
+            Repair(pf_l10n::client::dial_fingerprint_changed().into()),
             ForgetProfileThen("no".into()),
         );
+        // A locked profile prompts again on the retry too, and the stand-in line says nothing.
+        let locked = ConnectOutcome::Refused {
+            msg: crate::trust::connect_reject_message(R::ProfileLocked),
+            reason: R::ProfileLocked,
+        };
+        let prompt = Unlock {
+            id: "kid".into(),
+            error: None,
+            sent: false,
+        };
         for (tofu, profile, redial, outcome, want) in [
             (true, None, false, &rejected, Repair("pin".into())),
             (false, None, false, &rejected, changed),
             (false, Some("kid"), false, &refused, again),
             (false, Some("kid"), true, &refused, forget),
+            (false, Some("kid"), true, &locked, prompt),
         ] {
             let mut attempt = ConnectAttempt::default();
-            attempt.dial(tofu, profile, redial);
+            attempt.dial(tofu, profile, redial, false);
             assert_eq!(attempt.on_ready(), tofu);
-            let got = attempt.on_exit(&desk, outcome, "the client log");
+            let got = attempt.on_exit(&desk, outcome, Some("the client log"));
             assert_eq!(got, want, "tofu {tofu}, {profile:?}, redial {redial}");
             assert_eq!(attempt, ConnectAttempt::default());
+        }
+    }
+
+    /// An unlock dial's `Pending` is its desktop starting. A refusal before the stream came
+    /// up refused that unlock; after it, it met a redial that carried none.
+    #[test]
+    fn an_unlock_dial_waits_for_its_desktop_and_knows_what_was_refused() {
+        use crate::unlock::Pending;
+        use punktfunk_core::reject::RejectReason as R;
+        let locked = ConnectOutcome::Refused {
+            msg: "Wrong password.".into(),
+            reason: R::ProfileLocked,
+        };
+        let host = HostTarget::default();
+        for (unlock, ready, pending, sent) in [
+            (true, false, Pending::Starting, true),
+            (true, true, Pending::Approval, false),
+            (false, false, Pending::Approval, false),
+        ] {
+            let mut attempt = ConnectAttempt::default();
+            attempt.dial(false, Some("kid"), false, unlock);
+            if ready {
+                attempt.on_ready();
+            }
+            assert_eq!(
+                attempt.on_pending(),
+                pending,
+                "unlock {unlock}, ready {ready}"
+            );
+            let want = ExitRoute::Unlock {
+                id: "kid".into(),
+                error: Some("Wrong password.".into()),
+                sent,
+            };
+            assert_eq!(attempt.on_exit(&host, &locked, Some("log")), want);
         }
     }
 
@@ -1546,6 +1802,39 @@ mod tests {
         assert!(w.tick(false).send_packet);
     }
 
+    /// One unlock crosses the session's stdin whole. Past its bound, torn, followed by more
+    /// bytes, empty or of another type, the frame is refused.
+    #[test]
+    fn one_unlock_crosses_the_session_stdin() {
+        use punktfunk_core::quic::v2::msg::{
+            ProfileUnlock, V2Message, Zeroizing, ENROLL_NONE, UNLOCK_PASSWORD,
+        };
+        let secret = Zeroizing::new(b" tr0ub4dor &3 ".to_vec());
+        let unlock = ProfileUnlock::new(UNLOCK_PASSWORD, secret, true, ENROLL_NONE, vec![]);
+        let mut wire = Vec::new();
+        write_unlock(&mut wire, unlock.unwrap()).unwrap();
+        let back = read_unlock(&wire[..]).unwrap();
+        assert_eq!(back.secret.as_slice(), b" tr0ub4dor &3 ");
+        assert!(back.stay_signed_in);
+
+        let mut more = wire.clone();
+        more.push(0);
+        let mut long = wire.clone();
+        long[..4].copy_from_slice(&(UNLOCK_STDIN_MAX as u32 + 1).to_le_bytes());
+        let other = punktfunk_core::quic::PairResult { ok: true }.encode_v2();
+        let mut wrong = (other.len() as u32).to_le_bytes().to_vec();
+        wrong.extend_from_slice(&other);
+        for bad in [
+            &more[..],
+            &wire[..wire.len() - 1],
+            &long[..],
+            &wrong[..],
+            &[][..],
+        ] {
+            assert!(read_unlock(bad).is_err());
+        }
+    }
+
     /// One-off preset rides the flag; a host binding does not — the session
     /// resolves it with the same helper, so passing it would be a second source of truth.
     #[test]
@@ -1566,10 +1855,12 @@ mod tests {
                 fullscreen_on_stream: false,
                 ..Default::default()
             },
+            overrides: None,
             wake: true,
             connect_timeout_secs: None,
             tofu: false,
             clipboard: false,
+            prompts_unlock: false,
         };
         assert_eq!(
             plan.session_args(),
@@ -1588,10 +1879,12 @@ mod tests {
         plan.preset_override = Some("aaaaaaaaaaaa".into());
         plan.connect_timeout_secs = Some(185);
         plan.settings.fullscreen_on_stream = true;
+        plan.prompts_unlock = true;
         let args = plan.session_args();
         assert!(args.windows(2).any(|w| w == ["--preset", "aaaaaaaaaaaa"]));
         assert!(args.windows(2).any(|w| w == ["--connect-timeout", "185"]));
         assert!(args.contains(&"--fullscreen".to_string()));
+        assert!(args.contains(&PROMPTS_UNLOCK_ARG.to_string()));
         // Fullscreen Always outranks a preset that turned streams fullscreen off.
         plan.settings.fullscreen_on_stream = false;
         plan.settings.set_fullscreen_always(true);
@@ -1773,18 +2066,24 @@ mod tests {
             clipboard: true,
             preset: Some("Work".into()),
             preset_id: Some("3f9a0c11e2b4".into()),
+            overrides: Some(GameOverrides {
+                lines: Some(1080),
+                gamepad: Some("dualsense".into()),
+                ..Default::default()
+            }),
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert_eq!(serde_json::from_str::<ResolvedSpec>(&json).unwrap(), spec);
 
-        // No preset: the key is absent, not null.
+        // No preset, no overrides: the keys are absent, not null.
         let plain = ResolvedSpec {
             preset: None,
             preset_id: None,
+            overrides: None,
             ..spec.clone()
         };
         let json = serde_json::to_string(&plain).unwrap();
-        assert!(!json.contains("preset"));
+        assert!(!json.contains("preset") && !json.contains("overrides"));
         assert_eq!(serde_json::from_str::<ResolvedSpec>(&json).unwrap(), plain);
     }
 
@@ -1877,18 +2176,17 @@ mod tests {
             ),
             (
                 O::RendererFailed { code: 4 },
-                Some(
-                    "The console didn't start (punktfunk-session exited with code 4). \
-                     Check the client log."
-                        .into(),
-                ),
+                Some("The controller interface didn't start. Check the client log.".into()),
             ),
             (
                 O::RendererFailed { code: -1 },
-                Some("The console was killed — out of memory, or stopped by the system".into()),
+                Some(
+                    "The controller interface was killed — out of memory, or stopped by the system"
+                        .into(),
+                ),
             ),
         ] {
-            assert_eq!(outcome.console_banner(log), want, "{outcome:?}");
+            assert_eq!(outcome.console_banner(Some(log)), want, "{outcome:?}");
         }
         let args = |cmd: Command| -> Vec<String> {
             cmd.get_args().map(|a| a.to_string_lossy().into()).collect()
@@ -1914,12 +2212,26 @@ mod tests {
     }
 
     #[test]
-    fn exit_phrase_names_an_ntstatus_in_hex() {
-        assert_eq!(ConnectOutcome::exit_phrase(2), "exited with code 2");
-        let av = ConnectOutcome::exit_phrase(-1073741819);
+    fn a_silent_death_names_an_ntstatus_in_hex() {
+        assert_eq!(ExitHow::of(2), ExitHow::Code);
+        assert_eq!(ExitHow::of(-1073741819), ExitHow::AccessViolation);
+        let av = ConnectOutcome::died_banner(-1073741819, Some("the log"));
         assert!(av.contains("access violation (0xC0000005)"), "{av}");
-        let other = ConnectOutcome::exit_phrase(0xC000_0409u32 as i32);
-        assert!(other.contains("0xC0000409"), "{other}");
+        let other = ConnectOutcome::died_banner(0xC000_0409u32 as i32, Some("the log"));
+        assert!(other.contains("exception 0xC0000409"), "{other}");
+    }
+
+    /// A shell that writes no log has no path to name: the banner says "the client log".
+    #[test]
+    fn a_shell_without_a_log_file_names_none() {
+        let with = ConnectOutcome::died_banner(2, Some("/tmp/client.log"));
+        assert!(with.ends_with("Check /tmp/client.log."), "{with}");
+        for code in [2, -1073741819, 0xC000_0409u32 as i32] {
+            let bare = ConnectOutcome::died_banner(code, None);
+            assert!(bare.ends_with("Check the client log."), "{bare}");
+            let console = ConnectOutcome::RendererFailed { code }.console_banner(None);
+            assert!(console.unwrap().ends_with("Check the client log."));
+        }
     }
 
     #[test]
@@ -1957,6 +2269,19 @@ mod tests {
             parse_session_line(r#"{"error":"x","refused":"from-a-newer-session"}"#),
             Some(SessionEvent::Error(SessionError { refused: None, .. }))
         ));
+        // A locked profile reaches the shell as a refusal with the host's sentence.
+        let Some(SessionEvent::Error(locked)) =
+            parse_session_line(r#"{"error":"Wrong password.","refused":"profile-locked"}"#)
+        else {
+            panic!("a refusal line");
+        };
+        assert_eq!(
+            ConnectOutcome::from_exit(2, Some(locked), None, false),
+            ConnectOutcome::Refused {
+                msg: "Wrong password.".into(),
+                reason: punktfunk_core::reject::RejectReason::ProfileLocked,
+            }
+        );
         assert_eq!(
             parse_session_line(r#"{"ended":"Host ended the session"}"#),
             Some(SessionEvent::Ended("Host ended the session".into()))
@@ -2077,15 +2402,18 @@ mod tests {
                 codec: "av1".into(),
                 enable_444: true,
                 overlay_actions: r#"{"v":2,"ring":["stats"]}"#.into(),
+                shortcuts: r#"{"v":1,"bindings":[]}"#.into(),
                 vsync: false,
                 invert_scroll: true,
                 fullscreen_on_stream: true,
                 ..Default::default()
             },
+            overrides: None,
             wake: false,
             connect_timeout_secs: Some(45),
             tofu: false,
             clipboard: true,
+            prompts_unlock: false,
         };
         let force_software = Arc::new(AtomicBool::new(false));
         let probes = |hdr_enabled: bool, hevc_444_hardware: bool| Probes {
@@ -2115,6 +2443,7 @@ mod tests {
         assert_eq!(params.bitrate_kbps, plan.settings.bitrate_kbps);
         assert_ne!(plan.settings.bitrate_kbps, Settings::default().bitrate_kbps);
         assert_eq!(params.overlay_actions, plan.settings.overlay_actions);
+        assert_eq!(params.shortcuts, plan.settings.shortcuts);
         assert!(!params.vsync && params.invert_scroll && params.fullscreen);
         assert_eq!(
             params.render_scale_max_dim, 8192,
@@ -2184,5 +2513,183 @@ mod tests {
             off.display_hdr.is_none(),
             "the volume stays off with HDR off"
         );
+    }
+
+    /// The host's overrides fit the asked mode to this panel and codec (the shared vectors
+    /// 1, 4, 5 and 8); their HDR and pad are in the spec's settings before a probe reads them.
+    #[test]
+    fn game_overrides_reach_the_hello() {
+        let raw = include_str!("../../../../clients/shared/game-override-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vectors parse");
+        let mode = |a: &serde_json::Value| {
+            let n = |i: usize| a[i].as_u64().expect("number") as u32;
+            Mode {
+                width: n(0),
+                height: n(1),
+                refresh_hz: n(2),
+            }
+        };
+        let probes = |native: Mode, hdr_enabled: bool| Probes {
+            mode: native,
+            identity: ("client".into(), "desk".into()),
+            vulkan: None,
+            force_software: Arc::default(),
+            gamepad: GamepadPref::Auto,
+            hdr_enabled,
+            display_hdr: None,
+            hevc_444_hardware: false,
+            stats_verbosity: StatsVerbosity::Normal,
+        };
+        let h = host(
+            "Desk",
+            "192.168.1.50",
+            "11111111-2222-4333-8444-555555555555",
+            &"ab".repeat(32),
+        );
+        let fit_rows = file["fit"].as_array().expect("fit rows");
+        for row in [0, 3, 4, 7].map(|i| &fit_rows[i]) {
+            let asked = mode(&row["mode"]);
+            let settings = Settings {
+                width: asked.width,
+                height: asked.height,
+                refresh_hz: asked.refresh_hz,
+                ..Default::default()
+            };
+            let mut plan = ConnectPlan::resolve(
+                &h,
+                Some("steam:570"),
+                None,
+                &PresetsFile::default(),
+                &settings,
+            );
+            plan.overrides = Some(GameOverrides {
+                lines: row["lines"].as_u64().map(|v| v as u32),
+                hz: row["hz"].as_u64().map(|v| v as u32),
+                beyond_screen: row["beyond_screen"].as_bool().unwrap_or(false),
+                ..Default::default()
+            });
+            let params = plan.session_params([9; 32], probes(mode(&row["native"]), false));
+            assert_eq!(params.mode, mode(&row["expect"]), "{}", row["why"]);
+            assert!(params.host_overrides);
+        }
+
+        let device = Settings {
+            codec: "av1".into(),
+            hdr_enabled: false,
+            gamepad: "xboxone".into(),
+            ..Default::default()
+        };
+        let mut plan = ConnectPlan::resolve(
+            &h,
+            Some("steam:570"),
+            None,
+            &PresetsFile::default(),
+            &device,
+        );
+        plan.overrides = Some(GameOverrides {
+            hdr: Some(true),
+            gamepad: Some("dualsense".into()),
+            ..Default::default()
+        });
+        let spec = plan.spec(false);
+        assert!(
+            spec.settings.hdr_enabled,
+            "the session's HDR gate reads this"
+        );
+        assert_eq!(
+            spec.settings.gamepad, "dualsense",
+            "the session's pad probe reads this"
+        );
+        assert!(
+            !plan.settings.hdr_enabled,
+            "the plan keeps the device's own"
+        );
+        let params = plan.session_params(
+            [9; 32],
+            probes(mode(&serde_json::json!([1920, 1080, 60])), true),
+        );
+        assert_ne!(params.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR, 0);
+        assert_eq!(
+            params.hud_preset().as_deref(),
+            Some("set by the host for this game")
+        );
+        let named = SessionParams {
+            preset: Some("Work".into()),
+            ..params.clone()
+        };
+        assert_eq!(
+            named.hud_preset().as_deref(),
+            Some("Work \u{b7} set by the host for this game")
+        );
+
+        plan.overrides = None;
+        let params = plan.session_params(
+            [9; 32],
+            probes(mode(&serde_json::json!([1920, 1080, 60])), true),
+        );
+        assert_eq!(
+            params.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR,
+            0,
+            "the device's off"
+        );
+        assert!(params.hud_preset().is_none());
+    }
+
+    /// Above 1x the connect names the chosen size as its view beside the scaled mode; 1x and
+    /// below name none. An override that brings the mode down to the view drops it.
+    #[test]
+    fn the_connect_names_the_view_above_1x() {
+        let h = host(
+            "Desk",
+            "192.168.1.50",
+            "11111111-2222-4333-8444-555555555555",
+            &"ab".repeat(32),
+        );
+        let params = |render_scale: f64, lines: Option<u32>| {
+            let settings = Settings {
+                width: 1366,
+                height: 768,
+                render_scale,
+                ..Default::default()
+            };
+            let mut plan = ConnectPlan::resolve(
+                &h,
+                Some("steam:570"),
+                None,
+                &PresetsFile::default(),
+                &settings,
+            );
+            plan.overrides = lines.map(|l| GameOverrides {
+                lines: Some(l),
+                ..Default::default()
+            });
+            let p = plan.session_params(
+                [9; 32],
+                Probes {
+                    mode: Mode {
+                        width: 1920,
+                        height: 1080,
+                        refresh_hz: 60,
+                    },
+                    identity: ("client".into(), "desk".into()),
+                    vulkan: None,
+                    force_software: Arc::default(),
+                    gamepad: GamepadPref::Auto,
+                    hdr_enabled: false,
+                    display_hdr: None,
+                    hevc_444_hardware: false,
+                    stats_verbosity: StatsVerbosity::Normal,
+                },
+            );
+            ((p.mode.width, p.mode.height), p.view)
+        };
+        let view = Some((1366, 768));
+        assert_eq!(params(1.5, None), ((2048, 1152), view));
+        assert_eq!(params(2.0, None), ((2732, 1536), view));
+        assert_eq!(params(1.0, None), ((1366, 768), None));
+        assert_eq!(params(0.5, None), ((682, 384), None));
+        assert_eq!(params(2.0, Some(1080)), ((1920, 1080), view));
+        assert_eq!(params(2.0, Some(768)), ((1366, 768), None));
+        assert_eq!(params(2.0, Some(720)), ((1280, 720), None));
     }
 }

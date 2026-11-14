@@ -21,6 +21,43 @@ public enum ConsoleJSON {
         host.pinnedSHA256.map { $0.map { String(format: "%02x", $0) }.joined() } ?? ""
     }
 
+    /// The saved host a console command names. The fingerprint keys it: the record that pins
+    /// `fp`, else the unpaired one at `addr:port`, never a record pinned to another
+    /// fingerprint, which is the other system of a dual-boot box. With no `fp` the address
+    /// is all there is.
+    public static func host(
+        in hosts: [StoredHost], fp: String, addr: String, port: UInt16
+    ) -> StoredHost? {
+        if !fp.isEmpty, let pinned = hosts.first(where: { fingerprint($0) == fp }) {
+            return pinned
+        }
+        return hosts.first {
+            $0.address == addr && $0.port == port && (fp.isEmpty || $0.pinnedSHA256 == nil)
+        }
+    }
+
+    /// The saved host behind a row key: the fingerprint or `addr:port`, with a pinned card's
+    /// preset id behind a NUL. The port sits behind the last colon, as an IPv6 address has
+    /// its own; an empty key names no host.
+    public static func host(in hosts: [StoredHost], key: String) -> StoredHost? {
+        let base = key.split(separator: "\u{0}", omittingEmptySubsequences: false)
+            .first.map(String.init) ?? key
+        guard !base.isEmpty else { return nil }
+        if let host = hosts.first(where: { fingerprint($0) == base }) { return host }
+        guard let colon = base.lastIndex(of: ":"),
+              let port = UInt16(base[base.index(after: colon)...])
+        else { return nil }
+        let address = String(base[..<colon])
+        return hosts.first { $0.address == address && $0.port == port }
+    }
+
+    /// The preset a pinned card's row key carries behind its NUL; nil for a host's own row.
+    public static func preset(ofKey key: String) -> String? {
+        guard let nul = key.firstIndex(of: "\u{0}") else { return nil }
+        let id = key[key.index(after: nul)...]
+        return id.isEmpty ? nil : String(id)
+    }
+
     /// `HostRow.key` — the pinned fingerprint when there is one, else `addr:port`.
     public static func rowKey(_ fingerprint: String, _ address: String, _ port: UInt16) -> String {
         fingerprint.isEmpty ? "\(address):\(port)" : fingerprint
@@ -32,6 +69,8 @@ public enum ConsoleJSON {
             // Read by the speed test alone: a preset that PINS bitrate is the layer its host
             // streams at, so the console must not offer to write the global instead.
             "bitrate_kbps": preset.overrides.bitrateKbps ?? NSNull(),
+            // The card's Screen section and line under a preset that pins the host screen.
+            "host_screen": preset.overrides.hostScreen ?? NSNull(),
         ]
     }
 
@@ -44,6 +83,23 @@ public enum ConsoleJSON {
         }
     }
 
+    /// `HostRow.screens`: the host's `GET /display/targets` body in its own keys, `may_choose`
+    /// and `role` included, or null before it answers.
+    private static func screensJSON(
+        _ screens: [String: DisplayTargets], _ host: StoredHost
+    ) -> Any {
+        guard let rows = screens[fingerprint(host)], let data = try? JSONEncoder().encode(rows),
+              let json = try? JSONSerialization.jsonObject(with: data)
+        else { return NSNull() }
+        return json
+    }
+
+    /// A `SetScreen` command's write: its `screen`, and `topology` when the row is a role.
+    public static func screenPick(_ command: [String: Any]) -> ScreenPick? {
+        guard let data = try? JSONSerialization.data(withJSONObject: command) else { return nil }
+        return try? JSONDecoder().decode(ScreenPick.self, from: data)
+    }
+
     /// The home carousel: saved hosts in store order, which is the order they were added, each
     /// followed by its pinned preset cards, then the discovered-but-unsaved by name. The console
     /// applies the player's sort on top. `clients/shared/host-row-vectors.json` holds this, the
@@ -51,7 +107,7 @@ public enum ConsoleJSON {
     public static func hostRows(
         saved: [StoredHost], discovered: [DiscoveredHost], online: Set<StoredHost.ID>,
         presets: [StreamPreset], actions hostActions: [String: [HostAction]] = [:],
-        running: [String: String] = [:]
+        running: [String: String] = [:], screens: [String: DisplayTargets] = [:]
     ) -> String {
         var out: [[String: Any]] = []
         let same = { (d: DiscoveredHost, host: StoredHost) in
@@ -59,8 +115,9 @@ public enum ConsoleJSON {
         }
         for host in saved {
             let advert = discovered.first { same($0, host) }
-            let base = row(host, advert: advert, online: online.contains(host.id),
+            var base = row(host, advert: advert, online: online.contains(host.id),
                            presets: presets, hostActions: hostActions, running: running)
+            base["screens"] = screensJSON(screens, host)
             out.append(base)
             // A pinned card shares the primary tile's live state; its key rides the preset id
             // behind a NUL, which no fingerprint or `addr:port` can hold.
@@ -219,6 +276,33 @@ public enum ConsoleJSON {
         return string(doc)
     }
 
+    /// The input test's push for the iOS SC2 menu pad, nil while none delivers. Same names and
+    /// signs as `ConsoleModel.pushPadTest`'s GameController path: +y is down, a trigger counts
+    /// as held past half travel, ⧉ is Back and ☰ is Start.
+    @MainActor public static func padTest(sc2 manager: GamepadManager) -> String? {
+        manager.sc2MenuState.map { padTest(sc2: $0) }
+    }
+
+    static func padTest(sc2 s: Sc2Device.State) -> String {
+        let buttons: [(String, UInt32)] = [
+            ("A", Sc2Device.btnA), ("B", Sc2Device.btnB), ("X", Sc2Device.btnX),
+            ("Y", Sc2Device.btnY), ("LB", Sc2Device.btnLB), ("RB", Sc2Device.btnRB),
+            ("Back", Sc2Device.btnView), ("Start", Sc2Device.btnMenu),
+            ("Guide", Sc2Device.btnSteam), ("LS", Sc2Device.btnL3), ("RS", Sc2Device.btnR3),
+            ("Up", Sc2Device.btnDpadUp), ("Down", Sc2Device.btnDpadDown),
+            ("Left", Sc2Device.btnDpadLeft), ("Right", Sc2Device.btnDpadRight),
+        ]
+        var held = buttons.filter { s.buttons & $0.1 != 0 }.map(\.0)
+        if s.lt > 127 { held.append("LT") }
+        if s.rt > 127 { held.append("RT") }
+        let axes: [[Any]] = [
+            ["LX", Float(s.lsX) / 32767], ["LY", -Float(s.lsY) / 32767],
+            ["RX", Float(s.rsX) / 32767], ["RY", -Float(s.rsY) / 32767],
+            ["LT", Float(s.lt) / 255], ["RT", Float(s.rt) / 255],
+        ]
+        return string(["held": held, "axes": axes])
+    }
+
     /// The catalog with each preset's overrides, so a settings row can say when a host's bound
     /// preset outranks the global it shows.
     public static func presets(_ presets: [StreamPreset]) -> String {
@@ -232,52 +316,48 @@ public enum ConsoleJSON {
     /// reads: an override it cannot parse leaves that preset unmarked, not the catalog empty.
     private static func overrides(_ o: SettingsOverlay) -> [String: Any] {
         var j: [String: Any] = [:]
-        j["width"] = o.width
-        j["height"] = o.height
-        j["match_window"] = o.matchWindow
-        j["compositor"] = o.compositor.map(ConsoleSettings.compositorName)
-        j["gamepad"] = o.gamepadType.map(ConsoleSettings.padTypeName)
-        j["refresh_hz"] = o.refreshHz
-        j["bitrate_kbps"] = o.bitrateKbps
-        j["pyrowave_bpp"] = o.pyrowaveBpp
-        j["render_scale"] = o.renderScale
-        j["video_fit"] = o.videoFit
-        j["screens"] = o.screens
-        j["codec"] = o.codec
-        j["hdr_enabled"] = o.hdrEnabled
-        j["enable_444"] = o.enable444
-        j["ten_bit_sdr"] = o.tenBitSdr
-        j["audio_channels"] = o.audioChannels
-        j["audio_format"] = o.audioFormat
-        j["mic_enabled"] = o.micEnabled
-        j["echo_cancel"] = o.echoCancel
-        j["keep_host_audio"] = o.keepHostAudio
-        j["touch_mode"] = o.touchMode
-        j["mouse_mode"] = o.mouseMode
-        j["invert_scroll"] = o.invertScroll
-        j["overlay_actions"] = o.overlayActions
-        j["inhibit_shortcuts"] = o.inhibitShortcuts
-        j["gamepad_forwarding"] = o.gamepadForwarding
-        j["system_buttons"] = o.systemButtons
-        j["guide_gesture"] = o.guideGesture
-        j["stats_verbosity"] = o.statsVerbosity
-        j["fullscreen_on_stream"] = o.fullscreenWhileStreaming
-        j["present_priority"] = o.presentPriority
-        j["smooth_buffer"] = o.smoothBuffer
-        j["vsync"] = o.vsync
-        j["allow_vrr"] = o.allowVRR
-        return j.compactMapValues { $0 }
+        for (key, value) in consoleFields { j[key] = value(o) }
+        return j
     }
 
-    /// The keys `overrides(_:)` sends: exactly the ones a console save sets or clears.
-    private static let consoleKeys: Set<String> = [
-        "width", "height", "match_window", "compositor", "gamepad", "refresh_hz", "bitrate_kbps",
-        "pyrowave_bpp", "render_scale", "video_fit", "screens", "codec", "hdr_enabled", "enable_444",
-        "ten_bit_sdr",
-        "audio_channels", "audio_format", "mic_enabled", "echo_cancel", "keep_host_audio",
-        "touch_mode", "mouse_mode", "invert_scroll", "overlay_actions", "inhibit_shortcuts",
-        "gamepad_forwarding", "system_buttons", "guide_gesture", "stats_verbosity",
-        "fullscreen_on_stream", "present_priority", "smooth_buffer", "vsync", "allow_vrr",
+    /// Every key a console save sets or clears, with how `overrides(_:)` spells a preset's value.
+    private static let consoleFields: [(key: String, value: @Sendable (SettingsOverlay) -> Any?)] = [
+        ("width", { $0.width }),
+        ("height", { $0.height }),
+        ("match_window", { $0.matchWindow }),
+        ("compositor", { $0.compositor.map(ConsoleSettings.compositorName) }),
+        ("gamepad", { $0.gamepadType.map(ConsoleSettings.padTypeName) }),
+        ("refresh_hz", { $0.refreshHz }),
+        ("bitrate_kbps", { $0.bitrateKbps }),
+        ("pyrowave_bpp", { $0.pyrowaveBpp }),
+        ("render_scale", { $0.renderScale }),
+        ("video_fit", { $0.videoFit }),
+        ("screens", { $0.screens }),
+        ("host_screen", { $0.hostScreen }),
+        ("codec", { $0.codec }),
+        ("hdr_enabled", { $0.hdrEnabled }),
+        ("enable_444", { $0.enable444 }),
+        ("ten_bit_sdr", { $0.tenBitSdr }),
+        ("audio_channels", { $0.audioChannels }),
+        ("audio_format", { $0.audioFormat }),
+        ("mic_enabled", { $0.micEnabled }),
+        ("echo_cancel", { $0.echoCancel }),
+        ("keep_host_audio", { $0.keepHostAudio }),
+        ("touch_mode", { $0.touchMode }),
+        ("mouse_mode", { $0.mouseMode }),
+        ("invert_scroll", { $0.invertScroll }),
+        ("overlay_actions", { $0.overlayActions }),
+        ("shortcuts", { $0.shortcuts }),
+        ("inhibit_shortcuts", { $0.inhibitShortcuts }),
+        ("gamepad_forwarding", { $0.gamepadForwarding }),
+        ("system_buttons", { $0.systemButtons }),
+        ("guide_gesture", { $0.guideGesture }),
+        ("stats_verbosity", { $0.statsVerbosity }),
+        ("fullscreen_on_stream", { $0.fullscreenWhileStreaming }),
+        ("present_priority", { $0.presentPriority }),
+        ("smooth_buffer", { $0.smoothBuffer }),
+        ("vsync", { $0.vsync }),
+        ("allow_vrr", { $0.allowVRR }),
     ]
 
     /// The console's saved overlay over `base`: every key the console edits comes from it,
@@ -286,8 +366,7 @@ public enum ConsoleJSON {
         guard let data = try? JSONEncoder().encode(base),
             var j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return base }
-        for key in consoleKeys { j[key] = nil }
-        for (key, value) in console where consoleKeys.contains(key) { j[key] = value }
+        for (key, _) in consoleFields { j[key] = console[key] }
         // The console names these two; this app's overlay stores the wire number.
         j["compositor"] = (console["compositor"] as? String).flatMap(ConsoleSettings.compositorTag)
         j["gamepad"] = (console["gamepad"] as? String).flatMap(ConsoleSettings.padTypeTag)
@@ -327,34 +406,58 @@ public enum ConsoleJSON {
 
     // MARK: - library
 
-    /// `{"req", "games": [LibraryGame]}` from this client's catalog — the desktop service's
-    /// `to_model` mapping, under the `FetchLibrary` command's `req`. Without `stats` the Recent
-    /// and Most played sorts fall back to host order.
+    /// `{"req", "games": [LibraryGame]}` from this client's catalog, under the `FetchLibrary`
+    /// command's `req`.
     public static func libraryGames(_ req: Any, _ games: [GameEntry]) -> String {
-        string([
-            "req": req,
-            "games": games.map { g -> [String: Any] in
+        string(["req": req, "games": games.map(libraryGame)])
+    }
+
+    /// One `LibraryGame` — the desktop service's `to_model` mapping. Without `stats` the Recent
+    /// and Most played sorts fall back to host order. `overrides` only when the host set some.
+    private static func libraryGame(_ g: GameEntry) -> [String: Any] {
+        var row: [String: Any] = [
+            "id": g.id, "title": g.title, "store": g.store,
+            "launcher": g.role == "launcher",
+            "icon": g.iconToken ?? "",
+            "platform": g.platform ?? NSNull(), "developer": g.developer ?? NSNull(),
+            "year": g.releaseYear ?? NSNull(), "genres": g.genres ?? [],
+            "stats": g.stats.map { s -> [String: Any] in
                 [
-                    "id": g.id, "title": g.title, "store": g.store,
-                    "launcher": g.role == "launcher",
-                    "icon": g.icon.flatMap { validIconToken($0) ? $0 : nil } ?? "",
-                    "platform": g.platform ?? NSNull(), "developer": g.developer ?? NSNull(),
-                    "year": g.releaseYear ?? NSNull(), "genres": g.genres ?? [],
-                    "stats": g.stats.map { s -> [String: Any] in
-                        [
-                            "last_played_unix_ms": s.lastPlayedUnixMs, "play_time_ms": s.playTimeMs,
-                            "last_run_ms": s.lastRunMs, "launch_count": s.launchCount,
-                        ]
-                    } ?? NSNull(),
-                    "running": false,
-                    "install": g.install.map { i -> [String: Any] in
-                        var o: [String: Any] = ["state": i.state]
-                        if let size = i.sizeBytes { o["size_bytes"] = size }
-                        if let free = i.freeBytes { o["free_bytes"] = free }
-                        return o
-                    } ?? NSNull(),
+                    "last_played_unix_ms": s.lastPlayedUnixMs, "play_time_ms": s.playTimeMs,
+                    "last_run_ms": s.lastRunMs, "launch_count": s.launchCount,
                 ]
-            },
+            } ?? NSNull(),
+            "running": false,
+            "install": g.install.map { i -> [String: Any] in
+                var o: [String: Any] = ["state": i.state]
+                if let size = i.sizeBytes { o["size_bytes"] = size }
+                if let free = i.freeBytes { o["free_bytes"] = free }
+                return o
+            } ?? NSNull(),
+        ]
+        if let o = g.overrides, let data = try? JSONEncoder().encode(o) {
+            row["overrides"] = try? JSONSerialization.jsonObject(with: data)
+        }
+        return row
+    }
+
+    /// The `FetchHidden` answer for `profile` on host `fp`: `{"fp_hex", "profile", "answer"}`,
+    /// `answer` a `HiddenAnswer` — `{"Listed": [LibraryGame]}`, or `{"Failed": why}` when
+    /// `games` is nil.
+    public static func hiddenList(
+        fp: String, profile: String, games: [GameEntry]?, why: String = ""
+    ) -> String {
+        let answer: [String: Any] = games.map { ["Listed": $0.map(libraryGame)] } ?? ["Failed": why]
+        return string(["fp_hex": fp, "profile": profile, "answer": answer])
+    }
+
+    /// `HideAnswer`: what a `SetHidden` came to, echoing its host, profile, title and `hidden`.
+    public static func hideAnswer(
+        fp: String, profile: String, appID: String, hidden: Bool, done: Bool, notice: String
+    ) -> String {
+        string([
+            "fp_hex": fp, "profile": profile, "app_id": appID, "hidden": hidden, "done": done,
+            "notice": notice,
         ])
     }
 
@@ -371,12 +474,6 @@ public enum ConsoleJSON {
         }
         let json = try? JSONEncoder().encode(Push(downloads: downloads, grants: grants))
         return json.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-    }
-
-    /// `GameEntry::icon_token`'s re-validation: lowercase-first, at most 32 of `[a-z0-9-]`.
-    private static func validIconToken(_ t: String) -> Bool {
-        !t.isEmpty && t.count <= 32 && t.first!.isLowercase && t.first!.isLetter
-            && t.allSatisfy { $0.isNumber || $0 == "-" || ($0.isLowercase && $0.isLetter) }
     }
 
     public static func libraryError(_ req: Any, title: String, body: String, canRetry: Bool)

@@ -27,7 +27,8 @@
 use super::nvenc_core::{CreateInstance, EncodeApi, GetMaxSupportedVersion, NvStatusExt};
 use super::nvenc_session::{
     async_inflight_cap, async_retrieve_requested, async_retrieve_vetoed, full_chroma_input,
-    lock_copy, open_session, EncodeInput, NvSession, OpenTarget, RetrieveDone, RetrieveJob, POOL,
+    lock_copy, open_session, DoneTx, EncodeInput, NvSession, OpenTarget, RetrieveDone, RetrieveJob,
+    POOL,
 };
 use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -89,10 +90,43 @@ pub(crate) struct ProbedSupport {
     pub ten_bit: crate::CodecSupport,
 }
 
-/// Cached [`probe_support_uncached`] — one throwaway session per process.
+/// [`probe_support_uncached`], kept for the process once the driver has listed its codecs. A
+/// probe that could not ask (no CUDA context, no session, no GUID list) is not kept: a later
+/// ask runs it again, so a driver still starting does not pin 10-bit and 4:4:4 off. The caller
+/// bounds how often it asks.
 pub(crate) fn probe_support() -> ProbedSupport {
     static CACHE: std::sync::OnceLock<ProbedSupport> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(probe_support_uncached)
+    // One probe at a time: a second ask waits for the first one's answer.
+    static BUSY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if let Some(p) = CACHE.get() {
+        return *p;
+    }
+    let _one = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = CACHE.get() {
+        return *p;
+    }
+    let p = probe_support_uncached();
+    if p.codecs.h264 || p.codecs.h265 || p.codecs.av1 {
+        return *CACHE.get_or_init(|| p);
+    }
+    p
+}
+
+/// A probe that could not ask. The first miss warns with its cause; a repeat stays at debug,
+/// since the probe runs again for as long as it stays unanswered.
+fn probe_missed(what: &str, error: &str) {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let mut first = false;
+    WARNED.get_or_init(|| first = true);
+    if first {
+        tracing::warn!(
+            what,
+            error,
+            "NVENC codec probe unanswered — advertising the static set and probing again later"
+        );
+    } else {
+        tracing::debug!(what, error, "NVENC codec probe unanswered");
+    }
 }
 
 /// Ask this GPU's driver which codecs it encodes, plus HEVC 4:4:4 / 10-bit.
@@ -120,7 +154,7 @@ fn probe_support_uncached() -> ProbedSupport {
     let cu_ctx = match cuda::context() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "NVENC codec probe: no CUDA context");
+            probe_missed("no CUDA context", &format!("{e:#}"));
             return unknown;
         }
     };
@@ -136,10 +170,8 @@ fn probe_support_uncached() -> ProbedSupport {
         let enc = match open_session(api, target) {
             Ok(enc) => enc,
             Err(e) => {
-                tracing::warn!(
-                    error = %format!("{:#}", nvenc_status::call_err("open_encode_session_ex (codec probe)", e)),
-                    "NVENC codec probe failed — keeping the static codec advertisement"
-                );
+                let e = nvenc_status::call_err("open_encode_session_ex (codec probe)", e);
+                probe_missed("no encode session", &format!("{e:#}"));
                 return unknown;
             }
         };
@@ -195,9 +227,7 @@ fn probe_support_uncached() -> ProbedSupport {
         }
         let _ = (api.destroy_encoder)(enc);
         if !listed {
-            tracing::warn!(
-                "NVENC codec probe: driver listed no encode GUIDs — keeping the static advertisement"
-            );
+            probe_missed("no encode GUIDs listed", "");
             return unknown;
         }
         ProbedSupport {
@@ -270,14 +300,10 @@ fn chroma_plane(captured: &CapturedFrame, d: &DmabufFrame) -> Option<(u32, u32)>
     })
 }
 
-/// Retrieve thread: blocking-lock, copy, unlock, send. Exits when the job channel closes.
-/// Teardown drops the sender and joins before destroy, or leaks the session with a thread it
-/// cannot join, so `enc`/`bs` outlive uses here.
-fn retrieve_loop(
-    enc: usize,
-    work_rx: mpsc::Receiver<RetrieveJob>,
-    done_tx: mpsc::Sender<RetrieveDone>,
-) {
+/// Retrieve thread: blocking-lock, copy, unlock, send, which rings the loop's AU wake. Exits
+/// when the job channel closes. Teardown drops the sender and joins before destroy, or leaks
+/// the session with a thread it cannot join, so `enc`/`bs` outlive uses here.
+fn retrieve_loop(enc: usize, work_rx: mpsc::Receiver<RetrieveJob>, done_tx: DoneTx) {
     pf_frame::thread_qos::boost_thread_priority(false);
     // Shared process-wide CUDA context — same `cuCtxSetCurrent` the encode thread does.
     if let Err(e) = cuda::make_current() {
@@ -405,7 +431,7 @@ const DIRECT_IDLE: u64 = 600;
 
 /// The span NVENC reads a LINEAR raw frame from in place, and the chroma's byte offset from
 /// the luma (0 for packed RGB). `None` leaves the frame to the worker: tiled, a format NVENC
-/// does not take as is, or chroma that is not below the luma at the luma's stride.
+/// does not take as is, a zero stride, or chroma that is not below the luma at the luma's stride.
 fn direct_span(captured: &CapturedFrame, d: &DmabufFrame) -> Option<(pf_zerocopy::Span, u32)> {
     use pf_frame::PixelFormat as F;
     if d.modifier != 0 {
@@ -417,7 +443,11 @@ fn direct_span(captured: &CapturedFrame, d: &DmabufFrame) -> Option<(pf_zerocopy
             // A producer may pad the luma: the view runs on to the chroma's last row.
             let (off1, stride1) = chroma_plane(captured, d)?;
             let chroma = off1.checked_sub(d.offset)?;
-            if stride1 != d.stride || u64::from(chroma) < u64::from(d.stride) * u64::from(h) {
+            // The row count below divides by the stride.
+            if d.stride == 0
+                || stride1 != d.stride
+                || u64::from(chroma) < u64::from(d.stride) * u64::from(h)
+            {
                 return None;
             }
             let bytes = if captured.format == F::P010 { 2 } else { 1 };
@@ -1982,6 +2012,11 @@ impl Encoder for NvencCudaEncoder {
         }
     }
 
+    /// Every retrieve thread, this session's and a rebuild's, rings it after each AU.
+    fn set_au_wake(&mut self, wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+        self.s.au_wake.set(wake);
+    }
+
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
             // `cursor_blend_capable` predicts the same rule.
@@ -2038,6 +2073,10 @@ impl Encoder for NvencCudaEncoder {
 
     fn set_reference_floor(&mut self, acked: Option<crate::Acked>) {
         self.s.reference_floor = acked;
+    }
+
+    fn note_confirmed(&mut self, acked: Option<crate::Acked>) {
+        self.s.confirmed = acked;
     }
 
     fn invalidate_ref_frames(&mut self, first: i64, last: i64) -> bool {

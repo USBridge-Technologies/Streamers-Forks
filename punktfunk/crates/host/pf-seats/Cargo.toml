@@ -25,10 +25,20 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 zeroize = "1"
 
 # `net` reads a socket peer's credentials (SO_PEERCRED), `fs` opens a file without following a
-# link and `process` names the uid the state directory must belong to, all through safe wrappers,
-# so this half keeps `forbid(unsafe_code)`.
+# link, `process` names the uid the state directory must belong to, `thread` drops the login
+# helper's child to its person and `mount` clones a checked folder onto a seat's stage, all
+# through safe wrappers, so this half denies unsafe code except
+# in `linux::pam`, `linux::login`, one call of `linux::handover` and `linux::loopback`'s `bpf(2)`.
+# `pam` loads libpam at run time,
+# since this crate is linked into `punktfunk-host` too and only the seat daemon may need the
+# library. PAM frees the answers its conversation returns with `free()`, so they come from
+# libc's own allocator.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs", "net", "process"] }
+libc = "0.2"
+libloading = "0.9"
+rustix = { version = "1", features = ["fs", "mount", "net", "process", "thread"] }
+# Checks the console certificate root installs for Firefox (`linux::firefox`).
+x509-parser = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 pf-paths-win = { path = "../pf-paths-win" }
@@ -62,6 +72,7 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 pf-host-config = { path = "../pf-host-config" }
+rcgen = { workspace = true }
 tempfile = "3"
 
 [lints]

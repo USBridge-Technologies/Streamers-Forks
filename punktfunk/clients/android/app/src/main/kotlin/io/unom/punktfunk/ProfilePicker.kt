@@ -18,8 +18,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -27,6 +30,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,6 +38,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -41,7 +46,11 @@ import coil3.ImageLoader
 import coil3.compose.AsyncImage
 import io.unom.punktfunk.kit.ListedProfile
 import io.unom.punktfunk.kit.ProfilePick
+import io.unom.punktfunk.kit.R
+import io.unom.punktfunk.kit.Say
 import io.unom.punktfunk.kit.SeatGate
+import io.unom.punktfunk.kit.UnlockChallenge
+import io.unom.punktfunk.kit.UnlockNeed
 import io.unom.punktfunk.kit.initials
 import io.unom.punktfunk.kit.library.MgmtReply
 import io.unom.punktfunk.kit.library.mgmtBase
@@ -57,6 +66,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
@@ -64,7 +74,11 @@ import okhttp3.RequestBody.Companion.toRequestBody
 sealed interface ProfilesAnswer {
     data class Listed(val rows: List<ListedProfile>) : ProfilesAnswer
     data object NoProfiles : ProfilesAnswer
-    data class Failed(val why: String) : ProfilesAnswer
+
+    /** [why] is for the console, which shows it after its own line. */
+    data class Failed(val why: Say) : ProfilesAnswer {
+        constructor(text: String) : this(Say.Text(text))
+    }
 }
 
 /** The wait before a connect dials without an answer. */
@@ -98,6 +112,27 @@ object HostProfiles {
         }
         if (reply is MgmtReply.Answer && !reply.ok) Log.i(TAG, "profile seat did not wake: status ${reply.code}")
     }
+
+    /** The host's one-use challenge for this device's unlock key on profile [id], or `null`. */
+    fun unlockChallenge(
+        identity: ClientIdentity,
+        addr: String,
+        mgmtPort: Int,
+        fpHex: String,
+        id: String,
+        streamPort: Int = 0,
+    ): UnlockChallenge? {
+        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, PROFILES_WAIT_MS, streamPort) { base ->
+            val url = base.toHttpUrl().newBuilder()
+                .addPathSegments("api/v1/profiles").addPathSegment(id).addPathSegment("unlock-challenge").build()
+            Request.Builder().url(url).post(ByteArray(0).toRequestBody(null, 0, 0)).build()
+        }
+        if (reply !is MgmtReply.Answer || !reply.ok) {
+            Log.i(TAG, "no unlock challenge: ${(reply as? MgmtReply.Answer)?.code ?: "no answer"}")
+            return null
+        }
+        return UnlockChallenge.parse(reply.body)
+    }
 }
 
 /** A picker a connect is waiting on: [answer] completes with the pick, or `null` for Cancel. */
@@ -111,21 +146,28 @@ class ProfileAsk(
 
 /** What a connect does about the profile. */
 sealed interface ProfileChoice {
-    /** Dial with this id (`null` sends none). */
-    data class Dial(val id: String?) : ProfileChoice
+    /** Dial with this id (`null` sends none). [row] is its latest listing: its name and unlock. */
+    data class Dial(val id: String?, val row: ListedProfile? = null) : ProfileChoice
 
     /** The player cancelled the picker or the seat wait. */
     data object Cancelled : ProfileChoice
 
-    /** The profile can't play now. [line] is the host's own sentence. */
-    data class Refused(val line: String) : ProfileChoice
+    /** The profile can't play now. [line] is the host's own sentence, else ours. */
+    data class Refused(val line: Say) : ProfileChoice
 }
 
 /** A seat wait a connect shows: [title], the host's progress [detail], and Cancel. */
-class ProfileWait(val title: String) {
-    var detail by mutableStateOf<String?>(null)
+class ProfileWait(val title: Say) {
+    var detail by mutableStateOf<Say?>(null)
     val cancelled = CompletableDeferred<Unit>()
 }
+
+/**
+ * Profile [id] as this device knows it without a listing: by [saved]'s name when that is the
+ * pick, else by its id. Nothing about its unlock is known, so a dial as it goes bare first.
+ */
+internal fun savedRow(id: String, saved: ProfilePick?): ListedProfile =
+    ListedProfile(id = id, displayName = saved?.displayName?.takeIf { saved.id == id && it.isNotEmpty() } ?: id)
 
 /** Whether [host] still lists profile [id], by a fresh answer. */
 suspend fun stillListed(identity: ClientIdentity, host: KnownHost, id: String): Boolean =
@@ -160,7 +202,8 @@ object ProfileRetry {
 /**
  * The profile a connect to [host] dials as: asks the host who plays on it, applies
  * [pickerDecision], then [seatGate] to the profile that plays. A failed or late answer dials
- * with the saved pick. [link] is a link's `as=`. [ask] shows the picker and returns once the
+ * with the saved pick, named by what this device saved, so a `profile-locked` close can still
+ * ask for its password. [link] is a link's `as=`. [ask] shows the picker and returns once the
  * player has answered; [wait] shows the seat wait, and hides it with `null`.
  */
 suspend fun chooseProfile(
@@ -179,7 +222,10 @@ suspend fun chooseProfile(
     val listed = when (answer) {
         is ProfilesAnswer.Listed -> answer.rows.takeIf { it.isNotEmpty() }
         ProfilesAnswer.NoProfiles -> null
-        is ProfilesAnswer.Failed -> return ProfileChoice.Dial(link ?: saved?.id)
+        is ProfilesAnswer.Failed -> {
+            val id = link ?: saved?.id ?: return ProfileChoice.Dial(null)
+            return ProfileChoice.Dial(id, savedRow(id, saved))
+        }
     }
     val d = pickerDecision(listed, saved, link)
     if (!d.picker) {
@@ -195,7 +241,7 @@ suspend fun chooseProfile(
 
 /**
  * Dials as [id] once its seat in [listed] allows: wakes a stopped seat and polls `enumerate` while
- * it starts. There is no timeout; Cancel is the way out.
+ * it starts. There is no timeout; Cancel is the way out. The dial carries the row last listed.
  */
 private suspend fun gateSeat(
     id: String?,
@@ -204,14 +250,14 @@ private suspend fun gateSeat(
     host: KnownHost,
     wait: (ProfileWait?) -> Unit,
 ): ProfileChoice {
-    val row = listed?.firstOrNull { it.id == id } ?: return ProfileChoice.Dial(id)
+    var row = listed?.firstOrNull { it.id == id } ?: return ProfileChoice.Dial(id)
     val w = ProfileWait(wakingLine(row.displayName))
     wait(w)
     try {
         var gate = seatGate(row)
         while (true) {
             when (val g = gate) {
-                SeatGate.Dial -> return ProfileChoice.Dial(id)
+                SeatGate.Dial -> return ProfileChoice.Dial(id, row)
                 is SeatGate.Refuse -> return ProfileChoice.Refused(g.line)
                 SeatGate.Wake -> withContext(Dispatchers.IO) {
                     HostProfiles.wake(identity, host.address, host.effectiveMgmtPort, host.fpHex, row.id, host.port)
@@ -225,7 +271,8 @@ private suspend fun gateSeat(
             if (w.cancelled.isCompleted) return ProfileChoice.Cancelled
             val rows = (answer as? ProfilesAnswer.Listed)?.rows ?: continue
             // A profile deleted mid-wait dials anyway: the host's own refusal says so.
-            gate = rows.firstOrNull { it.id == row.id }?.let(::seatGate) ?: return ProfileChoice.Dial(id)
+            row = rows.firstOrNull { it.id == row.id } ?: return ProfileChoice.Dial(id)
+            gate = seatGate(row)
         }
     } finally {
         wait(null)
@@ -237,17 +284,17 @@ private suspend fun gateSeat(
 internal fun SeatWaitDialog(wait: ProfileWait, onCancel: () -> Unit) {
     AlertDialog(
         onDismissRequest = onCancel,
-        title = { Text(wait.title) },
+        title = { Text(wait.title.asString()) },
         text = {
             Column {
                 wait.detail?.let {
-                    Text(it, style = MaterialTheme.typography.bodyMedium)
+                    Text(it.asString(), style = MaterialTheme.typography.bodyMedium)
                     Spacer(Modifier.height(12.dp))
                 }
                 CircularProgressIndicator()
             }
         },
-        confirmButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+        confirmButton = { TextButton(onClick = onCancel) { Text(stringResource(R.string.common_cancel)) } },
     )
 }
 
@@ -317,8 +364,9 @@ internal fun ProfileFace(
 }
 
 /**
- * Who plays on [hostName]: one circle per profile, the saved pick first and ringed. [answer] is
- * `null` while the host is asked. A pick calls [onPick]; the dialog never saves anything itself.
+ * Who plays on [hostName]: one circle per profile, the saved pick first and ringed, a lock by the
+ * name of one that asks for a password where this shell can prompt. [answer] is `null` while the
+ * host is asked. A pick calls [onPick]; the dialog never saves anything itself.
  */
 @Composable
 internal fun ProfilePickerDialog(
@@ -330,14 +378,16 @@ internal fun ProfilePickerDialog(
     onPick: (ProfilePick) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val marksLocks = remember { promptsUnlock(context) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Who’s playing on $hostName?") },
+        title = { Text(stringResource(R.string.profile_title, hostName)) },
         text = {
             Column {
                 if (gone != null) {
                     Text(
-                        "$gone is gone from this host.",
+                        stringResource(R.string.profile_gone, gone),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.error,
                     )
@@ -345,11 +395,11 @@ internal fun ProfilePickerDialog(
                 }
                 when (answer) {
                     null -> CircularProgressIndicator()
-                    ProfilesAnswer.NoProfiles -> Text("No profiles on this host.")
-                    is ProfilesAnswer.Failed -> Text("Couldn’t load the profiles.")
+                    ProfilesAnswer.NoProfiles -> Text(stringResource(R.string.profile_none))
+                    is ProfilesAnswer.Failed -> Text(stringResource(R.string.profile_load_failed))
                     is ProfilesAnswer.Listed -> {
                         if (answer.rows.isEmpty()) {
-                            Text("No profiles on this host.")
+                            Text(stringResource(R.string.profile_none))
                         } else {
                             val rows = answer.rows.sortedByDescending { it.id == saved?.id }
                             Row(
@@ -370,15 +420,24 @@ internal fun ProfilePickerDialog(
                                             picture = p.avatar, art = art,
                                         )
                                         Spacer(Modifier.height(6.dp))
-                                        Text(
-                                            p.displayName,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            if (marksLocks && p.unlock != UnlockNeed.NONE) {
+                                                Icon(
+                                                    Icons.Filled.Lock,
+                                                    contentDescription = stringResource(R.string.profile_locked),
+                                                    modifier = Modifier.size(14.dp).padding(end = 2.dp),
+                                                )
+                                            }
+                                            Text(
+                                                p.displayName,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
                                         p.note()?.let {
                                             Text(
-                                                it,
+                                                it.asString(),
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 textAlign = TextAlign.Center,
@@ -396,12 +455,12 @@ internal fun ProfilePickerDialog(
         },
         confirmButton = {
             if (answer !is ProfilesAnswer.Listed || answer.rows.isEmpty()) {
-                TextButton(onClick = onDismiss) { Text("Close") }
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.common_close)) }
             }
         },
         dismissButton = {
             if (answer is ProfilesAnswer.Listed && answer.rows.isNotEmpty()) {
-                TextButton(onClick = onDismiss) { Text("Cancel") }
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.common_cancel)) }
             }
         },
     )

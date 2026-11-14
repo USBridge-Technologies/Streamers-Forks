@@ -13,58 +13,24 @@ pub(crate) struct Probes {
     pub(crate) backend: OnceLock<WindowsBackend>,
     /// The resolved backend's codec probe ([`probe_codec_support`]), kept only once it finds a
     /// codec.
-    pub(crate) codecs: OnceLock<CodecSupport>,
+    pub(crate) codecs: Probed<CodecSupport>,
     /// Set when the `codecs` probe found nothing, so the miss warns once.
     pub(crate) codecs_missed: OnceLock<()>,
 }
 
-/// Upstream: the pf-vdisplay driver holds the only Windows encoder (it opens the backend inside
-/// WUDFHost and `pf_capture::RemoteEncoder` wraps its access units), so this refused.
-///
-/// USBridge: a session captured with DXGI Desktop Duplication from the shared MttVDD monitor
-/// (`CaptureBackend::DxgiDup`) hands the host BGRA D3D11 textures, encoded here by the same
-/// backends the driver links (`pf-vdisplay`'s `encode/thread.rs::open_backend`, minus the
-/// WUDFHost plumbing). The session device comes from the first submitted frame.
+/// The pf-vdisplay driver holds the only Windows encoder: it opens the backend on the pooled
+/// device inside WUDFHost and publishes access units into the session's AU section, which
+/// the source's `pf_capture::RemoteEncoder` wraps as the loop's `Encoder`. Reaching here means a
+/// session resolved to a non-IDD-push capture source, which no longer exists.
 pub(crate) fn open(
-    r: &Resolved,
-    p: &OpenParams,
+    _: &Resolved,
+    _: &OpenParams,
     _: &Knobs,
 ) -> Result<(Box<dyn Encoder>, &'static str)> {
-    let OpenParams {
-        codec,
-        format,
-        width,
-        height,
-        fps,
-        bitrate_bps,
-        bit_depth,
-        hdr,
-        chroma,
-        slices,
-        ..
-    } = *p;
-    let luid = pf_gpu::resolve_render_adapter_luid();
-    match r.backend() {
-        #[cfg(feature = "nvenc")]
-        WindowsBackend::Nvenc => nvenc::NvencD3d11Encoder::open(
-            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, slices.max(1), luid,
-        )
-        .map(|e| (Box::new(e) as Box<dyn Encoder>, "nvenc")),
-        WindowsBackend::Amf => amf::AmfEncoder::open(
-            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, hdr, luid,
-        )
-        .map(|e| (Box::new(e) as Box<dyn Encoder>, "amf")),
-        #[cfg(feature = "qsv")]
-        WindowsBackend::Qsv => qsv::QsvEncoder::open(
-            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, hdr, luid,
-        )
-        .map(|e| (Box::new(e) as Box<dyn Encoder>, "qsv")),
-        WindowsBackend::MediaFoundation => mf::MfEncoder::open(
-            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, luid,
-        )
-        .map(|e| (Box::new(e) as Box<dyn Encoder>, "mf")),
-        other => anyhow::bail!("no Windows hardware encoder for backend {other:?}"),
-    }
+    anyhow::bail!(
+        "on Windows the pf-vdisplay driver encodes; the host opens no local video encoder \
+         (the session must come from the IDD-push capture source)"
+    )
 }
 
 /// GameStream `SERVER_CODEC_MODE_SUPPORT` for an unprobed backend.
@@ -101,21 +67,23 @@ pub(crate) fn advertised(r: &Resolved) -> Option<CodecSupport> {
 }
 
 /// HEVC 4:4:4 on the resolved backend. Only NVENC probes: VCN has no 4:4:4 encode
-/// (`design/native-amf-encoder.md`), VPL has no 4:4:4 query wired, and no MFT encodes it.
-pub(crate) fn hevc_444(r: &Resolved) -> bool {
-    match r.backend() {
+/// (`design/native-amf-encoder.md`), VPL has no 4:4:4 query wired, and no MFT encodes it. A
+/// probe that could not run reads `false`, same as a refusal, so every answer is kept.
+pub(crate) fn hevc_444(r: &Resolved) -> Option<bool> {
+    Some(match r.backend() {
         #[cfg(feature = "nvenc")]
         WindowsBackend::Nvenc => {
             nvenc::probe_can_encode_444(Codec::H265, pf_gpu::resolve_render_adapter_luid())
         }
         _ => false,
-    }
+    })
 }
 
 /// 10-bit `codec` on the resolved backend. A backend compiled out of this build answers
-/// `false`, and Media Foundation is 8-bit 4:2:0 only: it rejects P010 at open.
-pub(crate) fn ten_bit(r: &Resolved, codec: Codec) -> bool {
-    match r.backend() {
+/// `false`, and Media Foundation is 8-bit 4:2:0 only: it rejects P010 at open. A probe that
+/// could not run reads `false`, same as a refusal, so every answer is kept.
+pub(crate) fn ten_bit(r: &Resolved, codec: Codec) -> Option<bool> {
+    Some(match r.backend() {
         #[cfg(feature = "nvenc")]
         WindowsBackend::Nvenc => {
             nvenc::probe_can_encode_10bit(codec, pf_gpu::resolve_render_adapter_luid())
@@ -128,7 +96,7 @@ pub(crate) fn ten_bit(r: &Resolved, codec: Codec) -> bool {
             qsv::probe_can_encode_10bit(codec, pf_gpu::resolve_render_adapter_luid())
         }
         _ => false,
-    }
+    })
 }
 
 /// [`Resolved::is_gpu`] on Windows.
@@ -160,13 +128,20 @@ pub(crate) fn sdr10(r: &Resolved, codec: Codec) -> bool {
 
 /// [`Resolved::rgb_full_range`] on Windows: AMF's conversion, measured on the render adapter
 /// unless `PUNKTFUNK_AMF_FULL_RANGE` says.
-pub(crate) fn rgb_full_range(r: &Resolved) -> bool {
+pub(crate) fn rgb_full_range(r: &Resolved, _codec: Codec) -> RgbFullRange {
     if r.backend() != WindowsBackend::Amf {
-        return true;
+        return RgbFullRange::BOTH;
     }
-    Knobs::from_env().amf_full_range.unwrap_or_else(|| {
+    // AMF converts the 8-bit desktop only: an HDR session's P010 comes converted.
+    let sdr = Knobs::from_env().amf_full_range.unwrap_or_else(|| {
         pf_encode_win::amf_range::rgb_writes_full_range(pf_gpu::resolve_render_adapter_luid())
-    })
+    });
+    RgbFullRange { sdr, hdr: true }
+}
+
+/// [`Resolved::vcn_firmware`] on Windows: AMF keeps its firmware to itself.
+pub(crate) fn vcn_firmware(_: &Resolved) -> Option<VcnFirmware> {
+    None
 }
 
 impl Resolved {
@@ -194,14 +169,14 @@ impl Resolved {
     }
 
     /// The resolved backend's codec probe. Ask only when [`Self::is_probed`]. AV1 and HEVC must
-    /// be probed, not assumed. `None` while the probe finds nothing; it runs again next ask.
+    /// be probed, not assumed. `None` while the probe finds nothing; it runs again after
+    /// [`RETRY_AFTER`].
     fn codecs(&self) -> Option<CodecSupport> {
-        probe_until_found(
-            &self.probes.codecs,
-            &self.probes.codecs_missed,
-            "Windows",
-            || probe_codec_support(self.backend()),
-        )
+        self.probes.codecs.ask(|| {
+            codec_found(&self.probes.codecs_missed, "Windows", || {
+                probe_codec_support(self.backend())
+            })
+        })
     }
 }
 
@@ -351,14 +326,11 @@ mod tests {
             CODEC_H264
         );
         let amf = resolved(WindowsBackend::Amf, FULL);
-        amf.probes
-            .codecs
-            .set(CodecSupport {
-                h264: true,
-                h265: true,
-                av1: false,
-            })
-            .expect("unset");
+        amf.probes.codecs.fill(CodecSupport {
+            h264: true,
+            h265: true,
+            av1: false,
+        });
         assert_eq!(amf.wire_caps(), CODEC_H264 | CODEC_HEVC | CODEC_PYROWAVE);
         let qsv = resolved(
             WindowsBackend::Qsv,

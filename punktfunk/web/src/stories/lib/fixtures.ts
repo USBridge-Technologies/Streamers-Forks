@@ -10,6 +10,7 @@ import type { GameEntry } from "@/api/gen/model/gameEntry";
 import type { HostInfo } from "@/api/gen/model/hostInfo";
 import type { NativeClient } from "@/api/gen/model/nativeClient";
 import type { NativePairStatus } from "@/api/gen/model/nativePairStatus";
+import type { OverridesDoc } from "@/api/gen/model/overridesDoc";
 import type { PairedClient } from "@/api/gen/model/pairedClient";
 import type { PairingStatus } from "@/api/gen/model/pairingStatus";
 import type { PendingDevice } from "@/api/gen/model/pendingDevice";
@@ -252,6 +253,27 @@ export const library: GameEntry[] = [
 	},
 ];
 
+/** Game overrides: three shared overrides, a game on each kind of entry, a source default. */
+export const overridesDoc: OverridesDoc = {
+	version: 1,
+	sets: {
+		a1b2c3d4e5f6: {
+			name: "1080p60 DualSense",
+			lines: 1080,
+			hz: 60,
+			gamepad: "dualsense",
+		},
+		"0f1e2d3c4b5a": { name: "4K", lines: 2160, beyond_screen: true },
+		"9e8d7c6b5a4f": { name: "Handheld", lines: 800, hz: 72 },
+	},
+	games: {
+		"steam:1245620": { set: "a1b2c3d4e5f6" },
+		"steam:1086940": { set: "a1b2c3d4e5f6" },
+		"custom:eden": { lines: 1440, hz: 120, hdr: false },
+	},
+	sources: { lutris: { hz: 60, gamepad: "xbox360" } },
+};
+
 // --- Performance (stats) page ------------------------------------------------
 
 export const statsStatusIdle: StatsStatus = {
@@ -411,6 +433,8 @@ export const pendingDevices: PendingDevice[] = [
 			"9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211ffeeddccbbaa00",
 		age_secs: 8,
 		source: "lan",
+		relayed: false,
+		unfamiliar_origin: false,
 		until_disconnect: false,
 	},
 	{
@@ -420,6 +444,8 @@ export const pendingDevices: PendingDevice[] = [
 			"ff00eeddccbbaa998877665544332211009f8e7d6c5b4a39281706f5e4d3c2b1",
 		age_secs: 30,
 		source: "lan",
+		relayed: false,
+		unfamiliar_origin: false,
 		until_disconnect: false,
 	},
 	// A knock from the internet: badged, and offered an "Arm PIN" instead of Approve.
@@ -430,6 +456,33 @@ export const pendingDevices: PendingDevice[] = [
 			"5c5b5a595857565554535251504f4e4d4c4b4a494847464544434241403f3e3d",
 		age_secs: 3,
 		source: "wan",
+		relayed: false,
+		unfamiliar_origin: false,
+		until_disconnect: false,
+	},
+	// Through the web client: the same strict row, worded for the page server.
+	{
+		id: 6,
+		name: "Safari on Mac",
+		fingerprint:
+			"6d6c6b6a696867666564636261605f5e5d5c5b5a595857565554535251504f4e",
+		age_secs: 6,
+		source: "wan",
+		relayed: true,
+		unfamiliar_origin: false,
+		until_disconnect: false,
+	},
+	// From a public page the host has not paired from: strict on the LAN too, and the page shown.
+	{
+		id: 7,
+		name: "Chrome on Mac",
+		fingerprint:
+			"7e7d7c7b7a797877767574737271706f6e6d6c6b6a696867666564636261605f",
+		age_secs: 9,
+		source: "wan",
+		relayed: false,
+		origin: "https://play.example.com",
+		unfamiliar_origin: true,
 		until_disconnect: false,
 	},
 ];
@@ -442,6 +495,8 @@ export const pendingGuestReknock: PendingDevice = {
 		"0011223344556677889900aabbccddeeff102030405060708090a0b0c0d0e0f0",
 	age_secs: 12,
 	source: "lan",
+	relayed: false,
+	unfamiliar_origin: false,
 	until_disconnect: false,
 	access_level: "controller",
 	grants: 0x01,
@@ -513,6 +568,12 @@ export const displayPresets: {
 		summary:
 			"A virtual display per client, released 5 minutes after it disconnects.",
 		fields: policyFields(),
+	},
+	{
+		id: "play-together",
+		summary:
+			"For playing or watching with friends. Everyone sees and uses one screen, sized for the first to connect.",
+		fields: policyFields({ mode_conflict: "join" }),
 	},
 	{
 		id: "shared-desktop",
@@ -879,6 +940,8 @@ export const pendingWithProfile: PendingDevice = {
 		"a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
 	age_secs: 5,
 	source: "lan",
+	relayed: false,
+	unfamiliar_origin: false,
 	until_disconnect: false,
 	profile: { id: "9a3f1c2b7e40", display_name: "Kid" },
 };

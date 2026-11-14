@@ -504,20 +504,21 @@ final class DeadlineSelectorTests: XCTestCase {
     func testTheHostRateSetsTheCarryBoundOnceEveryWindow() {
         let p = 1.0 / 120
         var selector = DeadlineSelector(latePick: true, now: 10)
-        selector.noteRate(at: 11.9, period: p) { XCTFail("the window is not up"); return 0 }
-        selector.noteRate(at: 12, period: 0) { XCTFail("no period yet"); return 0 }
+        let w = DeadlineSelector.rateWindow
+        selector.noteRate(at: 10 + w - 0.1, period: p) { XCTFail("the window is not up"); return 0 }
+        selector.noteRate(at: 10 + w, period: 0) { XCTFail("no period yet"); return 0 }
         XCTAssertTrue(
             selector.endWindow(report: true) { "x" }!.contains("carryBound=24 hostHz=0.0 "),
             "unmeasured: the base bound")
-        // 238 frames in 2 s: 119 fps under a 120 Hz panel, so a hold ends within a beat.
-        selector.noteRate(at: 12, period: p) { 238 }
+        // 952 frames in 8 s: 119 fps under a 120 Hz panel, so a hold ends within a beat.
+        selector.noteRate(at: 10 + w, period: p) { 952 }
         let bound = Carry.run(forSlowBy: 1 / p - 119, period: p)
         XCTAssertGreaterThan(bound, Carry.maxRun)
         XCTAssertTrue(
             selector.endWindow(report: true) { "x" }!.contains("carryBound=\(bound) hostHz=119.0 "))
-        selector.noteRate(at: 13, period: p) { XCTFail("a new window opened at 12"); return 0 }
+        selector.noteRate(at: 11 + w, period: p) { XCTFail("a new window opened at 10 + w"); return 0 }
         // A host at the panel's rate keeps the base bound.
-        selector.noteRate(at: 14, period: p) { 238 + 240 }
+        selector.noteRate(at: 10 + 2 * w, period: p) { 952 + 960 }
         XCTAssertTrue(
             selector.endWindow(report: true) { "x" }!.contains("carryBound=24 hostHz=120.0 "))
     }
@@ -609,6 +610,39 @@ final class DeadlineSelectorTests: XCTestCase {
         XCTAssertTrue(gate.open, "six of eight")
         gate.note(shown: false); gate.note(shown: false); gate.note(shown: false)
         XCTAssertFalse(gate.open, "three empty vends close it")
+    }
+
+    /// A stall's record names each vend's fate: shown, dropped, still out, or never issued.
+    func testTheFlightRecordNamesEachVendsFate() {
+        let flight = PresentFlight()
+        for id in 1...4 {
+            flight.vend(id: id, surface: UInt32(id % 3), at: 1, deadline: 1.016, target: 1.033)
+        }
+        flight.fate(1, "I")
+        flight.gpu(1, start: 1.008, end: 1.015)
+        flight.glass(1, lateMs: 0.5)
+        flight.fate(2, "I")
+        flight.glass(2, lateMs: nil)
+        flight.fate(3, "I")
+        flight.fate(4, "X")
+        let lines = flight.drain("stall")
+        XCTAssertEqual(lines.count, 4)
+        XCTAssertTrue(lines[0].contains("id=1 surf=1"))
+        XCTAssertTrue(lines[0].contains("gpuMs=-8.00..-1.00 glass=0.50"), lines[0])
+        XCTAssertTrue(lines[1].contains("glass=drop"), lines[1])
+        XCTAssertTrue(lines[2].hasSuffix("gpuMs=na glass=out"), lines[2])
+        XCTAssertTrue(lines[3].contains("fate=X") && lines[3].hasSuffix("glass=-"), lines[3])
+        XCTAssertTrue(flight.drain("stall").isEmpty, "a drain starts the record over")
+    }
+
+    func testTheFlightRecordKeepsTheNewestVends() {
+        let flight = PresentFlight()
+        for id in 0..<(PresentFlight.capacity + 5) {
+            flight.vend(id: id, surface: 0, at: 1, deadline: 1.016, target: 1.033)
+        }
+        let lines = flight.drain("stall")
+        XCTAssertEqual(lines.count, PresentFlight.capacity)
+        XCTAssertTrue(lines[0].contains(" id=5 "), lines[0])
     }
 }
 #endif

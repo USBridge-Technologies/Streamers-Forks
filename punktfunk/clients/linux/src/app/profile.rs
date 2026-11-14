@@ -4,6 +4,7 @@
 use super::connect::Slot;
 use super::*;
 use pf_client_core::profiles::{self, SeatGate};
+use pf_l10n::{client, common, desktop};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -49,7 +50,7 @@ impl AppModel {
 
     /// Reads the host's list within [`ASK_BUDGET`] and posts `done` with it. `None`: the
     /// read failed or ran late.
-    fn fetch_profiles(
+    pub(super) fn fetch_profiles(
         &self,
         req: ConnectRequest,
         fp_hex: String,
@@ -142,8 +143,8 @@ impl AppModel {
     }
 
     /// Dials as profile `id` (`None` names none). `row` is its row in the list it came from:
-    /// its seat decides between dialing now, waiting for the seat and stopping. `redial` marks
-    /// the one retry after a refusal.
+    /// its seat decides between dialing, waiting for the seat and stopping, and its unlock
+    /// whether the password prompt comes first. `redial` marks the one retry after a refusal.
     fn dial_profile(
         &mut self,
         req: ConnectRequest,
@@ -161,15 +162,9 @@ impl AppModel {
                 self.wait_for_seat(req, fp_hex, row, false, redial, sender)
             }
             Some((_, SeatGate::Refuse(line))) => self.hosts.emit(HostsMsg::ShowError(line)),
-            Some((_, SeatGate::Dial)) | None => sender.input(AppMsg::StartSession {
-                req,
-                fp_hex,
-                tofu: false,
-                opts: SpawnOpts {
-                    profile: Some(id),
-                    redial,
-                },
-            }),
+            Some((_, SeatGate::Dial)) | None => {
+                self.dial_unlocked(req, fp_hex, id, row, redial, sender)
+            }
         }
     }
 
@@ -246,7 +241,7 @@ impl AppModel {
             Some(&profiles::waking_line(&row.display_name)),
             detail.filter(|_| !wake),
         );
-        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("cancel", common::common_cancel());
         dialog.set_close_response("cancel");
         let stop = Arc::new(AtomicBool::new(false));
         let (out, flag) = (sender.input_sender().clone(), stop.clone());
@@ -286,8 +281,8 @@ impl AppModel {
         })
     }
 
-    /// A poll's row: the dialog follows the seat, `ready` dials, `unavailable` stops. `Err`
-    /// is a line that ends the wait.
+    /// A poll's row: the dialog follows the seat, `ready` dials through the unlock gate,
+    /// `unavailable` stops. `Err` is a line that ends the wait.
     pub(super) fn seat_polled(
         &mut self,
         stop: Arc<AtomicBool>,
@@ -306,15 +301,8 @@ impl AppModel {
             SeatGate::Wake => {}
             SeatGate::Dial => {
                 if let Some(w) = self.end_seat_wait(&stop) {
-                    sender.input(AppMsg::StartSession {
-                        req: w.req,
-                        fp_hex: w.fp_hex,
-                        tofu: false,
-                        opts: SpawnOpts {
-                            profile: Some(Some(w.id)),
-                            redial: w.redial,
-                        },
-                    });
+                    let polled = row.as_ref().ok();
+                    self.dial_unlocked(w.req, w.fp_hex, Some(w.id), polled, w.redial, sender);
                 }
             }
             SeatGate::Refuse(line) => {
@@ -357,7 +345,7 @@ impl AppModel {
             }
         });
         if let Err(e) = saved {
-            self.toast(&format!("Couldn't save the profile \u{2014} {e:#}"));
+            self.toast(&desktop::desktop_profile_save_failed(format!("{e:#}")));
         }
     }
 
@@ -375,16 +363,23 @@ impl AppModel {
         sender: &ComponentSender<Self>,
     ) {
         let body = match (&rows, gone) {
-            (None, _) => Some("Couldn't load the profiles.".to_string()),
-            (Some(r), _) if r.is_empty() => Some("No profiles on this host.".to_string()),
-            (_, Some(g)) => Some(format!("{g} is gone from this host.")),
+            (None, _) => Some(client::profile_load_failed().to_string()),
+            (Some(r), _) if r.is_empty() => Some(client::profile_none().to_string()),
+            (_, Some(g)) => Some(client::profile_gone(g)),
             _ => None,
         };
         let dialog = adw::AlertDialog::new(
-            Some(&format!("Who\u{2019}s playing on {}?", req.host.name)),
+            Some(&client::profile_title(&req.host.name)),
             body.as_deref(),
         );
-        dialog.add_response("cancel", if rows.is_some() { "Cancel" } else { "Close" });
+        dialog.add_response(
+            "cancel",
+            if rows.is_some() {
+                common::common_cancel()
+            } else {
+                common::common_close()
+            },
+        );
         dialog.set_close_response("cancel");
         let mut rows = rows.unwrap_or_default();
         if let Some(i) = saved

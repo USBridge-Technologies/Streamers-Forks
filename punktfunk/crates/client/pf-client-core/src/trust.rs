@@ -35,22 +35,23 @@ pub use hosts::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use identity::{
-    device_name, load_or_create_identity, pair_and_save, pair_with_host, request_access_to_host,
-    REQUEST_ACCESS_TIMEOUT,
+    device_code, device_name, load_or_create_identity, pair_and_save, pair_with_host,
+    request_access_to_host, REQUEST_ACCESS_TIMEOUT,
 };
 pub use messages::{
     access_error_message, connect_reject_message, pair_error_message, reject_message,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use probe::{probe_known, probe_one, probe_reachable_many, PROBE_INTERVAL, PROBE_TIMEOUT};
-pub use punktfunk_core::fp::{hex, parse_hex32};
+pub use punktfunk_core::fp::{grouped, hex, parse_hex32};
 
 /// Load a client JSON file, or `T::default()`.
 ///
 /// A leading UTF-8 BOM is stripped — PowerShell `Set-Content -Encoding UTF8` writes
 /// one, and serde refuses it. Missing files are silent; other failures warn then
 /// fall back so a parse error is not an unexplained reset. A bad file never
-/// blocks a stream.
+/// blocks a stream. A file that exists but is not UTF-8 or does not parse is copied
+/// to `<name>.bad` first, so the store a caller saves next does not destroy it.
 pub(crate) fn load_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
     load_json(path).unwrap_or_default()
 }
@@ -58,29 +59,64 @@ pub(crate) fn load_json_or_default<T: serde::de::DeserializeOwned + Default>(pat
 /// [`load_json_or_default`] without the fallback: `None` for a missing, unreadable or
 /// unparsable file, with the same warnings.
 pub(crate) fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+    read_json(path).unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "config file not read — every setting in it is being IGNORED"
+        );
+        None
+    })
+}
+
+/// A store about to be edited and saved: `None` for a missing file (a first run) or one set
+/// aside as unparsable, an error for one that exists but can't be read, so the save that
+/// follows never replaces it. That error is a persist failure too ([`store_health`]): the edit
+/// it refuses is not saved.
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "config file could not be read — every setting in it is being IGNORED \
-                 (a UTF-16 file reads as invalid UTF-8 here; re-save it as UTF-8)"
-            );
-            return None;
+            store_health::record(path, &e);
+            return Err(e).with_context(|| format!("read {}", path.display()));
         }
     };
-    match serde_json::from_str(raw.strip_prefix('\u{feff}').unwrap_or(&raw)) {
-        Ok(v) => Some(v),
+    let parsed = match std::str::from_utf8(&bytes) {
+        Ok(raw) => serde_json::from_str(raw.strip_prefix('\u{feff}').unwrap_or(raw))
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    match parsed {
+        Ok(v) => Ok(Some(v)),
         Err(e) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
                 "config file did not parse — falling back to defaults for it, and the \
-                 settings in it are being IGNORED (fix or delete the file)"
+                 settings in it are being IGNORED (fix or delete the file; a UTF-16 file \
+                 is not UTF-8, re-save it as UTF-8)"
             );
-            None
+            set_aside(path, &bytes);
+            Ok(None)
+        }
+    }
+}
+
+/// Keep an unusable store's bytes as `<name>.bad`, so the defaults a caller saves next do
+/// not destroy them. The first copy stays until it is deleted. Best effort.
+fn set_aside(path: &Path, bytes: &[u8]) {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bad");
+    let bad = path.with_file_name(name);
+    if bad.exists() {
+        return;
+    }
+    let tmp = temp_sibling(&bad);
+    match std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &bad)) {
+        Ok(()) => tracing::warn!(kept = %bad.display(), "unusable config file kept for recovery"),
+        Err(e) => {
+            tracing::warn!(path = %bad.display(), error = %e, "unusable config file not kept");
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 }
@@ -390,6 +426,31 @@ mod tests {
         assert_eq!(d.codec, Settings::default().codec);
         let gone: Settings = load_json_or_default(&dir.join("nope.json"));
         assert_eq!(gone.codec, Settings::default().codec);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An edit starts empty only from a missing or unparsable store. One that exists but
+    /// can't be read is an error, so no save replaces it, and the app hears of it.
+    #[test]
+    fn only_a_missing_or_broken_store_reads_as_empty() {
+        let _guard = store_health_lock();
+        store_health::clear();
+        let dir = crate::presets::tests::scratch_dir("read-json");
+        let gone: Option<Settings> = read_json(&dir.join("nope.json")).unwrap();
+        assert!(gone.is_none());
+        std::fs::write(dir.join("broken.json"), "{").unwrap();
+        let broken: Option<Settings> = read_json(&dir.join("broken.json")).unwrap();
+        assert!(broken.is_none());
+        let unreadable = dir.join("unreadable.json");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        assert_eq!(
+            store_health::last_error(),
+            None,
+            "a first run is no failure"
+        );
+        assert!(read_json::<Settings>(&unreadable).is_err());
+        assert!(store_health::last_error().is_some());
+        store_health::clear();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

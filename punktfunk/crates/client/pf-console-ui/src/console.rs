@@ -144,12 +144,16 @@ pub struct Console {
 }
 
 impl Console {
-    /// Not `Send` (Skia). Build on the thread that will draw.
+    /// Not `Send` (Skia). Build on the thread that will draw. Sets the process's language from
+    /// [`ConsoleOptions::languages`] before any text is built.
     pub fn new(
         opts: ConsoleOptions,
         entry: ConsoleEntry,
         handles: &ConsoleHandles,
     ) -> Result<Console> {
+        if !opts.languages.is_empty() {
+            pf_l10n::set_languages(&opts.languages);
+        }
         let stream = stream_intent(&entry);
         let fetch = entry_fetch(&entry);
         let stack = entry_stack(entry, &opts.device_name);
@@ -168,6 +172,26 @@ impl Console {
         }
         let fonts = crate::theme::build_fonts()?;
         Ok(Console { shell, fonts })
+    }
+
+    /// The console with the host's own faces for what Geist lacks, ahead of the system's
+    /// ([`crate::theme::build_fonts_with`]). A host with no system fonts chains it onto
+    /// [`Console::new`], before the first frame.
+    pub fn with_fallback_fonts(mut self, faces: &[&[u8]]) -> Result<Console> {
+        self.fonts = crate::theme::build_fonts_with(faces)?;
+        Ok(self)
+    }
+
+    /// Add faces for what Geist lacks to a live console, after the ones it holds. The next
+    /// frame draws with them. On an error none is added.
+    pub fn add_fallback_fonts(&mut self, faces: &[&[u8]]) -> Result<()> {
+        self.fonts.add_fallback(faces)
+    }
+
+    /// The chars no face could draw since the last call, each once: what a host that fetches
+    /// faces on demand fetches next.
+    pub fn take_missing_chars(&self) -> String {
+        self.fonts.take_missing()
     }
 
     /// `pad` is the chip label; `None` means no controller.
@@ -225,6 +249,12 @@ impl Console {
         self.shell.text_input(text);
     }
 
+    /// An input method's text in progress for the open field, replacing the last; empty ends
+    /// it. The field draws it at the caret, and [`Self::text`] commits it.
+    pub fn preedit(&mut self, text: &str) {
+        self.shell.preedit(text);
+    }
+
     /// Nothing to back out of: focus is on a tab. A Back here asks to exit, and a TV hands
     /// the press to the system, which is why a host asks BEFORE it binds that button.
     pub fn at_root(&self) -> bool {
@@ -255,6 +285,12 @@ impl Console {
     /// The host refused the connect as `profile-unknown`; call before its failed phase.
     pub fn profile_gone(&mut self) {
         self.shell.profile_gone();
+    }
+
+    /// The host closed the connect with `profile-locked`; call before its failed phase, whose
+    /// message is the host's sentence.
+    pub fn profile_locked(&mut self) {
+        self.shell.profile_locked();
     }
 
     /// Drain after every input and every frame.

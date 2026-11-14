@@ -8,12 +8,23 @@ import PunktfunkKit
 import XCTest
 
 final class HostDiscoveryTests: XCTestCase {
+    /// A discovery its owner dropped goes away while it browses: its browser does not keep it.
+    @MainActor func testReleasedWhileBrowsing() {
+        weak var released: HostDiscovery?
+        do {
+            let discovery = HostDiscovery()
+            discovery.start()
+            released = discovery
+        }
+        XCTAssertNil(released, "the browser's handlers keep the discovery alive")
+    }
+
     func testFindsAdvertisedHost() async throws {
         let serviceName = "PunktfunkTest-\(UUID().uuidString.prefix(8))"
         let uniqueid = "test-\(UUID().uuidString)"
 
         var txt = NWTXTRecord()
-        txt["proto"] = "punktfunk/1"
+        txt["proto"] = "punktfunk/2"
         txt["fp"] = String(repeating: "ab", count: 32) // 64 hex chars, like a real cert SHA-256
         txt["pair"] = "required"
         txt["id"] = uniqueid

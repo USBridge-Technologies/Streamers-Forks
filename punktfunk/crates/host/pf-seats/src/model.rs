@@ -8,13 +8,14 @@
 //! observation, not a substitute for the backend's own process identity.
 //!
 //! On Linux one row may be the box owner's: an account that already exists,
-//! adopted rather than created. It takes a slot and ports like any seat.
+//! adopted rather than created. It takes a slot and ports like any seat. Any other
+//! Linux row may adopt a person's own account too, recorded by its uid.
 //! On Windows a row may adopt a person's own account, named by its SID; its
 //! account follows the SAM naming rule instead of the one for made accounts.
 
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -135,21 +136,39 @@ pub struct RuntimeStatus {
     pub state: RuntimeState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The host message `detail` is the English of, worded with `detail_params`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub detail_params: BTreeMap<String, String>,
 }
 
 impl RuntimeStatus {
     pub fn stopped() -> Self {
         Self {
             state: RuntimeState::Stopped,
-            detail: None,
+            ..Self::default()
         }
     }
 
     pub fn running() -> Self {
         Self {
             state: RuntimeState::Running,
-            detail: None,
+            ..Self::default()
         }
+    }
+
+    /// Names the host message `detail` is the English of.
+    pub fn worded(mut self, id: &str) -> Self {
+        self.detail_id = Some(id.to_string());
+        self
+    }
+
+    /// Fills the placeholder `name` of that message.
+    pub fn param(mut self, name: &str, value: impl ToString) -> Self {
+        self.detail_params
+            .insert(name.to_string(), value.to_string());
+        self
     }
 
     /// Backend error text is unbounded; capping it here keeps one long
@@ -166,6 +185,7 @@ impl RuntimeStatus {
         Self {
             state: RuntimeState::Failed,
             detail: Some(detail),
+            ..Self::default()
         }
     }
 }
@@ -185,6 +205,10 @@ pub struct Seat {
     /// The box owner's row (Linux). Its account is never created or deleted by the ledger.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub owner: bool,
+    /// The owner's row: the uid their account resolved to when the row was last prepared, which
+    /// no person's row may hold. `None`: a row not prepared since the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u32>,
     /// SHA-256 of the seat host's certificate DER, lowercase hex: the pin a client dials it
     /// with, carried by the box's `Redirect`. Learned while the seat runs; `None` before its
     /// host has minted an identity.
@@ -194,12 +218,32 @@ pub struct Seat {
     /// marks by comment. Never created or deleted; released with its rights put back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_sid: Option<String>,
+    /// A person's own Linux account this row adopted, by the uid the daemon resolved at adopt.
+    /// A name that later resolves to another uid is not the row's. Never created or deleted.
+    /// `None`: a made account, the owner's row or a Windows one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_uid: Option<u32>,
     /// Adopt put the account in Remote Desktop Users; release takes it out again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rdp_granted: bool,
+    /// The account held `SeDenyInteractiveLogonRight` before adopt; release leaves it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub console_deny_kept: bool,
 }
 
 impl Seat {
+    /// Whether the row runs on a person's own account, adopted by SID or by uid. The box
+    /// owner's row is not one: it is the owner's by role.
+    pub fn adopted(&self) -> bool {
+        self.adopted_sid.is_some() || self.adopted_uid.is_some()
+    }
+
+    /// Whether releasing this adopted Windows row takes the console deny off its account: only
+    /// when adopt added it. A row saved before [`Self::console_deny_kept`] existed takes it off.
+    pub fn releases_console_deny(&self) -> bool {
+        !self.console_deny_kept
+    }
+
     /// The UDP port this seat's browser plane listens on ([`browser_port_for`]).
     pub fn browser_port(&self) -> Option<u16> {
         browser_port_for(self.native_port)
@@ -251,6 +295,7 @@ impl Ledger {
         let mut names = HashSet::new();
         let mut accounts = HashSet::new();
         let mut sids = HashSet::new();
+        let mut uids = HashSet::new();
         let mut slots = HashSet::new();
         let mut ports = HashSet::new();
         if self.seats.iter().filter(|seat| seat.owner).count() > 1 {
@@ -262,7 +307,12 @@ impl Ledger {
         for seat in &self.seats {
             SeatId::parse(seat.id.as_str())?;
             validate_name(&seat.name)?;
-            validate_identity(&seat.account, seat.owner, seat.adopted_sid.as_deref())?;
+            validate_identity(
+                &seat.account,
+                seat.owner,
+                seat.adopted_sid.as_deref(),
+                seat.adopted_uid,
+            )?;
             if !DISPLAY_SLOTS.contains(&seat.display_slot) {
                 return Err(ValidationError::InvalidDisplaySlot(seat.display_slot));
             }
@@ -291,6 +341,10 @@ impl Ledger {
             if let Some(sid) = &seat.adopted_sid {
                 unique(&mut sids, sid.clone(), "account SID")?;
             }
+            // Two names can resolve to one user: `jdoe` and `jdoe@corp.example.com`.
+            for uid in [seat.adopted_uid, seat.owner_uid].into_iter().flatten() {
+                unique(&mut uids, uid, "account uid")?;
+            }
             unique(&mut slots, seat.display_slot, "display slot")?;
             unique(&mut ports, seat.native_port, "port")?;
             unique(&mut ports, seat.mgmt_port, "port")?;
@@ -305,7 +359,7 @@ impl Ledger {
                 break id;
             }
         };
-        self.allocate_with_id(request, id, false, None)
+        self.allocate_with_id(request, id, false, None, None)
     }
 
     /// The row for a person's own account `request.account`, whose SID is `sid`, with the slot
@@ -315,7 +369,17 @@ impl Ledger {
         request: CreateSeat,
         sid: String,
     ) -> Result<Seat, ValidationError> {
-        self.allocate_with_id(request, SeatId::random(), false, Some(sid))
+        self.allocate_with_id(request, SeatId::random(), false, Some(sid), None)
+    }
+
+    /// The row for a person's own Linux account `request.account`, which the daemon resolved to
+    /// `uid`, with the slot and ports a seat gets.
+    pub fn allocate_adopted_user(
+        &mut self,
+        request: CreateSeat,
+        uid: u32,
+    ) -> Result<Seat, ValidationError> {
+        self.allocate_with_id(request, SeatId::random(), false, None, Some(uid))
     }
 
     /// The owner's row for `account`, with the slot and ports a seat gets. The caller checks
@@ -326,16 +390,18 @@ impl Ledger {
             account: account.to_owned(),
             autostart: false,
         };
-        self.allocate_with_id(request, SeatId::random(), true, None)
+        self.allocate_with_id(request, SeatId::random(), true, None, None)
     }
 
-    /// Adds the row `request` asks for under `id`; `adopted_sid` marks a person's own account.
+    /// Adds the row `request` asks for under `id`; `adopted_sid` or `adopted_uid` marks a
+    /// person's own account.
     fn allocate_with_id(
         &mut self,
         request: CreateSeat,
         id: SeatId,
         owner: bool,
         adopted_sid: Option<String>,
+        adopted_uid: Option<u32>,
     ) -> Result<Seat, ValidationError> {
         self.validate()?;
         if self.seats.len() == MAX_SEATS {
@@ -344,7 +410,7 @@ impl Ledger {
 
         let request = request.normalized();
         validate_name(&request.name)?;
-        validate_identity(&request.account, owner, adopted_sid.as_deref())?;
+        validate_identity(&request.account, owner, adopted_sid.as_deref(), adopted_uid)?;
         let used_slots: HashSet<_> = self.seats.iter().map(|seat| seat.display_slot).collect();
         let used_ports: HashSet<_> = self
             .seats
@@ -366,9 +432,12 @@ impl Ledger {
             autostart: request.autostart,
             runtime: RuntimeStatus::stopped(),
             owner,
+            owner_uid: None,
             fingerprint: None,
             adopted_sid,
+            adopted_uid,
             rdp_granted: false,
+            console_deny_kept: false,
         };
         self.insert(seat.clone())?;
         Ok(seat)
@@ -432,6 +501,8 @@ pub enum ValidationError {
     InvalidSamAccount,
     #[error("adopted account SID must be S-1-5-21-<n>-<n>-<n>-<rid> with a RID of 1000 or more")]
     InvalidSid,
+    #[error("an adopted Linux account is an ordinary user's uid, on a row that isn't the owner's")]
+    InvalidUid,
     #[error("display slot {0} is outside the reserved 12..=15 range")]
     InvalidDisplaySlot(u8),
     #[error("{0} port {1} is zero or reserved for the console host")]
@@ -466,22 +537,29 @@ fn validate_account(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// A made row's account follows [`validate_account`], the Linux owner's [`valid_owner_account`];
-/// an adopted row's follows the SAM rule and carries a local user's SID.
+/// A made row's account follows [`validate_account`]. The Linux owner's and a Linux person's
+/// follow [`valid_owner_account`], the latter with an ordinary uid. A Windows adopted row's
+/// follows the SAM rule and carries a local user's SID. No row is adopted by both SID and uid.
 fn validate_identity(
     account: &str,
     owner: bool,
     adopted_sid: Option<&str>,
+    adopted_uid: Option<u32>,
 ) -> Result<(), ValidationError> {
-    match adopted_sid {
-        None if owner => valid_owner_account(account)
+    let linux = || {
+        valid_owner_account(account)
             .then_some(())
-            .ok_or(ValidationError::InvalidOwnerAccount),
-        None => validate_account(account),
-        Some(sid) => {
+            .ok_or(ValidationError::InvalidOwnerAccount)
+    };
+    match (adopted_sid, adopted_uid) {
+        (None, None) if owner => linux(),
+        (None, None) => validate_account(account),
+        (Some(sid), None) => {
             validate_sam_account(account)?;
             validate_sid(sid)
         }
+        (None, Some(uid)) if !owner && ordinary_uid(uid) => linux(),
+        (_, Some(_)) => Err(ValidationError::InvalidUid),
     }
 }
 
@@ -565,7 +643,7 @@ mod tests {
         let mut ledger = Ledger::new();
         let first_id = SeatId::parse("01".repeat(16)).unwrap();
         let first = ledger
-            .allocate_with_id(request(1), first_id.clone(), false, None)
+            .allocate_with_id(request(1), first_id.clone(), false, None, None)
             .unwrap();
         let second = ledger.allocate(request(2)).unwrap();
         assert_eq!(
@@ -896,6 +974,87 @@ mod tests {
         assert_eq!(serde_json::from_value::<Seat>(wire).unwrap(), granted);
     }
 
+    /// Release takes the console deny off only when adopt added it. A row without the field, as
+    /// an older build saved it, takes it off; the field is written only when set.
+    #[test]
+    fn release_keeps_a_console_deny_the_account_held_before() {
+        let request = CreateSeat {
+            name: "Bärbel".into(),
+            account: "Bärbel Ott".into(),
+            autostart: false,
+        };
+        let row = Ledger::new()
+            .allocate_adopted(request, "S-1-5-21-1-2-3-1001".into())
+            .unwrap();
+        let wire = serde_json::to_value(&row).unwrap();
+        for (kept, releases) in [(None, true), (Some(false), true), (Some(true), false)] {
+            let mut saved = wire.clone();
+            if let Some(kept) = kept {
+                saved["console_deny_kept"] = kept.into();
+            }
+            let seat: Seat = serde_json::from_value(saved).unwrap();
+            assert_eq!(seat.releases_console_deny(), releases, "{kept:?}");
+            let written = serde_json::to_value(&seat).unwrap();
+            assert_eq!(written.get("console_deny_kept").is_some(), !releases);
+        }
+    }
+
+    /// A Linux person's row records the uid the daemon resolved, names its account by the owner
+    /// rule, and never shares that uid with another row. A ledger written before the field reads
+    /// as before, and a made row's wire form is unchanged.
+    #[test]
+    fn a_linux_person_s_row_records_a_uid() {
+        let named = |account: &str| CreateSeat {
+            name: account.into(),
+            account: account.into(),
+            autostart: false,
+        };
+        let mut ledger = Ledger::new();
+        let made = ledger.allocate(request(1)).unwrap();
+        let person = ledger
+            .allocate_adopted_user(named("jdoe@corp.example.com"), 1500)
+            .unwrap();
+        assert_eq!(person.adopted_uid, Some(1500));
+        assert!(person.adopted() && !person.owner && person.adopted_sid.is_none());
+        assert!(ledger.validate().is_ok());
+
+        let again = ledger.clone().allocate_adopted_user(named("jdoe"), 1500);
+        assert!(matches!(
+            again,
+            Err(ValidationError::Duplicate {
+                kind: "account uid",
+                ..
+            })
+        ));
+        for (account, uid) in [("jdoe", 999), ("jdoe", 60001), ("jdoe", 0x8000_0000)] {
+            assert!(matches!(
+                Ledger::new().allocate_adopted_user(named(account), uid),
+                Err(ValidationError::InvalidUid)
+            ));
+        }
+        assert!(matches!(
+            Ledger::new().allocate_adopted_user(named("Jdoe"), 1500),
+            Err(ValidationError::InvalidOwnerAccount)
+        ));
+        let mut both = person.clone();
+        both.adopted_sid = Some("S-1-5-21-1-2-3-1001".into());
+        let mut owner = person.clone();
+        owner.owner = true;
+        for bad in [both, owner] {
+            let one = Ledger {
+                seats: vec![bad],
+                ..Ledger::new()
+            };
+            assert!(matches!(one.validate(), Err(ValidationError::InvalidUid)));
+        }
+
+        let wire = serde_json::to_value(&made).unwrap();
+        assert!(wire.get("adopted_uid").is_none());
+        assert_eq!(serde_json::to_value(&person).unwrap()["adopted_uid"], 1500);
+        let old: Seat = serde_json::from_value(wire).unwrap();
+        assert_eq!(old, made);
+    }
+
     /// A profile may carry the owner's login as its name, whichever row came first.
     #[test]
     fn a_profile_named_like_the_owners_login_coexists_with_the_owner_row() {
@@ -946,9 +1105,12 @@ mod tests {
                 autostart: false,
                 runtime: RuntimeStatus::default(),
                 owner: false,
+                owner_uid: None,
                 fingerprint: None,
                 adopted_sid: None,
+                adopted_uid: None,
                 rdp_granted: false,
+                console_deny_kept: false,
             })
             .collect();
         assert!(matches!(

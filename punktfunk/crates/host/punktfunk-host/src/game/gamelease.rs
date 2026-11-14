@@ -187,6 +187,9 @@ pub struct LeaseShared {
     /// The window stage is watching a compositor that lists windows, and has
     /// not found the game's yet. A launch hold waits on it past `running`.
     awaiting_window: AtomicBool,
+    /// The emulator bindings this launch's prepare wrote, the only ones its exit reverts
+    /// ([`crate::emulators::bindings_of`] at open, just after that prepare).
+    bindings: Option<u64>,
 }
 
 impl LeaseShared {
@@ -423,13 +426,33 @@ fn died_on_the_spot(quick: bool, success: bool, fallback: &LeaseKind) -> bool {
 /// 127 and 126 are the shell's own "no such command" / "cannot execute"; named,
 /// because a number is not a next move. Anything else gets how long it lasted.
 #[cfg_attr(target_os = "macos", allow(dead_code, reason = "no watcher on macOS"))]
-fn early_exit_message(title: &str, code: Option<i32>, secs: f32) -> String {
-    let cause = match code {
-        Some(127) => "this host doesn't have that command".to_string(),
-        Some(126) => "this host can't run that command".to_string(),
-        _ => format!("it closed again after {secs:.1} s"),
-    };
-    format!("Couldn't start {title} — {cause}.")
+fn early_exit_message(
+    title: &str,
+    code: Option<i32>,
+    secs: f32,
+) -> punktfunk_core::quic::LaunchOutcome {
+    use punktfunk_core::quic::{LaunchOutcome, LaunchOutcomeKind};
+    let failed = |text: String| LaunchOutcome::new(LaunchOutcomeKind::Failed, &text);
+    match code {
+        Some(127) => failed(format!(
+            "Couldn't start {title} — this host doesn't have that command."
+        ))
+        .worded("launch_command_missing", &[("title", title)]),
+        Some(126) => failed(format!(
+            "Couldn't start {title} — this host can't run that command."
+        ))
+        .worded("launch_command_not_runnable", &[("title", title)]),
+        _ => {
+            let seconds = format!("{secs:.1}");
+            failed(format!(
+                "Couldn't start {title} — it closed again after {seconds} s."
+            ))
+            .worded(
+                "launch_closed_at_once",
+                &[("title", title), ("seconds", &seconds)],
+            )
+        }
+    }
 }
 
 /// Open a lease and start watching. `on_exit` fires **at most once**: game
@@ -493,6 +516,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         group_leader: *leader,
     });
     let child = child.map(|(c, _)| c);
+    let bindings = crate::emulators::bindings_of(game.id.as_deref());
     let shared = Arc::new(LeaseShared {
         game,
         client,
@@ -514,6 +538,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         last_seen_ms: AtomicU64::new(0),
         outcome,
         awaiting_window: AtomicBool::new(false),
+        bindings,
     });
 
     if launcher {
@@ -579,7 +604,7 @@ fn spawn_watcher(
     if matches!(shared.kind, LeaseKind::Untracked)
         || (matches!(shared.kind, LeaseKind::Nested) && shared.spec.is_empty())
     {
-        reap_later(child);
+        reap_later(child, &shared);
         return None;
     }
     // No matcher (macOS has no launch path): status lease, no poll.
@@ -810,7 +835,7 @@ fn apply_on_window(stage: &WindowStage, win: &crate::vdisplay::Toplevel) {
 /// exit to end the session on.
 #[cfg_attr(target_os = "macos", allow(dead_code, reason = "no watcher on macOS"))]
 fn report_early_exit(shared: &LeaseShared, code: Option<i32>, ran: Duration) {
-    let said = early_exit_message(&shared.game.title, code, ran.as_secs_f32());
+    let outcome = early_exit_message(&shared.game.title, code, ran.as_secs_f32());
     tracing::warn!(
         title = %shared.game.title,
         status = ?code,
@@ -823,10 +848,7 @@ fn report_early_exit(shared: &LeaseShared, code: Option<i32>, ran: Duration) {
         crate::launchreg::unlaunched(p);
     }
     if let Some(tx) = &shared.outcome {
-        let _ = tx.send(punktfunk_core::quic::LaunchOutcome::new(
-            punktfunk_core::quic::LaunchOutcomeKind::Failed,
-            &said,
-        ));
+        let _ = tx.send(outcome);
     }
 }
 
@@ -1062,7 +1084,7 @@ impl Watcher {
         let mut seen_since: Option<Instant> = None;
         loop {
             if self.cancelled() {
-                reap_later(self.child.take());
+                reap_later(self.child.take(), &self.shared);
                 return None;
             }
             let child_kind = matches!(self.kind, LeaseKind::Child);
@@ -1176,7 +1198,7 @@ impl Watcher {
                 if let Some(run) = run.as_mut() {
                     run.flush();
                 }
-                reap_later(self.child.take());
+                reap_later(self.child.take(), &self.shared);
                 return;
             }
             let mut live = Vec::new();
@@ -1310,8 +1332,8 @@ fn finish(shared: &Arc<LeaseShared>, on_exit: &OnExit, why: &str, run: Option<Ru
 
 /// Mark the game exited and emit `game.exited`, once per lease: the watcher and the session's
 /// own exit signals (gamescope's atoms, a nested capture going away) can both see one exit.
-/// The emulator bindings `prepare` wrote for this session's pads go back too. A seat's saves
-/// are exported first, so the owner's plugins read the new ones.
+/// The emulator bindings this launch's `prepare` wrote go back too, unless a later launch has
+/// replaced them. A seat's saves are exported first, so the owner's plugins read the new ones.
 pub fn report_exit(shared: &LeaseShared) {
     if shared
         .state
@@ -1320,7 +1342,8 @@ pub fn report_exit(shared: &LeaseShared) {
     {
         return;
     }
-    std::thread::spawn(crate::emulators::revert_players);
+    let held = shared.bindings;
+    std::thread::spawn(move || crate::emulators::revert_players(held));
     crate::emulators::exchange::after_exit(shared.game.id.as_deref());
     crate::events::emit(crate::events::EventKind::GameExited {
         game: game_event_ref(shared),
@@ -1400,15 +1423,20 @@ fn start_secs(p: crate::procscan::ProcRef) -> f64 {
 
 /// The session left but the game runs on: wait for the child on a thread of
 /// its own so it never lingers as a zombie under the host. One thread per
-/// unwatched game, gone with it.
-fn reap_later(child: Option<std::process::Child>) {
+/// unwatched game, gone with it. The reap frees the pid, so the lease forgets it
+/// right after ([`LeaseShared::forget_child`]) and the end-game ladder never signals it.
+fn reap_later(child: Option<std::process::Child>, shared: &Arc<LeaseShared>) {
     let Some(mut c) = child else {
         return;
     };
+    let shared = Arc::downgrade(shared);
     let _ = std::thread::Builder::new()
         .name("pf1-childwait".into())
         .spawn(move || {
             let _ = c.wait();
+            if let Some(shared) = shared.upgrade() {
+                shared.forget_child();
+            }
         });
 }
 
@@ -1535,8 +1563,9 @@ pub fn end_detached(d: crate::launchreg::Detached, why: &'static str) {
             let procs: Vec<crate::procscan::ProcRef> =
                 d.procs.lock().unwrap_or_else(|e| e.into_inner()).clone();
             end_previous_launch(&d.game.title, &procs, why);
-            // No launch follows this one to revert the bindings.
-            crate::emulators::revert_players();
+            // Its bindings go back here, unless a later launch has replaced them.
+            let held = crate::emulators::bindings_of(d.game.id.as_deref());
+            crate::emulators::revert_players(held);
             crate::launchreg::ended(&d.procs);
             crate::emulators::exchange::after_exit(d.game.id.as_deref());
             crate::events::emit(crate::events::EventKind::GameExited {
@@ -1984,19 +2013,24 @@ mod tests {
     #[test]
     fn a_dead_launch_says_what_the_player_can_act_on() {
         assert_eq!(
-            early_exit_message("Quail", Some(127), 0.2),
+            early_exit_message("Quail", Some(127), 0.2).message,
             "Couldn't start Quail \u{2014} this host doesn't have that command."
         );
         assert_eq!(
-            early_exit_message("Quail", Some(126), 0.2),
+            early_exit_message("Quail", Some(126), 0.2).message,
             "Couldn't start Quail \u{2014} this host can't run that command."
         );
+        let closed = early_exit_message("Quail", Some(1), 0.24);
         assert_eq!(
-            early_exit_message("Quail", Some(1), 0.24),
+            closed.message,
             "Couldn't start Quail \u{2014} it closed again after 0.2 s."
         );
+        assert_eq!(closed.message_id, "launch_closed_at_once");
+        assert_eq!(closed.message_params[1], ("seconds".into(), "0.2".into()));
         // Killed by a signal: no code, same shape.
-        assert!(early_exit_message("Quail", None, 1.0).starts_with("Couldn't start Quail"));
+        assert!(early_exit_message("Quail", None, 1.0)
+            .message
+            .starts_with("Couldn't start Quail"));
     }
 
     /// The whole of ask 2 in one place: the client hears `failed`, and the
@@ -2641,6 +2675,36 @@ mod tests {
         // SAFETY: probing our own dead child with WNOHANG; ECHILD (reaped) is the pass.
         let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
         assert_eq!(r, -1, "the child must have been reaped");
+    }
+
+    /// The waiter that reaps a child after the session left also clears the lease's copy: the
+    /// pid is free from then on, and the end-game ladder would signal whoever got it next.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_reaped_after_the_session_left_is_forgotten() {
+        let child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn sleep");
+        let lease = open(
+            req("custom:forget", DetectSpec::default(), false),
+            Box::new(|| {}),
+        );
+        let shared = lease.shared();
+        *shared.child.lock().unwrap() = Some(OwnedChild {
+            pid: child.id(),
+            group_leader: false,
+        });
+        reap_later(Some(child), &shared);
+        assert!(shared.owned_child().is_some(), "still running, still ours");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.owned_child().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            shared.owned_child().is_none(),
+            "a reaped pid must not stay on the lease"
+        );
     }
 
     /// A Steam title is launched with `steam steam://rungameid/…`, and with Steam not already

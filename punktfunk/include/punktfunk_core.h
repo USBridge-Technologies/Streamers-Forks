@@ -308,6 +308,28 @@
 // hosts that do not know the bit ignore it.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 
+// [`PunktfunkProfileUnlock::kind`]: the account password as typed.
+#define PUNKTFUNK_UNLOCK_PASSWORD 1
+
+// [`PunktfunkProfileUnlock::kind`]: a signature over [`punktfunk_profile_unlock_message`].
+#define PUNKTFUNK_UNLOCK_KEY_PROOF 2
+
+// [`PunktfunkProfileUnlock::enroll_alg`]: enrol no key.
+#define PUNKTFUNK_ENROLL_NONE 0
+
+// [`PunktfunkProfileUnlock::enroll_alg`]: ECDSA P-256 with SHA-256, the 65-byte SEC1 point.
+#define PUNKTFUNK_ENROLL_P256 1
+
+// [`PunktfunkProfileUnlock::enroll_alg`]: RSA 2048 PKCS#1 v1.5 with SHA-256, a DER
+// `RSAPublicKey` of at most 600 bytes.
+#define PUNKTFUNK_ENROLL_RSA2048 2
+
+// Bytes [`punktfunk_profile_unlock_message`] writes.
+#define PUNKTFUNK_UNLOCK_MESSAGE_LEN 152
+
+// Bytes [`punktfunk_locked_profile_unlock_message`] writes.
+#define PUNKTFUNK_LOCKED_PROFILE_UNLOCK_MESSAGE_LEN 187
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`PunktfunkConnectOpts::reformat`]: this caller rebuilds its decoder on a frame flagged
 // [`FRAME_NEW_FORMAT`](punktfunk_core::packet::FRAME_NEW_FORMAT), from the codec, colour and
@@ -348,6 +370,33 @@
 // Bytes of state [`punktfunk_sc1_ble_input`] keeps per pad.
 #define PUNKTFUNK_SC1_BLE_STATE_LEN 160
 #endif
+
+// [`punktfunk_connection_screen_role`]: no role, or a host that does not say.
+#define PUNKTFUNK_SCREEN_ROLE_NONE 0
+
+// [`punktfunk_connection_screen_role`]: the only screen; the host's monitors are off.
+#define PUNKTFUNK_SCREEN_ROLE_ONLY 1
+
+// [`punktfunk_connection_screen_role`]: the main screen beside the host's monitors.
+#define PUNKTFUNK_SCREEN_ROLE_MAIN 2
+
+// [`punktfunk_connection_screen_role`]: one more screen beside the host's monitors.
+#define PUNKTFUNK_SCREEN_ROLE_SECOND 3
+
+// [`punktfunk_connection_screen_role_reason`]: as asked, or a host that does not say.
+#define PUNKTFUNK_SCREEN_ROLE_REASON_AS_ASKED 0
+
+// [`punktfunk_connection_screen_role_reason`]: this device may not choose its screen there.
+#define PUNKTFUNK_SCREEN_ROLE_REASON_NOT_ALLOWED 1
+
+// [`punktfunk_connection_screen_role_reason`]: an earlier session decided the monitors.
+#define PUNKTFUNK_SCREEN_ROLE_REASON_MONITORS_HELD 2
+
+// [`punktfunk_connection_screen_role_reason`]: the monitor asked for is off, taken or missing.
+#define PUNKTFUNK_SCREEN_ROLE_REASON_UNAVAILABLE 3
+
+// [`punktfunk_connection_screen_role_reason`]: the host's desktop has no monitors.
+#define PUNKTFUNK_SCREEN_ROLE_REASON_NO_MONITORS 4
 
 // [`PunktfunkClipEvent::kind`]: host announced clipboard content
 // (`transfer_id` = offer `seq`; `data`/`len` = `\n`-separated `"<mime>\t<size_hint>"`).
@@ -407,7 +456,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 63
+#define PUNKTFUNK_ABI_VERSION 72
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -684,14 +733,23 @@
 // Starting one is [`GRANT_LAUNCH`]: launching a missing title installs it anyway.
 #define PUNKTFUNK_GRANT_MANAGE_GAMES 128
 
+// Choosing the screen this device streams and what the host's monitors do meanwhile: its
+// own pick on the mgmt cert lane and a preset's wish in the Hello. Without it the operator's
+// answer applies.
+#define PUNKTFUNK_GRANT_DISPLAY 256
+
 // An omitted Welcome or registry mask reads as this: every bit above.
-#define PUNKTFUNK_GRANT_ALL 255
+#define PUNKTFUNK_GRANT_ALL 511
 
 // Stored "Full control" before [`GRANT_POWER`]. [`normalize_legacy_full`] lifts it.
 #define PUNKTFUNK_GRANT_ALL_PRE_POWER 63
 
 // Stored "Full control" before [`GRANT_MANAGE_GAMES`]. [`normalize_legacy_full`] lifts it.
 #define PUNKTFUNK_GRANT_ALL_PRE_MANAGE 127
+
+// "Full control" before [`GRANT_DISPLAY`]. [`normalize_legacy_full`] lifts it; a store that
+// can tell it from "all but the screen choice" uses [`lift_pre_manage`] instead.
+#define PUNKTFUNK_GRANT_ALL_PRE_DISPLAY 255
 
 // The management API rejects these; it never silently clears unknown bits
 // (that would grant less than the caller asked).
@@ -863,9 +921,9 @@
 
 // [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads
 // [`InputEdge`](super::control::InputEdge) off the control stream. Toward this bit the
-// client sends every key and mouse-button press and release there, where QUIC resends what
-// the network drops; a lost release on the datagram plane otherwise holds it until its next
-// edge. Motion, scroll and pads stay datagrams. Without the bit every event is a datagram.
+// client sends every key and mouse-button press and release and every character of text
+// there, where QUIC resends what the network drops and keeps text behind the Backspaces
+// before it. Motion, scroll and pads stay datagrams. Without the bit every event is a datagram.
 #define PUNKTFUNK_HOST_CAP2_INPUT_EDGES 64
 
 // [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
@@ -971,6 +1029,13 @@
 // Longest [`LaunchOutcome::message`] in UTF-8 bytes. One sentence plus a cause;
 // a host cannot make the client hold more than this.
 #define PUNKTFUNK_LAUNCH_MESSAGE_MAX 200
+
+// Longest [`LaunchOutcome::message_id`], and each placeholder name, in bytes.
+#define LAUNCH_ID_MAX 64
+
+// Most [`LaunchOutcome::message_params`]. With every field at its cap the frame stays
+// under the 1 KiB a client reads.
+#define LAUNCH_PARAMS_MAX 3
 
 #define PUNKTFUNK_AUDIO_MAGIC 201
 
@@ -1172,6 +1237,10 @@
 // Longest `reason` on the wire. Enough for one host sentence.
 #define PUNKTFUNK_REFUSED_REASON_MAX 256
 
+// Most [`Refused::reason_params`]. With every field at its cap the frame stays under the
+// 1 KiB a client reads.
+#define REFUSED_PARAMS_MAX 2
+
 // Implied by [`PEN_TOUCHING`]; [`PenTracker`] ORs it so a client that only sets TOUCHING still looks in-range.
 #define PUNKTFUNK_PEN_IN_RANGE 1
 
@@ -1229,8 +1298,8 @@
 #define PUNKTFUNK_REANCHOR_MARKS_TO_LIFT 2
 
 // `mode_conflict = reject` admission close. Distinct from a transport
-// failure so a client can render "host busy". Reason bytes carry live mode
-// + client label.
+// failure so a client can render "host busy". The reason bytes are empty: a
+// client words `reject_busy`, and the live mode stays in the host's log.
 #define PUNKTFUNK_REJECT_BUSY_CLOSE_CODE 66
 
 // Pairing-gate close. Occupies 0x60.., disjoint from
@@ -1290,6 +1359,11 @@
 // 0x70 and 0x71 are stream codes.
 #define ACCESS_GRANTED_CLOSE_CODE 114
 
+// The profile needs an unlock this connect did not carry, or the host refused the one it
+// did. Reason bytes carry the sentence to prompt with; empty asks for the password. 0x73 is
+// `PATH_SHRANK_CLOSE_CODE`.
+#define PROFILE_LOCKED_CLOSE_CODE 116
+
 // Under-render floor; presenter upscales.
 #define PUNKTFUNK_MIN_SCALE 0.5
 
@@ -1348,6 +1422,7 @@ enum PunktfunkStatus
     PUNKTFUNK_STATUS_REJECTED_NO_SEAT = -34,
     PUNKTFUNK_STATUS_REJECTED_SEAT_OCCUPIED = -35,
     PUNKTFUNK_STATUS_REJECTED_SEAT_UNAVAILABLE = -36,
+    PUNKTFUNK_STATUS_REJECTED_PROFILE_LOCKED = -37,
     PUNKTFUNK_STATUS_PANIC = -99,
 };
 #ifndef __cplusplus
@@ -1437,7 +1512,8 @@ typedef enum {
     // Decode the returned bytes instead: a missing current reference was moved to a picture
     // the decoder holds.
     PUNKTFUNK_CONCEALMENT_REWRITTEN = 1,
-    // Keep this and every following delta off the decoder and ask for an IDR.
+    // Keep this access unit off the decoder and ask for recovery. The concealer forgets it,
+    // so the host's anchor on a picture the decoder holds comes back `Intact`.
     PUNKTFUNK_CONCEALMENT_UNRECOVERABLE = 2,
 } PunktfunkConcealment;
 
@@ -1548,6 +1624,9 @@ typedef struct JitterTuning JitterTuning;
 // knows when the loss was. Lanes without a parser leave this [`Default`].
 typedef struct LocalRecovery LocalRecovery;
 
+// Opaque handle: one AV1 elementary stream's [`Av1Concealer`].
+typedef struct PunktfunkAv1Concealer PunktfunkAv1Concealer;
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Live `punktfunk/2` connection (one QUIC connection and its media, pumped on internal threads).
 // One puller thread per plane; never two threads on the same plane.
@@ -1635,6 +1714,42 @@ typedef struct {
     int32_t x;
     int32_t y;
 } PunktfunkScreen;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// What opens a profile on a person's own account ([`PunktfunkConnectOpts::unlock`]). Password:
+// `secret` is the password as typed, UTF-8, 1 to 512 bytes, never trimmed, no NUL; optionally
+// with a key to enrol. Key proof: `secret` is the signature, 1 to 1024 bytes, and nothing else
+// is set.
+typedef struct {
+    // `PUNKTFUNK_UNLOCK_*`.
+    uint8_t kind;
+    // Password only: `1` keeps this device signed in to the profile.
+    uint8_t stay_signed_in;
+    // Password only: `PUNKTFUNK_ENROLL_*` of `enroll_key`.
+    uint8_t enroll_alg;
+    // Always `0`.
+    uint8_t reserved[5];
+    // Readable for `secret_len` bytes during the call.
+    const uint8_t *secret;
+    // See `secret`.
+    uintptr_t secret_len;
+    // The public key to enrol, readable for `enroll_key_len` bytes; null with
+    // `PUNKTFUNK_ENROLL_NONE`.
+    const uint8_t *enroll_key;
+    // See `enroll_key`.
+    uintptr_t enroll_key_len;
+} PunktfunkProfileUnlock;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The size an asked screen is shown at when smaller than its mode: the host scales that screen's
+// picture to it before encoding. `0` on either axis names none. Read beside the screens, the one
+// at `i` for `screens[i]`; screen 0's view is the connect's or the mode ask's.
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+} PunktfunkScreenView;
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1744,6 +1859,29 @@ typedef struct {
     uint8_t shows_screens;
     // Always `0`. Fills what would otherwise be padding.
     uint8_t reserved5[6];
+    // The profile unlock this connect sends, or null. Read during the call: the secret is
+    // copied into a buffer the library wipes, and the caller wipes its own. An unlock outside
+    // the wire's bounds, or one without `pin_sha256`, fails the connect with `INVALID_ARG`
+    // before anything is dialed.
+    const PunktfunkProfileUnlock *unlock;
+    // `1`: this caller asks the player for a profile's password and dials again with it after
+    // `PUNKTFUNK_STATUS_REJECTED_PROFILE_LOCKED`. A non-null `unlock` implies it.
+    uint8_t prompts_unlock;
+    // Always `0`. Fills what would otherwise be padding.
+    uint8_t reserved6[7];
+    // The size this caller shows the picture at, when smaller than the mode: the host scales
+    // the picture to it before encoding. `0` on either axis, which a shorter prefix defaults
+    // to, encodes the mode.
+    uint32_t view_width;
+    // See `view_width`.
+    uint32_t view_height;
+    // Each asked screen's view, read for `screen_count` records beside `screens` during the
+    // call; null, which a shorter prefix defaults to, names none.
+    const PunktfunkScreenView *screen_views;
+    // The screen this dial's preset asks for, as a preset spells it: `only`, `main`, `second`
+    // or `monitor:<connector>`. Null, empty, which a shorter prefix defaults to, or any other
+    // spelling asks for none. [`punktfunk_connection_screen_role`] reads what the session got.
+    const char *host_screen;
 } PunktfunkConnectOpts;
 #endif
 
@@ -2612,6 +2750,41 @@ PunktfunkConnection *punktfunk_connect_ex12(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// The bytes a profile's unlock key signs, with SHA-256 as the digest, into `out`:
+// `"punktfunk-seat-unlock-v1" ‖ challenge ‖ seat id ‖ device fingerprint ‖ box fingerprint`.
+// `seat_id` is the seat's 32 lowercase hex characters; `device_sha256` is this device's
+// certificate fingerprint, `box_sha256` the box's as this caller pinned it. `INVALID_ARG` for
+// any other seat id, `NULL_POINTER` for a null argument.
+//
+// # Safety
+// `challenge`, `device_sha256` and `box_sha256` are readable for 32 bytes; `seat_id` is a
+// NUL-terminated string; `out` is writable for [`PUNKTFUNK_UNLOCK_MESSAGE_LEN`] bytes.
+PunktfunkStatus punktfunk_profile_unlock_message(const uint8_t *challenge,
+                                                 const char *seat_id,
+                                                 const uint8_t *device_sha256,
+                                                 const uint8_t *box_sha256,
+                                                 uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// What a locked profile's unlock key signs, with SHA-256 as the digest, into `out`:
+// `"punktfunk-profile-unlock-v1" ‖ challenge ‖ profile id, zero-padded to 64 ‖ device
+// fingerprint ‖ box fingerprint`. `profile_id` is 1 to 64 of `[A-Za-z0-9_-]`; the rest is
+// [`punktfunk_profile_unlock_message`]'s. `INVALID_ARG` for any other id, `NULL_POINTER` for a
+// null argument.
+//
+// # Safety
+// `challenge`, `device_sha256` and `box_sha256` are readable for 32 bytes; `profile_id` is a
+// NUL-terminated string; `out` is writable for [`PUNKTFUNK_LOCKED_PROFILE_UNLOCK_MESSAGE_LEN`]
+// bytes.
+PunktfunkStatus punktfunk_locked_profile_unlock_message(const uint8_t *challenge,
+                                                        const char *profile_id,
+                                                        const uint8_t *device_sha256,
+                                                        const uint8_t *box_sha256,
+                                                        uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // The sentence the host sent when it refused the last connect on this thread, for a caller
 // holding a `PUNKTFUNK_STATUS_REJECTED_*` status: a host can name what only it knows, such as
 // who holds the seat. Empty when it said nothing. Read on the connecting thread, right after
@@ -2679,7 +2852,8 @@ bool punktfunk_local_link_facts(const char *host_ip, uint8_t *out_kind, uint32_t
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // The line the PyroWave quality row shows when `required_kbps` is more than this device's
 // link carries ([`punktfunk_local_link_facts`]'s `kind` and `mbps`), NUL-terminated into
-// `out`; empty when it fits. One wording for every client. 160 bytes is ample.
+// `out`; empty when it fits. One wording for every client, in the language the console was
+// given (`languages`), English before. 160 bytes is ample.
 //
 // # Safety
 // `out` is writable for `cap` bytes.
@@ -2750,8 +2924,8 @@ PunktfunkStatus punktfunk_pair(const char *host,
 //
 // # Safety
 // `host`/`client_cert_pem`/`client_key_pem`/`name` are NUL-terminated UTF-8; `pin_sha256`
-// is NULL (trust on first use) or valid for 32 bytes; `host_sha256_out` is writable for
-// 32 bytes.
+// is valid for 32 bytes, the fingerprint the host must show (NULL is refused: a host with
+// none pairs by PIN); `host_sha256_out` is writable for 32 bytes.
 PunktfunkStatus punktfunk_request_access(const char *host,
                                          uint16_t port,
                                          const char *client_cert_pem,
@@ -3238,6 +3412,20 @@ PunktfunkStatus punktfunk_connection_request_screens(const PunktfunkConnection *
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`punktfunk_connection_request_screens`] with each screen's view, `views[i]` for
+// `screens[i]`: a further screen shown smaller than its mode is scaled to its view before
+// encoding. Null `views` names none.
+//
+// # Safety
+// `c` is a valid connection handle; `screens` and `views` are each null or readable for `n`
+// records.
+PunktfunkStatus punktfunk_connection_request_screens_view(const PunktfunkConnection *c,
+                                                          const PunktfunkScreen *screens,
+                                                          const PunktfunkScreenView *views,
+                                                          uintptr_t n);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Screen `screen`'s decoder cannot go on, or is new: its access units wait for a keyframe,
 // which core asks the host for, and that one carries `FRAME_NEW_FORMAT`.
 //
@@ -3532,6 +3720,34 @@ PunktfunkStatus punktfunk_connection_profile(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// `true` when this session started on a screen another device opened and sized. As the session
+// started: that device may leave later. `false` from a host that does not say.
+//
+// # Safety
+// `c` is a valid connection handle; `shared` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_shares_screen(const PunktfunkConnection *c, bool *shared);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The role this session got among the host's screens, `PUNKTFUNK_SCREEN_ROLE_*`. As the
+// session started.
+//
+// # Safety
+// `c` is a valid connection handle; `role` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_screen_role(const PunktfunkConnection *c, uint8_t *role);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Why this session's role is not the one its connect asked for,
+// `PUNKTFUNK_SCREEN_ROLE_REASON_*`. As the session started.
+//
+// # Safety
+// `c` is a valid connection handle; `reason` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_screen_role_reason(const PunktfunkConnection *c,
+                                                        uint8_t *reason);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // The host's sentence when this session's launch did not give the player their game,
 // NUL-terminated, into the caller's buffer; empty otherwise. The latest verdict wins, so
 // poll it. A 256-byte buffer is ample: the wire caps this at 200.
@@ -3541,6 +3757,20 @@ PunktfunkStatus punktfunk_connection_profile(const PunktfunkConnection *c,
 PunktfunkStatus punktfunk_connection_launch_notice(const PunktfunkConnection *c,
                                                    char *out,
                                                    uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`punktfunk_connection_launch_notice`] by message: the host message the sentence is the
+// English of, then the sentence, then each placeholder as `name<TAB>value`, one per line,
+// NUL-terminated, into the caller's buffer; empty when the launch needs no words. The id is
+// empty from a host that names none. A 1200-byte buffer is ample: the wire caps the id at 64
+// bytes, the sentence at 200 and each of at most 3 placeholders at 64 + 200.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for `cap` bytes.
+PunktfunkStatus punktfunk_connection_launch_message(const PunktfunkConnection *c,
+                                                    char *out,
+                                                    uintptr_t cap);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -3671,7 +3901,8 @@ PunktfunkStatus punktfunk_connection_clock_offset_now_ns(const PunktfunkConnecti
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Request a live mode switch. On accept, the first new-mode AU is an IDR with
-// in-band parameter sets — rebuild the decoder from it.
+// in-band parameter sets — rebuild the decoder from it. At the live size the host keeps the
+// view it scales to, so a rate change alone leaves its scale in place.
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -3679,6 +3910,22 @@ PunktfunkStatus punktfunk_connection_request_mode(const PunktfunkConnection *c,
                                                   uint32_t width,
                                                   uint32_t height,
                                                   uint32_t refresh_hz);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`punktfunk_connection_request_mode`] with the size this caller shows the picture at, when
+// smaller than the mode: the host scales the picture to it before encoding. `0` on either
+// view axis names none: the mode is encoded as it is, which is how a caller back at 1x
+// clears the view.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_request_mode_view(const PunktfunkConnection *c,
+                                                       uint32_t width,
+                                                       uint32_t height,
+                                                       uint32_t refresh_hz,
+                                                       uint32_t view_width,
+                                                       uint32_t view_height);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -3869,7 +4116,7 @@ PunktfunkStatus punktfunk_connection_wants_decode_latency(const PunktfunkConnect
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Start a bandwidth speed test: host bursts filler at `target_kbps` goodput for
-// `duration_ms` (clamped ≤ 10 Gbps / ≤ 5 s), briefly pausing video. Non-blocking —
+// `duration_ms` (clamped ≤ 10 Gbps / ≤ 5 s) beside the video. Non-blocking —
 // poll [`punktfunk_connection_probe_result`] until `done` is 1. Starting a probe
 // resets any prior measurement.
 //
@@ -3997,7 +4244,46 @@ PunktfunkStatus punktfunk_h265_concealer_conceal(PunktfunkH265Concealer *c,
                                                  uint8_t **out_buf,
                                                  uintptr_t *out_len);
 
-// Release a buffer [`punktfunk_h265_concealer_conceal`] returned. NULL is a no-op.
+// Create an AV1 reference concealer for one elementary stream (key frame first). Free with
+// [`punktfunk_av1_concealer_free`]. Never returns NULL.
+PunktfunkAv1Concealer *punktfunk_av1_concealer_new(void);
+
+// Free a concealer created by [`punktfunk_av1_concealer_new`]. NULL is a no-op.
+//
+// # Safety
+// `c` was returned by [`punktfunk_av1_concealer_new`] and is not used after this call.
+void punktfunk_av1_concealer_free(PunktfunkAv1Concealer *c);
+
+// The `concealed` verdict [`punktfunk_au_admission_note`] takes for one whole AV1 temporal
+// unit with wire `flags`, judged before the rule runs. `PUNKTFUNK_CONCEALED_DECODABLE` for an
+// error-resilient wave start: [`punktfunk_av1_concealer_conceal`] rewrites its stale
+// reference once the rule admits it. `PUNKTFUNK_CONCEALED_NONE` for every other AU. The
+// concealer is left as it was.
+//
+// # Safety
+// `c` is a valid handle; `au` points to `len` readable bytes; `out_concealed` is writable.
+PunktfunkStatus punktfunk_av1_concealer_verdict(const PunktfunkAv1Concealer *c,
+                                                const uint8_t *au,
+                                                uintptr_t len,
+                                                uint32_t flags,
+                                                uint32_t *out_concealed);
+
+// Fold one temporal unit the decoder is fed, in decode order. Outs as
+// [`punktfunk_h265_concealer_conceal`]; release a `Rewritten` buffer with
+// [`punktfunk_h265_concealer_release`]. An AU the rule withholds never reaches this: the
+// concealer mirrors the decoder's slots.
+//
+// # Safety
+// `c` is a valid handle; `au` points to `len` readable bytes; the out pointers are writable.
+PunktfunkStatus punktfunk_av1_concealer_conceal(PunktfunkAv1Concealer *c,
+                                                const uint8_t *au,
+                                                uintptr_t len,
+                                                PunktfunkConcealment *out_kind,
+                                                uint8_t **out_buf,
+                                                uintptr_t *out_len);
+
+// Release a buffer [`punktfunk_h265_concealer_conceal`] or
+// [`punktfunk_av1_concealer_conceal`] returned. NULL is a no-op.
 //
 // # Safety
 // `buf`/`len` are exactly what one `conceal` call returned, released once.

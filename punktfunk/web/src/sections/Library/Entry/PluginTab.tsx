@@ -12,14 +12,15 @@ import {
 } from "@/api/pluginSurface";
 import { gamePlugins, usePlugins } from "@/api/plugins";
 import { usePluginsReachable } from "@/api/seat";
-import { PasswordConfirmDialog } from "@/components/password-confirm";
+import { HandOverDialog } from "@/components/password-confirm";
 import {
 	type JsonObject,
 	type JsonSchemaDoc,
 	SchemaForm,
 } from "@/components/schema-form";
 import { Button } from "@/components/ui/button";
-import { newlyHanded } from "@/lib/handed-paths";
+import { type GrantRefusal, type Handover, handover } from "@/lib/handed-paths";
+import { apiText } from "@/lib/host-messages";
 import { m } from "@/paraglide/messages";
 import { Group } from "./fields";
 import type { PluginTabSpec } from "./view";
@@ -99,9 +100,12 @@ const PluginTab: FC<{
 	const stored = loaded.tag === "ready" ? (loaded.section.value ?? {}) : {};
 	const [draft, setDraft] = useState<JsonObject | null>(stored);
 	const [saving, setSaving] = useState(false);
-	const [refused, setRefused] = useState<{ path: string; error: string }[]>([]);
+	const [refused, setRefused] = useState<GrantRefusal[]>([]);
 	// A save that hands a folder over waits for the console password.
-	const [asking, setAsking] = useState(false);
+	const [asking, setAsking] = useState<{
+		value: JsonObject;
+		handover: Handover;
+	} | null>(null);
 
 	if (loaded.tag === "offline") {
 		return (
@@ -117,12 +121,17 @@ const PluginTab: FC<{
 	}
 
 	const dirty = JSON.stringify(draft) !== JSON.stringify(stored);
-	const put = async (value: JsonObject, password?: string) => {
+	const put = async (
+		value: JsonObject,
+		handed: Handover,
+		password?: string,
+	) => {
 		const saved = await pluginSurfaceOrThrow<{
-			access?: { refused?: { path: string; error: string }[] };
+			access?: { refused?: GrantRefusal[] };
 		} | null>(sectionUrl(plugin.id, entryId), {
 			method: "PUT",
 			body: value,
+			handover: handed,
 			password,
 		});
 		setRefused(saved?.access?.refused ?? []);
@@ -131,13 +140,14 @@ const PluginTab: FC<{
 	};
 	const save = async () => {
 		if (!draft) return;
-		if (newlyHanded(loaded.section.schema, stored, draft).length) {
-			setAsking(true);
+		const handed = handover(loaded.section.schema, stored, draft);
+		if (handed.grant.length) {
+			setAsking({ value: draft, handover: handed });
 			return;
 		}
 		setSaving(true);
 		try {
-			await put(draft);
+			await put(draft, handed);
 		} catch (e) {
 			toast.error(
 				m.library_entry_plugin_save_failed({
@@ -195,7 +205,10 @@ const PluginTab: FC<{
 					role="alert"
 					className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
 				>
-					{m.plugin_form_grant_refused({ path: r.path, issue: r.error })}
+					{m.plugin_form_grant_refused({
+						path: r.path,
+						issue: apiText(r.code, r.params, r.error),
+					})}
 				</p>
 			))}
 			<div>
@@ -207,16 +220,16 @@ const PluginTab: FC<{
 					{m.library_save()}
 				</Button>
 			</div>
-			<PasswordConfirmDialog
-				open={asking}
+			<HandOverDialog
+				open={asking !== null}
 				id={`plugin-game-password-${plugin.id}`}
-				title={m.plugin_form_confirm_title()}
-				body={m.plugin_form_confirm_body({ plugin: plugin.title })}
+				plugin={plugin.title}
+				paths={asking?.handover.grant ?? []}
 				submitLabel={m.library_save()}
 				onSubmit={async (password) => {
-					if (draft) await put(draft, password);
+					if (asking) await put(asking.value, asking.handover, password);
 				}}
-				onClose={() => setAsking(false)}
+				onClose={() => setAsking(null)}
 			/>
 		</Group>
 	);

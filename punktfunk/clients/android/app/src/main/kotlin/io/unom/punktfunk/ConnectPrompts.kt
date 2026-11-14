@@ -1,8 +1,10 @@
 package io.unom.punktfunk
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
+import io.unom.punktfunk.kit.security.deviceCode
 import io.unom.punktfunk.models.PendingLinkConnect
 import io.unom.punktfunk.models.PendingTrust
 
@@ -26,8 +28,6 @@ internal fun ConnectPrompts(
     identity: ClientIdentity?,
     /** Runs the PIN ceremony. */
     services: HostServices,
-    presets: List<StreamPreset>,
-    isOnline: (KnownHost) -> Boolean,
     // ---- trust / pairing --------------------------------------------------------------------
     pendingTrust: PendingTrust?,
     /** Dismiss (null) or re-aim the SAME decision at another kind — "Pair with PIN…" does that. */
@@ -69,6 +69,8 @@ internal fun ConnectPrompts(
     connectingHostName: String?,
     waker: WakeController,
     onCancelConnect: () -> Unit,
+    /** The profile whose desktop the dial's unlock is starting; `null` for a plain dial. */
+    startingProfile: String? = null,
 ) {
     pendingTrust?.let { pt ->
         val onPair = { onPendingTrustChange(pt.copy(kind = PendingTrust.Kind.PAIR)) }
@@ -103,7 +105,8 @@ internal fun ConnectPrompts(
     }
 
     awaitingHostName?.let { hostLabel ->
-        AwaitingApprovalPrompt(hostLabel = hostLabel, onCancel = onCancelApproval)
+        val deviceCode = remember(identity) { identity?.deviceCode() }
+        AwaitingApprovalPrompt(hostLabel = hostLabel, deviceCode = deviceCode, onCancel = onCancelApproval)
     }
 
     if (speedTest != null && speedTestTarget != null) {
@@ -117,7 +120,6 @@ internal fun ConnectPrompts(
         EditHostDialog(
             target = kh,
             suggestedMacs = editSuggestedMacs,
-            presets = presets,
             onSave = onSaveHost,
             onDismiss = onDismissEdit,
         )
@@ -139,5 +141,6 @@ internal fun ConnectPrompts(
         connectingHostName = connectingHostName,
         waker = waker,
         onCancelConnect = onCancelConnect,
+        startingProfile = startingProfile,
     )
 }

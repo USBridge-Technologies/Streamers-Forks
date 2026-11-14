@@ -110,8 +110,9 @@ private func disc(_ id: String, _ label: String, _ glyph: String, _ bit: UInt32,
 /// stick, the face buttons in the bottom-right corner with the right stick beside them, the
 /// shoulders in the top corners with the stick clicks beside them, Select, Guide and Start along
 /// the bottom edge, and the quick-action ring's button inboard of the left bumper. A narrow layer
-/// lifts the D-pad and the right stick above their neighbours and puts the middle three along the
-/// top edge instead. An unknown preset is `full`.
+/// lifts the D-pad and the right stick above their neighbours; the middle three keep the bottom
+/// edge only while the clusters leave it free, and take the top edge when they do not. An unknown
+/// preset is `full`.
 public func padControls(layout: String, w: Float, h: Float) -> [PadControl] {
     typealias P = VirtualPad
     let narrow = w < P.narrow
@@ -120,21 +121,21 @@ public func padControls(layout: String, w: Float, h: Float) -> [PadControl] {
     let bottom = h - P.margin
     var out: [PadControl] = []
     if sticks {
-        out.append(disc("lb", "Left bumper", "LB", GamepadWire.leftShoulder, P.margin + P.bumperRadius, P.margin + P.bumperRadius, P.bumperRadius))
-        out.append(PadControl(id: "lt", label: "Left trigger",
+        out.append(disc("lb", String(localized: L10n.padControlLeftBumper), "LB", GamepadWire.leftShoulder, P.margin + P.bumperRadius, P.margin + P.bumperRadius, P.bumperRadius))
+        out.append(PadControl(id: "lt", label: String(localized: L10n.padControlLeftTrigger),
                               rect: PadRect(P.margin, P.margin + 2 * P.bumperRadius + 8, P.triggerW, P.triggerH),
                               kind: .trigger(axis: GamepadWire.axisLT)))
-        out.append(disc("rb", "Right bumper", "RB", GamepadWire.rightShoulder, w - P.margin - P.bumperRadius, P.margin + P.bumperRadius, P.bumperRadius))
-        out.append(PadControl(id: "rt", label: "Right trigger",
+        out.append(disc("rb", String(localized: L10n.padControlRightBumper), "RB", GamepadWire.rightShoulder, w - P.margin - P.bumperRadius, P.margin + P.bumperRadius, P.bumperRadius))
+        out.append(PadControl(id: "rt", label: String(localized: L10n.padControlRightTrigger),
                               rect: PadRect(w - P.margin - P.triggerW, P.margin + 2 * P.bumperRadius + 8, P.triggerW, P.triggerH),
                               kind: .trigger(axis: GamepadWire.axisRT)))
         // The stick clicks sit inboard of the triggers, level with them: the index finger already
         // rests there, and the thumb keeps the stick — which is what L3-to-sprint asks for.
         let clickY = P.margin + 2 * P.bumperRadius + 8 + P.triggerH / 2
         let clickX = P.margin + P.triggerW + 8 + P.smallRadius
-        out.append(disc("l3", "Left stick click", "L3", GamepadWire.leftStickClick, clickX, clickY, P.smallRadius))
-        out.append(disc("r3", "Right stick click", "R3", GamepadWire.rightStickClick, w - clickX, clickY, P.smallRadius))
-        out.append(PadControl(id: "ls", label: "Left stick",
+        out.append(disc("l3", String(localized: L10n.padControlLeftStickClick), "L3", GamepadWire.leftStickClick, clickX, clickY, P.smallRadius))
+        out.append(disc("r3", String(localized: L10n.padControlRightStickClick), "R3", GamepadWire.rightStickClick, w - clickX, clickY, P.smallRadius))
+        out.append(PadControl(id: "ls", label: String(localized: L10n.padControlLeftStick),
                               rect: PadRect(P.margin, bottom - P.stickHit, P.stickHit, P.stickHit),
                               kind: .stick(axisX: GamepadWire.axisLSX, axisY: GamepadWire.axisLSY)))
     }
@@ -147,12 +148,12 @@ public func padControls(layout: String, w: Float, h: Float) -> [PadControl] {
         } else {
             dpad = PadRect(P.margin + P.stickHit + 10, bottom - 110 - P.dpadHit, P.dpadHit, P.dpadHit)
         }
-        out.append(PadControl(id: "dpad", label: "D-pad", rect: dpad, kind: .dpad))
+        out.append(PadControl(id: "dpad", label: String(localized: L10n.padControlDpad), rect: dpad, kind: .dpad))
         let c = P.faceHit / 2
         let gap: Float = 40
         out.append(PadControl(
             id: "face",
-            label: "Face buttons",
+            label: String(localized: L10n.padControlFace),
             rect: PadRect(w - P.margin - P.faceHit, bottom - P.faceHit, P.faceHit, P.faceHit),
             kind: .buttons([
                 PadDisc(label: "Y", glyph: "Y", bit: GamepadWire.y, cx: c, cy: c - gap, r: P.faceRadius),
@@ -170,15 +171,21 @@ public func padControls(layout: String, w: Float, h: Float) -> [PadControl] {
         } else {
             right = PadRect(w - P.margin - P.faceHit - 16 - P.stickHit, bottom - P.stickHit, P.stickHit, P.stickHit)
         }
-        out.append(PadControl(id: "rs", label: "Right stick", rect: right,
+        out.append(PadControl(id: "rs", label: String(localized: L10n.padControlRightStick), rect: right,
                               kind: .stick(axisX: GamepadWire.axisRSX, axisY: GamepadWire.axisRSY)))
     }
-    let midY = narrow ? P.margin + P.smallRadius : bottom - P.smallRadius
-    out.append(disc("select", "Select", "⧉", GamepadWire.back, w / 2 - 64, midY, P.smallRadius))
-    out.append(disc("guide", "Guide", "◎", GamepadWire.guide, w / 2, midY, P.smallRadius))
-    out.append(disc("start", "Start", "☰", GamepadWire.start, w / 2 + 64, midY, P.smallRadius))
+    // Measured against the clusters, not guessed from the width: between `narrow` and about
+    // 900 points the right stick still spreads into the bottom corner, near enough to sit on Start.
+    func middle(_ y: Float) -> [PadControl] {
+        [disc("select", "Select", "⧉", GamepadWire.back, w / 2 - 64, y, P.smallRadius),
+         disc("guide", "Guide", "◎", GamepadWire.guide, w / 2, y, P.smallRadius),
+         disc("start", "Start", "☰", GamepadWire.start, w / 2 + 64, y, P.smallRadius)]
+    }
+    let low = middle(bottom - P.smallRadius)
+    let blocked = low.contains { m in out.contains { $0.rect.overlaps(m.rect) } }
+    out += blocked ? middle(P.margin + P.smallRadius) : low
     let ringX = P.margin + 2 * P.bumperRadius + 8
-    out.append(PadControl(id: "ring", label: "Quick actions",
+    out.append(PadControl(id: "ring", label: String(localized: L10n.padControlRing),
                           rect: PadRect(ringX, P.margin + P.bumperRadius - P.smallRadius, 2 * P.smallRadius, 2 * P.smallRadius),
                           kind: .ring))
     return out

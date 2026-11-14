@@ -66,18 +66,16 @@ pub struct Published {
 /// nothing here authorises anything, and PAKE is still what proves the peer.
 #[derive(Clone, Debug)]
 pub struct CertAttestation {
-    /// Hex ECDSA-P256-SHA256 signature, ASN.1 DER, over `CERT_SIG_CONTEXT` + [`Published::cert_hash`].
+    /// Hex ECDSA-P256-SHA256 signature, ASN.1 DER, over
+    /// [`punktfunk_core::tls::PLANE_ATTESTATION_CONTEXT`] + [`Published::cert_hash`].
     pub cert_hash_sig: String,
     /// Base64 of the native identity's leaf certificate DER. A browser hashes this to check it
     /// against its pin, then verifies with the key inside it.
     pub host_cert_der: String,
 }
 
-/// Domain separation. The native key also signs X.509, so a signature it makes over a certificate
-/// hash must not be replayable as one over anything else.
-const CERT_SIG_CONTEXT: &str = "punktfunk-wt-cert-v1:";
-
 /// Sign `cert_hash` with the native identity, and hand back the certificate that verifies it.
+/// [`punktfunk_core::tls::verify_plane_attestation`] is the check.
 ///
 /// `None` rather than an error when the identity is not P-256: failing start-up over it would be
 /// worse than not attesting.
@@ -88,7 +86,10 @@ fn attest(ident: &crate::identity::NativeIdentity, cert_hash: &str) -> Option<Ce
         tracing::warn!("native identity is not P-256, so the browser plane is not attested");
         return None;
     }
-    let msg = format!("{CERT_SIG_CONTEXT}{cert_hash}");
+    let msg = format!(
+        "{}{cert_hash}",
+        punktfunk_core::tls::PLANE_ATTESTATION_CONTEXT
+    );
     let sig = rcgen::SigningKey::sign(&key, msg.as_bytes()).ok()?;
     let (_, pem) = x509_parser::pem::parse_x509_pem(ident.cert_pem.as_bytes()).ok()?;
     Some(CertAttestation {
@@ -123,9 +124,9 @@ struct Serving {
     plane: Plane,
     /// Raw SHA-256 of the leaf DER. The SPAKE2 host identity and the channel binding both.
     cert_hash: [u8; 32],
-    /// Last pairing attempt on this plane, for the same rate limit the native one applies.
-    /// SPAKE2 caps a ceremony at one online guess; this caps the ceremonies.
-    last_pairing: std::sync::Mutex<Option<std::time::Instant>>,
+    /// This plane's pairing clocks, the native plane's rule. SPAKE2 caps a ceremony at one online
+    /// guess; these cap the ceremonies.
+    pairing_clocks: crate::native::PairingClocks,
     /// The native plane's capturer, injector, mic and pairing store: an admitted browser runs
     /// the same session on the same state, which is why this plane is spawned from there.
     host: crate::native::SessionHost,
@@ -222,7 +223,7 @@ pub(crate) async fn serve(
                 .with_bind_address_v6(v6, wtransport::config::Ipv6DualStackConfig::Allow),
             v4 => ServerConfig::builder().with_bind_address(v4),
         }
-        .with_identity(identity)
+        .with_custom_transport(identity, plane_transport())
         // A browser tab that is throttled in the background must not look like a dead peer.
         .keep_alive_interval(Some(Duration::from_secs(3)))
         .build();
@@ -252,7 +253,7 @@ pub(crate) async fn serve(
         let serving = Arc::new(Serving {
             plane: plane.clone(),
             cert_hash,
-            last_pairing: std::sync::Mutex::new(None),
+            pairing_clocks: Default::default(),
             host: host.clone(),
         });
         // Accept until the certificate is due for replacement, then fall out and re-mint.
@@ -351,20 +352,133 @@ fn wanted_origins(
     }
 }
 
+/// Unidirectional streams a browser may open: HTTP/3 needs three, and the page opens none.
+const UNI_STREAMS: u32 = 16;
+
+/// The plane's QUIC limits, the native plane's: what one browser, admitted or not, can make the
+/// host hold unread.
+fn plane_transport() -> wtransport::config::QuicTransportConfig {
+    use punktfunk_core::quic::endpoint::{HOST_MAX_BIDI_STREAMS, HOST_RECEIVE_WINDOW};
+    let mut t = wtransport::config::QuicTransportConfig::default();
+    t.max_concurrent_uni_streams(UNI_STREAMS.into())
+        .max_concurrent_bidi_streams(HOST_MAX_BIDI_STREAMS.into())
+        .receive_window(HOST_RECEIVE_WINDOW.into());
+    t
+}
+
+/// Sessions one peer address may hold before admission.
+const UNADMITTED_PER_ADDR: usize = 8;
+/// Sessions the plane holds before admission, from every address together.
+const UNADMITTED_TOTAL: usize = 64;
+
+/// Sessions accepted and not admitted yet, by peer address. A slot is held from accept until the
+/// session is admitted, parks a knock (the pending caps bound those) or ends.
+#[derive(Default)]
+struct Unadmitted(std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>);
+
+/// One session's place in [`Unadmitted`], given back when dropped.
+pub(crate) struct UnadmittedSlot {
+    pool: Arc<Unadmitted>,
+    ip: std::net::IpAddr,
+}
+
+impl Unadmitted {
+    /// A slot for a session from `ip`, or `None` when that address or the plane is full.
+    fn take(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<UnadmittedSlot> {
+        let ip = ip.to_canonical();
+        let mut held = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mine = held.get(&ip).copied().unwrap_or(0);
+        if mine >= UNADMITTED_PER_ADDR || held.values().sum::<usize>() >= UNADMITTED_TOTAL {
+            return None;
+        }
+        held.insert(ip, mine + 1);
+        Some(UnadmittedSlot {
+            pool: self.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for UnadmittedSlot {
+    fn drop(&mut self) {
+        let mut held = self.pool.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = held.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.ip);
+            }
+        }
+    }
+}
+
 async fn accept_loop(
     endpoint: &Endpoint<wtransport::endpoint::endpoint_side::Server>,
     serving: Arc<Serving>,
     sem: Arc<tokio::sync::Semaphore>,
 ) {
+    let unadmitted = Arc::new(Unadmitted::default());
     loop {
         let incoming = endpoint.accept().await;
+        // As on the native plane: a source that has not shown it receives at its address gets a
+        // Retry, not a task, so a spoofed-source flood cannot make this host amplify.
+        if !incoming.remote_address_validated() {
+            incoming.retry();
+            continue;
+        }
+        let Some(slot) = unadmitted.take(incoming.remote_address().ip()) else {
+            tracing::debug!(peer = %incoming.remote_address(), "WebTransport session refused: too many not admitted yet");
+            incoming.refuse();
+            continue;
+        };
         let serving = serving.clone();
         let sem = sem.clone();
         tokio::spawn(async move {
-            if let Err(e) = session(incoming, &serving, sem).await {
+            if let Err(e) = session(incoming, &serving, sem, slot).await {
                 tracing::debug!(error = %e, "WebTransport session ended");
             }
         });
+    }
+}
+
+/// The page server and page a session came through. A page that is public and that nothing on
+/// this host knows makes the session's knocks strict.
+fn via(
+    relay: crate::native_pairing::Relay,
+    origin: Option<String>,
+    serving: &Serving,
+) -> crate::native_pairing::Via {
+    let unfamiliar_origin = origin.as_deref().is_some_and(|o| {
+        !local_origin(o)
+            && !serving.plane.origins.iter().any(|listed| listed == o)
+            && !serving.plane.pairing.knows_origin(o)
+    });
+    crate::native_pairing::Via {
+        relay,
+        origin,
+        unfamiliar_origin,
+    }
+}
+
+/// An origin no public website has: a local file (a packaged TV app sends `file://`), or a host
+/// that is a private address or a name no public zone holds. `null`, which any page can send from
+/// a sandboxed frame, is not one.
+fn local_origin(origin: &str) -> bool {
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("file") {
+        return true;
+    }
+    let host = match rest.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => rest.split(':').next().unwrap_or_default(),
+    };
+    match host.parse() {
+        Ok(ip) => {
+            crate::native_pairing::classify_source(Some(ip))
+                == crate::native_pairing::KnockSource::Lan
+        }
+        Err(_) => punktfunk_core::provenance::is_local_name(host),
     }
 }
 
@@ -398,13 +512,20 @@ pub fn is_confined(require_pairing: bool, origins: &[String]) -> bool {
 }
 
 /// One browser session: check the origin, then hand the connection to [`session::run`], which
-/// takes the session slot. `/echo` keeps Phase 1's loopback for the measurement pages.
+/// takes the session slot. `unadmitted` is held until then; the session request and its answer
+/// share one [`session::HANDSHAKE_TIMEOUT`]. A debug build keeps Phase 1's `/echo` for the
+/// measurement pages.
 async fn session(
     incoming: wtransport::endpoint::IncomingSession,
     serving: &Arc<Serving>,
     sem: Arc<tokio::sync::Semaphore>,
+    unadmitted: UnadmittedSlot,
 ) -> Result<()> {
-    let request = incoming.await.context("await session request")?;
+    let deadline = tokio::time::Instant::now() + session::HANDSHAKE_TIMEOUT;
+    let request = tokio::time::timeout_at(deadline, incoming)
+        .await
+        .context("session request: handshake timeout")?
+        .context("await session request")?;
     // The peer picks `:path` and nothing upstream value-checks it, so control characters would
     // reach the log ring verbatim and let an unauthenticated peer forge log lines.
     let path: String = request
@@ -420,34 +541,40 @@ async fn session(
             .take(128)
             .collect::<String>()
     });
-    // A bridge names the browser it dials for. Unvetted: it can only tighten a knock's source.
-    let client_addr = request
-        .headers()
-        .get("pf-client-addr")
-        .and_then(|a| a.parse().ok());
+    // A page server marks what it relays. Present at all, the session is strict.
+    let relay = crate::native_pairing::Relay::from_header(
+        request
+            .headers()
+            .get(punktfunk_core::provenance::CLIENT_ADDR_HEADER)
+            .map(String::as_str),
+    );
     if !origin_allowed(origin.as_deref(), &serving.plane.origins) {
-        request.forbidden().await;
+        let _ = tokio::time::timeout_at(deadline, request.forbidden()).await;
         tracing::warn!(
             origin = origin.as_deref().unwrap_or("<none>"),
             "WebTransport session refused: origin not in PUNKTFUNK_WEBTRANSPORT_ORIGINS"
         );
         return Ok(());
     }
-    let connection = request.accept().await.context("accept session")?;
+    let connection = tokio::time::timeout_at(deadline, request.accept())
+        .await
+        .context("accept session: handshake timeout")?
+        .context("accept session")?;
     tracing::info!(
         path = %path,
         origin = origin.as_deref().unwrap_or("<none>"),
         "WebTransport session accepted"
     );
 
-    // `/echo` keeps Phase 1's behaviour so the measurement pages still work against a host that
-    // streams on every other path.
+    // Phase 1's echo answers anyone with no slot and no timeout, so a release host has no such path.
+    #[cfg(debug_assertions)]
     if path == "/echo" {
         return echo(connection).await;
     }
     // The management API for a page that cannot `fetch` the host: no streaming slot, no
     // handshake clock, its own caps (`mgmt`).
     if path == "/mgmt" {
+        drop(unadmitted);
         return mgmt::serve(connection, serving).await;
     }
 
@@ -463,7 +590,8 @@ async fn session(
         return Ok(());
     }
     let peer = connection.remote_address();
-    match session::run(connection.clone(), serving.clone(), sem, client_addr).await {
+    let via = Arc::new(via(relay, origin, serving));
+    match session::run(connection.clone(), serving.clone(), sem, via, unadmitted).await {
         Ok(crate::native::Served::Session) => tracing::info!(%peer, "browser session complete"),
         Ok(
             crate::native::Served::ProbeClose
@@ -478,15 +606,18 @@ async fn session(
                 .downcast_ref::<session::Refusal>()
                 .map_or(punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE, |r| r.code);
             let detail = format!("{e:#}");
-            // A browser renders this text, so prefer the user sentence; the chain is
-            // the fallback only because there is nothing better to show yet.
-            let said = crate::native::setup_failed_sentence(&e).unwrap_or(detail.clone());
-            let mut cut = said.len().min(256);
-            while !said.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            refuse(&connection, code, &said[..cut]).await;
-            connection.close(wtransport::VarInt::from_u32(code), &said.as_bytes()[..cut]);
+            // A browser renders this text: the user sentence, or none and the refusal's own
+            // message. The chain stays in the log.
+            let said = crate::native::setup_failed_sentence(&e).unwrap_or_else(|| {
+                let id = punktfunk_core::reject::RejectReason::from_close_code(code)
+                    .map(|r| r.message_id())
+                    .unwrap_or_default();
+                crate::native::Said::new(&id, "")
+            });
+            let refused = said.refused(code);
+            let reason = refused.reason.clone();
+            refuse(&connection, refused).await;
+            connection.close(wtransport::VarInt::from_u32(code), reason.as_bytes());
             tracing::warn!(%peer, code, error = %detail, "browser session ended with error");
         }
     }
@@ -500,12 +631,17 @@ const OLDER_PAGE: &str =
 /// Say why on a fresh unidirectional stream, then give the browser a moment to read it. The
 /// close that follows carries no retransmit, so the wait is what makes the message arrive. The
 /// stream carries the `Refused` frame alone.
-pub(crate) async fn refuse(connection: &wtransport::Connection, code: u32, reason: &str) {
+pub(crate) async fn refuse(
+    connection: &wtransport::Connection,
+    mut refused: punktfunk_core::quic::Refused,
+) {
     use punktfunk_core::quic::v2::msg::V2Message;
-    let refused = punktfunk_core::quic::Refused {
-        code,
-        reason: reason.to_string(),
-    };
+    let max = punktfunk_core::quic::REFUSED_REASON_MAX;
+    let mut cut = refused.reason.len().min(max);
+    while !refused.reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    refused.reason.truncate(cut);
     say_then_wait(connection, &refused.encode_v2()).await;
 }
 
@@ -514,6 +650,7 @@ async fn refuse_older_page(connection: &wtransport::Connection, code: u32, reaso
     let refused = punktfunk_core::quic::Refused {
         code,
         reason: reason.to_string(),
+        ..Default::default()
     };
     say_then_wait(
         connection,
@@ -537,8 +674,9 @@ async fn say_then_wait(connection: &wtransport::Connection, bytes: &[u8]) {
     }
 }
 
-/// Phase 1's echo, still reachable at `/echo`: the page connects, sends datagrams and control
+/// Phase 1's echo, at `/echo` in a debug build: the page connects, sends datagrams and control
 /// bytes, and gets them back. It is what the seam's measurements run against.
+#[cfg(debug_assertions)]
 async fn echo(connection: wtransport::Connection) -> Result<()> {
     loop {
         tokio::select! {
@@ -649,6 +787,81 @@ mod tests {
         assert!(origin_allowed(None, &[]));
     }
 
+    /// Eight sessions from one address wait for admission; the ninth is refused while another
+    /// address still gets in, and a slot given back is free again. Sixty-four in all.
+    #[test]
+    fn unadmitted_sessions_are_capped_per_address_and_in_all() {
+        let pool = Arc::new(Unadmitted::default());
+        let one: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        let other: std::net::IpAddr = "192.168.1.21".parse().unwrap();
+        let mut held: Vec<_> = (0..UNADMITTED_PER_ADDR)
+            .map(|_| pool.take(one).expect("under the per-address cap"))
+            .collect();
+        assert!(pool.take(one).is_none(), "the ninth from one address");
+        let mapped: std::net::IpAddr = "::ffff:192.168.1.20".parse().unwrap();
+        assert!(pool.take(mapped).is_none(), "the same address, v4-mapped");
+        assert!(pool.take(other).is_some(), "another address still connects");
+        held.pop();
+        assert!(pool.take(one).is_some(), "a slot given back is free again");
+
+        let pool = Arc::new(Unadmitted::default());
+        let _all: Vec<_> = (0..UNADMITTED_TOTAL)
+            .map(|i| pool.take(std::net::Ipv4Addr::new(10, 0, 0, i as u8).into()))
+            .collect::<Option<_>>()
+            .expect("under the total cap");
+        assert!(pool.take(other).is_none(), "the plane is full");
+    }
+
+    /// A browser's session comes up under the plane's limits, and what it writes to streams the
+    /// host never reads stops at the connection window. Eight streams would hold 10 MB without it.
+    #[tokio::test]
+    async fn a_browser_cannot_fill_past_the_plane_s_window() {
+        let window = punktfunk_core::quic::endpoint::HOST_RECEIVE_WINDOW as usize;
+        let identity = Identity::self_signed(["localhost"]).unwrap();
+        let cert = identity.certificate_chain().as_slice()[0].hash();
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address(loopback)
+                .with_custom_transport(identity, plane_transport())
+                .build(),
+        )
+        .unwrap();
+        let url = format!("https://127.0.0.1:{}/", server.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let _held = server.accept().await.await.unwrap().accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let page = Endpoint::client(
+            wtransport::ClientConfig::builder()
+                .with_bind_address(loopback)
+                .with_server_certificate_hashes([cert])
+                .build(),
+        )
+        .unwrap()
+        .connect(url)
+        .await
+        .unwrap();
+
+        let stuck = Duration::from_millis(50);
+        let chunk = vec![0u8; 64 * 1024];
+        let mut sent = 0;
+        let mut streams = Vec::new();
+        for _ in 0..8 {
+            // A full window holds back the next stream's own header too.
+            let open = async { page.open_bi().await.unwrap().await.unwrap() };
+            let Ok((mut tx, rx)) = tokio::time::timeout(stuck, open).await else {
+                break;
+            };
+            while let Ok(Ok(n)) = tokio::time::timeout(stuck, tx.write(&chunk)).await {
+                sent += n;
+            }
+            streams.push((tx, rx));
+        }
+        assert!(sent > window / 2, "the streams took data: {sent}");
+        assert!(sent <= window, "{sent} bytes unread on one connection");
+    }
+
     /// `--open` and an empty origin list are each an operator's choice; together they are a
     /// desktop any page can drive, because nothing else stands in front of the session.
     #[test]
@@ -668,44 +881,36 @@ mod tests {
     #[test]
     fn attestation_verifies_against_the_pinned_host_certificate() {
         use base64::Engine as _;
+        use punktfunk_core::tls::{cert_fingerprint, verify_plane_attestation};
+        let leaf = |ident: &crate::identity::NativeIdentity| {
+            let (_, pem) = x509_parser::pem::parse_x509_pem(ident.cert_pem.as_bytes()).unwrap();
+            pem.contents
+        };
         let ident = crate::identity::ephemeral().expect("mint a native identity");
         let cert_hash = "a".repeat(64);
         let a = attest(&ident, &cert_hash).expect("P-256 identity attests");
-
-        // Step one of the browser's check: the certificate really is the one it pinned.
         let der = base64::engine::general_purpose::STANDARD
             .decode(&a.host_cert_der)
             .expect("host_cert_der is base64");
-        let (_, expected) = x509_parser::pem::parse_x509_pem(ident.cert_pem.as_bytes()).unwrap();
-        assert_eq!(
-            der, expected.contents,
-            "attested DER is the identity's leaf"
-        );
+        let sig = hex::decode(&a.cert_hash_sig).expect("cert_hash_sig is hex");
 
-        // Step two: the signature is that certificate's key over this hash, and nothing else.
-        let cert = expected.parse_x509().unwrap();
-        let key = cert.public_key().subject_public_key.data.to_vec();
-        let sig: Vec<u8> = (0..a.cert_hash_sig.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&a.cert_hash_sig[i..i + 2], 16).unwrap())
-            .collect();
-        let verify = |msg: &str| {
-            aws_lc_rs::signature::UnparsedPublicKey::new(
-                &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
-                &key,
-            )
-            .verify(msg.as_bytes(), &sig)
-        };
-        assert!(verify(&format!("{CERT_SIG_CONTEXT}{cert_hash}")).is_ok());
-        // Domain separation and the hash itself both have to matter, or the signature proves
-        // nothing about which certificate it names.
-        assert!(
-            verify(&cert_hash).is_err(),
-            "context is part of the message"
+        // The fingerprint that comes back is the one the browser pinned at pairing.
+        assert_eq!(
+            verify_plane_attestation(&cert_hash, &sig, &der).expect("attestation verifies"),
+            cert_fingerprint(&leaf(&ident)),
         );
         assert!(
-            verify(&format!("{CERT_SIG_CONTEXT}{}", "b".repeat(64))).is_err(),
+            verify_plane_attestation(&"b".repeat(64), &sig, &der).is_err(),
             "a different hash must not verify"
         );
+        let other = crate::identity::ephemeral().expect("mint a second identity");
+        assert!(
+            verify_plane_attestation(&cert_hash, &sig, &leaf(&other)).is_err(),
+            "another host's key must not verify"
+        );
+        // The same key over the bare hash: the context is part of the message.
+        let key = rcgen::KeyPair::from_pem(&ident.key_pem).unwrap();
+        let bare = rcgen::SigningKey::sign(&key, cert_hash.as_bytes()).unwrap();
+        assert!(verify_plane_attestation(&cert_hash, &bare, &der).is_err());
     }
 }

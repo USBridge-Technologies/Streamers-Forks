@@ -63,15 +63,17 @@ struct ContentView: View {
         /// The link's `as=`: the host profile to play as, this connect only.
         var asProfile: String?
 
-        var actionTitle: String { browse ? "Open Library" : "Connect" }
+        var actionTitle: String {
+            String(localized: browse ? L10n.appleLinkOpenLibrary : L10n.commonConnect)
+        }
         var message: String {
-            let asked = browse
-                ? "open \(host.displayName)'s game library"
-                : "connect to \(host.displayName)"
-                    + (launch.map { " and launch \u{201C}\($0)\u{201D}" } ?? "")
-            return "A link asked to \(asked). It names the host by its label or address, which "
-                + "anything that can open a link could guess — a shortcut made in Punktfunk names "
-                + "the host's id and opens without asking."
+            var paragraphs =
+                browse
+                ? [L10n.appleLinkConfirmAsksLibrary(host: host.displayName)]
+                : [L10n.linkConfirmAsks(host: host.displayName, address: host.address)]
+            if !browse, let launch { paragraphs.append(L10n.linkConfirmLaunch(game: launch)) }
+            paragraphs.append(String(localized: L10n.linkConfirmGuessable))
+            return paragraphs.joined(separator: "\n\n")
         }
     }
     @State private var deepLinkConfirm: DeepLinkConfirm?
@@ -96,6 +98,10 @@ struct ContentView: View {
     @State private var profileAsk: ProfileAsk?
     /// The wait for a profile's seat to come up, before the dial.
     @State private var seatWait: SeatWait?
+    /// The password prompt of a profile on a person's own account, before the dial.
+    @State private var unlockAsk: UnlockAsk?
+    /// What this window's connect flow keeps between taps.
+    @State private var flowLife = ConnectFlow.Life()
     @State private var speedTestTarget: StoredHost?
     @State private var libraryTarget: LibraryTarget?
     #if os(iOS) || os(visionOS) || os(tvOS)
@@ -113,8 +119,7 @@ struct ContentView: View {
     @Environment(\.controlActiveState) private var controlActiveState
     #endif
     /// Wakes a sleeping host and waits for it to come back online before connecting (drives the
-    /// "Waking…" phase of the connect overlay). Available on every platform now that the iOS/tvOS
-    /// multicast entitlement is granted (see PunktfunkConnection.wakeOnLANAvailable).
+    /// "Waking…" phase of the connect overlay). Available on every platform (`WakePolicy`).
     @StateObject private var waker = HostWaker()
     #if os(macOS)
     /// Whether the hosting window is native-fullscreen right now (reported by
@@ -184,6 +189,15 @@ struct ContentView: View {
             fullscreenAlways: fullscreenAlways)
     }
 
+    /// This device's code as a paragraph under the approval wait's message. The identity is
+    /// loaded by the time a request waits, so this reads the store's cached copy.
+    private var deviceCodeLine: String {
+        guard let code = (try? ClientIdentityStore.shared.load())?.identity.deviceCode else {
+            return ""
+        }
+        return "\n\n" + L10n.pairDeviceCode(code: code)
+    }
+
     /// A console that could not be built hands the screen back to this app's own UI.
     private var gamepadUIActive: Bool {
         !consoleFailed
@@ -203,65 +217,69 @@ struct ContentView: View {
             // is the no-PIN approval path, "Pair with PIN…" the SPAKE2 ceremony. The follow-on
             // presentation waits a tick so this alert is fully dismissed first.
             .alert(
-                "Pairing required",
+                L10n.pairRequiredTitle,
                 isPresented: approvalChoicePresented,
                 presenting: approvalChoice
             ) { req in
-                Button("Request Access") {
-                    DispatchQueue.main.async { flow.requestAccess(req) }
+                // A request names the fingerprint the host must show. A typed host has none.
+                if req.advertisedFingerprint != nil {
+                    Button(L10n.pairRequestAccess) {
+                        DispatchQueue.main.async { flow.requestAccess(req) }
+                    }
                 }
-                Button("Pair with PIN…") {
+                Button(L10n.pairUsePin) {
                     DispatchQueue.main.async {
                         pairThen = req.thenConnect
                         pairingTarget = req.host
                     }
                 }
-                Button("Cancel", role: .cancel) {}
+                Button(L10n.commonCancel, role: .cancel) {}
             } message: { req in
-                Text("\(req.host.displayName) requires pairing. Request access and approve this "
-                    + "device in the host's web console (port 47992 → Pairing) — no PIN needed. Or "
-                    + "pair with the 4-digit PIN it can display.")
+                Text(
+                    L10n.pairRequiredBody(host: req.host.displayName) + "\n\n"
+                        + String(
+                            localized: req.advertisedFingerprint == nil
+                                ? L10n.pairIntroPinOnly : L10n.pairIntro))
             }
             // One "Connection failed" surface for every home screen (touch grid, gamepad launcher)
             // and platform — SessionModel funnels all connect/session errors into `errorMessage`.
-            .alert("Connection failed", isPresented: connectionErrorPresented) {
-                Button("OK", role: .cancel) {}
+            .alert(L10n.appleDialFailedTitle, isPresented: connectionErrorPresented) {
+                Button(L10n.commonOk, role: .cancel) {}
             } message: {
                 Text(model.errorMessage ?? "")
             }
             // The delegated-approval wait: the host holds the request until the operator approves
-            // it. Cancel returns the UI at once; `ConnectFlow.requestAccess` drops the late answer.
+            // it. Cancel returns the UI at once and ends a dial the host parked (`cancelApproval`).
             .alert(
-                "Waiting for approval",
+                L10n.pairWaitingForApproval,
                 isPresented: awaitingApprovalPresented,
                 presenting: awaitingApproval
-            ) { _ in
-                Button("Cancel", role: .cancel) {}
+            ) { req in
+                Button(L10n.commonCancel, role: .cancel) { flow.cancelApproval(req) }
             } message: { req in
-                Text("Approve \u{201C}\(DeviceName.current)\u{201D} in \(req.host.displayName)'s "
-                    + "web console (port 47992 → Pairing). This device is paired once you "
-                    + "approve it.")
+                Text(L10n.dialApproveNoPin(host: req.host.displayName) + deviceCodeLine)
             }
             // Who is playing: shown by a connect when its host lists several profiles.
             .sheet(item: $profileAsk) { ProfilePickerView(ask: $0) }
             // The seat of the picked profile is starting; the dial follows once it is up.
             .sheet(item: $seatWait) { SeatWaitView(wait: $0) }
+            .sheet(item: $unlockAsk) { UnlockPromptView(ask: $0) }
             // Informational deep-link outcome (unknown host, a refused preset, already
             // streaming). Not an error.
-            .alert("Can't open", isPresented: deepLinkNoticePresented) {
-                Button("OK", role: .cancel) {}
+            .alert(L10n.linkRefusedTitle, isPresented: deepLinkNoticePresented) {
+                Button(L10n.commonOk, role: .cancel) {}
             } message: {
                 Text(deepLinkNotice ?? "")
             }
             // A link that named a saved host by a guessable reference: the dial (or the library)
             // happens on the user's word rather than on the link's.
             .alert(
-                "Open this link?",
+                L10n.linkConfirmTitle,
                 isPresented: deepLinkConfirmPresented,
                 presenting: deepLinkConfirm
             ) { confirm in
                 Button(confirm.actionTitle) { runDeepLinkConfirm(confirm) }
-                Button("Cancel", role: .cancel) {}
+                Button(L10n.commonCancel, role: .cancel) {}
             } message: { confirm in
                 Text(confirm.message)
             }
@@ -329,13 +347,16 @@ struct ContentView: View {
         }
         .animation(.easeInOut(duration: 0.3), value: model.launchHold)
         .onAppear {
+            flowLife.open()
             // A plain connect the host parked for its operator gets the request-access wait.
             let approval = $awaitingApproval
             model.onAwaitingApproval = { host in
                 if approval.wrappedValue == nil {
-                    approval.wrappedValue = ApprovalRequest(host: host, advertisedFingerprint: nil)
+                    approval.wrappedValue = ApprovalRequest(
+                        host: host, advertisedFingerprint: nil, viaDial: true)
                 }
             }
+            model.currentRecord = { [store] id in store.hosts.first { $0.id == id } }
             DemoMode.resume(in: store)
             autoConnectIfAsked()
             // An intent that ran before this window subscribed. Ahead of the start screen,
@@ -412,7 +433,6 @@ struct ContentView: View {
                 if let host = model.activeHost {
                     liveActivity.begin(
                         hostID: host.id, hostName: host.displayName,
-                        launchTitle: nil, // no live foreground-app title mid-session (v1)
                         modeLine: currentModeLine(), startedAt: Date())
                 }
             case .idle:
@@ -420,6 +440,12 @@ struct ContentView: View {
             default:
                 break
             }
+        }
+        // The picture's size lands after the activity begins: a host that scales sends less
+        // than its mode.
+        .onChange(of: model.pictureText) { _, _ in
+            let line = currentModeLine()
+            liveActivity.update { $0.modeLine = line }
         }
         .onChange(of: model.isBackgrounded) { _, backgrounded in
             liveActivity.update {
@@ -440,41 +466,40 @@ struct ContentView: View {
         // nothing.
         .onReceive(NotificationCenter.default.publisher(for: .punktfunkOpenDeepLink)) { note in
             guard let link = note.object as? NSURL else { return }
-            #if os(macOS)
-            // Every window hears it: the front one takes it now, another only if none did.
-            let wait: TimeInterval = controlActiveState == .key ? 0 : 0.25
-            DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+            @MainActor func run() {
                 guard DeepLinkInbox.take(link) else { return }
                 handleDeepLink(link as URL)
             }
-            #else
-            guard DeepLinkInbox.take(link) else { return }
-            handleDeepLink(link as URL)
-            #endif
+            // Every window hears it; the first to take it from the inbox runs it.
+            switch LinkArbiter.decide(
+                kind: .link(.current), isBusy: !linkSession.isIdle, isFront: isFrontWindow)
+            {
+            case .runHere: run()
+            case .retryAfter(let wait):
+                DispatchQueue.main.asyncAfter(deadline: .now() + wait) { run() }
+            case .leave: break
+            }
         }
         .onChange(of: model.phase) { _, phase in
+            // A parked dial that streamed, failed or was cancelled has nothing left to wait for.
+            if awaitingApproval?.viaDial == true, phase != .connecting { awaitingApproval = nil }
             switch phase {
             case .streaming:
                 #if os(iOS) || os(visionOS)
                 showTouchExit = true // the off-tier exit disc's 8 s window, per session start
                 #endif
                 ring.close()
-                ring.native = nil // this session's Welcome mode, captured at its first open
+                ring.native = model.connection.map { // the sheet's Native: this session's Welcome
+                    RingNav.Mode(width: $0.width, height: $0.height, hz: $0.refreshHz)
+                }
                 // Host-action slots are pre-fetched here, never when the ring opens (§3.1).
                 if let host = model.activeHost { HostPowerStore.shared.refresh(host) }
-                // `Select+A` on a pad opens the ring in the middle of the stage; while it is up
-                // the pad belongs to it. On tvOS the remote's short Back arrives here too, and on
-                // macOS the chord and the menu item do — on both, a second press closes it again,
-                // because on neither is there a finger to tap the scrim with. iOS opens only: the
-                // twist that opened it also winds it back.
-                model.onRingChord = { [ring] pad in
-                    #if os(tvOS) || os(macOS)
-                    ring.toggleCentred()
-                    #else
-                    ring.pressTick &+= 1
-                    ring.openCentred()
-                    #endif
-                    if ring.committed { ring.opener = pad }
+                // The remote's short Back opens the ring in the middle of the stage; a pad's
+                // Quick actions shortcut does the same through `onShortcut`. While it is up the
+                // pad belongs to it.
+                model.onRingChord = { [ring] pad in ring.chordToggle(pad: pad) }
+                model.onShortcut = { [weak model, ring] action, phase, pad in
+                    model?.runShortcut(action, phase, pad: pad, ring: ring)
                 }
                 model.onRingNav = { [ring] nav in ring.nav(nav) }
                 // A session actually started — remember it on the card ("Connected … ago"
@@ -495,6 +520,7 @@ struct ContentView: View {
         }
         .onDisappear { // window closed mid-session or mid-wake (Cmd+N spawns more)
             waker.cancel() // its onOnline would dial for a window that is gone
+            flowLife.close() // and so would the connect flow's deferred work
             model.disconnect()
         }
         // Expose the session to the Scene-level Stream menu (Disconnect ⌃⌥⇧D works even when
@@ -515,18 +541,6 @@ struct ContentView: View {
             cycleStats: { model.cycleStats() },
             toggleQuickActions: { if model.phase == .streaming { ring.toggleCentred() } },
             disconnect: { model.disconnect() }))
-        // ⌃⌥⇧A fired while input was CAPTURED (InputCapture's chord path posts it — the menu's
-        // identical equivalent can't reach a captured stream). Same toggle either way. It names
-        // its session, so a second window's stream keeps its own mic state.
-        .onReceive(NotificationCenter.default.publisher(for: .punktfunkToggleMicMute)) { note in
-            guard note.object as AnyObject === model.connection else { return }
-            model.toggleMicMute()
-        }
-        // ⌃⌥⇧C, captured: the same rule.
-        .onReceive(NotificationCenter.default.publisher(for: .punktfunkToggleClipboard)) { note in
-            guard note.object as AnyObject === model.connection else { return }
-            model.toggleClipboardSync()
-        }
         #endif
         #if os(macOS)
         // Fullscreen from launch under Always, else only while a session is up (incl. the trust
@@ -620,20 +634,22 @@ struct ContentView: View {
     }
 
     /// Run a host window's pending request here, unless another main window took it first. A
-    /// connect or a pairing needs an idle window: a busy one leaves it to an idle one, then opens
-    /// a window of its own for it.
+    /// window `LinkArbiter` sends away leaves it to an idle one, then opens a window of its own
+    /// for it.
     private func takeHostRequest() {
         guard let request = hostRouter.pending else { return }
-        switch request {
-        case .connect, .pair:
-            guard !model.isBusy else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    if hostRouter.claimOpening(request) { openWindow(id: PunktfunkClientApp.mainSceneID) }
-                }
-                return
+        let kind: LinkArbiter.Kind =
+            switch request {
+            case .connect, .pair: .hostDial
+            case .browse, .wake: .hostOther
             }
-        case .browse, .wake:
-            break
+        let decision = LinkArbiter.decide(
+            kind: kind, isBusy: !linkSession.isIdle, isFront: isFrontWindow)
+        guard decision != .leave else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + LinkArbiter.delay) {
+                if hostRouter.claimOpening(request) { openWindow(id: PunktfunkClientApp.mainSceneID) }
+            }
+            return
         }
         _ = hostRouter.take()
         func saved(_ id: StoredHost.ID) -> StoredHost? { store.hosts.first { $0.id == id } }
@@ -696,7 +712,8 @@ struct ContentView: View {
     }
 
     #if os(iOS) || os(visionOS)
-    /// The Live Activity mode line, e.g. "2560×1440 @120 · HEVC · HDR", from the live connection.
+    /// The Live Activity mode line, e.g. "2560×1440 @120 · HEVC · HDR", from the live connection:
+    /// the decoded picture's size once a frame arrived, the mode's before.
     private func currentModeLine() -> String {
         guard let c = model.connection else { return "" }
         let codec: String
@@ -706,13 +723,51 @@ struct ContentView: View {
         case .av1: codec = "AV1"
         case .pyrowave: codec = "PyroWave"
         }
-        var line = "\(c.width)×\(c.height)"
+        var line = model.pictureText.isEmpty ? "\(c.width)×\(c.height)" : model.pictureText
         if c.refreshHz > 0 { line += " @\(c.refreshHz)" }
         line += " · \(codec)"
         if c.isHDR { line += " · HDR" }
         return line
     }
     #endif
+
+    #if os(iOS) || os(visionOS) || os(tvOS)
+    /// Perform what `BackgroundPolicy` decides for this window's session.
+    private func applyBackgroundPolicy() {
+        switch BackgroundPolicy.decide(
+            phase: model.phase, keepAlive: backgroundKeepAlive, minutes: backgroundTimeoutMinutes)
+        {
+        case .hold(let minutes): model.enterBackground(timeoutMinutes: minutes)
+        case .end: model.disconnect(deliberate: false)
+        case .none: break
+        }
+    }
+    #endif
+
+    /// The key window on a Mac, a foreground-active scene elsewhere.
+    private var isFrontWindow: Bool {
+        #if os(macOS)
+        controlActiveState == .key
+        #else
+        scenePhase == .active
+        #endif
+    }
+
+    /// The wake wait that ends in a connect. A wake alone starts no session, so a link may.
+    private var wakeToConnect: HostWaker.Waking? {
+        waker.waking.flatMap { $0.connectsAfter ? $0 : nil }
+    }
+
+    /// What a link sees of this window: busy with its session, or with a redial, a wake or a
+    /// profile fetch on its way to one. The host a redial or a wake is for counts as the live one.
+    private var linkSession: DeepLinkRouter.SessionState {
+        DeepLinkRouter.SessionState(
+            isIdle: LinkIdle.isIdle(
+                phase: model.phase, redialPending: model.redial != nil,
+                waking: wakeToConnect != nil, preDialFetch: flowLife.fetching),
+            activeHostID: model.activeHost?.id ?? model.redial?.host.id ?? wakeToConnect?.hostID,
+            activeHostName: model.activeHost?.displayName)
+    }
 
     /// Route a `punktfunk://` deep link into the existing connect path — the whole §2 grammar
     /// (design/client-deep-links.md): a stable id, a unique host name or an `addr[:port]`, with
@@ -725,20 +780,6 @@ struct ContentView: View {
     /// live session (same host → focus, different host → say so; NEVER tear one down on a
     /// background tap), and carries only references — a preset it can't honor refuses with a
     /// notice rather than streaming with the wrong settings.
-    #if os(iOS) || os(visionOS) || os(tvOS)
-    /// Hold a streaming session under the opt-in keep-alive, or end it.
-    private func applyBackgroundPolicy() {
-        guard model.phase == .streaming else { return }
-        if backgroundKeepAlive {
-            model.enterBackground(timeoutMinutes: backgroundTimeoutMinutes)
-        } else {
-            // Not deliberate: the user may come straight back, so let the host linger the
-            // display for a fast reconnect instead of tearing it down.
-            model.disconnect(deliberate: false)
-        }
-    }
-    #endif
-
     private func handleDeepLink(_ url: URL) {
         // Explicit intent beats the start-screen policy, and the two race on a cold start:
         // `.onOpenURL` and `.onAppear` have no guaranteed order. Claiming the once-per-process
@@ -752,7 +793,7 @@ struct ContentView: View {
             return // not ours — ignore it silently rather than warning about someone else's URL
         } catch {
             deepLinkNotice = (error as? DeepLinkError)?.message
-                ?? "That link is malformed and was ignored."
+                ?? String(localized: L10n.linkErrorMalformed)
             return
         }
         switch link.route {
@@ -768,16 +809,12 @@ struct ContentView: View {
         case .wake:
             // Still reserved: saying so beats silently connecting instead. (Shortcuts users have
             // the Wake Host intent, which never round-trips through a URL.)
-            deepLinkNotice = "Punktfunk links can't do “wake” yet."
+            deepLinkNotice = L10n.linkRouteUnsupported(route: "wake")
             return
         }
-        let session = DeepLinkRouter.SessionState(
-            isIdle: model.phase == .idle,
-            activeHostID: model.activeHost?.id,
-            activeHostName: model.activeHost?.displayName)
         switch DeepLinkRouter.resolve(
             link: link, hosts: store.hosts, catalog: presets.catalog,
-            session: session, browse: false
+            session: linkSession, browse: false
         ) {
         case .notice(let text):
             deepLinkNotice = text
@@ -803,13 +840,9 @@ struct ContentView: View {
     /// host can't be browsed — the library fetch rides the paired mTLS identity, so there is
     /// nothing to show before the host is saved (the notice says what to do instead).
     private func openLibrary(from link: DeepLink) {
-        let session = DeepLinkRouter.SessionState(
-            isIdle: model.phase == .idle,
-            activeHostID: model.activeHost?.id,
-            activeHostName: model.activeHost?.displayName)
         switch DeepLinkRouter.resolve(
             link: link, hosts: store.hosts, catalog: presets.catalog,
-            session: session, browse: true
+            session: linkSession, browse: true
         ) {
         case .notice(let text):
             deepLinkNotice = text
@@ -913,12 +946,21 @@ struct ContentView: View {
             entry: $libraryTarget, notice: $deepLinkNotice, pairing: pairingBinding,
             linkConfirm: $deepLinkConfirm, runLink: runDeepLinkConfirm,
             onFailed: { consoleFailed = true }, onPaired: handlePaired,
-            connect: { flow.connect($0, preset: $1, profile: .send($2)) },
+            connect: { flow.connect($0, preset: $1, profile: $2) },
             connectDiscovered: flow.connectDiscovered,
             requestAccess: flow.consoleRequestAccess,
             requestAccessDiscovered: flow.requestAccessDiscovered,
-            launchTitle: { launch($0, $1, profile: .send($2)) }, connectShelf: connectFromShelf,
-            wakeOnly: { flow.wakeOnly($0) }, awaitingApproval: awaitingApproval != nil)
+            launchTitle: { launch($0, $1, profile: $2) }, connectShelf: connectFromShelf,
+            wakeOnly: { flow.wakeOnly($0) }, onQuit: quitApp,
+            awaitingApproval: awaitingApproval != nil)
+    }
+
+    /// The console's exit question was answered yes. Only a Mac asks it: no other Apple app
+    /// may close itself.
+    private func quitApp() {
+        #if os(macOS)
+        NSApplication.shared.terminate(nil)
+        #endif
     }
 
     #if !os(macOS)
@@ -942,19 +984,23 @@ struct ContentView: View {
     @ViewBuilder private var touchTabs: some View {
         if #available(iOS 18, *) {
             TabView(selection: $touchTab) {
-                Tab("Hosts", systemImage: "desktopcomputer", value: TouchTab.hosts) { touchHome }
-                Tab("Library", systemImage: "square.grid.2x2", value: TouchTab.library) {
-                    libraryTab
-                }
+                Tab(
+                    String(localized: L10n.hostsTab), systemImage: "desktopcomputer",
+                    value: TouchTab.hosts
+                ) { touchHome }
+                Tab(
+                    String(localized: L10n.hostsTabLibrary), systemImage: "square.grid.2x2",
+                    value: TouchTab.library
+                ) { libraryTab }
             }
             .tabViewStyle(.sidebarAdaptable)
         } else {
             TabView(selection: $touchTab) {
                 touchHome
-                    .tabItem { Label("Hosts", systemImage: "desktopcomputer") }
+                    .tabItem { Label(L10n.hostsTab, systemImage: "desktopcomputer") }
                     .tag(TouchTab.hosts)
                 libraryTab
-                    .tabItem { Label("Library", systemImage: "square.grid.2x2") }
+                    .tabItem { Label(L10n.hostsTabLibrary, systemImage: "square.grid.2x2") }
                     .tag(TouchTab.library)
             }
         }
@@ -968,11 +1014,11 @@ struct ContentView: View {
                 .tabItem { TouchTab.hostsLabel }
                 .tag(TouchTab.hosts)
             libraryTab
-                .tabItem { Label("Library", systemImage: "square.grid.2x2") }
+                .tabItem { Label(L10n.hostsTabLibrary, systemImage: "square.grid.2x2") }
                 .tag(TouchTab.library)
             NavigationStack { SettingsView() }
                 .tvPushSlide()
-                .tabItem { Label("Settings", systemImage: "gearshape") }
+                .tabItem { Label(L10n.hostsTabSettings, systemImage: "gearshape") }
                 .tag(TouchTab.settings)
         }
     }
@@ -1028,7 +1074,6 @@ struct ContentView: View {
             if let fp = pendingFingerprint {
                 TrustCardView(
                     fingerprint: fp,
-                    hostName: model.activeHost?.displayName ?? "host",
                     onCancel: { model.rejectTrust() },
                     onTrust: {
                         if let fp = model.confirmTrust(), let host = model.activeHost {
@@ -1059,13 +1104,10 @@ struct ContentView: View {
         #else
         .background(Color.black)
         .ignoresSafeArea()
-        // SWALLOW Menu/B during a session — a game controller's B button ALSO surfaces as this
-        // UIKit menu press, so the old instant-disconnect here ended the session on every B
-        // press in gameplay. The button still reaches the host via GamepadCapture; the
-        // DELIBERATE exits are holding the remote's Back ≥ 1 s (SiriRemotePointer) and holding
-        // L1+R1+Start+Select ≥ 1.5 s on a pad (GamepadCapture's escape chord), both surfaced by
-        // the start-of-stream banner. The empty handler is what keeps the press from bubbling
-        // out and suspending the app.
+        // Swallow Menu/B during a session: a pad's B is also this UIKit menu press, and unhandled
+        // it bubbles out and suspends the app. B still reaches the host via GamepadCapture. The
+        // exits are deliberate holds of 1 s: the remote's Back (SiriRemotePointer) and the pad's
+        // L1+R1+Start+Select (GamepadCapture), both named by the start-of-stream banner.
         .onExitCommand {}
         #endif
     }
@@ -1076,8 +1118,9 @@ struct ContentView: View {
     private var flow: ConnectFlow {
         ConnectFlow(
             model: model, store: store, presets: presets, discovery: discovery, waker: waker,
-            autoWake: $autoWakeEnabled, approvalChoice: $approvalChoice,
-            awaitingApproval: $awaitingApproval, profileAsk: $profileAsk, seatWait: $seatWait)
+            life: flowLife, autoWake: $autoWakeEnabled, approvalChoice: $approvalChoice,
+            awaitingApproval: $awaitingApproval, profileAsk: $profileAsk, seatWait: $seatWait,
+            unlockAsk: $unlockAsk)
     }
 
     /// A title picked on a library shelf: dial its host, booting straight into that title — with

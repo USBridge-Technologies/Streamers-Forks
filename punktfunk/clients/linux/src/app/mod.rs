@@ -10,6 +10,7 @@ pub mod gate;
 mod host_ops;
 mod profile;
 pub mod spawn;
+mod unlock;
 
 use crate::hosts::{self, ConnectRequest, HostsMsg, HostsOutput, HostsPage, Phase};
 use crate::library::{LibraryInit, LibraryMsg, LibraryOutput, LibraryPage};
@@ -19,11 +20,12 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use pf_client_core::orchestrate::{
     self, trust_route, ConnectAttempt, ConnectOutcome, ExitRoute, HostTarget, TrustRoute,
-    FINGERPRINT_CHANGED,
 };
 use pf_client_core::profiles::{ListedProfile as ProfileRow, ProfilePick};
 use pf_client_core::settings::GamepadUi;
 use pf_client_core::start;
+use pf_client_core::unlock::{starting_line, Pending};
+use pf_l10n::{client, desktop};
 use relm4::prelude::*;
 use spawn::{CancelHandle, SpawnOpts};
 use std::cell::RefCell;
@@ -113,6 +115,25 @@ pub enum AppMsg {
     },
     /// The seat dialog closed by Cancel or Escape.
     SeatCancelled(Arc<AtomicBool>),
+    /// The password prompt for `row`, with `error` above its field.
+    UnlockPrompt {
+        req: ConnectRequest,
+        fp_hex: String,
+        row: ProfileRow,
+        redial: bool,
+        error: Option<String>,
+    },
+    /// The host refused profile `id`'s unlock; its list came back for the prompt (`None`: the
+    /// read failed or ran late).
+    UnlockReasked {
+        req: ConnectRequest,
+        fp_hex: String,
+        id: String,
+        error: Option<String>,
+        /// The refused dial carried an unlock.
+        sent: bool,
+        listed: Option<Option<Vec<ProfileRow>>>,
+    },
     /// Show a destination by its view name.
     ShowView(&'static str),
     Find,
@@ -172,6 +193,8 @@ pub enum AppMsg {
     /// End this card key's stream the way its window does, or every stream with `None`.
     Disconnect(Option<String>),
     Toast(String),
+    /// A title left the Library's shelf: the line, with Undo for the title's id.
+    Hidden(String, String),
     /// A plain connect the host parked for its operator: show the waiting dialog.
     AwaitingApproval(ConnectRequest),
 }
@@ -328,14 +351,20 @@ impl SimpleComponent for AppModel {
                 LibraryOutput::Connect(req) => AppMsg::Connect(req),
                 LibraryOutput::WakeConnect(req) => AppMsg::WakeConnect(req),
                 LibraryOutput::Toast(msg) => AppMsg::Toast(msg),
+                LibraryOutput::Hidden(msg, id) => AppMsg::Hidden(msg, id),
                 LibraryOutput::ShowHosts => AppMsg::ShowView("hosts"),
                 LibraryOutput::Pair(req) => AppMsg::Pair(req),
             });
-        views.add_titled_with_icon(hosts.widget(), Some("hosts"), "Hosts", "computer-symbolic");
+        views.add_titled_with_icon(
+            hosts.widget(),
+            Some("hosts"),
+            client::hosts_tab(),
+            "computer-symbolic",
+        );
         views.add_titled_with_icon(
             library.widget(),
             Some("library"),
-            "Library",
+            client::hosts_tab_library(),
             "applications-games-symbolic",
         );
         let pages = [hosts.widget().clone(), library.widget().clone()];
@@ -519,6 +548,21 @@ impl SimpleComponent for AppModel {
             } => self.profile_reasked(req, fp_hex, id, msg, listed, &sender),
             AppMsg::SeatPolled { stop, row } => self.seat_polled(stop, row, &sender),
             AppMsg::SeatCancelled(stop) => self.seat_cancelled(&stop),
+            AppMsg::UnlockPrompt {
+                req,
+                fp_hex,
+                row,
+                redial,
+                error,
+            } => self.unlock_prompt(req, fp_hex, row, redial, error, &sender),
+            AppMsg::UnlockReasked {
+                req,
+                fp_hex,
+                id,
+                error,
+                sent,
+                listed,
+            } => self.unlock_reasked(req, fp_hex, id, error, sent, listed, &sender),
             AppMsg::SendLogs(req, mgmt_port) => self.send_logs(req, mgmt_port, &sender),
             AppMsg::HostAction {
                 req,
@@ -583,7 +627,9 @@ impl SimpleComponent for AppModel {
                 crate::settings::Scope::Defaults,
             )),
             AppMsg::ShowPreferencesScoped(scope) => self.show_preferences(scope, &sender),
-            AppMsg::ShowShortcuts => shortcuts_dialog().present(Some(&self.window)),
+            AppMsg::ShowShortcuts => {
+                shortcuts_dialog(&self.store.settings()).present(Some(&self.window))
+            }
             AppMsg::ShowAbout => crate::settings::show_about(&self.window),
             AppMsg::ShowAddHost => self.hosts.emit(HostsMsg::ShowAddHost),
             AppMsg::Disconnect(key) => {
@@ -591,18 +637,45 @@ impl SimpleComponent for AppModel {
                 self.show_streams();
             }
             AppMsg::Toast(msg) => self.toast(&msg),
+            AppMsg::Hidden(msg, id) => {
+                let toast = plain_toast(&msg);
+                toast.set_button_label(Some(pf_l10n::common::common_undo()));
+                let library = self.library.sender().clone();
+                toast.connect_button_clicked(move |_| {
+                    library.emit(LibraryMsg::SetHidden(id.clone(), false));
+                });
+                self.toasts.add_toast(toast);
+            }
             AppMsg::AwaitingApproval(req) => {
                 let flight = self.flights.of(&req.card_key());
-                // A request for access already shows it.
+                // A request for access already shows it. A dial with an unlock waits for its
+                // desktop to start, which is a progress line, not an approval.
                 if flight.waiting.borrow().is_none() {
                     if let connect::Slot::Session(child, _) = &flight.slot {
                         let child = child.clone();
-                        gate::present_waiting(
-                            &self.window,
-                            &flight.waiting,
-                            &req.host.name,
-                            move || child.terminate(DISCONNECT_GRACE),
-                        );
+                        let cancel = move || child.terminate(DISCONNECT_GRACE);
+                        let name = &req.host.name;
+                        match flight.attempt.on_pending() {
+                            Pending::Starting => {
+                                let line = starting_line(name);
+                                gate::present_wait(
+                                    &self.window,
+                                    &flight.waiting,
+                                    &line,
+                                    None,
+                                    cancel,
+                                );
+                            }
+                            Pending::Approval => {
+                                gate::present_waiting(
+                                    &self.window,
+                                    &flight.waiting,
+                                    name,
+                                    &self.identity,
+                                    cancel,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -610,9 +683,17 @@ impl SimpleComponent for AppModel {
     }
 }
 
+/// A toast that shows `msg` as written. A toast reads markup unless told not to, and these
+/// carry a host's name, a game's title or a link's text.
+fn plain_toast(msg: &str) -> adw::Toast {
+    let toast = adw::Toast::new(msg);
+    toast.set_use_markup(false);
+    toast
+}
+
 impl AppModel {
     pub fn toast(&self, msg: &str) {
-        self.toasts.add_toast(adw::Toast::new(msg));
+        self.toasts.add_toast(plain_toast(msg));
     }
 
     /// A destination, over any host page pushed on top of it.
@@ -690,6 +771,26 @@ fn clear_steam_sdl_device_filter() {
     }
 }
 
+/// Reads the OS's languages into `pf_l10n`. GTK and libadwaita translate their own strings
+/// through gettext; while Punktfunk reads English, their messages stay English too, so one
+/// window never mixes two languages. Every other locale category follows the OS. Call before
+/// GTK starts and before any other thread exists.
+#[allow(unsafe_code)]
+fn set_language() {
+    // Another language leaves GTK on the OS's list; matching it needs `LANGUAGE` narrowed.
+    if pf_l10n::set_languages(&pf_l10n::os_languages()) != "en" {
+        return;
+    }
+    gtk::disable_setlocale();
+    // gettext ignores `LANGUAGE` while messages are in the C locale.
+    // SAFETY: GTK has not started and no other thread exists, so nothing reads the locale
+    // while it changes. Both arguments are NUL-terminated literals.
+    unsafe {
+        libc::setlocale(libc::LC_ALL, c"".as_ptr());
+        libc::setlocale(libc::LC_MESSAGES, c"C".as_ptr());
+    }
+}
+
 pub fn run() -> glib::ExitCode {
     // Logs to stdout and the ring "Send logs to host" uploads. The spawned session's stderr
     // joins the ring too, so a bundle carries the stream's trail. Colour only on a terminal.
@@ -722,6 +823,7 @@ pub fn run() -> glib::ExitCode {
     {
         return crate::cli::exec_session();
     }
+    set_language();
 
     // HANDLES_OPEN is what makes `Exec=punktfunk-client %u` work: GApplication turns the URI
     // into an `open` call, and — this is the part that matters — a SECOND invocation forwards
@@ -821,29 +923,60 @@ fn install_actions(window: &adw::ApplicationWindow, sender: &ComponentSender<App
     }
 }
 
+/// A window key: what it does, the action it triggers, its accelerators.
+type Accel = (fn() -> &'static str, &'static str, &'static [&'static str]);
+
 /// The window's keys, as the shortcuts dialog lists them.
-const ACCELS: &[(&str, &str, &[&str])] = &[
-    ("Show Hosts", "win.show-hosts", &["<Control>1"]),
-    ("Show Library", "win.show-library", &["<Control>2"]),
-    ("Search the Library", "win.find", &["<Control>f"]),
-    ("Add a host", "win.add-host", &["<Control>n"]),
-    ("Rescan or reload", "win.reload", &["<Control>r", "F5"]),
-    ("Preferences", "win.preferences", &["<Control>comma"]),
+const ACCELS: &[Accel] = &[
     (
-        "Keyboard shortcuts",
+        desktop::desktop_accel_show_hosts,
+        "win.show-hosts",
+        &["<Control>1"],
+    ),
+    (
+        desktop::desktop_accel_show_library,
+        "win.show-library",
+        &["<Control>2"],
+    ),
+    (
+        desktop::desktop_accel_search_library,
+        "win.find",
+        &["<Control>f"],
+    ),
+    (
+        desktop::desktop_accel_add_host,
+        "win.add-host",
+        &["<Control>n"],
+    ),
+    (
+        desktop::desktop_accel_reload,
+        "win.reload",
+        &["<Control>r", "F5"],
+    ),
+    (
+        desktop::desktop_accel_preferences,
+        "win.preferences",
+        &["<Control>comma"],
+    ),
+    (
+        desktop::desktop_accel_shortcuts,
         "win.shortcuts",
         &["<Control>question"],
     ),
-    ("Toggle fullscreen", "win.fullscreen", &["F11"]),
     (
-        "Close the window",
+        desktop::desktop_accel_fullscreen,
+        "win.fullscreen",
+        &["F11"],
+    ),
+    (
+        desktop::desktop_accel_close_window,
         "window.close",
         &["<Control>w", "<Control>q"],
     ),
 ];
 
 /// The `Settings::extra` key the window's size is kept under: width, height, maximized.
-const WINDOW_KEY: &str = "shell_window";
+const WINDOW_KEY: &str = pf_client_core::settings::SHELL_WINDOW_KEY;
 
 /// Open at the size the window last closed at, and keep it on close.
 fn remember_size(window: &adw::ApplicationWindow, store: &Rc<Store>) {
@@ -910,64 +1043,42 @@ impl Banners {
 fn store_health_banner(pages: &[adw::ToolbarView], store: &Store) {
     let banners = Banners::new(pages, || {});
     let check = move || match pf_client_core::trust::store_health::last_error() {
-        Some(_) => banners.show(
-            "Your changes aren\u{2019}t being saved \u{2014} Punktfunk can\u{2019}t write to its \
-             settings folder.",
-            None,
-        ),
+        Some(_) => banners.show(desktop::desktop_store_unsaved_body(), None),
         None => banners.hide(),
     };
     check();
     store.subscribe(move |_| check());
 }
 
-/// The Keyboard Shortcuts dialog: this window's keys, then the session window's, then the
-/// controller chords and touch gestures, which have no accelerator to draw.
-pub fn shortcuts_dialog() -> adw::ShortcutsDialog {
+/// The Keyboard Shortcuts dialog: this window's keys, then the stream's shortcuts as `s`
+/// binds them, each chord as text since the player may have moved it anywhere.
+pub fn shortcuts_dialog(s: &crate::trust::Settings) -> adw::ShortcutsDialog {
     let dialog = adw::ShortcutsDialog::new();
-    for section in shortcut_sections() {
+    for section in shortcut_sections(s) {
         dialog.add(section);
     }
     dialog
 }
 
-fn shortcut_sections() -> Vec<adw::ShortcutsSection> {
-    use pf_client_core::shortcuts;
-    let shell = adw::ShortcutsSection::new(Some("This window"));
+fn shortcut_sections(s: &crate::trust::Settings) -> Vec<adw::ShortcutsSection> {
+    use pf_client_core::overlay_actions::{OverlayConfig, RingPlatform};
+    use pf_client_core::shortcuts::{Client, Kind};
+    let shell = adw::ShortcutsSection::new(Some(desktop::desktop_shortcuts_this_window()));
     for (title, action, _) in ACCELS {
-        shell.add(adw::ShortcutsItem::from_action(title, action));
+        shell.add(adw::ShortcutsItem::from_action(title(), action));
     }
-    let stream = adw::ShortcutsSection::new(Some("Stream (session window)"));
-    for (title, accel) in [
-        ("Toggle fullscreen", "F11 <Alt>Return"),
-        (
-            "Release captured input (click the stream to capture)",
-            "<Control><Alt><Shift>q",
-        ),
-        ("Disconnect", "<Control><Alt><Shift>d"),
-        (
-            "Cycle the statistics overlay (off · compact · normal · detailed)",
-            "<Control><Alt><Shift>s",
-        ),
-        (
-            "Mute or unmute your microphone (only while the stream sends one)",
-            "<Control><Alt><Shift>v",
-        ),
-        ("Open the quick actions dial", "<Control><Alt><Shift>o"),
-        ("Switch the mouse mode", "<Control><Alt><Shift>m"),
-    ] {
-        stream.add(adw::ShortcutsItem::new(title, accel));
-    }
-    let mut sections = vec![shell, stream];
-    // The keyboard group is the sections above; the rest read from the shared list.
-    for g in shortcuts::groups(shortcuts::Client::Desktop, true)
-        .into_iter()
-        .filter(|g| g.title != "Keyboard")
-    {
-        let section = adw::ShortcutsSection::new(Some(g.title));
+    let mut sections = vec![shell];
+    let stream = crate::settings::shortcuts::live(&s.shortcuts, &s.guide_gesture);
+    let ring = OverlayConfig::parse(&s.overlay_actions, RingPlatform::Desktop);
+    for g in stream.rows_in(&ring, Client::Desktop, true) {
+        let title = match g.kind {
+            Kind::Keyboard => desktop::desktop_shortcuts_stream_window().into(),
+            _ => g.heading(),
+        };
+        let section = adw::ShortcutsSection::new(Some(&title));
         for i in g.items {
-            let item = adw::ShortcutsItem::new(i.text, "");
-            item.set_subtitle(i.keys);
+            let item = adw::ShortcutsItem::new(&i.text(), "");
+            item.set_subtitle(&i.keys.to_string());
             section.add(item);
         }
         sections.push(section);
@@ -985,9 +1096,10 @@ mod shortcuts_tests {
     fn shortcuts_dialog_lists_the_controller_chords() {
         use adw::prelude::*;
         assert!(gtk::init().is_ok() && adw::init().is_ok(), "no display");
-        let _ = super::shortcuts_dialog();
+        let s = crate::trust::Settings::default();
+        let _ = super::shortcuts_dialog(&s);
         let mut found = false;
-        for section in super::shortcut_sections() {
+        for section in super::shortcut_sections(&s) {
             assert!(section.n_items() > 0, "{:?} is empty", section.title());
             for i in 0..section.n_items() {
                 let item = section

@@ -8,7 +8,7 @@ import {
 	pluginSurfaceOrThrow,
 	refusalText,
 } from "@/api/pluginSurface";
-import { PasswordConfirmDialog } from "@/components/password-confirm";
+import { HandOverDialog } from "@/components/password-confirm";
 import {
 	type JsonObject,
 	type JsonSchemaDoc,
@@ -22,8 +22,11 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
-import { newlyHanded } from "@/lib/handed-paths";
+import { type GrantRefusal, type Handover, handover } from "@/lib/handed-paths";
+import { apiText } from "@/lib/host-messages";
+import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
+import { StreamControls } from "./Stream";
 
 /**
  * A library source's settings, rendered as a **generic form** from the plugin's own JSON Schema.
@@ -38,15 +41,24 @@ import { m } from "@/paraglide/messages";
  *
  * `config` is optional on the kit's `serveUi`, so a source that ships its own page may serve no
  * `__config` at all. That 404 points at the plugin's page instead of reporting a failure.
+ *
+ * A game source also shows the stream settings its titles take when they have none of their
+ * own; those save as each control changes, apart from the form. A profile's view shows only
+ * those: the form is the owner's library's.
  */
 export const SourceSettingsDialog: FC<{
 	/** A game source, or an Art & Metadata source by its plugin id. */
 	source: Pick<ScannerInfo, "id" | "label" | "provider">;
+	/** A game source: its titles' stream settings show below the form. */
+	stream?: boolean;
+	/** The plugin's own form; off, the stream settings alone. */
+	form?: boolean;
 	onClose: () => void;
-}> = ({ source, onClose }) => {
+}> = ({ source, stream, form = true, onClose }) => {
 	const pluginId = source.provider ?? source.id;
 	const configUrl = `/api/plugin-config/${pluginId}`;
 	const config = useQuery({
+		enabled: form,
 		queryKey: ["plugin-config", pluginId],
 		queryFn: async () => {
 			const r = await pluginSurface<{
@@ -72,15 +84,30 @@ export const SourceSettingsDialog: FC<{
 	});
 	const [saving, setSaving] = useState(false);
 	// A save that hands a folder over waits for the console password.
-	const [asking, setAsking] = useState<JsonObject | null>(null);
+	const [asking, setAsking] = useState<{
+		value: JsonObject;
+		handover: Handover;
+	} | null>(null);
 
-	const put = async (value: JsonObject, password?: string) => {
+	const put = async (
+		value: JsonObject,
+		handed?: Handover,
+		password?: string,
+	) => {
 		const saved = await pluginSurfaceOrThrow<{
-			access?: { refused?: { path: string; error: string }[] };
-		} | null>(configUrl, { method: "PUT", body: value, password });
+			access?: { refused?: GrantRefusal[] };
+		} | null>(configUrl, {
+			method: "PUT",
+			body: value,
+			handover: handed,
+			password,
+		});
 		for (const r of saved?.access?.refused ?? []) {
 			toast.error(
-				m.plugin_form_grant_refused({ path: r.path, issue: r.error }),
+				m.plugin_form_grant_refused({
+					path: r.path,
+					issue: apiText(r.code, r.params, r.error),
+				}),
 			);
 		}
 		toast.success(m.library_source_settings_saved());
@@ -88,13 +115,16 @@ export const SourceSettingsDialog: FC<{
 	};
 	const save = async (value: JsonObject) => {
 		const loaded = config.data?.tag === "ready" ? config.data : null;
-		if (loaded && newlyHanded(loaded.schema, loaded.value, value).length) {
-			setAsking(value);
+		const handed = loaded
+			? handover(loaded.schema, loaded.value, value)
+			: undefined;
+		if (handed?.grant.length) {
+			setAsking({ value, handover: handed });
 			return;
 		}
 		setSaving(true);
 		try {
-			await put(value);
+			await put(value, handed);
 		} catch (e) {
 			toast.error(
 				m.library_source_settings_failed({
@@ -108,13 +138,13 @@ export const SourceSettingsDialog: FC<{
 
 	return (
 		<Dialog open onOpenChange={(open) => !open && onClose()}>
-			<DialogContent>
+			<DialogContent className="max-h-[85vh] overflow-y-auto">
 				<DialogHeader>
 					<DialogTitle>
 						{m.library_source_settings_title({ source: source.label })}
 					</DialogTitle>
 				</DialogHeader>
-				{config.isPending && <Spinner />}
+				{form && config.isPending && <Spinner />}
 				{config.isError && !config.data && (
 					<p className="text-sm text-destructive">
 						{m.library_source_settings_unreachable({
@@ -143,15 +173,30 @@ export const SourceSettingsDialog: FC<{
 						onSave={save}
 					/>
 				)}
+				{stream && (
+					<section
+						className={cn("@container space-y-4", form && "border-t pt-4")}
+					>
+						<div className="space-y-1">
+							<h3 className="font-semibold">
+								{m.library_stream_source_title({ source: source.label })}
+							</h3>
+							<p className="text-sm text-muted-foreground">
+								{m.library_stream_hint()}
+							</p>
+						</div>
+						<StreamControls kind="source" id={source.id} />
+					</section>
+				)}
 			</DialogContent>
-			<PasswordConfirmDialog
+			<HandOverDialog
 				open={asking !== null}
 				id="plugin-form-password"
-				title={m.plugin_form_confirm_title()}
-				body={m.plugin_form_confirm_body({ plugin: source.label })}
+				plugin={source.label}
+				paths={asking?.handover.grant ?? []}
 				submitLabel={m.library_source_settings_save()}
 				onSubmit={async (password) => {
-					if (asking) await put(asking, password);
+					if (asking) await put(asking.value, asking.handover, password);
 				}}
 				onClose={() => setAsking(null)}
 			/>

@@ -13,10 +13,11 @@ use pf_console_ui::bridge::{
 };
 use pf_console_ui::console::FrameCost;
 use pf_console_ui::{
-    Console, ConsoleEntry, ConsoleHandles, HostRow, InputSource, Insets, LicenseSection,
-    PadTestState, PairStatus, Platform, ProfilesAnswer, Prompt, SnapshotStore, SpeedPhase,
-    Viewport, WakeStatus,
+    Console, ConsoleEntry, ConsoleHandles, HiddenAnswer, HideAnswer, HostRow, InputSource, Insets,
+    LicenseSection, PadTestState, PairStatus, Platform, ProfilesAnswer, Prompt, SnapshotStore,
+    SpeedPhase, Viewport, WakeStatus,
 };
+use punktfunk_core::quic::v2::msg::{ProfileUnlock, UNLOCK_PASSWORD, UNLOCK_PASSWORD_MAX};
 use skia_safe::gpu::{self, mtl, DirectContext, SurfaceOrigin};
 use skia_safe::ColorType;
 use std::collections::VecDeque;
@@ -96,6 +97,15 @@ pub const PUNKTFUNK_CONSOLE_PUSH_PAD_TEST: u8 = 18;
 /// `{"fp_hex": "…", "answer": ProfilesAnswer}` — the answer to the `FetchProfiles` command:
 /// `{"Listed": [rows]}`, `"NoProfiles"` or `{"Failed": "why"}`.
 pub const PUNKTFUNK_CONSOLE_PUSH_PROFILES: u8 = 20;
+/// `{"fp_hex": "…", "profile": "…", "answer": HiddenAnswer}` — the answer to the `FetchHidden`
+/// command: `{"Listed": [LibraryGame]}` or `{"Failed": "why"}`.
+pub const PUNKTFUNK_CONSOLE_PUSH_HIDDEN: u8 = 21;
+/// `HideAnswer` — the answer to the `SetHidden` command, echoing its host, profile and title.
+pub const PUNKTFUNK_CONSOLE_PUSH_HIDE: u8 = 22;
+
+/// The room `punktfunk_console_take_unlock` needs: the longest password the wire takes.
+pub const PUNKTFUNK_CONSOLE_UNLOCK_MAX: usize = 512;
+const _: () = assert!(PUNKTFUNK_CONSOLE_UNLOCK_MAX == UNLOCK_PASSWORD_MAX);
 
 /// One console. Opaque to C.
 pub struct PunktfunkConsole {
@@ -226,7 +236,8 @@ pub unsafe extern "C" fn punktfunk_console_new(
         let cache_bytes = opts.gpu_cache_bytes;
         // SAFETY: a live device and a queue on it, per this function's contract; Skia retains
         // both for the context's lifetime.
-        let backend = unsafe { mtl::BackendContext::new(mtl_device as _, mtl_queue as _) };
+        let backend =
+            unsafe { mtl::BackendContext::new(mtl_device.cast_const(), mtl_queue.cast_const()) };
         let Some(mut context) = gpu::direct_contexts::make_metal(&backend, None) else {
             tracing::error!("console: Skia's Metal context did not come up");
             return std::ptr::null_mut();
@@ -282,8 +293,8 @@ pub unsafe extern "C" fn punktfunk_console_free(c: *mut PunktfunkConsole) {
 }
 
 /// Draw one frame into `mtl_texture` (`width`×`height`) and submit it to the queue.
-/// `scale` is design units per pixel; `0` takes the shell's own formula. `false` = nothing
-/// drawn (idle, or the texture could not be wrapped): present nothing.
+/// `scale` is device pixels per design unit; `0` takes the shell's own formula. `false` =
+/// nothing drawn (idle, or the texture could not be wrapped): present nothing.
 ///
 /// # Safety
 /// `c` is live. `mtl_texture` is an `id<MTLTexture>` from the console's device, render-target
@@ -322,7 +333,7 @@ pub unsafe extern "C" fn punktfunk_console_frame(
         }
         // SAFETY: a live texture from this device, per the contract; Skia retains it while
         // the render target lives.
-        let info = unsafe { mtl::TextureInfo::new(mtl_texture as _) };
+        let info = unsafe { mtl::TextureInfo::new(mtl_texture.cast_const()) };
         let target = gpu::backend_render_targets::make_mtl((width as i32, height as i32), &info);
         let mut wrapped = None;
         for ct in std::iter::once(shell.color_type).chain(COLOR_TYPES) {
@@ -540,7 +551,8 @@ pub unsafe extern "C" fn punktfunk_console_text(c: *const PunktfunkConsole, utf8
 }
 
 /// Where the session the console asked for stands: 0 connecting, 1 streaming, 2 failed,
-/// 3 ended (`message` NULL or empty = clean), 4 reconnecting.
+/// 3 ended (`message` NULL or empty = clean), 4 reconnecting, 6 awaiting approval, 7 failed
+/// as `profile-locked` (`message` the host's sentence, empty when it said none).
 ///
 /// # Safety
 /// `c` is live; `message` is NULL or a NUL-terminated string.
@@ -555,15 +567,58 @@ pub unsafe extern "C" fn punktfunk_console_phase(
         let (Some(c), msg) = (unsafe { c.as_ref() }, unsafe { str_arg(message) }) else {
             return;
         };
-        let Some(phase) = bridge::phase_code(phase, msg.unwrap_or("")) else {
+        let (code, Some(phase)) = (phase, bridge::phase_code(phase, msg.unwrap_or(""))) else {
             return;
         };
         let Some(mut shell) = c.shell() else {
             return;
         };
+        if code == bridge::PHASE_PROFILE_LOCKED {
+            shell.console.profile_locked();
+        }
         shell.console.session_phase(phase);
         c.publish(&mut shell);
     })
+}
+
+/// Moves the password the console's prompt typed for the `Launch` it just raised into `out`,
+/// its "Stay signed in" switch into `*stay`, and returns its length: 0 when the console holds
+/// none. The console's copy is wiped either way, so call it once per `Launch`, first.
+///
+/// # Safety
+/// `c` is live; `out` is NULL or `cap` writable bytes; `stay` is NULL or a writable `bool`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_take_unlock(
+    c: *const PunktfunkConsole,
+    out: *mut u8,
+    cap: usize,
+    stay: *mut bool,
+) -> usize {
+    guard(0, || {
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return 0;
+        };
+        let taken = c.handles.console.take_unlock();
+        if out.is_null() || stay.is_null() {
+            return 0;
+        }
+        // SAFETY: `out` is `cap` writable bytes and `stay` a writable `bool`, per the contract.
+        let (out, stay) = unsafe { (std::slice::from_raw_parts_mut(out, cap), &mut *stay) };
+        hand_over(taken, out, stay)
+    })
+}
+
+/// Copies a password unlock that fits into `out` and answers its length; anything else answers
+/// 0. `unlock` wipes as it drops.
+fn hand_over(unlock: Option<ProfileUnlock>, out: &mut [u8], stay: &mut bool) -> usize {
+    let Some(u) = unlock.filter(|u| u.kind == UNLOCK_PASSWORD && u.secret.len() <= out.len())
+    else {
+        return 0;
+    };
+    out[..u.secret.len()].copy_from_slice(&u.secret);
+    *stay = u.stay_signed_in;
+    u.secret.len()
 }
 
 #[derive(serde::Deserialize)]
@@ -576,6 +631,13 @@ struct SpeedJson {
 struct ProfilesJson {
     fp_hex: String,
     answer: ProfilesAnswer,
+}
+
+#[derive(serde::Deserialize)]
+struct HiddenJson {
+    fp_hex: String,
+    profile: String,
+    answer: HiddenAnswer,
 }
 
 /// Hand the console a model update; `kind` is a `PUNKTFUNK_CONSOLE_PUSH_*`. A bad kind or bad
@@ -609,6 +671,11 @@ pub unsafe extern "C" fn punktfunk_console_push(
             }
             PUNKTFUNK_CONSOLE_PUSH_PROFILES => {
                 json::<ProfilesJson>(text).map(|v| console.set_profiles(&v.fp_hex, v.answer))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_HIDDEN => json::<HiddenJson>(text)
+                .map(|v| console.set_hidden_list(&v.fp_hex, &v.profile, v.answer)),
+            PUNKTFUNK_CONSOLE_PUSH_HIDE => {
+                json::<HideAnswer>(text).map(|v| console.set_hide_answer(v))
             }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_BEGIN => {
                 library.begin_fetch();
@@ -741,9 +808,26 @@ pub unsafe extern "C" fn punktfunk_console_drain_cmds(c: *const PunktfunkConsole
 pub extern "C" fn punktfunk_console_palettes() -> *mut c_char {
     guard(std::ptr::null_mut(), || {
         let list: Vec<_> = (pf_console_ui::palette::PALETTES.iter())
-            .map(|p| serde_json::json!({ "id": p.id, "name": p.name }))
+            .map(|p| serde_json::json!({ "id": p.id, "name": (p.name)() }))
             .collect();
         out_string(serde_json::Value::from(list).to_string())
+    })
+}
+
+/// Word the Rust side's text in the first of `languages_json` that Punktfunk ships, a JSON
+/// array of BCP-47 tags, most preferred first. `punktfunk_console_new` does this from its
+/// `languages`; call it first when the palettes or the PyroWave warning are read with no
+/// console. NULL or bad JSON leaves the language as it was.
+///
+/// # Safety
+/// `languages_json` is NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_set_languages(languages_json: *const c_char) {
+    guard((), || {
+        // SAFETY: NULL or NUL-terminated per this function's contract.
+        if let Some(tags) = unsafe { str_arg(languages_json) }.and_then(json::<Vec<String>>) {
+            pf_l10n::set_languages(&tags);
+        }
     })
 }
 
@@ -757,5 +841,86 @@ pub unsafe extern "C" fn punktfunk_console_string_free(s: *mut c_char) {
     if !s.is_null() {
         // SAFETY: from `CString::into_raw` in this module, freed once, per the contract.
         drop(unsafe { CString::from_raw(s) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::quic::v2::msg::{Zeroizing, UNLOCK_KEY_PROOF};
+
+    fn unlock(kind: u8, secret: &[u8], stay: bool) -> ProfileUnlock {
+        ProfileUnlock::new(kind, Zeroizing::new(secret.to_vec()), stay, 0, Vec::new()).unwrap()
+    }
+
+    /// The palette names the picker offers are messages, read in the thread's language.
+    #[test]
+    fn palette_names_are_worded_from_messages() {
+        let names = |tag: &str| {
+            pf_l10n::with_language(tag, || {
+                let raw = punktfunk_console_palettes();
+                // SAFETY: a NUL-terminated string from `punktfunk_console_palettes`, freed once.
+                let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+                // SAFETY: as above, and not used again.
+                unsafe { punktfunk_console_string_free(raw) };
+                serde_json::from_str::<Vec<serde_json::Value>>(&text).unwrap()
+            })
+        };
+        let (plain, pseudo) = (names("en"), names("en-XA"));
+        assert!(!plain.is_empty());
+        for (p, x) in plain.iter().zip(&pseudo) {
+            assert_eq!(p["id"], x["id"]);
+            assert!(!p["name"].as_str().unwrap().starts_with('['));
+            assert!(x["name"].as_str().unwrap().starts_with('['));
+        }
+    }
+
+    /// Bad input leaves the language alone; a list it ships is taken.
+    #[test]
+    fn set_languages_takes_a_list_and_ignores_the_rest() {
+        let before = pf_l10n::language();
+        // SAFETY: NULL, or a NUL-terminated literal.
+        unsafe {
+            punktfunk_console_set_languages(std::ptr::null());
+            punktfunk_console_set_languages(c"not json".as_ptr());
+            assert_eq!(pf_l10n::language(), before);
+            punktfunk_console_set_languages(c"[\"en-GB\"]".as_ptr());
+        }
+        assert_eq!(pf_l10n::language(), "en");
+    }
+
+    /// A password that fits goes over with its switch. One that does not fit, a key proof and
+    /// nothing at all leave the buffer and the switch untouched.
+    #[test]
+    fn only_a_password_that_fits_is_handed_over() {
+        let (mut out, mut stay) = ([0u8; 8], false);
+        let fits = Some(unlock(UNLOCK_PASSWORD, b"pw!", true));
+        assert_eq!(hand_over(fits, &mut out, &mut stay), 3);
+        assert_eq!((&out[..4], stay), (&b"pw!\0"[..], true));
+        let (mut small, mut stay) = ([0u8; 2], false);
+        let long = Some(unlock(UNLOCK_PASSWORD, b"pw!", true));
+        assert_eq!(hand_over(long, &mut small, &mut stay), 0);
+        let proof = Some(unlock(UNLOCK_KEY_PROOF, b"sig", false));
+        assert_eq!(hand_over(proof, &mut small, &mut stay), 0);
+        assert_eq!(hand_over(None, &mut small, &mut stay), 0);
+        assert_eq!((small, stay), ([0, 0], false));
+    }
+
+    /// The hide pushes read every bridge sample: a `HiddenAnswer` under its host and profile,
+    /// a `HideAnswer` as it stands.
+    #[test]
+    fn hide_pushes_read_the_bridge_samples() {
+        let raw = include_str!("../../../shared/console-bridge-vectors.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
+        for answer in doc["models"]["HiddenAnswer"].as_array().unwrap() {
+            let push = serde_json::json!({"fp_hex": "ab12", "profile": "p", "answer": answer});
+            assert!(json::<HiddenJson>(&push.to_string()).is_some(), "{push}");
+        }
+        for answer in doc["models"]["HideAnswer"].as_array().unwrap() {
+            assert!(
+                json::<HideAnswer>(&answer.to_string()).is_some(),
+                "{answer}"
+            );
+        }
     }
 }

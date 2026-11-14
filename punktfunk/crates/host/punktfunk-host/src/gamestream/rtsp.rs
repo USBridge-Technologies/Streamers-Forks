@@ -66,18 +66,28 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                             tracing::warn!("RTSP: too many concurrent connections — dropping");
                             continue; // `stream` drops, connection closed
                         }
-                        // Guard before spawn: if `thread::spawn` panics (OS thread limit), Drop
-                        // still releases the slot.
+                        // The guard moves into the closure: a refused thread drops the closure,
+                        // the guard and the stream, which frees the slot and closes the connection.
                         let guard = ConnGuard;
                         let st = state.clone();
-                        std::thread::spawn(move || {
-                            let _guard = guard;
-                            if let Err(e) = handle_conn(stream, st) {
-                                tracing::warn!(error = %format!("{e:#}"), "RTSP connection ended");
-                            }
-                        });
+                        let spawned = std::thread::Builder::new()
+                            .name("punktfunk-rtsp-conn".into())
+                            .spawn(move || {
+                                let _guard = guard;
+                                if let Err(e) = handle_conn(stream, st) {
+                                    tracing::warn!(error = %format!("{e:#}"), "RTSP connection ended");
+                                }
+                            });
+                        if let Err(e) = spawned {
+                            tracing::warn!(error = %e, "RTSP connection thread did not start — dropping");
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "RTSP accept failed"),
+                    Err(e) => {
+                        // A persistent accept error (fd exhaustion) returns at once: pause so the
+                        // loop does not spin a core and flood the log.
+                        tracing::warn!(error = %e, "RTSP accept failed — backing off 100ms");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
         })
@@ -251,7 +261,33 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 return response_status("400 Bad Request", &req.cseq, &[], None);
             }
             match stream_config(&map, super::apps::by_id(ls.appid).as_ref()) {
-                Some(cfg) => {
+                Some(mut cfg) => {
+                    let owner = (state.gs.joined.lock().unwrap_or_else(|e| e.into_inner()))
+                        .as_ref()
+                        .map(|(_, d)| (d.hdr, d.format));
+                    if !follow_joined_hdr(&mut cfg, &map, owner.map(|o| o.0)) {
+                        tracing::warn!(
+                            "RTSP ANNOUNCE — refused: the shared display is HDR and this stream \
+                             can't be"
+                        );
+                        return response_status("406 Not Acceptable", &req.cseq, &[], None);
+                    }
+                    // A Moonlight client decodes what it asked for, so it matches a shared
+                    // capture's format or is refused.
+                    let shared = owner.and_then(|o| o.1);
+                    let can = super::stream::sample_format(&cfg);
+                    let joined =
+                        shared.map(|shared| crate::vdisplay::admission::joined_format(shared, can));
+                    if let Some(Err(gap)) = joined {
+                        tracing::warn!(
+                            ?gap,
+                            ?shared,
+                            ?can,
+                            "RTSP ANNOUNCE — refused: this stream can't take the shared \
+                             capture's format"
+                        );
+                        return response_status("406 Not Acceptable", &req.cseq, &[], None);
+                    }
                     tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
                     *state.gs.stream.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
                 }
@@ -285,10 +321,20 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                     st.end_session("client unreachable");
                 })
             };
+            // A launch that joined a native session shares its screen: it launches no app of its
+            // own, and its audio taps the owner's sink.
+            let joined = state
+                .gs
+                .joined
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             match cfg {
-                Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
-                    let app = super::apps::by_id(ls.appid);
-                    tracing::info!(app = ?app.as_ref().map(|a| &a.title), "RTSP PLAY — starting video stream");
+                Some(mut cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
+                    cfg.joined = joined.clone();
+                    let app = super::apps::by_id(ls.appid).filter(|_| joined.is_none());
+                    tracing::info!(app = ?app.as_ref().map(|a| &a.title), joined = joined.is_some(),
+                        "RTSP PLAY — starting video stream");
                     // Rikey reaches the video plane only when `SS_ENC_VIDEO` was negotiated.
                     let video_key = cfg.encrypt_video.then_some(ls.gcm_key);
                     stream::start(
@@ -348,6 +394,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                     ls.peer_ip,
                     // Same ping payload: first datagram from that address is this client.
                     state.av_ping_payload(),
+                    joined.map(|(_, display)| display.audio_sink),
                     &state.media,
                 );
             }
@@ -573,19 +620,11 @@ fn describe_sdp(codecs: u32) -> String {
     // Advertise pen/touch only where we can inject. Else 0 so Moonlight keeps
     // client-side mouse emulation. gamescope gets the pen as touch (`GsPointer`).
     // `PUNKTFUNK_PEN=0` is the kill-switch inside `pen_supported`.
-    let mut feature_flags: u32 = if crate::inject::pen_supported() {
+    let feature_flags: u32 = if crate::inject::pen_supported() {
         SS_FF_PEN_TOUCH_EVENTS
     } else {
         0
     };
-    // Under the USBridge agent: its client may send a HID device over this stream.
-    if super::usbridge::raw_hid_offered() {
-        feature_flags |= super::usbridge::SS_FF_USBRIDGE_RAW_HID;
-    }
-    // Its pads take the controller touchpad, motion and battery.
-    if super::usbridge::pads_via_broker() {
-        feature_flags |= super::usbridge::SS_FF_CONTROLLER_TOUCH_EVENTS;
-    }
     let (supported, requested) = enc_flags(gs_encryption_offer());
     let mut lines: Vec<String> = vec![
         format!("a=x-ss-general.featureFlags:{feature_flags}"),
@@ -792,7 +831,34 @@ fn stream_config(
         encrypt_video,
         studio_asked,
         encoder,
+        mirrored: false,
+        joined: None,
     })
+}
+
+/// A launch that joined a native session streams at the owner display's colour (`owner_hdr`),
+/// not its app's. `false` = that display is HDR and this client asked for no HDR or negotiated
+/// a codec without 10 bits.
+fn follow_joined_hdr(
+    cfg: &mut StreamConfig,
+    map: &HashMap<String, String>,
+    owner_hdr: Option<bool>,
+) -> bool {
+    let Some(owner) = owner_hdr else {
+        return true;
+    };
+    let asked = map
+        .get("x-nv-video[0].dynamicRangeMode")
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .is_some_and(|m| m != 0);
+    let can = owner && asked && cfg.encoder.can_encode_10bit(cfg.codec);
+    match crate::vdisplay::admission::joined_hdr(owner, can) {
+        Some(hdr) => {
+            cfg.hdr = hdr;
+            true
+        }
+        None => false,
+    }
 }
 
 /// Why a PyroWave ANNOUNCE (`bitStreamFormat=3`) cannot be served, or `None`. The driver
@@ -1083,6 +1149,30 @@ mod tests {
         }
         let unset = stream_config(&announce(&[]), None).unwrap().studio_asked;
         assert_eq!(unset, StudioAsk::default());
+    }
+
+    /// A joined launch takes the owner display's colour: SDR under an SDR display whatever it
+    /// asked, refused under an HDR one it asked no HDR of, and never SDR under an HDR one.
+    #[test]
+    fn a_joined_announce_follows_the_owners_colour() {
+        let asked = announce(&[
+            ("x-nv-video[0].dynamicRangeMode", "1"),
+            ("x-nv-vqos[0].bitStreamFormat", "1"),
+        ]);
+        let mut cfg = stream_config(&asked, None).unwrap();
+        cfg.hdr = true;
+        assert!(follow_joined_hdr(&mut cfg, &asked, Some(false)));
+        assert!(!cfg.hdr, "SDR display");
+        let unasked = announce(&[]);
+        let mut cfg = stream_config(&unasked, None).unwrap();
+        assert!(!follow_joined_hdr(&mut cfg, &unasked, Some(true)));
+        let mut cfg = stream_config(&asked, None).unwrap();
+        let served = follow_joined_hdr(&mut cfg, &asked, Some(true));
+        assert_eq!(served, cfg.hdr, "an HDR display streams HDR or not at all");
+        let mut own = stream_config(&asked, None).unwrap();
+        let before = own.hdr;
+        assert!(follow_joined_hdr(&mut own, &asked, None));
+        assert_eq!(own.hdr, before, "not a join: its own verdict");
     }
 
     #[test]
@@ -1403,9 +1493,6 @@ mod tests {
     fn describe_advertises_codecs_and_surround() {
         let h264_only = describe_sdp(super::super::SCM_H264);
         assert!(!h264_only.contains("AAAAAU") && !h264_only.contains("AV1/90000"));
-        assert!(!h264_only.contains("PYROWAVE/90000"), "PyroWave only when the bit is set");
-        let pyrowave = describe_sdp(super::super::SCM_H264 | super::super::SCM_PYROWAVE);
-        assert!(pyrowave.contains("a=rtpmap:99 PYROWAVE/90000"), "PyroWave indicator");
         let sdp = describe_sdp(
             super::super::SCM_H264 | super::super::SCM_HEVC | super::super::SCM_AV1_MAIN8,
         );

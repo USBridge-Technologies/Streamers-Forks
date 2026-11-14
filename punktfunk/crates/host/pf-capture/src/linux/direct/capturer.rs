@@ -2,13 +2,13 @@
 
 use super::spawn;
 use crate::linux::{
-    drain_edges, health_identity, wait_for_frame, FrameSlot, StreamShared, StreamStatus,
+    drain_edges, health_identity, wait_for_frame, FrameSlot, Nudges, StreamShared, StreamStatus,
 };
-use crate::{CapturedFrame, Capturer, Feed, FirstFrame, ZeroCopyPolicy};
+use crate::{CapturedFrame, Capturer, Feed, FirstFrame, Paced, ZeroCopyPolicy};
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -22,6 +22,11 @@ use std::time::Duration;
 pub struct WlCapturer {
     slot: FrameSlot,
     wake: Receiver<()>,
+    /// Set by [`Feed::arrival_poke`] and [`Feed::au_wake`]; the arrival wait takes one and
+    /// returns with no frame.
+    nudges: Arc<Nudges>,
+    /// The thread's wake sender, held weakly so the thread's end still disconnects `wake`.
+    poke_wake: Weak<SyncSender<()>>,
     shared: StreamShared,
     output_name: String,
     quit: Arc<AtomicBool>,
@@ -66,6 +71,8 @@ impl WlCapturer {
         Ok(WlCapturer {
             slot: h.slot,
             wake: h.wake,
+            nudges: Arc::default(),
+            poke_wake: h.poke_wake,
             shared: h.shared,
             output_name,
             quit: h.quit,
@@ -160,9 +167,39 @@ impl Capturer for WlCapturer {
     }
 }
 
+impl WlCapturer {
+    /// Sets the nudge (`encoded`: an access unit, else a poke), then the thread's wake edge.
+    fn nudge(&self, encoded: bool) -> Arc<dyn Fn() + Send + Sync> {
+        let (nudges, wake) = (self.nudges.clone(), self.poke_wake.clone());
+        Arc::new(move || {
+            nudges.flag(encoded).store(true, Ordering::Relaxed);
+            if let Some(wake) = wake.upgrade() {
+                let _ = wake.try_send(());
+            }
+        })
+    }
+}
+
 impl Feed for WlCapturer {
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        wait_for_frame(&self.slot, &self.wake, &self.shared, deadline);
+        self.wait_paced(std::time::Instant::now(), deadline);
+    }
+
+    fn wait_paced(
+        &mut self,
+        not_before: std::time::Instant,
+        deadline: std::time::Instant,
+    ) -> Paced {
+        let (slot, wake, shared, nudges) = (&self.slot, &self.wake, &self.shared, &self.nudges);
+        wait_for_frame(slot, wake, shared, nudges, not_before, deadline)
+    }
+
+    fn arrival_poke(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        Some(self.nudge(false))
+    }
+
+    fn au_wake(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        Some(self.nudge(true))
     }
 
     fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
@@ -194,6 +231,8 @@ mod wl_capturer_tests {
         let mut cap = WlCapturer {
             slot: Arc::default(),
             wake,
+            nudges: Arc::default(),
+            poke_wake: std::sync::Weak::new(),
             shared: StreamShared::new(pf_zerocopy::zero_copy_health(u64::MAX)),
             output_name: "TEST-1".into(),
             quit: Arc::new(AtomicBool::new(false)),
@@ -236,12 +275,13 @@ mod wl_capturer_tests {
     /// before the capturer's `Drop` joins it.
     struct Rig {
         _parked: Option<std::sync::mpsc::Sender<()>>,
-        edge: Option<std::sync::mpsc::SyncSender<()>>,
+        edge: Option<Arc<std::sync::mpsc::SyncSender<()>>>,
         cap: WlCapturer,
     }
 
     fn rig(at: At) -> Rig {
         let (edge, wake) = sync_channel::<()>(1);
+        let edge = Arc::new(edge);
         let (parked, park) = std::sync::mpsc::channel::<()>();
         let join = std::thread::spawn(move || {
             let _ = park.recv();
@@ -251,6 +291,8 @@ mod wl_capturer_tests {
         let cap = WlCapturer {
             slot: Arc::default(),
             wake,
+            nudges: Arc::default(),
+            poke_wake: Arc::downgrade(&edge),
             shared,
             output_name: "TEST-1".into(),
             quit: Arc::new(AtomicBool::new(false)),
@@ -370,5 +412,38 @@ mod wl_capturer_tests {
             assert_eq!(waits(&mut r.cap), wait, "{at:?}");
             assert_eq!(latest(&mut r.gone().cap), gone, "{at:?}");
         }
+    }
+
+    /// A poke or an AU wake from another thread ends the wait with its own answer and no
+    /// frame, the gate before `not_before` included, and is taken; a frame alone waits the
+    /// gate out.
+    #[test]
+    fn a_nudge_ends_the_gate_and_a_frame_waits_for_it() {
+        use crate::{Feed, Paced};
+        use std::time::{Duration, Instant};
+        let mut r = rig(At::Streaming);
+        let nudges = [
+            (r.cap.arrival_poke().expect("a poke"), Paced::Poked),
+            (r.cap.au_wake().expect("an AU wake"), Paced::Encoded),
+        ];
+        for (nudge, answer) in nudges {
+            let t0 = Instant::now();
+            let (gate, deadline) = (t0 + Duration::from_secs(2), t0 + Duration::from_secs(3));
+            let woke = std::thread::scope(|s| {
+                s.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    nudge();
+                });
+                r.cap.wait_paced(gate, deadline)
+            });
+            assert_eq!(woke, answer);
+            assert!(t0.elapsed() < Duration::from_secs(1), "woke on {answer:?}");
+        }
+        r.put_frame();
+        let t0 = Instant::now();
+        let gate = t0 + Duration::from_millis(60);
+        let woke = r.cap.wait_paced(gate, t0 + Duration::from_secs(2));
+        assert_eq!(woke, Paced::Due, "the nudges were taken");
+        assert!(Instant::now() >= gate, "a frame ended the gate");
     }
 }

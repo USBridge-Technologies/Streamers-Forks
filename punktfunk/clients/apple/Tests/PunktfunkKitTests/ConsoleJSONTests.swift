@@ -137,6 +137,21 @@ final class ConsoleJSONTests: XCTestCase {
         XCTAssertTrue(pads.last?["battery"] is NSNull)
     }
 
+    /// The iOS SC2 menu pad's input test: the GameController path's names and signs.
+    func testSc2PadTestUsesTheGameControllerNames() throws {
+        var s = Sc2Device.State()
+        s.buttons = Sc2Device.btnA | Sc2Device.btnView | Sc2Device.btnMenu | Sc2Device.btnDpadUp
+        s.lsY = 32767
+        s.rt = 255
+        let data = try XCTUnwrap(ConsoleJSON.padTest(sc2: s).data(using: .utf8))
+        let doc = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(doc["held"] as? [String], ["A", "Back", "Start", "Up", "RT"])
+        let axes = try XCTUnwrap(doc["axes"] as? [[Any]])
+        XCTAssertEqual(axes[1][0] as? String, "LY")
+        XCTAssertEqual(axes[1][1] as? Double, -1)
+        XCTAssertEqual(axes[5][1] as? Double, 1)
+    }
+
     /// The Recent and Most played sorts read `stats`; a title the host never launched has none.
     func testLibraryGamesCarryPlayStats() throws {
         let wire = #"""
@@ -154,6 +169,20 @@ final class ConsoleJSONTests: XCTestCase {
         XCTAssertEqual(stats["play_time_ms"] as? UInt64, 5_400_000)
         XCTAssertEqual(stats["launch_count"] as? Int, 12)
         XCTAssertTrue(out.last?["stats"] is NSNull)
+    }
+
+    /// The console builds a resource name from `icon`: only `[a-z0-9-]`, as core checks it.
+    func testLibraryGamesDropANonAsciiIcon() throws {
+        let wire = #"""
+            [{"id": "a", "store": "steam", "title": "A", "art": {}, "icon": "steam-2"},
+             {"id": "b", "store": "steam", "title": "B", "art": {}, "icon": "café"},
+             {"id": "c", "store": "steam", "title": "C", "art": {}, "icon": "x٣"}]
+            """#
+        let games = try JSONDecoder().decode([GameEntry].self, from: Data(wire.utf8))
+        let push = ConsoleJSON.libraryGames(ConsoleJSON.unasked, games)
+        let doc = try JSONSerialization.jsonObject(with: Data(push.utf8)) as? [String: Any]
+        let icons = try XCTUnwrap(doc?["games"] as? [[String: Any]]).map { $0["icon"] as? String }
+        XCTAssertEqual(icons, ["steam-2", "", ""])
     }
 
     func testKnownHostsCarryWhatALinkNeeds() throws {
@@ -193,6 +222,41 @@ final class ConsoleJSONTests: XCTestCase {
         defaults.removePersistentDomain(forName: "console-json-tests")
     }
 
+    /// The console's document has no `default_host` key once the player clears the default
+    /// (the Rust field skips `None`), so a save without the key clears this app's default too.
+    func testAConsoleSaveWithoutADefaultHostClearsIt() throws {
+        let suite = "console-default-host-tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        ConsoleSettings.apply(["default_host": "desk"], defaults)
+        XCTAssertEqual(defaults.string(forKey: DefaultsKey.defaultHost), "desk")
+        ConsoleSettings.apply(["vsync": true], defaults)
+        XCTAssertEqual(defaults.string(forKey: DefaultsKey.defaultHost), "")
+        XCTAssertTrue(ConsoleSettings.document(defaults)["default_host"] is NSNull)
+    }
+
+    /// A JSON null is no property-list value, and storing one raises: the base document is
+    /// kept without them, at any depth.
+    func testASavedDocumentIsStoredWithoutItsNulls() throws {
+        let suite = "console-null-tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        ConsoleSettings.apply(
+            ["decoder": NSNull(), "vsync": true,
+             "pads": ["a": ["speaker_volume": NSNull(), "name": "couch"]]],
+            defaults)
+        let stored = try XCTUnwrap(defaults.dictionary(forKey: ConsoleSettings.documentKey))
+        XCTAssertNil(stored["decoder"])
+        XCTAssertEqual(stored["vsync"] as? Bool, true)
+        let pad = (stored["pads"] as? [String: [String: Any]])?["a"]
+        XCTAssertEqual(pad?["name"] as? String, "couch")
+        XCTAssertNil(pad?["speaker_volume"])
+    }
+
     /// A preset the console saved lands on this app's copy: the console's keys set or clear,
     /// the compositor comes back as its wire number, and an override only this app edits stays.
     func testAConsoleSaveKeepsWhatOnlyThisAppEdits() {
@@ -208,6 +272,30 @@ final class ConsoleJSONTests: XCTestCase {
         XCTAssertEqual(merged.hdrEnabled, false)
         XCTAssertNil(merged.codec, "the console cleared it")
         XCTAssertEqual(merged.modifierLayout, "pc", "only this app edits it")
+    }
+
+    /// The console's preset editor reads, sets and clears the host screen, and a card's preset
+    /// chip carries it for the card's Screen section.
+    func testTheHostScreenCrossesTheBridge() throws {
+        var pinned = SettingsOverlay()
+        pinned.hostScreen = "second"
+        let set = ConsoleJSON.overlay(["host_screen": "monitor:DP-1"], over: pinned)
+        XCTAssertEqual(set.hostScreen, "monitor:DP-1")
+        XCTAssertNil(ConsoleJSON.overlay([:], over: pinned).hostScreen, "the console cleared it")
+
+        var saved = host(name: "Desk")
+        saved.presetID = "p1"
+        let preset = StreamPreset(name: "Couch", id: "p1", overrides: pinned)
+        let row = try XCTUnwrap(
+            rows(ConsoleJSON.hostRows(
+                saved: [saved], discovered: [], online: [saved.id], presets: [preset])).first)
+        let chip = try XCTUnwrap(row["bound_preset"] as? [String: Any])
+        XCTAssertEqual(chip["host_screen"] as? String, "second")
+        let catalog = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(ConsoleJSON.presets([preset]).utf8))
+                as? [[String: Any]])
+        let overrides = try XCTUnwrap(catalog.first?["overrides"] as? [String: Any])
+        XCTAssertEqual(overrides["host_screen"] as? String, "second")
     }
 
     /// `clients/shared/console-bridge-vectors.json`: the models this client writes match its
@@ -258,6 +346,12 @@ final class ConsoleJSONTests: XCTestCase {
         let wire = #"{"id": "steam:570", "store": "steam", "title": "Dota 2", "art": {}}"#
         let dota = try JSONDecoder().decode(GameEntry.self, from: Data(wire.utf8))
         try check("GamesPush", 0, ConsoleJSON.libraryGames(fetch, [dota]))
+        let cyberpunk = try JSONDecoder().decode(GameEntry.self, from: Data(#"""
+            {"id": "steam:1091500", "store": "steam", "title": "Cyberpunk 2077", "art": {},
+             "overrides": {"name": "1080p60 DualSense", "lines": 1080, "hz": 60,
+                           "gamepad": "dualsense"}}
+            """#.utf8))
+        try check("GamesPush", 1, ConsoleJSON.libraryGames(fetch, [cyberpunk]))
         let downloads = [
             HostDownload(
                 appID: "steam:570", state: "downloading", doneBytes: 1_048_576,
@@ -292,6 +386,48 @@ final class ConsoleJSONTests: XCTestCase {
             XCTAssertEqual(
                 phase.map { "\($0)" }, name == "profile_gone" ? nil : camel(name), "phase \(code)")
         }
+    }
+
+    /// The answers to `FetchHidden` and `SetHidden` match the bridge's `HiddenAnswer` and
+    /// `HideAnswer` samples, each answer under the command sample's host and profile.
+    func testHideAnswersMatchTheSharedVectors() throws {
+        let doc = try sharedVectors("console-bridge-vectors.json")
+        let models = try XCTUnwrap(doc["models"] as? [String: [Any]])
+        let commands = try XCTUnwrap(doc["commands"] as? [Any])
+        let fetch = try XCTUnwrap(
+            commands.lazy.compactMap { ($0 as? [String: Any])?["FetchHidden"] as? [String: Any] }
+                .first)
+        func object(_ written: String) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(written.utf8)) as? [String: Any])
+        }
+        func same(_ got: Any?, _ model: String, _ i: Int) {
+            let want = models[model]?[i]
+            XCTAssertTrue((got as AnyObject?)?.isEqual(want) ?? false, "\(model)[\(i)] wrote \(String(describing: got))")
+        }
+
+        let (fp, profile) = (fetch["fp_hex"] as? String ?? "", fetch["profile"] as? String ?? "")
+        let wire = #"{"id": "steam:70", "store": "steam", "title": "Half-Life", "art": {}}"#
+        let halfLife = try JSONDecoder().decode(GameEntry.self, from: Data(wire.utf8))
+        let listed = try object(ConsoleJSON.hiddenList(fp: fp, profile: profile, games: [halfLife]))
+        XCTAssertEqual(listed["fp_hex"] as? String, "ab12")
+        XCTAssertEqual(listed["profile"] as? String, "a1b2c3d4e5f6")
+        same(listed["answer"], "HiddenAnswer", 0)
+        same(try object(ConsoleJSON.hiddenList(fp: fp, profile: profile, games: []))["answer"], "HiddenAnswer", 1)
+        let failed = ConsoleJSON.hiddenList(
+            fp: fp, profile: profile, games: nil, why: "Couldn't reach the host.")
+        same(try object(failed)["answer"], "HiddenAnswer", 2)
+
+        let done = HideForMe.Outcome.done.notice(hidden: true, title: "Dota 2", name: "Kid")
+        same(
+            try object(ConsoleJSON.hideAnswer(
+                fp: fp, profile: profile, appID: "steam:570", hidden: true, done: true, notice: done)),
+            "HideAnswer", 0)
+        let said = "This device can't change this profile. Ask the host's owner to change it in the web console."
+        same(
+            try object(ConsoleJSON.hideAnswer(
+                fp: fp, profile: profile, appID: "steam:570", hidden: false, done: false,
+                notice: HideForMe.Outcome.refused(said).notice(hidden: false, title: "Dota 2", name: "Kid"))),
+            "HideAnswer", 1)
     }
 
     /// One of the `clients/shared` vector files.

@@ -3,116 +3,52 @@ package io.unom.punktfunk
 import android.content.Context
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.GridItemSpan
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.rememberLazyGridState
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.pager.HorizontalPager
-import androidx.compose.foundation.pager.PageSize
-import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.DesktopWindows
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
+import androidx.annotation.StringRes
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.TransformOrigin
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.layout.boundsInWindow
-import androidx.compose.ui.layout.onGloballyPositioned
-import android.content.res.Configuration
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.liveRegion
-import androidx.compose.ui.semantics.LiveRegionMode
-import androidx.compose.ui.semantics.selected
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.zIndex
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeSource
-import kotlinx.coroutines.launch
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.compose.ui.res.stringResource
 import coil3.ImageLoader
-import io.unom.punktfunk.components.launcherIcon
-import io.unom.punktfunk.kit.link.DeepLinks
+import io.unom.punktfunk.kit.ListedProfile
+import io.unom.punktfunk.kit.R
+import io.unom.punktfunk.kit.Say
 import io.unom.punktfunk.kit.library.Download
 import io.unom.punktfunk.kit.library.GameEntry
+import io.unom.punktfunk.kit.library.Hide
+import io.unom.punktfunk.kit.library.HideOutcome
 import io.unom.punktfunk.kit.library.HostStatus
 import io.unom.punktfunk.kit.library.InstallAction
 import io.unom.punktfunk.kit.library.InstallOutcome
-import io.unom.punktfunk.kit.library.TileBadge
+import io.unom.punktfunk.kit.library.LibraryCache
 import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
-import io.unom.punktfunk.kit.library.LibraryCache
 import io.unom.punktfunk.kit.library.RunningGame
+import io.unom.punktfunk.kit.link.DeepLinks
+import io.unom.punktfunk.kit.say
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.IdentityHolder
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.LaunchHold
-import kotlin.math.PI
-import kotlin.math.absoluteValue
-import kotlin.math.cos
-import kotlin.math.sign
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-// The host game-library browser — the Android mirror of the Apple client's LibraryView: ONE screen
-// with two presentations of the same shelf, chosen the same way every other screen here chooses.
-// The console (gamepad) one is a poster coverflow (centered cover flat + prominent, neighbours
-// receding on a 3D Y-tilt), reached with Y from a saved host; the touch one is the poster GRID the
-// Apple, GTK and Windows shells draw, reached from a host card's "Browse library…". Both fetch from
-// the host's management API over mTLS, and everything data-shaped — the fetch, the states, the
-// launch — is shared: only the arrangement differs, because only the input device does.
+// One shelf of the touch library: a host's catalog fetched over its management API on the paired
+// identity, the acts on its titles, and the dial a launch makes. [TouchLibrary] draws it. The
+// console shell has its own shelf and shares the fetch, the cache and the launch.
 
 /**
  * Whether the shelf on screen is an observation or a memory — and, if a memory, what is being done
@@ -120,14 +56,14 @@ import kotlinx.coroutines.withContext
  * "checking" while the host is merely asked, and "last known library" once it isn't going to
  * become current. The same copy as `pf_console_ui::Stale`.
  */
-private enum class Stale(val note: String?) {
+internal enum class Stale(@StringRes val note: Int?) {
     No(null),
-    Checking("Last known library — checking the host…"),
-    Waking("Last known library — waking the host…"),
-    Offline("Last known library — the host didn't answer"),
+    Checking(R.string.lib_stale_checking),
+    Waking(R.string.lib_stale_waking),
+    Offline(R.string.lib_stale_offline),
 }
 
-private sealed class LibState {
+internal sealed class LibState {
     object Loading : LibState()
 
     /**
@@ -148,37 +84,9 @@ private sealed class LibState {
         /** `/status` downloads by library id, and this device's grants: host state, as [running]. */
         val downloads: Map<String, Download> = emptyMap(),
         val grants: Int? = null,
-    ) : LibState() {
-        /**
-         * Display order: anything already running first, so getting back into it is the first
-         * thing on screen rather than something to scroll for.
-         *
-         * Applied on top of the launchers-first grouping the fetch already did, never instead of
-         * it — a launcher that is up still belongs with the launchers, which is what keeps design
-         * D4's two sections from interleaving. `sortedBy` is stable, so the host's own title order
-         * survives inside each of the four resulting bands.
-         */
-        val ordered: List<GameEntry>
-            get() {
-                // …and the desktop tile leads all of it, so streaming the host itself is one tap
-                // rather than a menu — and a host with no plugins still has something to tap.
-                // Model state only: it is never fetched and never cached.
-                val all = listOf(desktopTile) + games
-                if (running.isEmpty()) return all
-                return all.sortedBy {
-                    if (it.isDesktop) -1
-                    else (if (it.isLauncher) 0 else 2) + (if (running[it.id] != null) 0 else 1)
-                }
-            }
+    ) : LibState()
 
-        /** Names what the tap does, so it does not read "Desktop" while tapping it resumes. */
-        private val desktopTile: GameEntry
-            get() = GameEntry.desktop(
-                running.values.firstOrNull()?.let { "Resume ${it.title}" } ?: "Desktop",
-            )
-    }
-
-    data class Message(val text: String) : LibState() // unauthorized / empty / error
+    data class Message(val text: Say) : LibState() // unauthorized / empty / error
 }
 
 /** A `/status` read on the shelf: what is up, what downloads, and what this device may do. */
@@ -186,7 +94,7 @@ private fun LibState.Ready.withStatus(status: HostStatus) = copy(
     running = status.games
         .filter { it.isUp }
         // Two sessions can have the same title up (the host admits concurrent sessions); for a
-        // Resume badge either one is the same answer, and the endable one (sorted last, so it
+        // Running badge either one is the same answer, and the endable one (sorted last, so it
         // wins) carries End game.
         .sortedBy { it.endable }
         .mapNotNull { g -> g.appId?.let { it to g } }
@@ -195,52 +103,46 @@ private fun LibState.Ready.withStatus(status: HostStatus) = copy(
     grants = status.grants,
 )
 
+/**
+ * One shelf of the Library tab: [host]'s catalog, and every act on its titles. [pinnedPresetId] is
+ * set for a pinned host+preset card's shelf: each launch off it runs with that preset, as the
+ * card's own connect does. Null follows the host's binding ([PresetStore.resolveFor]).
+ */
 @Composable
-fun LibraryScreen(
+internal fun LibraryScreen(
     host: KnownHost,
     settings: Settings,
     onLaunched: (ActiveSession) -> Unit,
-    onBack: () -> Unit,
-    /**
-     * The preset this shelf launches with, when it was opened from a PINNED host+preset card
-     * (design §5.2a) rather than the host's own tile: a one-off, exactly like the card's plain
-     * connect. Null = the host's tile, and the host's binding decides — the same rule
-     * [PresetStore.resolveFor] applies to every other connect.
-     */
     pinnedPresetId: String? = null,
     /**
      * Stream this host's desktop as soon as the shelf can dial (`start_in = stream`). One attempt
-     * per app start: a refusal leaves the shelf on screen and nothing retries, and [onLaunched]
-     * disarms the caller's flag, so a shelf composed again after a stream stays a shelf. Goes
-     * through the same [launch] every tap does, so the auto-start and a tap on the Desktop tile
-     * cannot drift.
+     * per app start: a refusal leaves the shelf on screen, and [onLaunched] disarms the caller's
+     * flag. It goes through the same [launch] every tap does.
      */
     autoStream: Boolean = false,
+    /** Every paired host's desktop, for the Desktops row. */
+    desktops: List<DesktopTile> = emptyList(),
+    /** Drawn over the sections: the shelf chips. */
+    header: (@Composable () -> Unit)? = null,
 ) {
-    BackHandler(onBack = onBack)
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    // Bumped by the touch header's Reload — re-keys the fetch effect below without the screen
-    // having to be popped and re-pushed to try a flaky host again.
+    // Bumped by Reload: re-keys the fetch below.
     var reloadKey by remember { mutableIntStateOf(0) }
     var state by remember { mutableStateOf<LibState>(LibState.Loading) }
-    // A launch (connect) in flight: shows an overlay + gates the pad so a second press can't dial twice.
+    // A launch in flight: shows an overlay, and a second press can't dial twice.
     var launching by remember { mutableStateOf(false) }
-    // The preset every launch off this shelf runs with, resolved ONCE per shelf by the same rule
-    // the host-list connect uses: this card's pin as the one-off, else the host's binding, else the
-    // globals. Resolved here rather than per launch so a preset edited mid-browse cannot make two
-    // titles on one shelf stream differently.
-    val preset = remember(host.id, pinnedPresetId) {
-        PresetStore(context).resolveFor(host, pinnedPresetId)
-    }
-    val streamSettings = remember(settings, preset) { settings.effectiveFor(preset) }
+    val presetStore = remember { PresetStore(context) }
+    // How this device arranges a shelf, and the titles it marked on this host.
+    var layout by remember { mutableStateOf(LibraryLayout.load(context)) }
+    var favorites by remember(host.fpHex) { mutableStateOf(LibraryLayout.favorites(context, host.fpHex)) }
     val knownHostStore = remember { KnownHostStore(context) }
     val services = remember { HostServices(knownHostStore, JniHostNative(context)) }
     // The profile picker a launch waits on.
     var profileAsk by remember { mutableStateOf<ProfileAsk?>(null) }
     profileAsk?.let { ask ->
         ProfilePickerDialog(
-            hostName = host.name.ifBlank { host.address },
+            hostName = ask.host.name.ifBlank { ask.host.address },
             answer = ProfilesAnswer.Listed(ask.listed),
             saved = ask.host.asProfile,
             gone = ask.gone,
@@ -253,87 +155,124 @@ fun LibraryScreen(
     seatWait?.let { w ->
         SeatWaitDialog(w, onCancel = { w.cancelled.complete(Unit); seatWait = null })
     }
+    // The password prompt a launch waits on.
+    var unlockAsk by remember { mutableStateOf<PasswordAsk?>(null) }
+    unlockAsk?.let { UnlockPromptDialog(it) }
+
+    // Hide for me ([Hide]): the shelf's profile row while the box lets this device hide its titles,
+    // and what that profile hides, shown in the shelf's place while asked for (null: the shelf).
+    var hides by remember { mutableStateOf<ListedProfile?>(null) }
+    var hiddenView by remember { mutableStateOf<LibState?>(null) }
+    var hiddenReload by remember { mutableIntStateOf(0) }
+    // The title that takes focus once the one beside it left the grid.
+    var refocus by remember { mutableStateOf<String?>(null) }
+    val snackbar = remember { SnackbarHostState() }
+    BackHandler(enabled = hiddenView != null) { hiddenView = null }
 
     // Keyed on the mgmt port too: a discovery tick can learn it after this screen is composed, and
     // the fetch must redo itself against the real port rather than stay on a stale 47990 failure.
-    LaunchedEffect(host.address, host.port, host.fpHex, host.effectiveMgmtPort, reloadKey) {
-        loadLibrary(context, host, settings.autoWakeEnabled) { state = it }
+    // And on the saved pick: the shelf is the library that profile plays, and only it hides.
+    LaunchedEffect(host.address, host.port, host.fpHex, host.effectiveMgmtPort, host.asProfile?.id, reloadKey) {
+        val offer = { row: ListedProfile? ->
+            hides = row
+            if (row == null) hiddenView = null
+        }
+        if (hides?.id != host.asProfile?.id) offer(null)
+        loadLibrary(context, host, settings.autoWakeEnabled, offer) { state = it }
+    }
+    val hiddenOpen = hiddenView != null
+    LaunchedEffect(hiddenOpen, hiddenReload) {
+        val row = hides
+        if (!hiddenOpen || row == null) return@LaunchedEffect
+        hiddenView = LibState.Loading
+        hiddenView = loadHidden(context, host, row.id, state)
     }
 
-    // A pinned card's shelf says so, in the card's own `host · preset` shape: what a launch here
-    // will use is a property of the shelf, not something to remember from the tile two screens back.
-    val title = if (pinnedPresetId != null && preset != null) {
-        "${host.name} · ${preset.name} — Library"
-    } else {
-        "${host.name} — Library"
-    }
-
-    // Dial through [HostServices.dial] on the pinned trust, booting straight into this title (the
-    // host resolves `launch` = its library id). A grid tap and A on a centred cover share this one
-    // launch. [link] names the profile to play as; [redial] marks the one dial [ProfileRetry] grants.
-    fun launch(identity: ClientIdentity, game: GameEntry, link: String? = null, redial: Boolean = false) {
+    // Dial [target] on the pinned trust and the profile's unlock, booting straight into [game]
+    // with its preset and the host's overrides for it. The desktop entry streams with no launch
+    // id: asking a host to launch what it already shows starts a second copy. [target] is this
+    // shelf's host, or another paired host for its desktop tile, which takes no pinned preset.
+    // [link] names the profile to play as; [redial] marks the one dial [ProfileRetry] grants.
+    fun launch(
+        identity: ClientIdentity,
+        game: GameEntry,
+        link: String? = null,
+        redial: Boolean = false,
+        target: KnownHost = host,
+    ) {
         if (launching) return
         launching = true
-        // The desktop tile is the host, not one of its titles: it streams with no launch id, and
-        // there is no place to remember for something that is not in the catalog. Asking a host
-        // to launch what it is already showing is how a second copy starts.
+        val pin = pinnedPresetId.takeIf { target.id == host.id }
         if (!game.isDesktop) {
-            // The player's place in this shelf, remembered as the TITLE rather than an index or a
-            // scroll offset — the only moment they are definitely leaving the grid for one.
-            // Recorded before the dial rather than after it succeeds: a failed launch still means
-            // "this is the one I was going for", and coming back to it is right either way.
-            LibraryPosition.remember(context, host.id, game.id)
+            // The player's place in this shelf, as the title. Before the dial: a failed launch
+            // still names the one they were going for.
+            LibraryPosition.remember(context, target.id, game.id)
         }
         scope.launch {
-            val choice = chooseProfile(knownHostStore, identity, host, link, wait = { seatWait = it }) {
+            val choice = chooseProfile(knownHostStore, identity, target, link, wait = { seatWait = it }) {
                 profileAsk = it
             }
             profileAsk = null
             if (choice !is ProfileChoice.Dial) {
                 launching = false
                 if (choice is ProfileChoice.Refused) {
-                    Toast.makeText(context, choice.line, Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, choice.line.words(context.resources), Toast.LENGTH_LONG).show()
                 }
                 return@launch
             }
+            val launchId = game.id.takeUnless { game.isDesktop }
+            val launchPreset = presetStore.resolveFor(target, pin, launchId)
             val spec = DialSpec(
-                streamSettings, identity, host.address, host.port, host.fpHex,
-                launch = game.id.takeUnless { game.isDesktop },
+                settings.effectiveFor(launchPreset), identity, target.address, target.port, target.fpHex,
+                launch = launchId,
                 dialer = "touch/library",
-                preset = preset,
+                preset = launchPreset,
                 profile = choice.id,
+                promptsUnlock = promptsUnlock(context),
+                overrides = game.overrides,
             )
-            val dialed = services.dial(spec, host, host.name)
+            val hooks = touchUnlockHooks(context, identity, target, ask = { ask ->
+                unlockAsk = ask
+                try {
+                    ask.answer.await()
+                } finally {
+                    unlockAsk = null
+                }
+            })
+            val dialed = dialUnlocked(hooks, spec.pinHex, choice.row) { unlock ->
+                services.dial(spec, target, target.name, unlock = unlock)
+            }
             launching = false
             if (dialed is HostServices.Connected) {
                 onLaunched(
                     dialed.session.copy(
-                        // Where to come back to when this game exits — this shelf, pin and all,
-                        // not the host's default one.
+                        // Where to come back to when this game exits: this shelf, pin and all.
                         launchedFromLibrary = true,
-                        libraryPresetId = pinnedPresetId,
+                        libraryPresetId = pin,
                         // The host never tracks a launcher tile or the desktop, so there is
                         // nothing to wait for.
                         launchHold = game.takeUnless { it.isLauncher || it.isDesktop }?.let {
                             LaunchHold(
-                                it, host.address, host.effectiveMgmtPort, host.fpHex,
-                                sourceRect = TileFrames.rect(it.id), streamPort = host.port,
+                                it, target.address, target.effectiveMgmtPort, target.fpHex,
+                                sourceRect = TileFrames.rect(it.id), streamPort = target.port,
                             )
                         },
                     ),
                 )
             } else if (dialed is HostServices.Failed) {
                 val token = dialed.token
-                if (ProfileRetry.afterRefusal(token, host, choice, redial, knownHostStore) { h, p ->
+                if (ProfileRetry.afterRefusal(token, target, choice, redial, knownHostStore) { h, p ->
                         stillListed(identity, h, p)
                     }
                 ) {
-                    launch(identity, game, choice.id, redial = true)
+                    launch(identity, game, choice.id, redial = true, target = target)
                     return@launch
                 }
                 Toast.makeText(
                     context,
-                    dialed.said.ifEmpty { ConnectErrors.connectMessage(token, requestAccess = false) },
+                    dialed.said.ifEmpty {
+                        context.getString(ConnectErrors.connectMessage(token, requestAccess = false))
+                    },
                     Toast.LENGTH_LONG,
                 ).show()
             }
@@ -345,7 +284,18 @@ fun LibraryScreen(
     // `launching` guards the second pass a state change would otherwise cause.
     val ready = (state as? LibState.Ready)?.identity
     LaunchedEffect(autoStream, ready) {
-        if (autoStream && ready != null) launch(ready, GameEntry.desktop())
+        if (autoStream && ready != null) launch(ready, GameEntry.desktop(context.getString(R.string.lib_desktop)))
+    }
+
+    // A desktop tile: stream that host, launching nothing. The identity is the device's, so a
+    // shelf that failed to load still streams a desktop.
+    fun streamDesktop(target: KnownHost) {
+        scope.launch {
+            val identity = (state as? LibState.Ready)?.identity
+                ?: withContext(Dispatchers.IO) { IdentityHolder.shared(context).await() }
+                ?: return@launch
+            launch(identity, GameEntry.desktop(context.getString(R.string.lib_desktop)), target = target)
+        }
     }
 
     // One TITLE's link handed out (design/client-deep-links.md §4/§5): the host card's form plus
@@ -355,17 +305,17 @@ fun LibraryScreen(
     fun linkAction(game: GameEntry, action: LinkAction) {
         val url = DeepLinks.forHost(host, launch = game.id, preset = pinnedPresetId).toUrl()
         val name = if (game.isDesktop) host.name else game.title
-        val say = { text: String -> Toast.makeText(context, text, Toast.LENGTH_SHORT).show() }
+        val toast = { text: String -> Toast.makeText(context, text, Toast.LENGTH_SHORT).show() }
         when (action) {
-            LinkAction.Copy -> linkCopyMessage(putLinkOnClipboard(context, url))?.let(say)
-            LinkAction.LauncherFile -> (context as? MainActivity)?.saveLauncherFile(name, url, say)
+            LinkAction.Copy -> linkCopyMessage(putLinkOnClipboard(context, url))?.let { toast(context.getString(it)) }
+            LinkAction.LauncherFile -> (context as? MainActivity)?.saveLauncherFile(name, url, toast)
             LinkAction.HomeScreen -> {
                 val identity = (state as? LibState.Ready)?.identity
                 val key = shortcutId(host.id, game.id.takeUnless { game.isDesktop }, pinnedPresetId)
                 scope.launch {
                     withContext(Dispatchers.IO) {
                         pinTitleShortcut(context, identity, host, game.art.posterCandidates, url, name, key)
-                    }?.let(say)
+                    }?.let(toast)
                 }
             }
         }
@@ -381,7 +331,7 @@ fun LibraryScreen(
     val resumeAt = remember(host.id) { LibraryPosition.last(context, host.id) }
 
     // End game: the title the confirm asks about, then the host's answer as a toast. Gone either
-    // way drops the Resume badge here; the next load reads the host again.
+    // way drops the Running badge here; the next load reads the host again.
     var endAsk by remember { mutableStateOf<GameEntry?>(null) }
     fun endGame(game: GameEntry) {
         val ready = state as? LibState.Ready ?: return
@@ -394,7 +344,7 @@ fun LibraryScreen(
             if (outcome.gameGone) {
                 (state as? LibState.Ready)?.let { state = it.copy(running = it.running - game.id) }
             }
-            Toast.makeText(context, outcome.notice(game.title), Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, outcome.notice(game.title).words(context.resources), Toast.LENGTH_SHORT).show()
         }
     }
     // A title's files: the action, the host's answer as a toast, then `/status` again. A removal
@@ -430,8 +380,60 @@ fun LibraryScreen(
                     )
                 }
             }
-            Toast.makeText(context, outcome.notice(action, game.title), Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                context,
+                outcome.notice(action, game.title).words(context.resources),
+                Toast.LENGTH_SHORT,
+            ).show()
             refreshStatus()
+        }
+    }
+    // Hide ([hidden]) or show [game] for the shelf's profile. What the host takes moves at once,
+    // with no refetch, the cached catalog follows, and [next] takes its focus. A hide offers Undo,
+    // which puts the title back at [at]. A refusal is the host's sentence and changes nothing.
+    val undo = stringResource(R.string.common_undo)
+    fun setHidden(game: GameEntry, hidden: Boolean, next: String?, at: Int? = null) {
+        val row = hides ?: return
+        val ready = state as? LibState.Ready ?: hiddenView as? LibState.Ready ?: return
+        scope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                Hide.set(
+                    ready.identity, host.address, host.effectiveMgmtPort, host.fpHex, row.id, game.id, hidden, host.port,
+                )
+            }
+            val notice = outcome.notice(hidden, game.title, row.displayName).words(context.resources)
+            // The newest line replaces the one up, rather than queueing behind it.
+            snackbar.currentSnackbarData?.dismiss()
+            if (outcome != HideOutcome.Done) {
+                snackbar.showSnackbar(notice)
+                return@launch
+            }
+            var from: Int? = null
+            when (val s = state) {
+                is LibState.Ready -> state = if (hidden) {
+                    from = s.games.indexOfFirst { it.id == game.id }
+                    s.copy(games = s.games.filter { it.id != game.id })
+                } else {
+                    val rest = s.games.filter { it.id != game.id }
+                    val i = (at ?: rest.size).coerceIn(0, rest.size)
+                    s.copy(games = rest.take(i) + game + rest.drop(i))
+                }
+                // A shelf that was empty, or failed while the host now answers, holds this one.
+                is LibState.Message -> if (!hidden) state = LibState.Ready(listOf(game), ready.loader, ready.identity)
+                LibState.Loading -> {}
+            }
+            (hiddenView as? LibState.Ready)?.let { v -> hiddenView = v.copy(games = v.games.filter { it.id != game.id }) }
+            refocus = next
+            withContext(Dispatchers.IO) {
+                LibraryCache.standard(context.cacheDir)
+                    .noteHidden(LibraryCache.keyFor(host, host.fpHex), row.id, game.id, game.takeIf { !hidden })
+            }
+            val result = snackbar.showSnackbar(
+                notice,
+                actionLabel = undo.takeIf { hidden },
+                duration = if (hidden) SnackbarDuration.Long else SnackbarDuration.Short,
+            )
+            if (result == SnackbarResult.ActionPerformed) setHidden(game, hidden = false, next = game.id, at = from)
         }
     }
     // Percentages move while a download runs and the shelf is up.
@@ -444,37 +446,52 @@ fun LibraryScreen(
     }
     removeAsk?.let { game ->
         PunktfunkDialog(
-            title = "Remove ${game.title}?",
+            title = stringResource(R.string.lib_remove_confirm_title, game.title),
             onDismiss = { removeAsk = null },
             actions = listOf(
-                DialogAction("Remove download", primary = true) {
+                DialogAction(stringResource(R.string.lib_download_remove), primary = true) {
                     removeAsk = null
                     changeInstall(game, InstallAction.Remove)
                 },
-                DialogAction("Cancel") { removeAsk = null },
+                DialogAction(stringResource(R.string.common_cancel)) { removeAsk = null },
             ),
-        ) { PromptText("Saves stay on the host.") }
+        ) { PromptText(stringResource(R.string.lib_remove_confirm_body)) }
     }
     endAsk?.let { game ->
         PunktfunkDialog(
-            title = "End ${game.title}?",
+            title = stringResource(R.string.lib_end_game_confirm_title, game.title),
             onDismiss = { endAsk = null },
             actions = listOf(
-                DialogAction("End game", primary = true) {
+                DialogAction(stringResource(R.string.lib_end_game), primary = true) {
                     endAsk = null
                     endGame(game)
                 },
-                DialogAction("Cancel") { endAsk = null },
+                DialogAction(stringResource(R.string.common_cancel)) { endAsk = null },
             ),
-        ) { PromptText("Unsaved progress in the game is lost.") }
+        ) { PromptText(stringResource(R.string.lib_end_game_confirm_body)) }
     }
 
     TouchLibrary(
-        title = title,
         state = state,
         launching = launching,
-        onBack = onBack,
-        onReload = { reloadKey++ },
+        onReload = { if (hiddenOpen) hiddenReload++ else reloadKey++ },
+        layout = layout,
+        onLayout = {
+            layout = it
+            LibraryLayout.save(context, settings, it)
+        },
+        favorites = favorites,
+        onFavorite = { game -> favorites = LibraryLayout.toggleFavorite(context, settings, host.fpHex, game.id) },
+        desktops = desktops,
+        onDesktop = { target -> streamDesktop(target) },
+        header = header,
+        hidesFor = hides?.displayName,
+        hidden = hiddenView,
+        onHidden = { open -> hiddenView = if (open) LibState.Loading else null },
+        onSetHidden = { game, hidden, next -> setHidden(game, hidden, next) },
+        refocus = refocus,
+        onRefocused = { refocus = null },
+        snackbar = snackbar,
         onLaunch = { identity, game -> launch(identity, game) },
         onLink = { game, action -> linkAction(game, action) },
         onEndGame = { game -> endAsk = game },
@@ -494,7 +511,9 @@ fun LibraryScreen(
  *      and only then does the shelf say "waking";
  *   3. the live fetch runs, retrying across the boot window, and replaces the cached shelf;
  *   4. `/status` says which titles are already up, AFTER the catalog so a slow answer can never
- *      hold the titles back.
+ *      hold the titles back;
+ *   5. last, the profile the shelf was fetched as goes to [offer] when its `enumerate` row lets
+ *      this device hide its titles ([Hide.offer]), else null.
  * A cached catalog also outranks a failure: if the host never answers, the titles on screen are
  * still the right ones to choose from.
  */
@@ -502,16 +521,18 @@ private suspend fun loadLibrary(
     context: Context,
     host: KnownHost,
     autoWake: Boolean,
+    offer: (ListedProfile?) -> Unit,
     set: (LibState) -> Unit,
 ) {
     set(LibState.Loading)
     val cache = LibraryCache.standard(context.cacheDir)
     val key = LibraryCache.keyFor(host, host.fpHex)
     val (identity, loader) = prepareLoader(context, host) ?: run {
-        set(LibState.Message("Identity unavailable — re-pair may be required"))
+        set(LibState.Message(say(R.string.android_lib_identity_unavailable)))
         return
     }
-    val cached = withContext(Dispatchers.IO) { cache.load(key)?.games }?.takeIf { it.isNotEmpty() }
+    val profile = host.asProfile?.id
+    val cached = withContext(Dispatchers.IO) { cache.load(key, profile)?.games }?.takeIf { it.isNotEmpty() }
     if (cached != null) {
         set(LibState.Ready(cached, loader, identity, stale = Stale.Checking))
     }
@@ -524,6 +545,7 @@ private suspend fun loadLibrary(
             fpHex = host.fpHex,
             macs = host.mac,
             autoWake = autoWake,
+            profile = profile,
             streamPort = host.port,
             isCancelled = { !isActive },
             onWaking = {
@@ -536,23 +558,31 @@ private suspend fun loadLibrary(
         )
     }
     when (res) {
-        is LibraryResult.Ok -> if (res.games.isEmpty()) {
-            set(LibState.Message("No games found on this host."))
-        } else {
-            set(LibState.Ready(res.games, loader, identity))
-            // Remembered AFTER it is on screen: the disk write is not on the path to a shelf.
-            withContext(Dispatchers.IO) { cache.store(key, res.games) }
-            val status = withContext(Dispatchers.IO) {
-                LibraryClient.fetchStatus(
-                    address = host.address,
-                    mgmtPort = host.effectiveMgmtPort,
-                    certPem = identity.certPem,
-                    keyPem = identity.privateKeyPem,
-                    fpHex = host.fpHex,
-                    streamPort = host.port,
-                )
+        is LibraryResult.Ok -> {
+            if (res.games.isEmpty()) {
+                set(LibState.Message(say(R.string.lib_empty)))
+            } else {
+                set(LibState.Ready(res.games, loader, identity))
+                // Remembered AFTER it is on screen: the disk write is not on the path to a shelf.
+                withContext(Dispatchers.IO) { cache.store(key, res.profile, res.games) }
+                val status = withContext(Dispatchers.IO) {
+                    LibraryClient.fetchStatus(
+                        address = host.address,
+                        mgmtPort = host.effectiveMgmtPort,
+                        certPem = identity.certPem,
+                        keyPem = identity.privateKeyPem,
+                        fpHex = host.fpHex,
+                        streamPort = host.port,
+                    )
+                }
+                set(LibState.Ready(res.games, loader, identity).withStatus(status))
             }
-            set(LibState.Ready(res.games, loader, identity).withStatus(status))
+            val listed = res.profile?.let {
+                withContext(Dispatchers.IO) {
+                    HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex, host.port)
+                } as? ProfilesAnswer.Listed
+            }
+            offer(Hide.offer(listed?.rows, res.profile))
         }
         // The shelf stays if we have one; only the words change. The player can still pick a
         // title — the launch dials and wakes the host on its own.
@@ -564,13 +594,31 @@ private suspend fun loadLibrary(
                 // title to carry the frame, so it supplies one (SkiaConsole passes its own).
                 LibState.Message(
                     when (res) {
-                        is LibraryResult.Unauthorized -> "Couldn't load the library — ${res.message}"
-                        is LibraryResult.Error -> "Couldn't load the library — ${res.message}"
-                        else -> "Couldn't load the library"
+                        is LibraryResult.Unauthorized -> say(R.string.lib_load_failed_why, res.message)
+                        is LibraryResult.Error -> say(R.string.lib_load_failed_why, res.message)
+                        else -> say(R.string.lib_load_failed)
                     },
                 )
             },
         )
+    }
+}
+
+/**
+ * What [profile] hides on [host], fetched each time it is asked for and never cached. The
+ * shelf's identity and art loader when [shelf] has them. A failure is the shelf's own line.
+ */
+private suspend fun loadHidden(context: Context, host: KnownHost, profile: String, shelf: LibState): LibState {
+    val (identity, loader) = (shelf as? LibState.Ready)?.let { it.identity to it.loader }
+        ?: prepareLoader(context, host)
+        ?: return LibState.Message(say(R.string.android_lib_identity_unavailable))
+    val res = withContext(Dispatchers.IO) {
+        Hide.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex, profile, host.port)
+    }
+    return when (res) {
+        is LibraryResult.Ok -> LibState.Ready(res.games, loader, identity)
+        is LibraryResult.Unauthorized -> LibState.Message(say(R.string.lib_load_failed_why, res.message))
+        is LibraryResult.Error -> LibState.Message(say(R.string.lib_load_failed_why, res.message))
     }
 }
 
@@ -585,488 +633,4 @@ internal suspend fun prepareLoader(context: Context, host: KnownHost): Pair<Clie
             ?: return@withContext null
         id to loader
     }
-
-/**
- * The touch shelf: a Material poster grid under a back/reload header — the same page the Apple,
- * GTK and Windows shells draw, and the reason a finger-driven user can reach the library at all.
- *
- * Deliberately NOT the coverflow with the pad legend hidden: a coverflow is a one-at-a-time strip
- * built for a D-pad, and on a phone it turns a 400-title library into 400 swipes. The grid is what
- * every other touch surface in this app (and every other client's) already shows.
- */
-@Composable
-private fun TouchLibrary(
-    title: String,
-    state: LibState,
-    launching: Boolean,
-    onBack: () -> Unit,
-    onReload: () -> Unit,
-    onLaunch: (ClientIdentity, GameEntry) -> Unit,
-    onLink: (GameEntry, LinkAction) -> Unit,
-    /** Ask to end a title this device launched; the caller confirms. */
-    onEndGame: (GameEntry) -> Unit = {},
-    /** Install, pause, resume or remove a title's download; the caller confirms a removal. */
-    onFiles: (GameEntry, InstallAction) -> Unit = { _, _ -> },
-    /** The title this shelf last launched — where the grid opens. Null on a first visit. */
-    resumeAt: String? = null,
-) {
-    Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize().safeArea()) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 8.dp),
-            ) {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                }
-                Text(
-                    title,
-                    style = MaterialTheme.typography.titleLarge,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                // A shelf that failed to load is otherwise a dead end you have to back out of and
-                // re-enter; every other client's library page has had this from the start.
-                IconButton(onClick = onReload, enabled = state !is LibState.Loading) {
-                    Icon(Icons.Filled.Refresh, contentDescription = "Reload")
-                }
-            }
-            // Says the titles below are remembered rather than observed — shown only while that is
-            // true, and never as an error: a cached library is a working library, and a host that
-            // is still waking is the case this whole path exists to serve.
-            (state as? LibState.Ready)?.stale?.note?.let {
-                Text(
-                    it,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier
-                        .semantics { liveRegion = LiveRegionMode.Polite }
-                        .padding(horizontal = 20.dp, vertical = 2.dp),
-                )
-            }
-            when (state) {
-                is LibState.Loading -> Box(
-                    Modifier.weight(1f).fillMaxWidth(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(14.dp),
-                    ) {
-                        CircularProgressIndicator()
-                        Text("Loading library…", style = MaterialTheme.typography.bodyLarge)
-                    }
-                }
-                is LibState.Message -> Box(
-                    Modifier.weight(1f).fillMaxWidth(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        state.text,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(horizontal = 24.dp),
-                    )
-                }
-                is LibState.Ready -> TouchGrid(
-                    games = state.ordered,
-                    loader = state.loader,
-                    onLaunch = { game -> onLaunch(state.identity, game) },
-                    onLink = onLink,
-                    onEndGame = onEndGame,
-                    running = state.running,
-                    downloads = state.downloads,
-                    grants = state.grants,
-                    onFiles = onFiles,
-                    resumeAt = resumeAt,
-                    modifier = Modifier.weight(1f),
-                )
-            }
-        }
-        if (launching) {
-            Box(
-                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    CircularProgressIndicator(color = Color.White)
-                    Text("Launching…", color = Color.White, style = MaterialTheme.typography.bodyLarge)
-                }
-            }
-        }
-    }
-}
-
-/**
- * The poster grid. Design D4: launcher entries get their own shelf above the titles, never
- * interleaved, and the headings only appear when both groups exist — so a library without
- * launchers looks exactly like a plain grid.
- *
- * Internal (not private) for the same reason as [Coverflow]: the screenshot harness composes the
- * real grid with a mock shelf, because the screen around it takes its state off the network.
- */
-@Composable
-internal fun TouchGrid(
-    games: List<GameEntry>,
-    loader: ImageLoader,
-    onLaunch: (GameEntry) -> Unit,
-    onLink: (GameEntry, LinkAction) -> Unit,
-    onEndGame: (GameEntry) -> Unit = {},
-    /**
-     * Which titles the host already has up, keyed by library id — so a tile the player can return
-     * to says `Resume` rather than looking like every other one. Empty on an older host, an
-     * unreachable one, and while a shelf is being served from cache.
-     */
-    running: Map<String, RunningGame> = emptyMap(),
-    /** `/status` downloads by library id, and this device's grants: a tile's badge and menu row. */
-    downloads: Map<String, Download> = emptyMap(),
-    grants: Int? = null,
-    onFiles: (GameEntry, InstallAction) -> Unit = { _, _ -> },
-    /** The title this shelf last launched — where the grid opens. Null on a first visit. */
-    resumeAt: String? = null,
-    modifier: Modifier = Modifier,
-) {
-    val launchers = games.filter { it.isLauncher }
-    val titles = games.filter { !it.isLauncher }
-    val both = launchers.isNotEmpty() && titles.isNotEmpty()
-    val grid = rememberLazyGridState()
-    // Put the player back where they were. Leaving a stream re-composes this screen from scratch —
-    // a new LazyGridState — so a long library came back at the top every time, and the round trip
-    // this shelf exists for (browse → play → quit → browse) lost your place on every lap.
-    //
-    // Anchored on the TITLE, not an index or a pixel offset: an offset is meaningless across the
-    // things that legitimately change between visits (a rotation, a resize, a foldable unfolding,
-    // a host that gained titles, the running-first ordering above), and the list is re-ordered at
-    // least twice per visit as the cached catalog gives way to the live one and then to `/status`.
-    // Keyed on the list so it can still land once the title it names arrives, and one-shot so a
-    // later re-order never yanks the grid out from under someone who has started scrolling.
-    var restored by rememberSaveable { mutableStateOf(false) }
-    LaunchedEffect(games, resumeAt) {
-        if (restored || resumeAt == null) return@LaunchedEffect
-        val index = flatIndexOf(resumeAt, launchers, titles, both)
-        if (index == null) return@LaunchedEffect
-        restored = true
-        // Without animation: it should simply already be there, not visibly travel.
-        grid.scrollToItem(index)
-    }
-    LazyVerticalGrid(
-        columns = GridCells.Adaptive(minSize = 130.dp),
-        state = grid,
-        modifier = modifier.fillMaxWidth(),
-        contentPadding = PaddingValues(16.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        if (launchers.isNotEmpty()) {
-            if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Launchers") }
-            items(launchers, key = { "launcher-${it.id}" }) {
-                TouchPoster(
-                    it, loader, onLaunch, onLink, running[it.id] != null,
-                    endable = running[it.id]?.endable == true, onEndGame = onEndGame,
-                    download = downloads[it.id], grants = grants, onFiles = onFiles,
-                )
-            }
-        }
-        if (titles.isNotEmpty()) {
-            if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Games") }
-            items(titles, key = { "game-${it.id}" }) {
-                TouchPoster(
-                    it, loader, onLaunch, onLink, running[it.id] != null,
-                    endable = running[it.id]?.endable == true, onEndGame = onEndGame,
-                    download = downloads[it.id], grants = grants, onFiles = onFiles,
-                )
-            }
-        }
-    }
-}
-
-/**
- * Where a title sits in the FLAT item stream `LazyVerticalGrid` scrolls by, headings included.
- *
- * The grid is not one list: design D4 gives the launchers their own section, and each section
- * carries a full-span heading whenever both exist. `scrollToItem` counts those headings, so an
- * index taken from `games` alone lands one or two tiles short — which is exactly the kind of
- * off-by-a-heading that only shows up on a library that happens to have launchers.
- *
- * Null when the title isn't in this grid at all: a host that lost it since, or a shelf filtered
- * down to a group it doesn't belong to.
- */
-private fun flatIndexOf(
-    id: String,
-    launchers: List<GameEntry>,
-    titles: List<GameEntry>,
-    both: Boolean,
-): Int? {
-    val heading = if (both) 1 else 0
-    launchers.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let { return heading + it }
-    val gamesStart = if (launchers.isEmpty()) 0 else heading + launchers.size
-    return titles.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let { gamesStart + heading + it }
-}
-
-@Composable
-private fun TouchGroupHeading(text: String) {
-    Text(
-        text.uppercase(),
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        letterSpacing = 1.4.sp,
-    )
-}
-
-/**
- * One touch tile: 2:3 poster, store badge, title. Tap launches; a LONG PRESS opens this title's own
- * actions — the finger's context menu, and the same gesture the host cards' overflow answers to.
- */
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun TouchPoster(
-    game: GameEntry,
-    loader: ImageLoader,
-    onLaunch: (GameEntry) -> Unit,
-    onLink: (GameEntry, LinkAction) -> Unit,
-    /** Already up on the host, so tapping resumes rather than starts. */
-    running: Boolean = false,
-    /** Up, and this device launched it: the long press offers End game. */
-    endable: Boolean = false,
-    onEndGame: (GameEntry) -> Unit = {},
-    /** Its download, if the host reports one. */
-    download: Download? = null,
-    grants: Int? = null,
-    onFiles: (GameEntry, InstallAction) -> Unit = { _, _ -> },
-) {
-    var menu by remember { mutableStateOf(false) }
-    val context = LocalContext.current
-    val canPin = remember { canPinShortcuts(context) }
-    val files = InstallAction.forTitle(game.install, download, grants)
-    val badge = TileBadge.forTitle(game.install, download)
-    val shape = MaterialTheme.shapes.medium
-    Box {
-        Column(
-            Modifier.combinedClickable(
-                onClickLabel = "Launch ${game.title}",
-                onLongClickLabel = "More options for ${game.title}",
-                onClick = { onLaunch(game) },
-                onLongClick = { menu = true },
-            ),
-        ) {
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(2f / 3f)
-                    // What the launch hold flies this title's cover out of.
-                    .onGloballyPositioned { TileFrames.record(game.id, it.boundsInWindow()) }
-                    .clip(shape)
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
-                contentAlignment = Alignment.Center,
-            ) {
-                TouchPosterArt(game, loader)
-                // Opposite corner from the store chip, so the two never meet on a narrow tile.
-                if (running) {
-                    Box(Modifier.fillMaxSize().padding(6.dp), contentAlignment = Alignment.TopEnd) {
-                        RunningBadge(compact = true)
-                    }
-                } else if (badge != null) {
-                    Box(Modifier.fillMaxSize().padding(6.dp), contentAlignment = Alignment.TopEnd) {
-                        FilesBadge(badge)
-                    }
-                }
-                Box(Modifier.fillMaxSize().padding(6.dp), contentAlignment = Alignment.TopStart) {
-                    Text(
-                        game.storeLabel,
-                        style = MaterialTheme.typography.labelSmall,
-                        // A launcher's badge is brand-filled (design D4); a game's sits on a dark
-                        // wash over its own art, where the theme's own ink would be a coin toss.
-                        color = if (game.isLauncher) {
-                            MaterialTheme.colorScheme.onPrimary
-                        } else {
-                            Color.White
-                        },
-                        modifier = Modifier
-                            .semantics {
-                                contentDescription = if (game.isLauncher) {
-                                    "Opens ${game.storeLabel}"
-                                } else {
-                                    "From ${game.storeLabel}"
-                                }
-                            }
-                            .clip(PillShape)
-                            .background(
-                                if (game.isLauncher) {
-                                    MaterialTheme.colorScheme.primary
-                                } else {
-                                    Color.Black.copy(alpha = 0.5f)
-                                },
-                            )
-                            .padding(horizontal = 8.dp, vertical = 3.dp),
-                    )
-                }
-            }
-            Text(
-                game.title,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 6.dp),
-            )
-        }
-        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-            DropdownMenuItem(
-                text = { Text("Copy link") },
-                onClick = {
-                    menu = false
-                    onLink(game, LinkAction.Copy)
-                },
-            )
-            if (canPin) {
-                DropdownMenuItem(
-                    text = { Text("Add to home screen") },
-                    onClick = {
-                        menu = false
-                        onLink(game, LinkAction.HomeScreen)
-                    },
-                )
-            }
-            DropdownMenuItem(
-                text = { Text("Save launcher file\u2026") },
-                onClick = {
-                    menu = false
-                    onLink(game, LinkAction.LauncherFile)
-                },
-            )
-            if (files != null) {
-                DropdownMenuItem(
-                    text = { Text(files.label(game.install)) },
-                    onClick = {
-                        menu = false
-                        onFiles(game, files)
-                    },
-                )
-            }
-            if (endable) {
-                DropdownMenuItem(
-                    text = { Text("End game") },
-                    onClick = {
-                        menu = false
-                        onEndGame(game)
-                    },
-                )
-            }
-        }
-    }
-}
-
-/** A title's files on its tile: `42 %` downloading, paused, failed, or the size to download. */
-@Composable
-private fun FilesBadge(badge: TileBadge) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .clip(PillShape)
-            .background(Color.Black.copy(alpha = 0.72f))
-            .padding(horizontal = 6.dp, vertical = 3.dp),
-    ) {
-        Icon(
-            when (badge.icon) {
-                "pause" -> Icons.Filled.Pause
-                "alert" -> Icons.Filled.Warning
-                else -> Icons.Filled.Download
-            },
-            contentDescription = null,
-            tint = Color.White,
-            modifier = Modifier.size(12.dp),
-        )
-        Text(
-            badge.text,
-            style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.SemiBold,
-            color = Color.White,
-            modifier = Modifier.padding(start = 4.dp),
-        )
-    }
-}
-
-/**
- * "This one is already up on the host" — the Resume affordance, overlaid on a poster.
- *
- * A badge rather than a changed action label because these tiles have no labels to change: the
- * poster *is* the control. It says `Resume` rather than `Running` on purpose — the player does not
- * need a status report, they need to know what tapping it will do.
- *
- * A fixed semantic green rather than the theme's primary: this is a state the HOST reports, not a
- * Punktfunk surface, and it has to stay distinguishable from the launcher chip, which already owns
- * the brand fill one corner away. Fixed also means it survives Material You seeding the touch theme
- * from a wallpaper that happens to be green.
- */
-@Composable
-private fun TouchPosterArt(game: GameEntry, loader: ImageLoader) {
-    PosterArt(game, loader) {
-        // A launcher ships no poster by design, so its brand mark IS the poster; falling back to the
-        // launcher's NAME says "opens Steam", where a title would read as "a cover that failed to load".
-        // The desktop tile is not a brand, so its mark comes from Material rather than the brand
-        // table — the same job the Lucide `monitor` does on the shells that carry that set.
-        val mark = launcherIcon(game.iconToken)
-            ?: Icons.Filled.DesktopWindows.takeIf { game.isDesktop }
-        if (mark != null) {
-            Icon(
-                imageVector = mark,
-                contentDescription = game.title,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.fillMaxSize(0.45f),
-            )
-        } else {
-            Text(
-                if (game.isLauncher) game.storeLabel else game.title,
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(12.dp),
-            )
-        }
-    }
-}
-
-@Composable
-private fun RunningBadge(compact: Boolean = false) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .semantics { contentDescription = "Running on the host \u2014 resume" }
-            .clip(PillShape)
-            .background(RESUME_GREEN)
-            .padding(horizontal = if (compact) 6.dp else 8.dp, vertical = 3.dp),
-    ) {
-        Icon(
-            Icons.Filled.PlayArrow,
-            contentDescription = null,
-            tint = RESUME_INK,
-            modifier = Modifier.size(12.dp),
-        )
-        // Glyph only on the touch grid, whose tiles go down to ~130 dp wide and already carry the
-        // store chip in the opposite corner; at that size "Resume" plus an icon leaves the two
-        // badges touching in the middle. The coverflow's covers are several times wider and take
-        // the word.
-        if (!compact) {
-            Text(
-                "Resume",
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = RESUME_INK,
-                modifier = Modifier.padding(start = 4.dp),
-            )
-        }
-    }
-}
-
-/** The host presence green the console palette already uses for "this machine is up". */
-private val RESUME_GREEN = Color(0xFF33D64A)
-
-/** Near-black on that green — a fixed pair, so neither theme nor palette can wash it out. */
-private val RESUME_INK = Color(0xFF0A1A0D)
 

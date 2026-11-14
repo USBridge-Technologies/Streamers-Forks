@@ -84,7 +84,7 @@ pub(crate) fn list() -> Result<Vec<pf_seats::Seat>, ApiError> {
 
 /// The ledger and who plays on each running seat. A profile list reads every seat at once, and
 /// reads within [`FRESH`] of the last one share it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Snapshot {
     /// The operator turned seats on. Linux seats are on whenever the supervisor answers.
     pub on: bool,
@@ -122,6 +122,13 @@ impl Snapshot {
             self.owner().ok().flatten(),
             pf_paths::seat::role().is_door(),
         )
+    }
+
+    /// The row `account` plays on when it is a person's own Linux account. Only the
+    /// supervisor's unlock lets a device onto it or starts it.
+    pub(crate) fn person_row(&self, account: &OsAccount) -> Option<&pf_seats::Seat> {
+        let (seat, _) = self.seat(self.row_of(account)?)?;
+        seat.adopted_uid.is_some().then_some(seat)
     }
 }
 
@@ -495,6 +502,7 @@ pub(crate) fn forward_within(
         &path,
         call.content_type.as_deref(),
         call.device.as_deref(),
+        call.person.as_deref(),
         call.body,
     );
     let (status, content_type, body) = sent.ok()?;
@@ -512,7 +520,14 @@ pub(crate) fn tail(seat: &pf_seats::Seat, path: &str) -> Option<Box<dyn std::io:
         crate::ctl::client::Client::seat(seat_pin(seat)?, &host_dir(seat), seat.mgmt_port, None)
             .ok()?;
     let (status, _, body) = client
-        .send("GET", &format!("/api/v1/{path}"), None, None, Vec::new())
+        .send(
+            "GET",
+            &format!("/api/v1/{path}"),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
         .ok()?;
     (status == 200).then_some(body)
 }

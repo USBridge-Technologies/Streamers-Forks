@@ -94,6 +94,10 @@ mod planes;
 use planes::PlaneEnds;
 mod launch;
 use launch::Launch;
+/// A locked profile: its list, or its PIN, before anything places or plays it.
+mod lock;
+/// A person's own Linux account: the supervisor's unlock before placement, `Left` after.
+pub(crate) mod unlock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
@@ -145,6 +149,30 @@ use crate::stats_recorder::StatsRecorder;
 
 /// Bounds online PIN guessing: SPAKE2 already gives one guess per ceremony; this caps the rate.
 pub(crate) const PAIRING_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One plane's pairing clocks, [`PAIRING_COOLDOWN`] each. Strict attempts (relayed, or from the
+/// internet) run on their own, so a stranger who holds that one leaves the home network's free.
+#[derive(Default)]
+pub(crate) struct PairingClocks {
+    strict: std::sync::Mutex<Option<std::time::Instant>>,
+    local: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl PairingClocks {
+    /// Charge one attempt from `source` to its clock. `false` while that clock still runs.
+    pub(crate) fn charge(&self, source: crate::native_pairing::KnockSource) -> bool {
+        let clock = match source {
+            crate::native_pairing::KnockSource::Wan => &self.strict,
+            crate::native_pairing::KnockSource::Lan => &self.local,
+        };
+        let mut last = clock.lock().unwrap_or_else(|p| p.into_inner());
+        if last.is_some_and(|t| t.elapsed() < PAIRING_COOLDOWN) {
+            return false;
+        }
+        *last = Some(std::time::Instant::now());
+        true
+    }
+}
 
 use punktfunk_core::quic::wall_clock_ns as now_ns;
 
@@ -309,9 +337,10 @@ pub(crate) async fn serve(
         crate::audio::pad_endpoint::provision_at_startup(true);
     }
     // Windows: mint "Punktfunk Speakers/Microphone" (Valve streaming drivers). Best-effort;
-    // without Steam's drivers the wiring plan keeps its name-based ladder.
+    // without Steam's drivers the wiring plan keeps its name-based ladder. The Speakers hide
+    // between captures, so Windows never defaults to the silent sink on its own.
     #[cfg(target_os = "windows")]
-    crate::audio::minted::provision_at_startup();
+    crate::audio::minted::provision_at_startup(true);
     // Debounced TV-session restore on idle, not per-disconnect. Dropping this stops it.
     let _restore_worker = (!door).then(crate::vdisplay::start_restore_worker);
     if !door {
@@ -360,6 +389,7 @@ pub(crate) async fn serve(
         profiles: profiles.clone(),
         stats: stats.clone(),
         knobs: HostKnobs::get(),
+        host_fp: fingerprint,
     };
     // Secondary tier: a port it cannot bind must not take the streaming host down. Loud, though.
     if let Some(plane) = web {
@@ -369,7 +399,7 @@ pub(crate) async fn serve(
     let at = Arc::new(Accepting {
         fingerprint,
         media_socket,
-        last_pairing: std::sync::Mutex::new(None),
+        pairing_clocks: PairingClocks::default(),
         sem,
         accepted: std::sync::atomic::AtomicU32::new(0),
         done: tokio::sync::Notify::new(),
@@ -446,7 +476,7 @@ fn advertise(
 struct Accepting {
     fingerprint: [u8; 32],
     media_socket: Arc<std::net::UdpSocket>,
-    last_pairing: std::sync::Mutex<Option<std::time::Instant>>,
+    pairing_clocks: PairingClocks,
     /// The session slots, shared with the browser plane.
     sem: Arc<tokio::sync::Semaphore>,
     /// Handshakes that completed. `--max-sessions` counts those, not attempts, so the task that
@@ -482,7 +512,7 @@ async fn serve_connection(incoming: quinn::Incoming, host: SessionHost, at: Arc<
             at.media_socket.clone(),
             &at.fingerprint,
             &host.np,
-            &at.last_pairing,
+            &at.pairing_clocks,
         )
         .await;
         return;
@@ -514,7 +544,7 @@ async fn serve_connection(incoming: quinn::Incoming, host: SessionHost, at: Arc<
         &at.fingerprint,
         &np,
         &profiles,
-        &at.last_pairing,
+        &at.pairing_clocks,
         stats,
         at.sem.clone(),
     )
@@ -534,7 +564,10 @@ async fn serve_connection(incoming: quinn::Incoming, host: SessionHost, at: Arc<
             let detail = format!("{e:#}");
             conn_err.close(
                 punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE.into(),
-                setup_failed_sentence(&e).unwrap_or_default().as_bytes(),
+                setup_failed_sentence(&e)
+                    .unwrap_or_default()
+                    .text
+                    .as_bytes(),
             );
             tracing::warn!(%peer, error = %detail, "session ended with error")
         }
@@ -642,38 +675,52 @@ fn spawn_box_watch(np: Arc<NativePairing>, profiles: Arc<crate::profiles::Profil
     });
 }
 
-/// Ends the session as an operator stop when the console removes the profile it plays as.
-/// The end is written before the refuse, or the connection watcher would read the host's
-/// own close back as `lost`.
-fn spawn_profile_watch(scope: &SessionScope, profile: String) {
+/// Ends the session as an operator stop when the console removes the profile it plays as, or
+/// once device `fp` no longer opens it: signed out, the profile locked, a PIN's day over. The
+/// lock is read once a second. The end is written before the refuse, or the connection watcher
+/// would read the host's own close back as `lost`.
+fn spawn_profile_watch(
+    scope: &SessionScope,
+    profiles: &Arc<crate::profiles::Profiles>,
+    profile: String,
+    fp: Option<String>,
+) {
     let (conn, life) = (scope.conn().clone(), scope.life().clone());
+    let profiles = Arc::clone(profiles);
     let mut removed = crate::profiles::removed();
     scope.task(async move {
-        loop {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let said = loop {
             tokio::select! {
                 _ = conn.closed() => return,
                 id = removed.recv() => match id {
-                    Ok(id) if id == profile => break,
+                    Ok(id) if id == profile => break Said::new(
+                        "close_profile_removed",
+                        "Your profile was removed by the host's owner.",
+                    ),
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(_) => return,
                 },
+                _ = tick.tick() => {
+                    if !lock::still_opens(&profiles, &profile, fp.as_deref()) {
+                        let (id, text) = lock::SIGNED_OUT;
+                        break Said::new(id, text);
+                    }
+                }
             }
-        }
-        tracing::info!(%profile, "profile removed — closing its session");
+        };
+        tracing::info!(%profile, why = %said.id, "profile closed to this device — ending its session");
         life.end(crate::events::SessionEndReason::StoppedByOperator);
         let reason = punktfunk_core::reject::RejectReason::SeatUnavailable;
-        conn.refuse(
-            reason.close_code(),
-            "Your profile was removed by the host's owner.",
-        )
-        .await;
+        conn.refuse_said(reason.close_code(), &said).await;
     });
 }
 
 /// Close with the typed reject code before the session task returns `Err`. A bare drop
 /// closes with code 0, which the client cannot tell from transport trouble.
 async fn close_rejected(conn: &link::SessionLink, reason: punktfunk_core::reject::RejectReason) {
-    conn.refuse(reason.close_code(), &reason.to_string()).await;
+    let said = Said::new(&reason.message_id(), &reason.to_string());
+    conn.refuse_said(reason.close_code(), &said).await;
 }
 
 /// Client close code for a deliberate quit (user "stop"). Tears the virtual display down
@@ -697,7 +744,7 @@ const PENDING_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// [`wait_for_approval`], then a session slot like any fresh client's (waits if busy).
 ///
-/// `Ok(Ok(_))` is an approval with its slot. `Ok(Err(reason))` is the refusal to send.
+/// `Ok(Ok(_))` is an admission with its slot. `Ok(Err(reason))` is the refusal to send.
 /// `Err` means the client left before a decision.
 pub(crate) async fn park_knock(
     conn: &link::SessionLink,
@@ -711,14 +758,12 @@ pub(crate) async fn park_knock(
     if let Err(reason) = wait_for_approval(conn, send, np, label, fp_hex, profile).await? {
         return Ok(Err(reason));
     }
-    tracing::info!(name = %label, fingerprint = %fp_hex,
-        "device approved in console — admitting session (no reconnect)");
     Ok(Ok(slot_while_connected(conn, sem).await?))
 }
 
 /// A session slot, waited for only while the client is still there. A waiter that left must not
 /// take a slot, and with it, under `mode_conflict = steal`, another session's display.
-async fn slot_while_connected(
+pub(crate) async fn slot_while_connected(
     conn: &link::SessionLink,
     sem: &Arc<tokio::sync::Semaphore>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
@@ -729,10 +774,16 @@ async fn slot_while_connected(
     }
 }
 
+/// How long a seat host waits for a device the box admitted to reach its copy of the box's
+/// pairings. The supervisor copies them every 2 s; the box redirects at once.
+const TRUST_COPY_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Park an unpaired knock until the console decides, holding no session slot. A
-/// `punktfunk/2` client hears `Pending` on `v2` meanwhile, every [`PENDING_EVERY`].
+/// `punktfunk/2` client hears `Pending` on `v2` meanwhile, every [`PENDING_EVERY`]. A seat host
+/// parks nothing: it admits a device once the box's pairing reaches it, within
+/// [`TRUST_COPY_WAIT`], and refuses one the box never paired.
 ///
-/// `Ok(Ok(()))` is an approval. `Ok(Err(reason))` is the refusal to send. `Err` means the
+/// `Ok(Ok(()))` is an admission. `Ok(Err(reason))` is the refusal to send. `Err` means the
 /// client left before a decision.
 pub(crate) async fn wait_for_approval(
     conn: &link::SessionLink,
@@ -744,20 +795,25 @@ pub(crate) async fn wait_for_approval(
 ) -> Result<Result<(), punktfunk_core::reject::RejectReason>> {
     use punktfunk_core::reject::RejectReason;
     if np.pairing_refused() {
+        if np.admits_within(fp_hex, TRUST_COPY_WAIT).await {
+            tracing::info!(name = %label, fingerprint = %fp_hex,
+                "the box's pairing reached this seat — admitting session");
+            return Ok(Ok(()));
+        }
         tracing::info!(name = %label, fingerprint = %fp_hex,
             "unpaired device knocked on a seat — it pairs with the box");
         return Ok(Err(RejectReason::PairingNotArmed));
     }
     tracing::info!(name = %label, fingerprint = %fp_hex,
         "unpaired device knocked — parking connection for delegated approval in the console");
-    // QUIC-validated source IP for the pending per-source cap; a bridge's client address only
-    // tightens its class. Knock generation makes this connection the one an approval admits —
+    // QUIC-validated source IP for the pending per-source cap; a page server's relay or an
+    // unfamiliar page makes the knock strict. Knock generation makes this connection the one an approval admits —
     // siblings must not all start a session.
     let knock_seq = np.note_pending(
         label,
         fp_hex,
         Some(conn.remote_address().ip()),
-        conn.client_addr(),
+        conn.via(),
         profile,
     );
     let wait = np.wait_for_decision(fp_hex, knock_seq, PENDING_APPROVAL_WAIT);
@@ -780,7 +836,11 @@ pub(crate) async fn wait_for_approval(
         }
     };
     let reason = match decision {
-        PairingDecision::Approved => return Ok(Ok(())),
+        PairingDecision::Approved => {
+            tracing::info!(name = %label, fingerprint = %fp_hex,
+                "device approved in console — admitting session (no reconnect)");
+            return Ok(Ok(()));
+        }
         PairingDecision::Denied => RejectReason::Denied,
         // The device can knock again.
         PairingDecision::TimedOut => RejectReason::ApprovalTimeout,
@@ -800,35 +860,91 @@ pub(crate) enum Served {
     Access,
 }
 
-/// The sentence a person reads when setup fails, or `None` where the host has no
+/// A close reason a person reads: its English, the host message it is (`close_*`,
+/// `reject_*`, `apierr_*`; empty for none), and that message's placeholder values. The
+/// native close carries the English alone; a browser's `Refused` frame carries all three.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Said {
+    pub(crate) text: String,
+    pub(crate) id: String,
+    pub(crate) params: Vec<(String, String)>,
+}
+
+impl Said {
+    pub(crate) fn new(id: &str, text: &str) -> Self {
+        Said {
+            text: text.to_string(),
+            id: id.to_string(),
+            params: Vec::new(),
+        }
+    }
+
+    /// Fills the placeholder `name`.
+    pub(crate) fn param(mut self, name: &str, value: impl ToString) -> Self {
+        self.params.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// The `Refused` frame a browser reads for a close with `code` and these words.
+    pub(crate) fn refused(&self, code: u32) -> punktfunk_core::quic::Refused {
+        let params: Vec<(&str, &str)> = self
+            .params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        punktfunk_core::quic::Refused {
+            code,
+            reason: self.text.clone(),
+            ..Default::default()
+        }
+        .worded(&self.id, &params)
+    }
+}
+
+/// The words a person reads when setup fails, or `None` where the host has no
 /// wording better than the client's own generic one. Every close that carries text
 /// goes through here: the reason bytes reach a user, and an `anyhow` chain is
 /// operator register.
 ///
 /// `downcast_ref` walks the context chain, so a failure keeps its sentence however
 /// deep under `.context()` it was raised.
-pub(crate) fn setup_failed_sentence(e: &anyhow::Error) -> Option<String> {
+pub(crate) fn setup_failed_sentence(e: &anyhow::Error) -> Option<Said> {
     if let Some(m) = e.downcast_ref::<pf_vdisplay::monitors::MonitorNotFound>() {
-        return Some(m.user_message());
+        let (id, params) = m.message();
+        return Some(
+            params
+                .into_iter()
+                .fold(Said::new(id, &m.user_message()), |said, (name, value)| {
+                    said.param(name, value)
+                }),
+        );
     }
     #[cfg(target_os = "linux")]
     if let Some(n) = e.downcast_ref::<pf_vdisplay::NoVirtualOutputs>() {
-        return Some(n.user_message().into());
+        return Some(Said::new("close_niri_no_outputs", n.user_message()));
     }
     #[cfg(target_os = "linux")]
     if let Some(m) = e.downcast_ref::<pf_vdisplay::UmbrielIpcMismatch>() {
-        return Some(m.user_message().into());
+        return Some(Said::new("close_umbriel_mismatch", m.user_message()));
     }
     // Umbriel is the one Linux backend whose outputs have no PipeWire node.
     #[cfg(target_os = "linux")]
     if e.downcast_ref::<pf_capture::NoPipeWireNode>().is_some() {
-        return Some(
-            "This Umbriel session can't be captured directly; the stream needs a GPU encoder."
-                .into(),
-        );
+        return Some(Said::new(
+            "close_umbriel_no_capture",
+            "This Umbriel session can't be captured directly; the stream needs a GPU encoder.",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if e.downcast_ref::<pf_capture::SharedCaptureTaken>().is_some() {
+        return Some(Said::new(
+            "close_join_other_codec",
+            "Couldn't join the shared screen — this device streams with a video codec that \
+             can't share it. Set the same video codec on both devices, then join again.",
+        ));
     }
     e.downcast_ref::<pf_vdisplay::DisplayAsleep>()
-        .map(|d| d.user_message())
+        .map(|d| Said::new("close_display_asleep", &d.user_message()))
 }
 
 /// Handshake → input/audio → data plane. RAII teardown. A first-message PairRequest is
@@ -845,7 +961,7 @@ async fn serve_session(
     host_fp: &[u8; 32],
     np_arc: &Arc<NativePairing>,
     profiles: &Arc<crate::profiles::Profiles>,
-    last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
+    pairing_clocks: &PairingClocks,
     stats: Arc<StatsRecorder>,
     // The session slots. An unpaired knock releases its slot while parked, re-acquires on approval.
     sem: Arc<tokio::sync::Semaphore>,
@@ -873,7 +989,7 @@ async fn serve_session(
         .map_err(|_| anyhow!("first message timeout"))??;
     if let Ok(req) = v2msg::decode::<PairRequest>(ty, &body) {
         let wire = pairing::PairWire::V2 { send, recv };
-        return serve_pairing(&conn, wire, req, host_fp, np, last_pairing).await;
+        return serve_pairing(&conn, wire, req, host_fp, np, pairing_clocks).await;
     }
     let first = v2msg::decode::<ClientHello>(ty, &body)
         .map_err(|e| anyhow!("ClientHello decode: {e:?}"))?;
@@ -958,6 +1074,7 @@ async fn serve_session(
         profiles: profiles.clone(),
         stats,
         knobs: HostKnobs::get(),
+        host_fp: *host_fp,
     };
     let data_plane = DataPlane::Shared(
         conn.v2()
@@ -975,7 +1092,7 @@ async fn serve_pairing<W, R>(
     req: PairRequest,
     host_fp: &[u8; 32],
     np: &NativePairing,
-    last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
+    pairing_clocks: &PairingClocks,
 ) -> Result<Served>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -988,18 +1105,11 @@ where
         anyhow::bail!("pairing requires the client to present a certificate");
     };
     let client_fp_hex = hex::encode(client_fp);
-    // Charge the cooldown before consulting arming, on every outcome including rejections.
-    // Otherwise "is pairing armed?" is a free oracle. A spam of knocks can hold the
-    // cooldown against the real device.
-    let limited = {
-        let mut last = last_pairing.lock().unwrap();
-        let limited = last.is_some_and(|t| t.elapsed() < PAIRING_COOLDOWN);
-        if !limited {
-            *last = Some(std::time::Instant::now());
-        }
-        limited
-    };
-    if limited {
+    // The class is free to compute and tells the peer nothing, so it picks the clock. The charge
+    // comes before arming is consulted, on every outcome: otherwise "is pairing armed?" is a free
+    // oracle. A spam of strict attempts holds only the strict clock.
+    let source = crate::native_pairing::classify_source(Some(peer.ip()));
+    if !pairing_clocks.charge(source) {
         close_rejected(
             conn,
             punktfunk_core::reject::RejectReason::PairingRateLimited,
@@ -1009,7 +1119,6 @@ where
     }
     // Live PIN per attempt so a lapsed window no longer pairs; honor fingerprint binding
     // and the address the knock came from.
-    let source = crate::native_pairing::classify_source(Some(peer.ip()));
     let pin = match np.pin_for_attempt(&client_fp_hex, source) {
         crate::native_pairing::PinAttempt::Pin(pin) => pin,
         crate::native_pairing::PinAttempt::Disarmed => {
@@ -1052,7 +1161,7 @@ async fn serve_pkf1(
     media_socket: Arc<std::net::UdpSocket>,
     host_fp: &[u8; 32],
     np: &NativePairing,
-    last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
+    pairing_clocks: &PairingClocks,
 ) {
     let peer = conn.remote_address();
     let first = async {
@@ -1067,7 +1176,7 @@ async fn serve_pkf1(
                 Arc::new(link::V2Link::new(conn.clone(), media_socket)),
             );
             let wire = pairing::PairWire::Pkf1 { send, recv };
-            match serve_pairing(&link, wire, req, host_fp, np, last_pairing).await {
+            match serve_pairing(&link, wire, req, host_fp, np, pairing_clocks).await {
                 Ok(_) => tracing::info!(%peer, "pairing over punktfunk/1 complete"),
                 Err(e) => {
                     tracing::warn!(%peer, error = %format!("{e:#}"), "pairing over punktfunk/1 failed")
@@ -1095,6 +1204,8 @@ pub(crate) struct SessionHost {
     pub(crate) profiles: Arc<crate::profiles::Profiles>,
     pub(crate) stats: Arc<StatsRecorder>,
     pub(crate) knobs: &'static HostKnobs,
+    /// SHA-256 of this host's certificate, as a client pins it: a key proof signs it.
+    pub(crate) host_fp: [u8; 32],
 }
 
 impl SessionHost {
@@ -1127,6 +1238,7 @@ impl SessionHost {
             profiles,
             stats: StatsRecorder::new(crate::stats_recorder::default_dir()),
             knobs: HostKnobs::get(),
+            host_fp: [0; 32],
         }
     }
 }
@@ -1154,7 +1266,8 @@ pub(crate) async fn run_admitted(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Served> {
     let (mut send, mut recv) = (send, recv);
-    let Some((mut who, resolved)) = admit_here(host, &conn, &mut send, &first).await? else {
+    let admitted = admit_here(host, &conn, &mut send, &mut recv, &first).await?;
+    let Some((mut who, resolved)) = admitted else {
         // Placed on its seat's host: the redirect was this connect's session.
         return Ok(Served::Session);
     };
@@ -1164,8 +1277,14 @@ pub(crate) async fn run_admitted(
     // Held first, so the slot comes back last.
     scope.hold(permit);
     scope.hold(who.count.take());
+    scope.hold(who.presence.take());
     spawn_end_watch(&scope);
-    spawn_profile_watch(&scope, resolved.id.clone());
+    spawn_profile_watch(
+        &scope,
+        &host.profiles,
+        resolved.id.clone(),
+        who.fp_hex.clone(),
+    );
     scope.life().enter(crate::lifecycle::Phase::Negotiating);
     // Every phase's error returns here, so every exit reaches the one teardown.
     let result: Result<()> = async {
@@ -1210,6 +1329,8 @@ struct Admitted {
     profile_ref: crate::events::ProfileRef,
     /// This device's session count, until the scope holds it.
     count: Option<crate::native_pairing::SessionCountGuard>,
+    /// Its place on a locked profile's list, until the scope holds it.
+    presence: Option<crate::profiles::locks::Presence>,
     knobs: SessionKnobs,
     /// Hello in hand; send thread finishes this when the first video packet leaves.
     bringup: Arc<crate::bringup::Trace>,
@@ -1218,12 +1339,13 @@ struct Admitted {
     counters: Arc<crate::session_status::SessionCounters>,
 }
 
-/// The trust record, the profile and its placement. `None` once the profile was sent to play
-/// on its seat's host.
+/// The trust record, the profile and its placement, a person's own account unlocked first.
+/// `None` once the profile was sent to play on its seat's host.
 async fn admit_here(
     host: &SessionHost,
     conn: &link::SessionLink,
     send: &mut link::CtlSend,
+    recv: &mut link::CtlReader,
     first: &ClientHello,
 ) -> Result<Option<(Admitted, crate::profiles::Resolved)>> {
     let fp_hex = conn.peer_fingerprint().map(hex::encode);
@@ -1252,13 +1374,26 @@ async fn admit_here(
         }
     };
     tracing::info!(profile = %resolved.id, name = %resolved.display_name, via = ?resolved.via, "profile");
+    // Before placement, so a profile that plays here and one sent to its seat pass one check.
+    let fp = fp_hex.as_deref();
+    let wire = (&mut *send, &mut *recv);
+    let (presence, unlocked) = lock::admit(host, conn, wire, first, &resolved, fp).await?;
     // A refusal ends the connect here and leaves the profile's last-used time alone.
-    let placed = place_profile(conn, send, fp_hex.clone(), first, &resolved).await?;
+    let placed = place_profile(
+        conn,
+        (send, recv),
+        fp_hex.clone(),
+        first,
+        (&resolved, unlocked),
+        host,
+    )
+    .await?;
     host.profiles.touch(&resolved.id);
     if placed.is_some() {
-        if let (Some(guard), Some(fp)) = (session, fp_hex) {
-            if host.np.is_session_only(&fp) {
-                hold_while_on_seat(guard, fp, false);
+        if let Some(fp) = fp_hex {
+            let count = session.filter(|_| host.np.is_session_only(&fp));
+            if count.is_some() || presence.is_some() {
+                hold_while_on_seat((count, presence), fp, false);
             }
         }
         return Ok(None);
@@ -1275,6 +1410,7 @@ async fn admit_here(
         expires_in_secs: remaining_secs_wire(deadline_unix, at_unix),
         profile_ref,
         count: session,
+        presence,
         knobs: SessionKnobs::read(),
         bringup: crate::bringup::Trace::start("bringup", Arc::new(AtomicU32::new(0))),
         counters: Arc::new(crate::session_status::SessionCounters::default()),
@@ -1332,25 +1468,20 @@ async fn negotiate_session(
         host_mbps = n.host_link.link_mbps,
         "link facts of both ends"
     );
-    let join_live = n.joined.is_some();
     // Live reconfigure is off for gamescope (resize must not relaunch the title),
-    // `identity: per-client-mode` (resize would resolve a different slot), a monitor
-    // mirror (physical head ignores the requested mode) and a `join` session (the mode
-    // is the owner's). Synthetic stays on. Captured once here, the mirror pin too: a console
-    // change mid-session must not change this session's answer.
-    let mirrored = crate::session_plan::mirrored();
+    // `identity: per-client-mode` (resize would resolve a different slot) and a monitor
+    // mirror (physical head ignores the requested mode). The mirror is the handshake's pick: a
+    // console change mid-session must not change this session's answer. A `join` session is
+    // asked at each switch (`wiring::joined_held`).
+    let mirrored = n.mirrored;
     let live_reconfig_ok = {
         let per_client_mode_identity = crate::vdisplay::policy::prefs()
             .configured_effective()
             .is_some_and(|e| e.identity == crate::vdisplay::policy::Identity::PerClientMode);
-        reconfig_allowed(
-            n.compositor,
-            per_client_mode_identity,
-            mirrored || join_live,
-        )
+        reconfig_allowed(n.compositor, per_client_mode_identity, mirrored)
     };
-    // A mirror and a `join` session share another session's capture: their format stays.
-    let format_change_ok = !(mirrored || join_live);
+    // A mirror shares another session's capture: its format stays.
+    let format_change_ok = !mirrored;
     let codec = crate::encode::codec_from_wire(n.welcome.codec);
     tracing::info!(
         peer = %scope.conn().remote_address(),
@@ -1419,6 +1550,9 @@ async fn wire_session(
             (n.client_link.kind, n.client_link.mbps),
         ),
     );
+    // A joiner may not switch before its stream knows the display it joined.
+    let joined = wiring::joined_display(n.joined.is_some(), None);
+    shared.joined_display.store(joined, Ordering::Relaxed);
     // Shard renegotiation only if `Hello::max_shard_payload` and not PyroWave (PyroWave pins
     // the Welcome value for the session; a mid-stream re-key would desync). Not for a browser
     // either: the driver's targets are UDP-over-IP maths, and a WebTransport datagram also
@@ -1667,6 +1801,7 @@ fn spawn_control(
         clock: conn.v2_session().clock.clone(),
         input_tx,
         initial_mode: hello.mode,
+        initial_picture: n.picture(),
         stream_config: v2msg::StreamConfig {
             stream: 0,
             epoch: 0,
@@ -1684,6 +1819,10 @@ fn spawn_control(
             host_link_mbps: host_link.link_mbps,
             host_sndbuf_kb: host_link.sndbuf_kb,
             host_forced_shape: host_link.forced_shape,
+            picture: crate::session_plan::picture_field(welcome.mode, {
+                let p = n.picture();
+                (p.width, p.height)
+            }),
         },
         anchored: features.has(punktfunk_core::quic::v2::registry::FEATURE_STREAM_CONFIG),
         codec,
@@ -1733,6 +1872,7 @@ fn spawn_control(
         plane: conn.plane(),
         counters: who.counters.clone(),
         stats: host.stats.clone(),
+        conn: conn.clone(),
     }));
 }
 
@@ -1934,23 +2074,29 @@ fn display_half(
         pyrowave_bpp,
         slices,
         joined,
+        view,
         features,
+        mirrored,
+        screen,
+        topology,
+        display_hdr,
         ..
     } = n;
     // Read back from what the ServerHello agreed, like `cursor_forward` below.
-    let format_facts = handshake::FormatFacts::of(
+    let mut format_facts = handshake::FormatFacts::of(
         &hello,
         crate::session_plan::StudioAsk::of(&features),
         compositor,
         gamescope_route.as_ref(),
         &knobs,
+        joined.as_ref().map(|(d, _)| d),
+        handshake::follows_source(&features, mirrored),
     );
-    let reframe_to = joined.as_ref().map(|(_, view)| {
-        (
-            punktfunk_core::video_fit::VideoFit::from_wire(hello.video_fit),
-            *view,
-        )
-    });
+    // The content the Welcome was resolved for, not a second look at it.
+    format_facts.content_hdr = format_facts
+        .follows_content()
+        .then_some(welcome.color.is_hdr());
+    let reframe_to = handshake::reframe_to(hello.video_fit, handshake::joined_view(&joined), view);
     // Read back from Welcome, not recomputed (would re-probe and could drift).
     let cursor_forward = welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0;
     // Mid-stream resize counterpart; latest accepted Reconfigure wins.
@@ -1961,6 +2107,7 @@ fn display_half(
             .expect("the Virtual source resolves a compositor during the handshake"),
         gamescope_route,
         format_facts,
+        display_hdr,
         encoder,
         host_knobs,
         knobs,
@@ -1980,6 +2127,9 @@ fn display_half(
         // `None` = older client or no HDR: the EDID and 0xCE take built-in defaults.
         client_hdr: hello.display_hdr.map(crate::encode::hdr_meta_from_wire),
         join_live: joined.is_some(),
+        mirrored,
+        screen,
+        topology,
         reframe_to,
         frame_map: lanes.frame_map,
         #[cfg(target_os = "linux")]
@@ -2001,16 +2151,58 @@ fn display_half(
     }
 }
 
-/// A seat profile plays on its seat's host: send the client there, or say why not. `Some` when
-/// the session ended in a redirect; `None` when it plays here.
+/// A seat profile plays on its seat's host: send the client there, or say why not. A person's
+/// own Linux account goes there only once the supervisor unlocked it for this device, and the
+/// device's claim on it goes to [`unlock::watch_left`]. A made seat starts for a dial that
+/// announced an unlock ([`start_for_dial`]) when `unlocked` (that unlock opened the profile's
+/// lock) or when the wake route would start it for this device ([`crate::mgmt::may_wake`]).
+/// `Some` when the session ended in a redirect; `None` when it plays here.
 async fn place_profile(
     conn: &link::SessionLink,
-    send: &mut link::CtlSend,
+    (send, recv): (&mut link::CtlSend, &mut link::CtlReader),
     fp: Option<String>,
     first: &ClientHello,
-    resolved: &crate::profiles::Resolved,
+    (resolved, unlocked): (&crate::profiles::Resolved, bool),
+    host: &SessionHost,
 ) -> Result<Option<Served>> {
-    use crate::seats::placement::{place, Asker, Placement};
+    use crate::seats::placement::{here, place, Asker, Placement};
+    if here(&resolved.os_account) {
+        return Ok(None);
+    }
+    let seats = unlock::seats_for(fp.as_deref());
+    let asked = Arc::clone(&seats);
+    let mut snap = tokio::task::spawn_blocking(move || asked.ledger())
+        .await
+        .context("seat ledger task")?;
+    let claim = match snap.person_row(&resolved.os_account).cloned() {
+        Some(row) => {
+            let device = fp.as_deref().map(|fp| {
+                let label = host
+                    .np
+                    .list()
+                    .into_iter()
+                    .find(|c| c.fingerprint.eq_ignore_ascii_case(fp))
+                    .map(|c| c.name);
+                unlock::device(fp, label.as_deref())
+            });
+            let (seat, claim) =
+                unlock::unlock(conn, send, recv, first, &row, device, &seats).await?;
+            if let Some(at) = snap.seats.iter().position(|s| s.id == seat.id) {
+                snap.seats[at] = seat;
+            }
+            Some(claim)
+        }
+        None => None,
+    };
+    // A dial with an announced unlock starts its stopped seat when that unlock opened the
+    // lock, or as a wake would.
+    if claim.is_none()
+        && first.unlock_follows()
+        && (unlocked
+            || crate::mgmt::may_wake(Some(&host.np), &host.profiles, &resolved.id, fp.as_deref()))
+    {
+        snap = start_for_dial(conn, send, &seats, snap, &resolved.os_account).await?;
+    }
     let follows = first
         .features
         .has(punktfunk_core::quic::v2::registry::FEATURE_PROFILES);
@@ -2028,22 +2220,97 @@ async fn place_profile(
             joins,
             browser,
         };
-        place(&who, &asker)
+        place(&who, &asker, &snap)
     })
     .await
     .context("placement task")?;
     match placed {
-        Placement::Here => Ok(None),
         Placement::Redirect(to) => {
             tracing::info!(profile = %resolved.id, seat = %to.seat_name, port = to.port,
                 "redirected to the profile's seat");
-            redirect(conn, send, &to).await?;
+            let sent = redirect(conn, send, &to).await;
+            if let Some(claim) = claim {
+                unlock::watch_left(seats, claim, sent.is_ok());
+            }
+            sent?;
             Ok(Some(Served::Session))
         }
         Placement::Refuse(reason) => {
+            if let Some(claim) = claim {
+                unlock::watch_left(seats, claim, false);
+            }
             close_rejected(conn, reason).await;
             anyhow::bail!("seat refused: {reason}");
         }
+    }
+}
+
+/// How long a dial waits for the seat it started. A first logon takes tens of seconds.
+const SEAT_START_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The ledger once `account`'s made seat is up, started for this dial when it was down, with
+/// `Pending` to the client every [`PENDING_EVERY`] meanwhile. A seat already up, a person's own
+/// account, one that went down again and one still down after [`SEAT_START_WAIT`] come back as
+/// they stand, and placement answers for them.
+async fn start_for_dial(
+    conn: &link::SessionLink,
+    send: &mut link::CtlSend,
+    seats: &Arc<dyn crate::mgmt::owner::Seats>,
+    snap: crate::seats::Snapshot,
+    account: &crate::profiles::OsAccount,
+) -> Result<crate::seats::Snapshot> {
+    let Some(id) = snap.row_of(account).map(str::to_string) else {
+        return Ok(snap);
+    };
+    let mut moved = false;
+    match snap.seat(&id) {
+        Some((s, _)) if s.adopted_uid.is_none() && !start_settled(Some(s), &mut moved) => {}
+        _ => return Ok(snap),
+    }
+    tracing::info!(seat = %id, "starting the seat for a dial");
+    crate::mgmt::start_seat(&id);
+    let deadline = tokio::time::Instant::now() + SEAT_START_WAIT;
+    let mut pending = tokio::time::interval(PENDING_EVERY);
+    let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = conn.closed() => anyhow::bail!("client left while its seat started"),
+            _ = pending.tick() => {
+                // Bounded: a peer that stops reading would hold the other arms with this one.
+                let sent = punktfunk_core::quic::v2::io::send(&mut *send, &v2msg::Pending {});
+                if !matches!(tokio::time::timeout(PENDING_EVERY, sent).await, Ok(Ok(_))) {
+                    anyhow::bail!("client stopped reading while its seat started");
+                }
+            }
+            _ = poll.tick() => {
+                let asked = Arc::clone(seats);
+                let now = tokio::task::spawn_blocking(move || asked.ledger())
+                    .await
+                    .context("seat ledger task")?;
+                let settled = start_settled(now.seat(&id).map(|(s, _)| s), &mut moved);
+                if settled || tokio::time::Instant::now() >= deadline {
+                    return Ok(now);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a dial stops waiting on `seat`: up with its host's pin, gone, or down again once
+/// `moved` saw it starting.
+fn start_settled(seat: Option<&pf_seats::Seat>, moved: &mut bool) -> bool {
+    use pf_seats::RuntimeState::{Failed, Running, Starting, Stopped};
+    let Some(seat) = seat else {
+        return true;
+    };
+    match seat.runtime.state {
+        Running if seat.fingerprint.is_some() => true,
+        Starting | Running => {
+            *moved = true;
+            false
+        }
+        Failed | Stopped => *moved,
+        _ => false,
     }
 }
 
@@ -2066,15 +2333,11 @@ pub(crate) fn hold_guests_kept_at_start(np: &Arc<NativePairing>) {
     }
 }
 
-/// A guest on a "this session" record plays on a seat after the redirect ended the door's own
-/// session. Holds the count until it has played there and left, so the record outlasts the
-/// play and not the redirect. The grace after the last count is the usual one. `landed` is true
-/// for a guest already seen on a seat.
-fn hold_while_on_seat(
-    session: crate::native_pairing::SessionCountGuard,
-    fp: String,
-    mut landed: bool,
-) {
+/// A redirected device plays on a seat after the redirect ended the door's own session. Holds
+/// `session` until it has played there and left: a "this session" record's count, or its place
+/// on a locked profile's list, so either outlasts the play and not the redirect. The grace after
+/// is the usual one. `landed` is true for a device already seen on a seat.
+fn hold_while_on_seat(session: impl Send + 'static, fp: String, mut landed: bool) {
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         let mut heard = started;

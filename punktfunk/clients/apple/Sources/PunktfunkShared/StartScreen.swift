@@ -24,9 +24,9 @@ public enum StartIn: String, CaseIterable, Sendable {
     /// Settings-row label. The value line names the resolved host beside it.
     public var label: String {
         switch self {
-        case .hosts: return "Host list"
-        case .library: return "Library"
-        case .stream: return "Stream"
+        case .hosts: return String(localized: L10n.playerStartInHosts)
+        case .library: return String(localized: L10n.playerStartInLibrary)
+        case .stream: return String(localized: L10n.playerStartInStream)
         }
     }
 }
@@ -39,7 +39,8 @@ public enum StartScreen: Equatable, Sendable {
     /// and nothing retries.
     case stream(StoredHost)
 
-    /// Where a resolved default came from, for the one log line a launch prints.
+    /// Where a resolved default came from. No Swift caller reads it: it is here so the shared
+    /// start-screen vectors can hold the three resolvers to the same answer.
     public enum Source: String, Sendable {
         case explicit
         case derived

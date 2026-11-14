@@ -81,6 +81,16 @@
 // `{"Listed": [rows]}`, `"NoProfiles"` or `{"Failed": "why"}`.
 #define PUNKTFUNK_CONSOLE_PUSH_PROFILES 20
 
+// `{"fp_hex": "…", "profile": "…", "answer": HiddenAnswer}` — the answer to the `FetchHidden`
+// command: `{"Listed": [LibraryGame]}` or `{"Failed": "why"}`.
+#define PUNKTFUNK_CONSOLE_PUSH_HIDDEN 21
+
+// `HideAnswer` — the answer to the `SetHidden` command, echoing its host, profile and title.
+#define PUNKTFUNK_CONSOLE_PUSH_HIDE 22
+
+// The room `punktfunk_console_take_unlock` needs: the longest password the wire takes.
+#define PUNKTFUNK_CONSOLE_UNLOCK_MAX 512
+
 // One console. Opaque to C.
 typedef struct PunktfunkConsole PunktfunkConsole;
 
@@ -114,8 +124,8 @@ PunktfunkConsole *punktfunk_console_new(const char *options_json,
 void punktfunk_console_free(PunktfunkConsole *c);
 
 // Draw one frame into `mtl_texture` (`width`×`height`) and submit it to the queue.
-// `scale` is design units per pixel; `0` takes the shell's own formula. `false` = nothing
-// drawn (idle, or the texture could not be wrapped): present nothing.
+// `scale` is device pixels per design unit; `0` takes the shell's own formula. `false` =
+// nothing drawn (idle, or the texture could not be wrapped): present nothing.
 //
 // # Safety
 // `c` is live. `mtl_texture` is an `id<MTLTexture>` from the console's device, render-target
@@ -172,11 +182,23 @@ bool punktfunk_console_key(const PunktfunkConsole *c, uint8_t key, bool shift, b
 void punktfunk_console_text(const PunktfunkConsole *c, const char *utf8);
 
 // Where the session the console asked for stands: 0 connecting, 1 streaming, 2 failed,
-// 3 ended (`message` NULL or empty = clean), 4 reconnecting.
+// 3 ended (`message` NULL or empty = clean), 4 reconnecting, 6 awaiting approval, 7 failed
+// as `profile-locked` (`message` the host's sentence, empty when it said none).
 //
 // # Safety
 // `c` is live; `message` is NULL or a NUL-terminated string.
 void punktfunk_console_phase(const PunktfunkConsole *c, uint8_t phase, const char *message);
+
+// Moves the password the console's prompt typed for the `Launch` it just raised into `out`,
+// its "Stay signed in" switch into `*stay`, and returns its length: 0 when the console holds
+// none. The console's copy is wiped either way, so call it once per `Launch`, first.
+//
+// # Safety
+// `c` is live; `out` is NULL or `cap` writable bytes; `stay` is NULL or a writable `bool`.
+uintptr_t punktfunk_console_take_unlock(const PunktfunkConsole *c,
+                                        uint8_t *out,
+                                        uintptr_t cap,
+                                        bool *stay);
 
 // Hand the console a model update; `kind` is a `PUNKTFUNK_CONSOLE_PUSH_*`. A bad kind or bad
 // JSON is a logged no-op.
@@ -221,6 +243,15 @@ char *punktfunk_console_drain_cmds(const PunktfunkConsole *c);
 // The console's background palettes in cycle order, as `[{"id", "name"}]`: what a native
 // picker offers for `ui_palette`. Free with `punktfunk_console_string_free`.
 char *punktfunk_console_palettes(void);
+
+// Word the Rust side's text in the first of `languages_json` that Punktfunk ships, a JSON
+// array of BCP-47 tags, most preferred first. `punktfunk_console_new` does this from its
+// `languages`; call it first when the palettes or the PyroWave warning are read with no
+// console. NULL or bad JSON leaves the language as it was.
+//
+// # Safety
+// `languages_json` is NULL or a NUL-terminated string.
+void punktfunk_console_set_languages(const char *languages_json);
 
 // Free a string from `punktfunk_console_next_event`, `punktfunk_console_drain_cmds` or
 // `punktfunk_console_palettes`.

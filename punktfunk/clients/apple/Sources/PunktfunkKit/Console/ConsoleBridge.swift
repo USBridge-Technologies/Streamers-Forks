@@ -36,6 +36,8 @@ public final class ConsoleBridge {
         case padTest = 18
         case libraryDownloads = 19
         case profiles = 20
+        case hidden = 21
+        case hide = 22
     }
 
     /// A discrete menu event, as the shell numbers them.
@@ -85,13 +87,15 @@ public final class ConsoleBridge {
         case setClipboard = "SetClipboard", unpairHost = "UnpairHost", savePreset = "SavePreset"
         case deletePreset = "DeletePreset", padTest = "PadTest", loadLicenses = "LoadLicenses"
         case promptAnswer = "PromptAnswer", padAction = "PadAction", hostAction = "HostAction"
-        case endGame = "EndGame", install = "Install"
+        case setScreen = "SetScreen", endGame = "EndGame", install = "Install"
+        case setHidden = "SetHidden", fetchHidden = "FetchHidden"
     }
 
-    /// Where the session the console asked for stands.
+    /// Where the session the console asked for stands. `profileLocked` is a failure the host
+    /// closed with `profile-locked`, its message the host's sentence: the console's prompt opens.
     public enum Phase: UInt8 {
         case connecting = 0, streaming = 1, failed = 2, ended = 3, reconnecting = 4
-        case awaitingApproval = 6
+        case awaitingApproval = 6, profileLocked = 7
     }
 
     /// `nil` when the options JSON or Skia's Metal context fails; the log says which.
@@ -104,10 +108,9 @@ public final class ConsoleBridge {
         self.handle = handle
     }
 
-    deinit {
-        // `free` belongs to this thread, and a @MainActor class is only ever released on it.
-        MainActor.assumeIsolated { punktfunk_console_free(handle) }
-    }
+    /// `free` belongs to the main thread. The deinit runs there even when another thread drops
+    /// the last reference.
+    isolated deinit { punktfunk_console_free(handle) }
 
     /// Draw into `texture` and submit. `false` = nothing drawn (idle, or the texture was
     /// refused): present nothing this tick.
@@ -150,6 +153,17 @@ public final class ConsoleBridge {
         punktfunk_console_phase(handle, phase.rawValue, message)
     }
 
+    /// The password the console's prompt typed for the `Launch` it just raised, moved out of the
+    /// console into a secret that wipes; nil when it holds none. Take it before anything else
+    /// the `Launch` does: one left in the console is wiped by the next.
+    public func takeUnlock() -> ProfileUnlock? {
+        var stay = false
+        let secret = UnlockSecret(capacity: Int(PUNKTFUNK_CONSOLE_UNLOCK_MAX)) { out in
+            Int(punktfunk_console_take_unlock(handle, out.baseAddress, UInt(out.count), &stay))
+        }
+        return secret.count > 0 ? ProfileUnlock.password(secret, staySignedIn: stay) : nil
+    }
+
     public func push(_ kind: Push, _ json: String) {
         punktfunk_console_push(handle, kind.rawValue, json)
     }
@@ -182,6 +196,15 @@ public final class ConsoleBridge {
         guard let raw = punktfunk_console_drain_cmds(handle) else { return "[]" }
         defer { punktfunk_console_string_free(raw) }
         return String(cString: raw)
+    }
+
+    /// Words the text Rust writes with no console built (the palette names, the PyroWave
+    /// warning) in the OS languages. The app calls it once at start, before any of it is read.
+    public nonisolated static func setLanguages() {
+        guard let json = try? JSONEncoder().encode(Locale.preferredLanguages),
+            let tags = String(data: json, encoding: .utf8)
+        else { return }
+        punktfunk_console_set_languages(tags)
     }
 
     /// The console's background palettes in cycle order: the `ui_palette` choices.

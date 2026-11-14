@@ -2,13 +2,16 @@
 //! only).
 //!
 //! Three lanes:
-//! - **paired device** — [`cert_may_access`] (status reads plus three writes: log upload,
-//!   host-action invoke, ending its own games). Proven either by a client certificate over
-//!   mTLS, or — for a browser, which has none — by a device token from
+//! - **paired device** — [`cert_may_access`] (status reads, a few writes about its own play, and
+//!   a locked profile's own view as its person, `mgmt::person`). Proven either by a client
+//!   certificate over mTLS, or — for a browser, which has none — by a device token from
 //!   [`super::device_auth`]. Same authority either way, because it is the same pairing.
 //! - **plugin token** (bearer, loopback) — [`plugin_may_access`]: admin minus hooks, pairing
 //!   admin, host logs, store, and update.
 //! - **admin token** (bearer, loopback) — everything.
+//! - **person** — a session its seat host opened from a ticket only the account could sign
+//!   (`mgmt::person_session`): profile scope on that seat host, and that profile's own view on
+//!   the box once the seat host vouched for it.
 //!
 //! The tray's `tray-token` (bearer, loopback) is not a lane: it opens `/local/summary` alone.
 
@@ -20,6 +23,7 @@ use axum::http::header;
 use axum::http::request::Parts;
 use axum::http::Method;
 use axum::middleware::Next;
+use punktfunk_core::mgmt_routes::path_matches;
 use sha2::{Digest, Sha256};
 use std::marker::PhantomData;
 
@@ -121,15 +125,22 @@ pub(crate) enum AuthLane {
     /// A paired device: the [`cert_may_access`] set. Its fingerprint is stamped as
     /// [`PairedDevice`], whichever way it was proven.
     Cert,
+    /// A person on their own seat host, by a session token it opened from a ticket only their
+    /// account could sign: [`super::person_session::may_reach`].
+    Person,
+    /// A person session on the box, which that profile's seat host vouched for, or the door
+    /// vouched for to the owner's host: [`super::person_session::box_may_reach`], for the profile
+    /// stamped as [`super::person::Vouched`].
+    PersonVouched,
     /// Open route (`/health`), or the tray summary on the token every local account may read.
     Public,
 }
 
 impl AuthLane {
-    /// Fields that become command execution as the host user. Admin only. Still refused
-    /// on other lanes if a write that carries `prep` / `launch.kind` is later allowlisted.
+    /// Fields that become command execution as the host user: the operator's, and on a seat
+    /// host its own person's, who is that user. Refused on every other lane.
     pub(crate) fn may_set_privileged_fields(self) -> bool {
-        matches!(self, AuthLane::Admin)
+        matches!(self, AuthLane::Admin | AuthLane::Person)
     }
 
     /// Operator's own lane (the console), as opposed to a paired client or a plugin.
@@ -145,12 +156,13 @@ impl AuthLane {
 
 /// Paired client cert (mTLS, from anywhere) or a bearer token from a loopback peer.
 /// `/health` is always open; `/local/summary` takes the tray token from loopback, else the
-/// lanes below. Cert: [`cert_may_access`]. Bearer: full admin, confined to loopback because
+/// lanes below. Cert: [`device_may`]. Bearer: full admin, confined to loopback because
 /// the listener binds all interfaces by default. Loopback is the [`PeerAddr`] the transport
-/// stamped; a request that carries none is a 500 on every route.
+/// stamped; a request that carries none is a 500 on every route. A request a page server
+/// relayed is never loopback, whatever its peer.
 pub(crate) async fn require_auth(
     State(st): State<Arc<MgmtState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     /// Stamp the lane so a handler can refuse privileged fields to a non-operator (see [`AuthLane`]).
@@ -196,7 +208,11 @@ pub(crate) async fn require_auth(
             "request carries no peer address",
         );
     };
-    let from_loopback = peer.ip().to_canonical().is_loopback();
+    // A page server on this machine reaches the host from loopback for every visitor it relays.
+    let relayed = req
+        .headers()
+        .contains_key(punktfunk_core::provenance::CLIENT_ADDR_HEADER);
+    let from_loopback = peer.ip().to_canonical().is_loopback() && !relayed;
 
     if req.uri().path() == "/api/v1/health" {
         return forward(req, next, AuthLane::Public).await;
@@ -214,6 +230,17 @@ pub(crate) async fn require_auth(
         req.uri().path(),
         "/api/v1/auth/device/challenge" | "/api/v1/auth/device/token"
     ) {
+        return forward(req, next, AuthLane::Public).await;
+    }
+    // A person opening or ending their session on their own seat host: the ticket or the
+    // session token in the request is the proof, from loopback as every bearer.
+    if req.uri().path() == "/api/v1/auth/person/session" {
+        if !from_loopback {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "a person session is opened and closed from loopback only",
+            );
+        }
         return forward(req, next, AuthLane::Public).await;
     }
     // Tray status: the tray token from loopback. A loopback peer is nobody on a box with
@@ -234,7 +261,7 @@ pub(crate) async fn require_auth(
         // `effective`, not `is_paired`. The expiry-blind verb answers "is this device listed"
         // (the roster). Authorizing on the listing would leave a lapsed guest on this lane
         // for as long as the record sits in the store.
-        if cert_may_access(req.method(), req.uri().path())
+        if device_may(&req)
             && st
                 .native
                 .as_ref()
@@ -250,7 +277,7 @@ pub(crate) async fn require_auth(
     // rather than when its token lapses.
     if let Some(token) = bearer(&req) {
         if let Some(fp) = st.device_auth.device_for(token) {
-            if cert_may_access(req.method(), req.uri().path())
+            if device_may(&req)
                 && st
                     .native
                     .as_ref()
@@ -274,6 +301,13 @@ pub(crate) async fn require_auth(
             "the admin API is loopback-only — a LAN client must present a paired client certificate",
         );
     }
+    // A person session on the box: the console calling for a person, with no bearer.
+    if req
+        .headers()
+        .contains_key(super::person_session::SESSION_HEADER)
+    {
+        return person_session(&st, req, next).await;
+    }
     // `run` always passes a token; no-token is a misconfigured caller (a test building `app`
     // directly) — deny.
     let Some(expected) = st.token.as_deref() else {
@@ -283,19 +317,38 @@ pub(crate) async fn require_auth(
     match presented {
         Some(token) if token_eq(token, expected) => match vouched(&req) {
             // The door, holding this host's token, calls for a device it placed here: the
-            // device's own lane, under the device's own pairing as this host holds it.
+            // device's own lane, under the device's own pairing as this host holds it. A person
+            // the door vouches for needs none: a locked owner's copy lists the owner's alone.
             Some(fp) => {
                 let paired = st
                     .native
                     .as_ref()
                     .is_some_and(|n| n.effective(&fp, crate::clock::unix_secs()).is_some());
-                if paired && cert_may_access(req.method(), req.uri().path()) {
+                let person = vouched_person(&st, &req);
+                if (paired || person.is_some()) && device_may(&req) {
+                    if let Some(person) = person {
+                        req.extensions_mut().insert(person);
+                    }
                     forward_device(req, next, fp).await
                 } else {
                     api_error(
                         StatusCode::UNAUTHORIZED,
                         "the vouched device is not paired here, or may not reach this route",
                     )
+                }
+            }
+            // The door calls for a person session it checked with that profile's seat host:
+            // that profile's view alone, never the operator's lane.
+            None if req.headers().contains_key(super::person::VOUCH_HEADER) => {
+                match vouched_session(&st, &req) {
+                    Some(person) => {
+                        req.extensions_mut().insert(person);
+                        forward(req, next, AuthLane::PersonVouched).await
+                    }
+                    None => api_error(
+                        StatusCode::UNAUTHORIZED,
+                        "the vouched person may not reach this route here",
+                    ),
                 }
             }
             None => forward(req, next, AuthLane::Admin).await,
@@ -310,8 +363,13 @@ pub(crate) async fn require_auth(
         {
             forward_plugin(req, next, None).await
         }
-        // A plugin's OWN token: the same routes, plus the identity that makes them its own.
+        // A plugin's OWN token: the same routes, plus the identity that makes them its own. A
+        // person's session on their own seat host first: it costs no file read.
         Some(token) => {
+            let now = std::time::Instant::now();
+            if let Some(profile) = st.person.as_ref().and_then(|p| p.session(token, now)) {
+                return forward_person(req, next, profile).await;
+            }
             let find = |tokens: &std::collections::BTreeMap<String, String>| {
                 tokens
                     .iter()
@@ -349,10 +407,109 @@ fn vouched(req: &Request) -> Option<String> {
     (fp.len() == 64 && fp.bytes().all(|b| b.is_ascii_hexdigit())).then(|| fp.to_ascii_lowercase())
 }
 
+/// The person the door names beside a vouched device, on a person's route of a host that takes
+/// its word ([`super::person::takes_vouch`]).
+fn vouched_person(st: &MgmtState, req: &Request) -> Option<super::person::Vouched> {
+    let id = req
+        .headers()
+        .get(super::person::VOUCH_HEADER)?
+        .to_str()
+        .ok()?;
+    let takes = st
+        .app
+        .profiles
+        .get()
+        .is_some_and(|p| super::person::takes_vouch(p));
+    let route = super::person::person_route(req.method().as_str(), req.uri().path());
+    (takes && route && crate::library::is_profile_id(id))
+        .then(|| super::person::Vouched(id.to_string()))
+}
+
+/// The person lane of this seat host, for session `profile`: its reach, and no other profile.
+/// The call carries `profile` as [`super::person_session::PersonOf`].
+async fn forward_person(req: Request, next: Next, profile: String) -> Response {
+    use super::person_session::may_reach;
+    if !may_reach(req.method(), req.uri().path()) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "a person session reaches its profile's routes and this host's name and status alone",
+        );
+    }
+    if super::person::named(req.uri()).is_some_and(|named| named != profile) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "a person session is for its own profile alone",
+        );
+    }
+    let mut req = req;
+    req.extensions_mut().insert(AuthLane::Person);
+    req.extensions_mut()
+        .insert(super::person_session::PersonOf { profile });
+    next.run(req).await
+}
+
+/// A person session on the box: no bearer beside it, a route it reaches, `as` naming its
+/// profile, and that profile's seat host saying the token is live there for it.
+async fn person_session(st: &MgmtState, mut req: Request, next: Next) -> Response {
+    use super::person_session::{box_may_reach, presented, session_ended, vouched_by_seat};
+    let Some((token, profile)) = presented(req.headers()) else {
+        return session_ended();
+    };
+    let (token, profile) = (token.to_string(), profile.to_string());
+    let bare = !req.headers().contains_key(header::AUTHORIZATION);
+    let named = super::person::named(req.uri());
+    if !bare || !box_may_reach(req.method(), req.uri().path()) || named != Some(profile.clone()) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "a person session carries no bearer, and reaches its own profile's view alone",
+        );
+    }
+    match vouched_by_seat(st, &profile, &token).await {
+        Some(profile) => {
+            req.extensions_mut().insert(super::person::Vouched(profile));
+            req.extensions_mut().insert(AuthLane::PersonVouched);
+            next.run(req).await
+        }
+        None => session_ended(),
+    }
+}
+
+/// The person session the door names on a call with this host's token and no device: the
+/// owner's host's alone, on a route a session reaches, for the profile `as` names, never the owner.
+fn vouched_session(st: &MgmtState, req: &Request) -> Option<super::person::Vouched> {
+    let id = req
+        .headers()
+        .get(super::person::VOUCH_HEADER)?
+        .to_str()
+        .ok()?;
+    let profiles = st.app.profiles.get()?;
+    let owner = profiles.owner_id();
+    let ok = super::person::takes_vouch(profiles)
+        && crate::library::is_profile_id(id)
+        && owner.as_deref() != Some(id)
+        && super::person_session::box_may_reach(req.method(), req.uri().path())
+        && super::person::named(req.uri()).as_deref() == Some(id);
+    ok.then(|| super::person::Vouched(id.to_string()))
+}
+
+/// [`cert_may_access`], and a person's route only for a call that names a profile: with no `as`
+/// a device isn't let in there at all.
+fn device_may(req: &Request) -> bool {
+    let (method, path) = (req.method(), req.uri().path());
+    cert_may_access(method, path)
+        && (!super::person::person_route(method.as_str(), path)
+            || super::person::named(req.uri()).is_some())
+}
+
 /// The `Authorization: Bearer` value, if there is one. Every lane that takes a token reads it
 /// through here so they cannot disagree about the prefix.
 fn bearer(req: &Request) -> Option<&str> {
-    req.headers()
+    bearer_of(req.headers())
+}
+
+/// [`bearer`] of a request's headers.
+pub(crate) fn bearer_of(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
@@ -393,6 +550,7 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::PUT, "/api/v1/display/settings"),
         (&Method::GET, "/api/v1/display/state"),
         (&Method::GET, "/api/v1/display/monitors"),
+        (&Method::GET, "/api/v1/display/targets"),
         (&Method::PUT, "/api/v1/display/layout"),
         (&Method::POST, "/api/v1/display/release"),
         (&Method::GET, "/api/v1/display/presets"),
@@ -467,69 +625,10 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         .any(|(m, pat)| *m == method && path_matches(pat, path))
 }
 
-/// `{}` is exactly one segment. Never a prefix test: `/api/v1/plugins/{}` must not swallow
-/// `/api/v1/plugins/x/ui-credential` the way `starts_with` would.
-fn path_matches(pattern: &str, path: &str) -> bool {
-    let (mut p, mut a) = (pattern.split('/'), path.split('/'));
-    loop {
-        match (p.next(), a.next()) {
-            (None, None) => return true,
-            (Some(pe), Some(ae)) if pe == "{}" || pe == ae => continue,
-            _ => return false,
-        }
-    }
-}
-
-/// Allowlist a paired streaming cert may reach. Deny-by-default: pairing PIN, pending queue,
-/// and every other mutation need the operator bearer. `/health` is always open, separately.
+/// Allowlist a paired device may reach: [`punktfunk_core::mgmt_routes::paired_may_access`], the
+/// table the browser client's page server relays by. `/health` is always open, separately.
 pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
-    // Write-only: the device gets an id back and can read nothing, not even its own upload.
-    // Size- and quota-capped in the handler/store.
-    if method == Method::POST && path == "/api/v1/client-logs" {
-        return true;
-    }
-    // Id-only invoke. The handler re-reads `effective(fp, now)` and demands `GRANT_POWER`;
-    // the route being reachable grants nothing by itself. `GET /actions` is on the read list.
-    if method == Method::POST && path_matches("/api/v1/actions/{}", path) {
-        return true;
-    }
-    // The handler scopes it to games this device launched, and refuses an expired device.
-    if method == Method::POST && path == "/api/v1/game/end" {
-        return true;
-    }
-    // Installing is what launching a missing title does anyway; the handler demands
-    // `GRANT_LAUNCH`. Pause and remove demand `GRANT_MANAGE_GAMES`; cancel stays the operator's.
-    if (method == Method::POST || method == Method::DELETE)
-        && path_matches("/api/v1/library/install/{}", path)
-    {
-        return true;
-    }
-    if method == Method::POST && path_matches("/api/v1/library/install/{}/pause", path) {
-        return true;
-    }
-    // A client's picker: the list, a picture, and getting a seat ready. Editing stays the
-    // console's.
-    if method == Method::GET
-        && (path == "/api/v1/profiles/enumerate"
-            || path_matches("/api/v1/profiles/{}/avatar", path))
-    {
-        return true;
-    }
-    if method == Method::POST && path_matches("/api/v1/profiles/{}/wake", path) {
-        return true;
-    }
-    method == Method::GET
-        && (matches!(
-            path,
-            "/api/v1/host"
-                | "/api/v1/compositors"
-                | "/api/v1/status"
-                | "/api/v1/actions"
-                // Rosters are not on this lane: they name every other paired device. Library
-                // GET is; POST/PUT/DELETE stay token-only via this exact-path match.
-                | "/api/v1/library"
-                | "/api/v1/library/page"
-        ) || path.starts_with("/api/v1/library/art/"))
+    punktfunk_core::mgmt_routes::paired_may_access(method.as_str(), path)
 }
 
 /// Compare SHA-256 digests, not the strings — constant-time in the secret without a ct-eq

@@ -26,7 +26,7 @@ pub const KWIN_POOL_MAX: i32 = 4;
 /// Encode-backend facts the Linux zero-copy negotiation needs, resolved once
 /// by the host facade and passed in so capture never calls back into encode.
 #[cfg(target_os = "linux")]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct ZeroCopyPolicy {
     /// VAAPI (AMD/Intel): hand raw dmabufs through instead of the EGL→CUDA
     /// import (`encode::linux_zero_copy_is_vaapi`).
@@ -193,6 +193,9 @@ pub struct VirtualOutputOpts {
     /// Read the pointer from gamescope's nested Xwaylands: its node carries no
     /// `SPA_META_Cursor`. `None` everywhere else.
     pub gamescope_cursor: Option<crate::GamescopeCursorTargets>,
+    /// Sessions may share this node's screen: an open takes its frames from the stream
+    /// already on the node, since a reliable producer feeds one PipeWire link only.
+    pub share: bool,
     /// Capture this output directly first. Skipped without zero-copy (it delivers dmabufs
     /// only) or under `PUNKTFUNK_DIRECT_CAPTURE=0`.
     pub direct: Option<DirectOutput>,
@@ -208,6 +211,19 @@ pub struct NoPipeWireNode;
 impl std::fmt::Display for NoPipeWireNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("direct capture refused and the backend has no PipeWire node")
+    }
+}
+
+/// The node's one stream is held in a format this open's encoder does not take, and its own
+/// stream got no frame: a reliable producer feeds one link. Retrying cannot help.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct SharedCaptureTaken;
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for SharedCaptureTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("shared capture is taken in another format")
     }
 }
 
@@ -318,28 +334,6 @@ pub struct IddPushOpts {
     /// [`RemoteEncoder`](crate::RemoteEncoder) opens and drives the driver's encoder through.
     pub set_encode: SetEncodeSender,
     pub encode_ctl: EncodeCtlSender,
-}
-
-/// USBridge: DXGI Desktop Duplication capturer on an existing monitor (the MttVDD virtual
-/// monitor, a target with `wudf_pid == 0`). BGRA frames for the host encoders. On failure
-/// `keepalive` is handed back.
-#[cfg(target_os = "windows")]
-pub fn open_dxgi_dup(
-    target: pf_frame::dxgi::WinCaptureTarget,
-    keepalive: Box<dyn Send>,
-) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
-    // `open` consumes the keepalive only on success; keep a way to hand it back.
-    let mut keep = Some(keepalive);
-    let target_c = target.clone();
-    match crate::windows::dxgi_dup::DxgiDupCapturer::open(target, Box::new(())) {
-        Ok(mut c) => {
-            // Swap the placeholder for the real lease now that the capture is open.
-            let _ = c.take_keepalive();
-            c.set_keepalive(keep.take().unwrap());
-            Ok(Box::new(c) as Box<dyn Capturer>)
-        }
-        Err(e) => Err((e.context(format!("DXGI duplication of {}", target_c.gdi_name)), keep.take().unwrap())),
-    }
 }
 
 /// Windows IDD direct-push capturer on a pf-vdisplay target. On failure `keepalive` is handed

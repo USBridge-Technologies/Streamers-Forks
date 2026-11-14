@@ -6,7 +6,8 @@ import XCTest
 import PunktfunkShared
 
 final class VirtualPadTests: XCTestCase {
-    private let sizes: [(Float, Float)] = [(933, 420), (420, 933), (1024, 768)]
+    // The last is a phone on its side, between `narrow` and the width the bottom row fits.
+    private let sizes: [(Float, Float)] = [(933, 420), (420, 933), (1024, 768), (830, 345)]
 
     func testEveryPresetFitsItsLayerWithNoTwoControlsOverlapping() {
         for layout in ["full", "sticks", "dpad", ""] {
@@ -29,16 +30,25 @@ final class VirtualPadTests: XCTestCase {
 
     func testPresetsCarryTheControlsTheDesignNames() {
         func labels(_ layout: String) -> Set<String> { Set(padControls(layout: layout, w: 933, h: 420).map(\.label)) }
+        func text(_ r: LocalizedStringResource) -> String { String(localized: r) }
         let full = labels("full")
         XCTAssertEqual(full.count, 14)
-        XCTAssertTrue(full.isSuperset(of: ["Left stick", "Right stick", "D-pad", "Face buttons", "Left trigger",
-                                          "Right bumper", "Start", "Left stick click", "Right stick click"]))
+        XCTAssertTrue(full.isSuperset(of: [
+            text(L10n.padControlLeftStick), text(L10n.padControlRightStick), text(L10n.padControlDpad),
+            text(L10n.padControlFace), text(L10n.padControlLeftTrigger), text(L10n.padControlRightBumper),
+            "Start", text(L10n.padControlLeftStickClick), text(L10n.padControlRightStickClick),
+        ]))
         let sticks = labels("sticks")
-        XCTAssertTrue(sticks.isSuperset(of: ["Left stick", "Right stick", "Left bumper", "Right trigger"]))
-        XCTAssertFalse(sticks.contains("D-pad") || sticks.contains("Face buttons"))
+        XCTAssertTrue(sticks.isSuperset(of: [
+            text(L10n.padControlLeftStick), text(L10n.padControlRightStick),
+            text(L10n.padControlLeftBumper), text(L10n.padControlRightTrigger),
+        ]))
+        XCTAssertFalse(sticks.contains(text(L10n.padControlDpad)) || sticks.contains(text(L10n.padControlFace)))
         let dpad = labels("dpad")
-        XCTAssertTrue(dpad.isSuperset(of: ["D-pad", "Face buttons"]))
-        XCTAssertFalse(dpad.contains("Left stick") || dpad.contains("Left trigger") || dpad.contains("Left stick click"))
+        XCTAssertTrue(dpad.isSuperset(of: [text(L10n.padControlDpad), text(L10n.padControlFace)]))
+        XCTAssertFalse(dpad.contains(text(L10n.padControlLeftStick))
+            || dpad.contains(text(L10n.padControlLeftTrigger))
+            || dpad.contains(text(L10n.padControlLeftStickClick)))
         XCTAssertEqual(full, labels("bogus"))
     }
 

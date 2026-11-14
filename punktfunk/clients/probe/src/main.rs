@@ -9,7 +9,7 @@
 //!
 //! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE]
 //! [--bitrate KBPS] [--codec auto|h264|hevc|av1]
-//! [--input-test|--mic-test|--touch-test|--pad-audio-test [--pads N]]
+//! [--input-test|--mic-test|--touch-test|--type TEXT|--pad-audio-test [--pads N]]
 //! [--pin HEX|--pair -] [--compositor NAME] [--gamepad NAME] [--trajectory FILE] |
 //! --discover [SECS]`
 #![forbid(unsafe_code)]
@@ -48,6 +48,8 @@ struct Args {
     mic_burst: bool,
     /// `--touch-test` — drag a synthetic finger in a circle (proves the touch path).
     touch_test: bool,
+    /// `--type TEXT` — type TEXT as committed text, one scalar per event (the soft-keyboard path).
+    type_text: Option<String>,
     /// `--rich-input-test` — drive the DualSense touchpad + motion over 0xCC (host needs
     /// `PUNKTFUNK_GAMEPAD=dualsense`); also logs the 0xCD HID-output feedback that comes back.
     rich_input_test: bool,
@@ -166,6 +168,9 @@ struct Args {
     /// `--screens N` (2–4) — ask for N screens of `--mode` side by side and count each one's
     /// frames; screen k's go to `<out>.s<stream>`. 1 asks for none.
     screens: u8,
+    /// `--view WxH` — name the size the picture is shown at, smaller than `--mode`: a host that
+    /// reads it scales the picture down before encoding. A `--remode` carries it too.
+    view: Option<(u32, u32)>,
 }
 
 /// The screens `--screens` asks for: `--mode` each, left to right; empty for one.
@@ -305,6 +310,7 @@ fn parse_argv(argv: Vec<String>) -> Args {
         mic_test: argv.iter().any(|a| a == "--mic-test"),
         mic_burst: argv.iter().any(|a| a == "--mic-burst"),
         touch_test: argv.iter().any(|a| a == "--touch-test"),
+        type_text: get("--type").map(String::from),
         rich_input_test: argv.iter().any(|a| a == "--rich-input-test"),
         pad_audio_test: argv.iter().any(|a| a == "--pad-audio-test"),
         pads: get("--pads")
@@ -407,6 +413,10 @@ fn parse_argv(argv: Vec<String>) -> Args {
             .and_then(|s| s.parse::<u8>().ok())
             .unwrap_or(1)
             .clamp(1, punktfunk_core::quic::v2::msg::SCREENS_MAX as u8),
+        view: get("--view").and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        }),
     }
 }
 
@@ -698,6 +708,9 @@ async fn session(mut args: Args) -> Result<()> {
     if args.touch_test {
         spawn_touch_test(&conn, args.mode);
     }
+    if let Some(text) = args.type_text.clone() {
+        spawn_type_test(&conn, text);
+    }
     if args.rich_input_test {
         spawn_rich_input_test(&conn);
     }
@@ -960,6 +973,8 @@ async fn handshake(
         profile: args.as_profile.clone(),
         access_only: false,
         screens: screens_ask(args),
+        view: args.view,
+        screen_wish: None,
     };
     v2io::send(send, &hello).await?;
     // `Pending` repeats while the host asks its console about this probe.
@@ -1085,7 +1100,7 @@ async fn control_plane(
         tracing::info!(link_kbps, "sent the link rate");
     }
     if let Some((new_mode, after_secs)) = args.remode {
-        spawn_remode(send, recv, new_mode, after_secs);
+        spawn_remode(send, recv, new_mode, args.view, after_secs);
     } else if let Some((new_kbps, after_secs)) = args.rebitrate {
         spawn_rebitrate(conn, send, recv, new_kbps, after_secs);
     } else if let Some(test) = args.speed_test {
@@ -1139,13 +1154,20 @@ async fn next_of<M: V2Message>(r: &mut CtlRx) -> std::io::Result<M> {
     }
 }
 
-fn spawn_remode(mut rs: CtlTx, mut rr: CtlRx, new_mode: Mode, after_secs: u32) {
+fn spawn_remode(
+    mut rs: CtlTx,
+    mut rr: CtlRx,
+    new_mode: Mode,
+    view: Option<(u32, u32)>,
+    after_secs: u32,
+) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(after_secs as u64)).await;
         tracing::info!(?new_mode, "requesting mid-stream mode switch");
         let ask = Reconfigure {
             mode: new_mode,
-            exclude_codecs: 0,
+            view,
+            ..Default::default()
         };
         if v2io::send(&mut rs, &ask).await.is_err() {
             tracing::error!("Reconfigure write failed");
@@ -1538,6 +1560,29 @@ fn spawn_input_test(conn: &Wire, mode: Mode) {
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
         tracing::info!("input-test: done");
+    });
+}
+
+/// Text plane: `text` as committed text, the events a soft keyboard's commit sends. 80 ms
+/// apart is a fast typist; a host that needs longer between characters fails this.
+fn spawn_type_test(conn: &Wire, text: String) {
+    let conn2 = conn.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tracing::info!(chars = text.chars().count(), "type-test: typing");
+        for c in text.chars() {
+            let ev = InputEvent {
+                kind: InputKind::TextInput,
+                _pad: [0; 3],
+                code: c as u32,
+                x: 0,
+                y: 0,
+                flags: 0,
+            };
+            let _ = conn2.send_datagram(ev.encode().to_vec());
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        tracing::info!("type-test: done");
     });
 }
 

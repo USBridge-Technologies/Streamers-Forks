@@ -10,14 +10,23 @@
 use std::collections::HashMap;
 
 use pf_fluent::{Palette, Shade};
+use pf_l10n::tools;
 use punktfunk_setup::platform::windows::demo::win_preset;
 use punktfunk_setup_win::real::Seams;
 use punktfunk_setup_win::wizard::{Wizard, WizardInput};
 use windows_reactor::test::{
-    ComponentHost, EventDispatch, EventId, EventPayload, EventValue, Mutation, ObjectId,
-    ObjectType, PropertyId, PropertyValue, RecordingAdapter, RelationId,
+    ComponentHost, EventCall, EventDispatch, EventId, EventValue, Mutation, ObjectId, ObjectType,
+    PropertyId, PropertyValue, RecordingAdapter, RelationId,
 };
 use windows_reactor::{component, Brush, ThemeBrush};
+
+/// What a fired event carries; [`Wiz::fire`] pairs it with the control's recorded callback.
+enum EventPayload {
+    Unit,
+    Bool(bool),
+    OptionalBool(Option<bool>),
+    SelectionIndex(Option<usize>),
+}
 
 #[derive(Default)]
 struct Model {
@@ -154,8 +163,18 @@ impl Wiz {
             .and_then(|e| e.get(&event))
             .cloned()
             .unwrap_or_else(|| panic!("the control has no {event:?} handler"));
-        self.host
-            .queue_event(EventDispatch::new(id, event, value, payload));
+        let call = match (value, payload) {
+            (EventValue::Unit(cb), EventPayload::Unit) => EventCall::Unit(cb),
+            (EventValue::Bool(cb), EventPayload::Bool(v)) => EventCall::Bool(cb, v),
+            (EventValue::OptionalBool(cb), EventPayload::OptionalBool(v)) => {
+                EventCall::OptionalBool(cb, v)
+            }
+            (EventValue::SelectionIndex(cb), EventPayload::SelectionIndex(v)) => {
+                EventCall::SelectionIndex(cb, v)
+            }
+            (value, _) => panic!("{event:?} does not take this payload: {value:?}"),
+        };
+        self.host.queue_event(EventDispatch::new(id, event, call));
         self.settle();
     }
 
@@ -229,7 +248,10 @@ impl Wiz {
 #[test]
 fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
     let mut wiz = Wiz::open("win11-fresh");
-    assert!(wiz.has_text("punktfunk"), "the Welcome wordmark");
+    assert!(
+        wiz.has_text("Punktfunk"),
+        "the Welcome sentence names the product"
+    );
     assert!(wiz.has_text("Recommended") && wiz.has_text("Custom"));
     assert_eq!(wiz.dots(), 3, "Recommended: Welcome · Install · Done");
     assert!(
@@ -242,7 +264,7 @@ fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
     assert_eq!(wiz.dots(), 4, "Custom adds the Configure dot");
     wiz.click("Continue");
     assert!(
-        wiz.has_text("Moonlight compat"),
+        wiz.has_text(tools::wizard_row_gamestream()),
         "the Configure rows render"
     );
     assert!(
@@ -254,7 +276,7 @@ fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
         "the fresh-only password row"
     );
 
-    let gamestream = wiz.toggle_of("Moonlight compat");
+    let gamestream = wiz.toggle_of(tools::wizard_row_gamestream());
     wiz.fire(gamestream, EventId::Toggled, EventPayload::Bool(true));
 
     wiz.click("Install");
@@ -356,13 +378,13 @@ fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() 
 fn the_uninstaller_demo_offers_only_the_teardown_and_runs_it_in_the_sandbox() {
     let mut wiz = Wiz::open("win11-uninstall");
     assert!(wiz.has_text("0.34.0 · host installed"));
-    assert!(wiz.has_text("This removes punktfunk"));
+    assert!(wiz.has_text(tools::wizard_welcome_uninstall()));
     assert!(!wiz.has_text("Reconfigure"), "no payload, no reconfigure");
     assert_eq!(wiz.dots(), 3, "Welcome · Uninstall · Done");
     wiz.click("Uninstall");
     wiz.wait_for_done();
     assert!(wiz.has_text("service uninstall"), "the teardown ran");
-    assert!(wiz.has_text("punktfunk was removed"));
+    assert!(wiz.has_text(tools::wizard_done_removed()));
 }
 
 #[test]
@@ -371,7 +393,7 @@ fn the_upgrade_demo_opens_in_manage_mode_and_reconfigure_walks_the_upgrade() {
     assert!(wiz.has_text("0.34.0 · host installed"));
     wiz.click("Reconfigure");
     assert!(
-        wiz.has_text("Moonlight compat"),
+        wiz.has_text(tools::wizard_row_gamestream()),
         "the Configure rows render"
     );
     assert!(
@@ -393,7 +415,7 @@ fn uninstall_from_the_manage_welcome_tears_down() {
     wiz.click("Uninstall");
     wiz.wait_for_done();
     assert!(wiz.has_text("service uninstall"), "the teardown ran");
-    assert!(wiz.has_text("punktfunk was removed"));
+    assert!(wiz.has_text(tools::wizard_done_removed()));
 }
 
 #[test]

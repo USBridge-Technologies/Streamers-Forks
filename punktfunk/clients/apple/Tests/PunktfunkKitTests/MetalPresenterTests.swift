@@ -20,6 +20,21 @@ final class MetalPresenterTests: XCTestCase {
             "stage-2 Metal shaders failed to compile (presenter init returned nil)")
     }
 
+    /// The launch warm-up builds the shared pipelines off the main thread; `make()` then uses them.
+    func testWarmBuildsThePipelinesOffTheMainThread() throws {
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            throw XCTSkip("no Metal device available in this environment")
+        }
+        let warmed = expectation(description: "warmed")
+        DispatchQueue.global(qos: .utility).async {
+            XCTAssertFalse(Thread.isMainThread)
+            MetalVideoPresenter.warm()
+            warmed.fulfill()
+        }
+        wait(for: [warmed], timeout: 60)
+        XCTAssertNotNil(MetalVideoPresenter.make(), "the warmed pipelines build a presenter")
+    }
+
     /// Linear always takes half-float; the env lever picks the PQ drawable over the device rule.
     func testHDRDrawableFormat() {
         XCTAssertEqual(hdrDrawableFormat(linear: true, env: "10", halfFloatPQ: false), .rgba16Float)
@@ -150,6 +165,28 @@ final class MetalPresenterTests: XCTestCase {
             "a 10-bit SDR frame reconciles the layer to the 10-bit drawable")
     }
 
+    /// The PyroWave twin: 16-bit planes without PQ are a 10-bit SDR stream, and take the 10-bit
+    /// drawable; 8-bit planes keep the plain one.
+    func testRenderPlanarTenBitSDRWidensTheDrawable() throws {
+        guard let presenter = MetalVideoPresenter.make(),
+              let device = MTLCreateSystemDefaultDevice()
+        else { throw XCTSkip("no Metal device available in this environment") }
+        func planes(_ format: MTLPixelFormat) throws -> WaveletPlanes {
+            func plane(_ side: Int) throws -> MTLTexture {
+                let d = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: format, width: side, height: side, mipmapped: false)
+                return try XCTUnwrap(device.makeTexture(descriptor: d))
+            }
+            return WaveletPlanes(
+                y: try plane(64), cb: try plane(32), cr: try plane(32),
+                csc: CscUniform(r0: .zero, r1: .zero, r2: .zero), pq: false)
+        }
+        _ = presenter.renderPlanar(try planes(.r16Unorm))
+        XCTAssertEqual(presenter.layer.pixelFormat, .bgr10a2Unorm)
+        _ = presenter.renderPlanar(try planes(.r8Unorm))
+        XCTAssertEqual(presenter.layer.pixelFormat, .bgra8Unorm)
+    }
+
     /// `render` with a freshly-allocated NV12 buffer must present without crashing or hanging — the
     /// main-thread present path is the highest-risk part of the stage-2 rewrite. (A headless CI with no
     /// display can still allocate a drawable from a CAMetalLayer; if it can't, render returns false,
@@ -165,11 +202,56 @@ final class MetalPresenterTests: XCTestCase {
             kCFAllocatorDefault, 256, 256, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             attrs as CFDictionary, &pb)
         guard status == kCVReturnSuccess, let pixelBuffer = pb else {
-            throw XCTSkip("could not allocate a test pixel buffer")
+            throw XCTSkip("couldn't allocate a test pixel buffer")
         }
         // Just asserting it returns (true or false) without trapping — the layer may have no drawable
         // source headless, so a false return is acceptable.
         _ = presenter.render(pixelBuffer, isHDR: false)
+    }
+
+    /// The decoder's pool cycles a few surfaces and now and then replaces one. The cycling ones
+    /// stay cached; the replaced one leaves once nothing has touched it for `idle` calls.
+    func testTheSurfaceCacheLetsGoOfASurfaceThePoolStoppedCycling() {
+        var cache = RecentCache<Int, String>(capacity: 48, idle: 10)
+        func frame(_ key: Int) -> [String] {
+            let hit = cache.touch(key)
+            var gone = cache.sweep()
+            if hit == nil { gone += cache.insert("s\(key)", for: key) }
+            return gone
+        }
+        var gone: [String] = []
+        for i in 0..<12 { gone += frame(i % 4) }
+        XCTAssertEqual(gone, [], "four cycling surfaces")
+        // The pool swaps surface 3 for surface 9.
+        for i in 0..<40 { gone += frame([0, 1, 2, 9][i % 4]) }
+        XCTAssertEqual(gone, ["s3"])
+        XCTAssertEqual(cache.count, 4)
+    }
+
+    func testTheSurfaceCacheEvictsTheLeastRecentPastItsCapacity() {
+        var cache = RecentCache<Int, String>(capacity: 2, idle: 1_000)
+        _ = cache.touch(1)
+        XCTAssertEqual(cache.insert("a", for: 1), [])
+        _ = cache.touch(2)
+        XCTAssertEqual(cache.insert("b", for: 2), [])
+        XCTAssertEqual(cache.touch(1), "a")
+        _ = cache.touch(3)
+        XCTAssertEqual(cache.insert("c", for: 3), ["b"], "2 is the least recently touched")
+        _ = cache.touch(3)
+        XCTAssertEqual(cache.insert("c2", for: 3), ["c"], "the same key replaces its entry")
+        XCTAssertEqual(cache.removeAll().sorted(), ["a", "c2"])
+        XCTAssertEqual(cache.count, 0)
+    }
+
+    /// A parked pass reads its uniform when the GPU runs it. With three buffers, pass 4 takes
+    /// pass 1's: it parks only once pass 1 has run, however far the GPU is behind.
+    func testAParkedPassWaitsForItsUniformsLastPass() {
+        let free = MetalVideoPresenter.latchUniformFree
+        XCTAssertTrue(free(3, 0, 3), "the first three passes share no buffer")
+        XCTAssertFalse(free(4, 0, 3), "pass 1 is still queued")
+        XCTAssertTrue(free(4, 1, 3))
+        XCTAssertFalse(free(9, 5, 3), "pass 6 is still queued")
+        XCTAssertFalse(free(1, 0, 0), "no buffer was allocated")
     }
 }
 #endif

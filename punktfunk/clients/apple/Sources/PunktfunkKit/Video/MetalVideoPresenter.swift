@@ -1,15 +1,14 @@
-// Stage-2 presenter, present half: draw a decoded NV12 / P010 / 4:4:4 CVPixelBuffer into a CAMetalLayer
-// drawable with a Y′CbCr→RGB shader. The hosting view's CADisplayLink still paces the pipeline once per
-// vsync, but the actual `render` runs on Stage2Pipeline's dedicated RENDER THREAD (the link tick just
-// signals it), so `nextDrawable()`'s blocking never lands on the main thread. See docs
-// apple-stage2-presenter.md.
+// Stage-2 presenter, present half: draw a decoded NV12 / P010 / 4:4:4 CVPixelBuffer, or a
+// PyroWave planar frame, into a CAMetalLayer drawable with a Y′CbCr→RGB shader. `render` runs on
+// Stage2Pipeline's dedicated RENDER THREAD, so `nextDrawable()`'s blocking never lands on main.
 //
-// Threading: created during view setup (main); `render`/`configure` run on the render thread — the
-// layer's drawable/format/colour mutations all happen there (CAMetalLayer is designed for dedicated
-// render threads; only the layer's GEOMETRY — frame/contentsScale — is touched from main, in
-// SessionPresenter.layout, which also pushes the resulting pixel size here via `setDrawableTarget`
-// so the render thread never reads layer geometry cross-thread). `setHdrMeta` (pump thread) and
-// `setDrawableTarget` (main) only write lock-guarded staging state the render thread drains.
+// Threading: created during view setup (main). `render`/`configure` and every layer format,
+// colour and size write run on the render thread, except under deadline pacing, where the
+// CAMetalDisplayLink's thread applies the queued writes between vends (`deferLayerWrites`).
+// Main touches only the layer's geometry (SessionPresenter.layout), which also pushes the
+// resulting pixel size here via `setDrawableTarget`, so the render thread never reads layer
+// geometry cross-thread. `setHdrMeta` (pump thread) and `setDrawableTarget` (main) only write
+// lock-guarded staging state the render thread drains.
 
 #if canImport(Metal) && canImport(QuartzCore)
 import CoreGraphics
@@ -32,16 +31,12 @@ private let presenterLog = ClientLog(category: "presenter")
 /// `SDR_REFERENCE_WHITE_NITS`). A host-side SDR brightness setting deliberately moves SDR off it.
 private let hdrReferenceWhiteNits: Float = 203.0
 
-/// The SDR layer's colour tag. `colorspace = nil` means NO colour matching: the BT.709-encoded
-/// stream is handed to the compositor untagged and drawn in the display's native space. That is
-/// mild oversaturation on a P3 Mac or iPad, and on a tvOS display composited for HDR it also lifts
-/// the black floor — the 2026-08-13 field report of greys where blacks should be, which arrived
-/// with the client's own HDR switch already OFF, so no other stage had tagged those pixels either.
-/// Tagging lets CoreAnimation colour-match into whatever the output actually is, which is the
-/// strictly correct rendering, so it is now the default.
+/// The SDR layer's colour tag, sRGB. An untagged layer (`colorspace = nil`) draws the BT.709
+/// stream in the display's native space: mild oversaturation on a P3 Mac or iPad, and on a tvOS
+/// display composited for HDR a lifted black floor. Tagged, CoreAnimation colour-matches the
+/// stream into whatever the output is.
 ///
-/// `PUNKTFUNK_SDR_COLORSPACE=none` restores the old untagged look — the A/B lever if a panel
-/// regresses, or for anyone who preferred the more vivid rendition.
+/// `PUNKTFUNK_SDR_COLORSPACE=none` leaves the layer untagged, the A/B lever if a panel regresses.
 private let sdrColorspace: CGColorSpace? = {
     guard ProcessInfo.processInfo.environment["PUNKTFUNK_SDR_COLORSPACE"] != "none" else {
         return nil
@@ -127,14 +122,13 @@ private let preA15AppleTV: Bool = {
 
 /// Runtime-compiled (no metallib build step needed in SwiftPM): a fullscreen triangle and Y′CbCr→RGB
 /// fragment shaders whose conversion arrives as three constant rows computed per frame on the CPU
-/// (`CscRows` — the Swift port of pf-client-core's `csc_rows`, from the decoded buffer's actual
-/// signaling). One set of coefficients honors BT.601/709/2020 × full/limited × 8/10-bit instead of
-/// the old hardcoded BT.709/BT.2020 matrices — a BT.601-signaled stream (a Linux host's RGB-input
-/// NVENC) used to render with BT.709 coefficients, a constant hue error. uv.y is flipped (1 - p.y)
-/// so the top-left-origin texture presents upright (NDC y is up). The HDR shader outputs PQ-encoded
-/// R′G′B′ as-is — the CAMetalLayer's `itur_2100_PQ` colour space + `edrMetadata` tell the system
-/// compositor the samples are PQ and how to tone-map them (no EOTF here, matching the host's
-/// BT.2020 PQ emission).
+/// (`CscRows` — the Swift port of pf-client-video's `csc_rows`, from the decoded buffer's actual
+/// signaling). One set of coefficients honors BT.601/709/2020 × full/limited × 8/10-bit. uv.y is
+/// flipped (1 - p.y) so the top-left-origin texture presents upright (NDC y is up). Under
+/// `HdrMode.pq` the HDR shader outputs PQ-encoded R′G′B′ as-is — the CAMetalLayer's
+/// `itur_2100_PQ` colour space + `edrMetadata` tell the system compositor the samples are PQ and
+/// how to tone-map them (no EOTF here, matching the host's BT.2020 PQ emission). Under `.linear`
+/// the shader decodes PQ itself.
 private let shaderSource = """
 #include <metal_stdlib>
 using namespace metal;
@@ -232,8 +226,8 @@ float3 sampleRgb(texture2d<float> lumaTex, texture2d<float> chromaTex, float2 lu
                            dot(csc.r2.xyz, yuv) + csc.r2.w));
 }
 
-// SDR: 8-bit NV12 / 4:4:4 → full-range RGB, transfer left baked (shown as-is, the proven SDR
-// layer config).
+// SDR: 8-bit NV12 / 4:4:4, or 10-bit P010 into `sdr10Drawable` → full-range RGB, transfer left
+// baked (shown as-is).
 fragment float4 pf_frag(VOut in [[stage_in]],
                         texture2d<float> lumaTex [[texture(0)]],
                         texture2d<float> chromaTex [[texture(1)]],
@@ -242,7 +236,7 @@ fragment float4 pf_frag(VOut in [[stage_in]],
 }
 
 // PyroWave planar SDR: three separate R8 planes (Y full-res, Cb/Cr half-res 4:2:0) from the
-// Metal wavelet decoder — the Metal twin of pf-presenter's planar_csc.frag. Same bicubic luma
+// Metal wavelet decoder — the Metal twin of pf-client-video's planar_csc.frag. Same bicubic luma
 // and left-cosited chroma correction as the biplanar path (chromaUV self-disables at 4:4:4).
 fragment float4 pf_frag_planar(VOut in [[stage_in]],
                                texture2d<float> lumaTex [[texture(0)]],
@@ -259,10 +253,10 @@ fragment float4 pf_frag_planar(VOut in [[stage_in]],
     return float4(rgb, 1.0);
 }
 
-// HDR: 10-bit P010 / 4:4:4 (BT.2020, PQ-encoded Y′CbCr) → full-range PQ R′G′B′, output as-is —
+// HdrMode.pq: 10-bit P010 / 4:4:4 (BT.2020, PQ-encoded Y′CbCr) → full-range PQ R′G′B′, output as-is —
 // the CAMetalLayer's itur_2100_PQ colour space + edrMetadata tell the compositor the samples are
 // PQ, so it does the PQ→display tone-map. No EOTF here. The rows fold in the exact 10-bit
-// MSB-packing factor (the old hardcoded shader carried a documented ~0.1% /1024-vs-/1023 error).
+// MSB-packing factor.
 fragment float4 pf_frag_hdr(VOut in [[stage_in]],
                             texture2d<float> lumaTex [[texture(0)]],
                             texture2d<float> chromaTex [[texture(1)]],
@@ -270,8 +264,8 @@ fragment float4 pf_frag_hdr(VOut in [[stage_in]],
     return float4(sampleRgb(lumaTex, chromaTex, in.luv, in.uv, in.upscale, csc), 1.0);
 }
 
-// tvOS without HDR headroom has no EDR API and composites a PQ tag untone-mapped, so PQ becomes
-// SDR in-shader for the sRGB-tagged layer. Same curve as pf-client-core's tonemap.glsl and the
+// tvOS outside an HDR output mode composites a PQ tag untone-mapped (see `configureColor`), so
+// PQ becomes SDR in-shader for the sRGB-tagged layer. Same curve as pf-client-video's tonemap.glsl and the
 // host's gamescope capture: BT.2390 EETF in PQ from a 1000-nit source onto 203-nit white, on
 // max(R,G,B) in linear BT.709, then the sRGB OETF.
 static inline float pqEotf(float e) {
@@ -425,12 +419,14 @@ public final class MetalVideoPresenter {
     private let pipelineHDRToneMap: MTLRenderPipelineState?
     /// PyroWave's 3-plane SDR path (pf_frag_planar → bgra8) — see `renderPlanar`.
     private let pipelinePlanar: MTLRenderPipelineState
+    /// `pf_frag_planar` into `sdr10Drawable`: a 10-bit SDR PyroWave stream.
+    private let pipelinePlanarSDR10: MTLRenderPipelineState
     /// PyroWave planar HDR passthrough (pf_frag_planar → `hdrDrawable`; the layer's PQ colour
     /// space + EDR interpret the samples) and the planar PQ→SDR tone-map (pf_frag_planar_tm →
-    /// bgra8; tvOS without HDR headroom).
+    /// bgra8; tvOS without HDR headroom, nil elsewhere).
     private let pipelinePlanarHDR: MTLRenderPipelineState
-    private let pipelinePlanarToneMap: MTLRenderPipelineState
-    private var textureCache: CVMetalTextureCache?
+    private let pipelinePlanarToneMap: MTLRenderPipelineState?
+    private let textureCache: CVMetalTextureCache
     /// Apple's Lanczos scaler for luma whenever the render target is smaller than the frame; nil
     /// without MPS or under `PUNKTFUNK_DOWNSCALE=bicubic` (the shader's Catmull-Rom scales then).
     /// Render-thread confined, like `scaledLuma`, the reused target it writes.
@@ -458,12 +454,9 @@ public final class MetalVideoPresenter {
     /// `configure`; not read while `hdrActive`.
     private var tenBitSDRActive = false
     /// Has `configureColor` run even once? `hdrActive` starts `false`, so a session that is SDR from
-    /// the first frame matches the initial state and used to fall straight through `configure`'s
-    /// guard — the layer then kept `make()`'s bare config, which never assigns a colour space, and
-    /// the SDR stream presented untagged for the whole session. That also made
-    /// `PUNKTFUNK_SDR_COLORSPACE` dead code on exactly the sessions it was meant to fix, so an
-    /// operator A/B-ing it in the field saw nothing change. Same-state calls after the first are
-    /// still no-ops, which is what the guard is for.
+    /// the first frame matches the initial state and would skip `configure`'s guard: the layer
+    /// would keep `make()`'s bare config, which assigns no colour space. Same-state calls after
+    /// the first stay no-ops.
     private var didConfigureColor = false
     /// tvOS only: whether HDR frames currently present as PQ PASSTHROUGH (display has HDR headroom
     /// — its own tone-map applies) vs the in-shader tone-map fallback. Render-thread confined;
@@ -499,10 +492,11 @@ public final class MetalVideoPresenter {
     /// The visible part of the frame in texture UV, staged by `setSourceRect`. The unit square
     /// except under Crop to fill (or a few-pixel snap).
     private var sourceRect = CGRect(x: 0, y: 0, width: 1, height: 1)
-    /// tvOS: the display's current EDR headroom (UIScreen.currentEDRHeadroom), pushed from the
-    /// main thread (SessionPresenter.layout + the mode-switch observers). > 1 ⇒ the display is
-    /// composited with HDR headroom, so HDR frames present as PQ passthrough; otherwise the
-    /// in-shader tone-map keeps the picture from blowing out. 1 (the default) is the safe start.
+    /// The display's current EDR headroom (UIScreen.currentEDRHeadroom), pushed from the main
+    /// thread: on tvOS by SessionPresenter.layout and the mode-switch observers, on iOS by a
+    /// timer. tvOS: > 1 ⇒ the display is composited with HDR headroom, so HDR frames present as
+    /// PQ passthrough; otherwise the in-shader tone-map. iOS: the linear HDR shaders roll
+    /// highlights onto it (`hdrTarget`). 1 (the default) is the safe start.
     private var stagedDisplayHeadroom: CGFloat = 1.0
     /// tvOS: the box switched into the HDR output mode our display criteria asked for.
     private var stagedHDROutput = false
@@ -530,7 +524,8 @@ public final class MetalVideoPresenter {
         let device: MTLDevice
         let sdr, sdr10, hdr: MTLRenderPipelineState
         let hdrToneMap: MTLRenderPipelineState?
-        let planar, planarHDR, planarToneMap: MTLRenderPipelineState
+        let planar, planarSDR10, planarHDR: MTLRenderPipelineState
+        let planarToneMap: MTLRenderPipelineState?
         /// The late-latch twins of `sdr`, `sdr10` and `hdr`; the tone-map variants have none.
         let latchedSDR, latchedSDR10, latchedHDR: MTLRenderPipelineState
     }
@@ -544,8 +539,9 @@ public final class MetalVideoPresenter {
         let pipelineHDR: MTLRenderPipelineState
         let pipelineHDRToneMap: MTLRenderPipelineState?
         let pipelinePlanar: MTLRenderPipelineState
+        let pipelinePlanarSDR10: MTLRenderPipelineState
         let pipelinePlanarHDR: MTLRenderPipelineState
-        let pipelinePlanarToneMap: MTLRenderPipelineState
+        let pipelinePlanarToneMap: MTLRenderPipelineState?
         let latchedSDR: MTLRenderPipelineState
         let latchedSDR10: MTLRenderPipelineState
         let latchedHDR: MTLRenderPipelineState
@@ -595,17 +591,23 @@ public final class MetalVideoPresenter {
             planar.fragmentFunction = library.makeFunction(name: "pf_frag_planar")
             planar.colorAttachments[0].pixelFormat = .bgra8Unorm
             pipelinePlanar = try device.makeRenderPipelineState(descriptor: planar)
+            planar.colorAttachments[0].pixelFormat = sdr10Drawable
+            pipelinePlanarSDR10 = try device.makeRenderPipelineState(descriptor: planar)
             let planarHdr = MTLRenderPipelineDescriptor()
             planarHdr.vertexFunction = vtx
             planarHdr.fragmentFunction = library.makeFunction(
                 name: linear ? "pf_frag_planar_hdr_linear" : "pf_frag_planar")
             planarHdr.colorAttachments[0].pixelFormat = hdrDrawable
             pipelinePlanarHDR = try device.makeRenderPipelineState(descriptor: planarHdr)
+            #if os(tvOS)
             let planarTm = MTLRenderPipelineDescriptor()
             planarTm.vertexFunction = vtx
             planarTm.fragmentFunction = library.makeFunction(name: "pf_frag_planar_tm")
             planarTm.colorAttachments[0].pixelFormat = .bgra8Unorm
             pipelinePlanarToneMap = try device.makeRenderPipelineState(descriptor: planarTm)
+            #else
+            pipelinePlanarToneMap = nil
+            #endif
             // The latched twins: the pool-indexed fragment on the same three attachments.
             func latched(_ name: String, _ format: MTLPixelFormat) throws -> MTLRenderPipelineState {
                 let d = MTLRenderPipelineDescriptor()
@@ -624,9 +626,14 @@ public final class MetalVideoPresenter {
         return Pipelines(
             device: device, sdr: pipelineSDR, sdr10: pipelineSDR10, hdr: pipelineHDR,
             hdrToneMap: pipelineHDRToneMap, planar: pipelinePlanar,
+            planarSDR10: pipelinePlanarSDR10,
             planarHDR: pipelinePlanarHDR, planarToneMap: pipelinePlanarToneMap,
             latchedSDR: latchedSDR, latchedSDR10: latchedSDR10, latchedHDR: latchedHDR)
     }()
+
+    /// Compiles the shader library and pipelines on the calling thread. Run at launch, off the
+    /// main actor, it leaves the first session's `make()` nothing to build.
+    public static func warm() { _ = pipelines }
 
     /// nil if Metal is unavailable (no GPU / a headless CI) or a shader fails to compile — the caller
     /// falls back to stage-1.
@@ -643,18 +650,10 @@ public final class MetalVideoPresenter {
         layer.framebufferOnly = true
         layer.isOpaque = true
         #if os(macOS)
-        // displaySyncEnabled MUST stay false on macOS. It has flip-flopped, so the full history:
-        // sync ON was tried twice and starves the drawable pool both times — on macOS 26 a synced
-        // present only reaches glass when the WindowServer composites the window, and its FramePacing
-        // path does not treat our out-of-band image-queue presents as damage, so with a static scene
-        // the ONLY recurring damage is the 1 Hz stats HUD update: presents queue, all drawables stay
-        // held, `nextDrawable()` sleeps (sampled: ~70% of the render thread inside
-        // CAMetalLayerPrivateNextDrawableLocked → usleep), and the stream turns into a ~1 fps
-        // slideshow with normal-LOOKING stats (each rare frame is fresh, newest-wins ring). The
-        // 94fb7d1b fullscreen judder was the same starvation biting the then-main-thread render.
-        // With sync OFF the flip is immediate; the vsync alignment that sync was supposed to give
-        // (the HUD-off direct-scanout pacing fix) comes from scheduling the present at the display
-        // link's target time instead (`present(at:)` — see `render`).
+        // displaySyncEnabled must stay false: on macOS 26 a synced present reaches glass only when
+        // the window is composited, so on a static scene presents queue, every drawable stays held
+        // and `nextDrawable()` sleeps. The present is scheduled at the link's target time instead
+        // (`presentAtMediaTime` in `render`).
         layer.displaySyncEnabled = false
         #endif
         // The drawable is rendered at the LAYER's pixel size (set per-frame in `render`), so the
@@ -663,19 +662,16 @@ public final class MetalVideoPresenter {
         // transient fallback: during a live resize the compositor may composite a drawable from
         // the previous layout before the next render catches up.
         layer.contentsGravity = .resizeAspect
-        // Triple-buffer: more in-flight drawables before `nextDrawable()` (called on the display-link /
-        // MAIN thread) has to block waiting for one to free.
-        // ⚠ This is the STAGE-2/3 depth. Stage-4 (deadline pacing, the iOS default) never
-        // calls `nextDrawable()` — the link vends every drawable — so the third slot only gives
-        // the compositor room to queue a second present ahead of scanout, i.e. the two-refresh
-        // present floor. `Stage2Pipeline.startDeadlinePresenter` clamps it to 2 for that pacing;
-        // keep the two in step if this number ever changes.
+        // Three drawables: the render thread's `nextDrawable()` blocks only once all are in
+        // flight. Deadline pacing never calls it; `Stage2Pipeline.startDeadlinePresenter`
+        // sets the count for its link from `drawableCount(env:)`.
         layer.maximumDrawableCount = 3
 
         return MetalVideoPresenter(
             device: device, queue: queue, pipelineSDR: p.sdr, pipelineSDR10: p.sdr10,
             pipelineHDR: p.hdr,
             pipelineHDRToneMap: p.hdrToneMap, pipelinePlanar: p.planar,
+            pipelinePlanarSDR10: p.planarSDR10,
             pipelinePlanarHDR: p.planarHDR, pipelinePlanarToneMap: p.planarToneMap,
             textureCache: textureCache, layer: layer)
     }
@@ -685,8 +681,9 @@ public final class MetalVideoPresenter {
         pipelineSDR10: MTLRenderPipelineState,
         pipelineHDR: MTLRenderPipelineState, pipelineHDRToneMap: MTLRenderPipelineState?,
         pipelinePlanar: MTLRenderPipelineState,
+        pipelinePlanarSDR10: MTLRenderPipelineState,
         pipelinePlanarHDR: MTLRenderPipelineState,
-        pipelinePlanarToneMap: MTLRenderPipelineState,
+        pipelinePlanarToneMap: MTLRenderPipelineState?,
         textureCache: CVMetalTextureCache, layer: CAMetalLayer
     ) {
         self.device = device
@@ -696,6 +693,7 @@ public final class MetalVideoPresenter {
         self.pipelineHDR = pipelineHDR
         self.pipelineHDRToneMap = pipelineHDRToneMap
         self.pipelinePlanar = pipelinePlanar
+        self.pipelinePlanarSDR10 = pipelinePlanarSDR10
         self.pipelinePlanarHDR = pipelinePlanarHDR
         self.pipelinePlanarToneMap = pipelinePlanarToneMap
         self.textureCache = textureCache
@@ -705,8 +703,9 @@ public final class MetalVideoPresenter {
     /// Configure the layer + active pipeline for an SDR or HDR session. Called once at session start
     /// (main, before the render thread exists) and again per-frame from `render` on the RENDER THREAD
     /// (idempotent — the guard makes a same-state call a no-op), so a mid-session HDR toggle (the host
-    /// re-inits its encoder; the decoded `frame.isHDR` flips) reconfigures here automatically. HDR uses
-    /// `hdrDrawable` + BT.2020 PQ colour space + EDR with a 203-nit reference-white anchor;
+    /// re-inits its encoder; the decoded frame's HDR flag flips) reconfigures here automatically. HDR uses
+    /// `hdrDrawable`, with the BT.2020 PQ colour space + EDR (a 203-nit reference-white anchor) under
+    /// `HdrMode.pq` and extended-linear Display P3 without metadata under `.linear`;
     /// SDR uses the sRGB-tagged 8-bit drawable, or `sdr10Drawable` when `tenBitSDR` (a 10-bit
     /// session — HDR outranks it, an HDR frame never lands on the SDR-10 drawable).
     public func configure(hdr: Bool, tenBitSDR: Bool = false) {
@@ -714,7 +713,7 @@ public final class MetalVideoPresenter {
         #if os(tvOS)
         // Reconfigure on an HDR flip AND on a passthrough↔tone-map flip. Passthrough needs the
         // box in an HDR output mode: the switch our criteria asked for landed (`setHDROutput`),
-        // or the screen reports headroom — which tvOS never does, even in HDR.
+        // or the screen reports headroom above 1.
         stagingLock.lock()
         let headroom = stagedDisplayHeadroom
         let hdrOutput = stagedHDROutput
@@ -767,10 +766,11 @@ public final class MetalVideoPresenter {
     }
 
     /// Set the layer's pixel format + colour config for SDR or HDR through `writeLayer`, on
-    /// `configure`'s thread. EDR is requested on macOS + iOS. tvOS has NO EDR API
-    /// (`wantsExtendedDynamicRangeContent`/`edrMetadata`/`CAEDRMetadata` are all unavailable there) —
-    /// and a bare PQ colour-space tag composites UNtone-mapped (the "overblown HDR" Apple TV report),
-    /// so tvOS instead tone-maps PQ→SDR in the shader (pf_frag_hdr_tv) and keeps the SDR layer config.
+    /// `configure`'s thread. EDR is requested on macOS + iOS. tvOS lacks
+    /// `wantsExtendedDynamicRangeContent`, `edrMetadata` and `CAEDRMetadata`; it has
+    /// `CALayer.toneMapMode` from tvOS 18, which this presenter does not set. A bare PQ
+    /// colour-space tag composites untone-mapped into an SDR output, so without an HDR output
+    /// tvOS tone-maps PQ→SDR in the shader (pf_frag_hdr_tv) and keeps the SDR layer config.
     private func configureColor(hdr: Bool, tenBitSDR: Bool) {
         if hdr {
             #if os(tvOS)
@@ -836,13 +836,14 @@ public final class MetalVideoPresenter {
     }
 
     /// Deadline pacing, LINK THREAD, once per update: apply the queued writes. The update's
-    /// drawable is already vended, so they reach the next vend and never race one.
+    /// drawable is already vended, so they reach the next vend and never race one. Applied
+    /// under the lock: a retired link thread that outlives its join still runs this, and its
+    /// batch must not land after a newer one.
     func applyLayerWrites() {
         layerWriteLock.lock()
-        let writes = layerWrites
+        defer { layerWriteLock.unlock() }
+        for write in layerWrites { write(layer) }
         layerWrites.removeAll()
-        layerWriteLock.unlock()
-        for write in writes { write(layer) }
     }
 
     /// Size the next drawable. Compared against the last requested size, not the layer's: a
@@ -944,7 +945,7 @@ public final class MetalVideoPresenter {
 
     // MARK: Late latch
 
-    /// `PUNKTFUNK_LATE_LATCH=0` encodes at the pick as before, for the A/B.
+    /// `PUNKTFUNK_LATE_LATCH=0` encodes every pass at the pick: the A/B lever.
     static let lateLatchEnabled =
         ProcessInfo.processInfo.environment["PUNKTFUNK_LATE_LATCH"] != "0"
     /// Parked passes queue apart from `queue`: one waiting on its event would hold the
@@ -952,16 +953,27 @@ public final class MetalVideoPresenter {
     private lazy var latchQueue: MTLCommandQueue? = device.makeCommandQueue()
     private lazy var latchEvent: MTLSharedEvent? = device.makeSharedEvent()
     private var latchValue: UInt64 = 0
-    /// Three uniforms in rotation: a pass has long run before its buffer comes round.
+    /// The value of the newest parked pass the GPU has finished, raised by its completed
+    /// handler. A queued pass reads its uniform and its planes only when it runs, so neither is
+    /// reused or made non-resident before this reaches the pass.
+    private let latchDone = OSAllocatedUnfairLock(initialState: UInt64(0))
+    /// Uniforms in rotation, three unless an allocation failed: `park` rotates over the ones
+    /// that exist, and takes one only once its last pass has run.
     private lazy var latchUniforms: [MTLBuffer] = (0..<3).compactMap { _ in
         device.makeBuffer(length: MemoryLayout<LatchUniform>.stride, options: .storageModeShared)
+    }
+
+    /// Whether pass `value` may take its uniform. The buffer last served pass `value - slots`:
+    /// still queued, that pass would run on this one's uniform.
+    static func latchUniformFree(value: UInt64, done: UInt64, slots: Int) -> Bool {
+        slots > 0 && value <= done + UInt64(slots)
     }
     /// The planes a latch names reach the GPU by resource ID, so they must be resident on the
     /// latch queue: this set holds every surface `latchTextures` wrapped. nil before iOS 18, or
     /// without Metal 3 — no latching there. Typed `AnyObject` because a stored property
     /// cannot be conditionally available; the readers cast under the same check.
     private lazy var latchResidency: AnyObject? = {
-        guard #available(iOS 18, tvOS 18, macOS 15, visionOS 2, *),
+        guard #available(iOS 18, tvOS 18, macOS 15, *),
               device.supportsFamily(.metal3), let queue = latchQueue
         else { return nil }
         let desc = MTLResidencySetDescriptor()
@@ -970,12 +982,17 @@ public final class MetalVideoPresenter {
         queue.addResidencySet(set)
         return set
     }()
-    /// Decoded surfaces as textures, made on the surface (not through the cache, so nothing
-    /// pins a pool buffer), keyed by surface ID and checked against the surface itself: the
-    /// pool allocates freely, so an ID can come back on a new surface. Oldest out past 48.
-    private var latchCache: [IOSurfaceID: (surface: IOSurfaceRef, luma: MTLTexture, chroma: MTLTexture)] = [:]
-    private var latchOrder: [IOSurfaceID] = []
+    /// Decoded surfaces as textures, made on the surface (not through the texture cache, so
+    /// the pool can reuse a buffer), keyed by surface ID and checked against the surface
+    /// itself: the pool allocates freely, so an ID can come back on a new surface. An entry
+    /// keeps its surface's memory alive, 50 MB at 4K 4:4:4, so one the pool stopped cycling
+    /// must leave: 120 calls is two seconds at 60 Hz, and a live one comes round in a dozen.
+    private var latchCache = RecentCache<IOSurfaceID, LatchedSurface>(capacity: 48, idle: 120)
     private var latchTenBit = false
+    /// The other depth's surfaces after a depth flip. They stay resident until `latchDone`
+    /// reaches `latchRetiredAt`: the passes parked before the flip name them.
+    private var latchRetired: [LatchedSurface] = []
+    private var latchRetiredAt: UInt64 = 0
     /// The last luma's size, for the park's fit check.
     private var latchLumaSize: CGSize?
 
@@ -984,21 +1001,36 @@ public final class MetalVideoPresenter {
     private func latchTextures(
         for pixelBuffer: CVPixelBuffer, tenBit: Bool
     ) -> (luma: MTLTexture, chroma: MTLTexture)? {
-        guard #available(iOS 18, tvOS 18, macOS 15, visionOS 2, *),
+        guard #available(iOS 18, tvOS 18, macOS 15, *),
               let residency = latchResidency as? MTLResidencySet,
               let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue()
         else { return nil }
         let id = IOSurfaceGetID(surface)
-        if latchTenBit != tenBit {
-            for entry in latchCache.values {
+        func release(_ gone: [LatchedSurface]) {
+            for entry in gone {
                 residency.removeAllocation(entry.luma)
                 residency.removeAllocation(entry.chroma)
             }
-            latchCache.removeAll()
-            latchOrder.removeAll()
+        }
+        if latchTenBit != tenBit {
+            latchRetired += latchCache.removeAll()
+            latchRetiredAt = latchValue
             latchTenBit = tenBit
         }
-        if let hit = latchCache[id], hit.surface === surface { return (hit.luma, hit.chroma) }
+        var released = false
+        if !latchRetired.isEmpty, latchDone.withLock({ $0 }) >= latchRetiredAt {
+            release(latchRetired)
+            latchRetired.removeAll()
+            released = true
+        }
+        let hit = latchCache.touch(id)
+        let idle = latchCache.sweep()
+        release(idle)
+        released = released || !idle.isEmpty
+        if let hit, hit.surface === surface {
+            if released { residency.commit() }
+            return (hit.luma, hit.chroma)
+        }
         func plane(_ i: Int, _ format: MTLPixelFormat) -> MTLTexture? {
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: format, width: CVPixelBufferGetWidthOfPlane(pixelBuffer, i),
@@ -1008,21 +1040,12 @@ public final class MetalVideoPresenter {
         }
         guard let luma = plane(0, tenBit ? .r16Unorm : .r8Unorm),
               let chroma = plane(1, tenBit ? .rg16Unorm : .rg8Unorm)
-        else { return nil }
-        if let stale = latchCache.removeValue(forKey: id) {
-            residency.removeAllocation(stale.luma)
-            residency.removeAllocation(stale.chroma)
-            latchOrder.removeAll { $0 == id }
+        else {
+            if released { residency.commit() }
+            return nil
         }
-        while latchOrder.count >= 48, let oldest = latchOrder.first {
-            latchOrder.removeFirst()
-            if let entry = latchCache.removeValue(forKey: oldest) {
-                residency.removeAllocation(entry.luma)
-                residency.removeAllocation(entry.chroma)
-            }
-        }
-        latchCache[id] = (surface, luma, chroma)
-        latchOrder.append(id)
+        release(latchCache.insert(
+            LatchedSurface(surface: surface, luma: luma, chroma: chroma), for: id))
         residency.addAllocation(luma)
         residency.addAllocation(chroma)
         residency.commit()
@@ -1052,9 +1075,15 @@ public final class MetalVideoPresenter {
         pipeline = hdrActive
             ? pipelines.latchedHDR : (tenBitSDRActive ? pipelines.latchedSDR10 : pipelines.latchedSDR)
         #endif
-        guard let pipeline, let commandBuffer = queue.makeCommandBuffer() else { return nil }
+        let uniforms = latchUniforms
         let value = latchValue + 1
-        let uniform = latchUniforms[Int(value % 3)]
+        let done = latchDone
+        guard let pipeline,
+              Self.latchUniformFree(
+                  value: value, done: done.withLock({ $0 }), slots: uniforms.count),
+              let commandBuffer = queue.makeCommandBuffer()
+        else { return nil }
+        let uniform = uniforms[Int(value % UInt64(uniforms.count))]
         uniform.contents().storeBytes(of: Int32(-1), toByteOffset: LatchUniform.slotOffset, as: Int32.self)
         commandBuffer.encodeWaitForEvent(event, value: value)
         let pass = MTLRenderPassDescriptor()
@@ -1082,6 +1111,8 @@ public final class MetalVideoPresenter {
             if presents { parked.drawable.present() }
         }
         commandBuffer.addCompletedHandler { cb in
+            done.withLock { $0 = max($0, value) }
+            Self.noteUnfinished(cb, "parked")
             parked.lock.lock()
             let onGPU = parked.onGPU, signalAt = parked.signalAt
             parked.keep.removeAll()
@@ -1202,8 +1233,7 @@ public final class MetalVideoPresenter {
         var csc = CscRows.rows(
             CscRows.signal(of: pixelBuffer), depth: tenBit ? 10 : 8, msbPacked: tenBit)
         var target = hdrTarget()
-        guard let textureCache,
-              let luma = makeTexture(
+        guard let luma = makeTexture(
                 pixelBuffer, plane: 0, format: tenBit ? .r16Unorm : .r8Unorm, cache: textureCache),
               let chroma = makeTexture(
                 pixelBuffer, plane: 1, format: tenBit ? .rg16Unorm : .rg8Unorm, cache: textureCache),
@@ -1215,8 +1245,11 @@ public final class MetalVideoPresenter {
         // drops what nothing is using.
         CVMetalTextureCacheFlush(textureCache, 0)
         // Warm the latch: the first park needs a plane size, and a wrapped surface saves the
-        // pick the wrap.
-        if Self.lateLatchEnabled { _ = latchTextures(for: pixelBuffer, tenBit: tenBit) }
+        // pick the wrap. Only where a link vends the drawable: no other pacing parks, and a
+        // wrapped surface holds its memory past the decoder pool.
+        if Self.lateLatchEnabled, drawable != nil {
+            _ = latchTextures(for: pixelBuffer, tenBit: tenBit)
+        }
 
         #if os(tvOS)
         // HDR splits by the display's headroom (kept in step with the layer by `configure` above):
@@ -1242,10 +1275,10 @@ public final class MetalVideoPresenter {
         }
     }
 
-    /// Draw one PyroWave planar frame (three R8 planes off the Metal wavelet decoder) and
-    /// present it. RENDER THREAD, same contract as `render` — PyroWave is 8-bit SDR, so the
-    /// layer always takes the plain SDR config, and the CSC rows arrive precomputed from the
-    /// stream's own sequence-header signaling (no CVPixelBuffer to inspect).
+    /// Draw one PyroWave planar frame (three planes off the Metal wavelet decoder) and present
+    /// it. RENDER THREAD, same contract as `render`. The layer follows the planes: PQ takes
+    /// the HDR config, 10-bit SDR the 10-bit drawable, 8-bit the plain one. The CSC rows arrive
+    /// precomputed from the stream's own sequence-header signaling (no CVPixelBuffer to inspect).
     @discardableResult
     func renderPlanar(
         _ planes: WaveletPlanes,
@@ -1257,13 +1290,13 @@ public final class MetalVideoPresenter {
         let targetFromLayout = drawableTarget
         stagingLock.unlock()
         // A PQ (HDR) pyrowave stream drives the same layer/EDR machinery as the biplanar path.
-        configure(hdr: planes.pq)
+        configure(hdr: planes.pq, tenBitSDR: planes.tenBitSDR)
         applyStagedHdrMeta()
         var csc = planes.csc
         var target = hdrTarget()
-        // PQ passthrough needs the HDR drawable; a PQ frame while the drawable is (still)
-        // 8-bit — tvOS without display headroom, or a not-yet-flipped layer — tone-maps
-        // in-shader instead (the pipeline must match the drawable's pixel format).
+        // PQ passthrough needs the HDR drawable. On tvOS without display headroom the drawable
+        // stays 8-bit, so a PQ frame tone-maps in-shader (the pipeline must match the
+        // drawable's pixel format).
         #if os(tvOS)
         let planarPassthrough = hdrActive && hdrPassthroughActive
         #else
@@ -1271,8 +1304,8 @@ public final class MetalVideoPresenter {
         #endif
         let planarPipeline: MTLRenderPipelineState =
             planes.pq
-                ? (planarPassthrough ? pipelinePlanarHDR : pipelinePlanarToneMap)
-                : pipelinePlanar
+                ? (planarPassthrough ? pipelinePlanarHDR : (pipelinePlanarToneMap ?? pipelinePlanarHDR))
+                : (tenBitSDRActive ? pipelinePlanarSDR10 : pipelinePlanar)
         return encodePresent(
             decodedSize: CGSize(width: planes.width, height: planes.height),
             targetFromLayout: targetFromLayout, pipeline: planarPipeline,
@@ -1342,8 +1375,7 @@ public final class MetalVideoPresenter {
         if let onPresented {
             #if targetEnvironment(simulator)
             // The simulator SDK exposes neither addPresentedHandler nor presentedTime — report
-            // nil so the caller stamps with its display-link estimate (the pre-presentedTime
-            // behavior; simulator numbers are indicative only anyway).
+            // nil so the caller stamps with its display-link estimate.
             onPresented(nil)
             #else
             // Registered BEFORE present. presentedTime is CACurrentMediaTime-based; 0 means the
@@ -1365,6 +1397,7 @@ public final class MetalVideoPresenter {
         let onGPUTime = onGPUTime
         commandBuffer.addCompletedHandler { cb in
             _ = keepAlive
+            Self.noteUnfinished(cb, "present")
             if let onGPUTime, cb.gpuEndTime > cb.gpuStartTime {
                 onGPUTime(cb.gpuStartTime, cb.gpuEndTime)
             }
@@ -1372,6 +1405,25 @@ public final class MetalVideoPresenter {
         target.present(commandBuffer, presentAtMediaTime)
         commandBuffer.commit()
         return true
+    }
+
+    private static let unfinished = OSAllocatedUnfairLock(initialState: 0)
+
+    /// Logs a command buffer the GPU did not finish: one it timed out on, lost to a restart, or
+    /// refused after those. A restart fails every buffer in flight, so the first eight are
+    /// named and then every 64th.
+    static func noteUnfinished(_ cb: MTLCommandBuffer, _ what: String) {
+        guard cb.status == .error else { return }
+        let n = unfinished.withLock { count -> Int in
+            count += 1
+            return count
+        }
+        guard n <= 8 || n % 64 == 0 else { return }
+        let error = cb.error as NSError?
+        let line = "stage2: GPU did not finish a \(what) pass (\(n)): "
+            + "\(error?.domain ?? "no error") code=\(error?.code ?? 0) \(error?.localizedDescription ?? "")"
+        presenterLog.error("\(line, privacy: .public)")
+        if presentDebug { print(line) }
     }
 
     /// Where one frame draws: a layer drawable, or the curved screen's.
@@ -1538,6 +1590,66 @@ private struct LatchUniform {
     var luma: MTLResourceID
     var chroma: MTLResourceID
     static let slotOffset = MemoryLayout<LatchUniform>.offset(of: \.slot)!
+}
+
+/// A decoded surface with its two planes as textures. Holding it keeps the surface's memory.
+struct LatchedSurface {
+    let surface: IOSurfaceRef
+    let luma: MTLTexture, chroma: MTLTexture
+}
+
+/// A small cache that lets go by recency. Each `touch` is one call on its clock: an entry no
+/// call has touched for `idle` calls leaves at the next `sweep`, and an insert past
+/// `capacity` evicts the least recently touched. Not thread-safe. Internal for tests.
+struct RecentCache<Key: Hashable, Value> {
+    let capacity: Int
+    let idle: UInt64
+    private var clock: UInt64 = 0
+    private var entries: [Key: (value: Value, touched: UInt64)] = [:]
+
+    init(capacity: Int, idle: UInt64) {
+        self.capacity = max(1, capacity)
+        self.idle = idle
+    }
+
+    var count: Int { entries.count }
+
+    /// Advances the clock and returns `key`'s entry, now the most recent.
+    mutating func touch(_ key: Key) -> Value? {
+        clock += 1
+        guard let entry = entries[key] else { return nil }
+        entries[key] = (entry.value, clock)
+        return entry.value
+    }
+
+    /// Removes and returns every entry idle for longer than `idle` calls.
+    mutating func sweep() -> [Value] {
+        var gone: [Value] = []
+        for (key, entry) in entries where clock - entry.touched > idle {
+            gone.append(entry.value)
+            entries[key] = nil
+        }
+        return gone
+    }
+
+    /// Stores `value` as the most recent and returns what it displaced: the entry `key` held,
+    /// and the least recent one when the cache was full.
+    mutating func insert(_ value: Value, for key: Key) -> [Value] {
+        var gone: [Value] = []
+        if let old = entries.removeValue(forKey: key) { gone.append(old.value) }
+        if entries.count >= capacity,
+           let oldest = entries.min(by: { $0.value.touched < $1.value.touched })?.key,
+           let evicted = entries.removeValue(forKey: oldest) {
+            gone.append(evicted.value)
+        }
+        entries[key] = (value, clock)
+        return gone
+    }
+
+    mutating func removeAll() -> [Value] {
+        defer { entries.removeAll() }
+        return entries.values.map(\.value)
+    }
 }
 
 /// The deadline path's pass, encoded at the vend and parked on the GPU behind the presenter's

@@ -82,7 +82,14 @@ struct SessionAccess {
     deadline: Option<i64>,
     /// The grants record was deleted while this session was live. Terminal, like expiry.
     revoked: bool,
+    /// When the owner's lock was last asked about this device ([`LOCK_EVERY`]).
+    lock_asked: Option<std::time::Instant>,
+    /// The owner's profile no longer opens for this device. Terminal, like expiry.
+    locked_out: bool,
 }
+
+/// How often a live session asks whether the owner's profile still opens for its device.
+const LOCK_EVERY: Duration = Duration::from_secs(1);
 
 impl SessionAccess {
     /// Subscribe first, then fold the channel's current value, so a console edit racing
@@ -97,6 +104,8 @@ impl SessionAccess {
             mask: GRANT_ALL,
             deadline: None,
             revoked: false,
+            lock_asked: None,
+            locked_out: false,
         };
         if let Some(np) = registry {
             let rx = np.subscribe(&access.fp_hex);
@@ -139,6 +148,20 @@ impl SessionAccess {
     fn expired(&self, now_unix: i64) -> bool {
         self.revoked || self.deadline.is_some_and(|d| now_unix >= d)
     }
+
+    /// Asks the owner's lock about this device once per [`LOCK_EVERY`]: a lock or a sign-out
+    /// that leaves it off the owner's list ends the session.
+    fn ask_lock(&mut self, state: &AppState) {
+        let now = std::time::Instant::now();
+        if self
+            .lock_asked
+            .is_some_and(|at| now.duration_since(at) < LOCK_EVERY)
+        {
+            return;
+        }
+        self.lock_asked = Some(now);
+        self.locked_out |= !super::nvhttp::owner_opens(state, Some(&self.fp_hex));
+    }
 }
 
 /// The virtual Xbox pad this session presents, and the only place this plane picks a backend.
@@ -150,55 +173,131 @@ impl SessionAccess {
 /// `xinputhid` exists, XUSB where it does not, `PUNKTFUNK_XBOX_BACKEND` overriding both.
 ///
 /// Elsewhere there is no choice: Linux is one uinput X-Box pad; other platforms drop events.
-enum SessionPads {
+enum PadDevices {
     /// Linux uinput / the Windows XUSB companion — `crate::inject::gamepad`.
     Xusb(GamepadManager),
     /// Windows UMDF HID Xbox pad — the native plane's default.
     #[cfg(target_os = "windows")]
     Hid(crate::inject::xbox_windows::XboxWindowsManager),
-    /// Under the USBridge agent: virtual pads on its USB broker's USB/IP ports.
-    Usbridge(super::usbridge::Pads),
 }
+
+/// This session's pads, made under host-wide OS slots ([`crate::inject::pad_pool`]). Every
+/// client numbers its first pad 0, and the OS names a pad by its index, so the wire index
+/// is never the device's: a native session beside this one holds slots too.
+struct SessionPads {
+    dev: PadDevices,
+    slots: crate::inject::pad_pool::PadSlotMap<'static>,
+    /// When each wire pad's removal frame came. Its slot goes back after
+    /// [`PAD_RELEASE_GRACE`], once the device and its mailbox are gone.
+    removed_at: [Option<std::time::Instant>; MAX_PADS],
+}
+
+/// The managers' 300 ms unplug grace plus one pump, as the native plane waits.
+const PAD_RELEASE_GRACE: Duration = Duration::from_millis(400);
 
 impl SessionPads {
     fn new() -> SessionPads {
-        if super::usbridge::pads_via_broker() {
-            return SessionPads::Usbridge(super::usbridge::Pads::new());
-        }
+        SessionPads::with_slots(crate::inject::pad_pool::PadSlotMap::default())
+    }
+
+    fn with_slots(slots: crate::inject::pad_pool::PadSlotMap<'static>) -> SessionPads {
         #[cfg(target_os = "windows")]
-        if crate::native::gamepad::windows_xbox_hid() {
-            return SessionPads::Hid(crate::inject::xbox_windows::XboxWindowsManager::new());
+        let dev = if crate::native::gamepad::windows_xbox_hid() {
+            PadDevices::Hid(crate::inject::xbox_windows::XboxWindowsManager::new())
+        } else {
+            PadDevices::Xusb(GamepadManager::new())
+        };
+        #[cfg(not(target_os = "windows"))]
+        let dev = PadDevices::Xusb(GamepadManager::new());
+        SessionPads {
+            dev,
+            slots,
+            removed_at: [None; MAX_PADS],
         }
-        SessionPads::Xusb(GamepadManager::new())
     }
 
-    /// Apply one decoded controller event (create/destroy by mask, then state).
+    /// Apply one decoded controller event (create/destroy by mask, then state) in OS-slot space.
     fn handle(&mut self, ev: &GamepadEvent) {
-        match self {
-            SessionPads::Xusb(m) => m.handle(ev),
+        let Some(ev) = self.in_slot_space(ev, std::time::Instant::now()) else {
+            return;
+        };
+        match &mut self.dev {
+            PadDevices::Xusb(m) => m.handle(&ev),
             #[cfg(target_os = "windows")]
-            SessionPads::Hid(m) => m.handle(ev),
-            SessionPads::Usbridge(p) => p.handle(ev),
+            PadDevices::Hid(m) => m.handle(&ev),
         }
     }
 
-    /// The USB broker's pads, when they are this session's.
-    fn usbridge(&mut self) -> Option<&mut super::usbridge::Pads> {
-        match self {
-            SessionPads::Usbridge(p) => Some(p),
-            _ => None,
+    /// The event renumbered to the slot its device is made under, `active_mask` included. A
+    /// present pad claims its slot; a removal never mints one. `None`: out of range, a removal
+    /// of a pad that holds no slot, or every slot on the host held.
+    fn in_slot_space(
+        &mut self,
+        ev: &GamepadEvent,
+        now: std::time::Instant,
+    ) -> Option<GamepadEvent> {
+        let (wire, present) = match ev {
+            GamepadEvent::State(f) => {
+                let wire = usize::try_from(f.index).ok().filter(|&w| w < MAX_PADS)?;
+                (wire, f.active_mask & (1 << wire) != 0)
+            }
+            GamepadEvent::Arrival { index, .. } => (usize::from(*index), true),
+        };
+        let slot = if present {
+            let slot = self.slots.claim_for(wire)?;
+            self.removed_at[wire] = None;
+            slot
+        } else {
+            let slot = self.slots.slot_of(wire)?;
+            self.removed_at[wire] = Some(now);
+            slot
+        };
+        Some(match *ev {
+            GamepadEvent::State(f) => GamepadEvent::State(GamepadFrame {
+                index: i16::from(slot),
+                active_mask: self.slots.os_mask(f.active_mask),
+                ..f
+            }),
+            GamepadEvent::Arrival {
+                kind,
+                capabilities,
+                audio_caps,
+                ..
+            } => GamepadEvent::Arrival {
+                index: slot,
+                kind,
+                capabilities,
+                audio_caps,
+            },
+        })
+    }
+
+    /// Hand back the slots of pads removed at least [`PAD_RELEASE_GRACE`] ago.
+    fn release_removed(&mut self, now: std::time::Instant) {
+        for wire in 0..MAX_PADS {
+            if self.removed_at[wire].is_some_and(|t| now.duration_since(t) >= PAD_RELEASE_GRACE) {
+                self.removed_at[wire] = None;
+                self.slots.release(wire);
+            }
         }
     }
 
     /// Pump force-feedback every tick: games block inside the kernel handshake until answered.
     /// HID rich-feedback is discarded — GameStream's rumble (`0x010B`) carries the two handle
-    /// motors only, so trigger levels are dropped at the call site.
-    fn pump_rumble(&mut self, rumble: impl FnMut(u16, u16, u16, u16, u16)) {
-        match self {
-            SessionPads::Xusb(m) => m.pump_rumble(rumble),
+    /// motors only, so trigger levels are dropped at the call site. `rumble` gets the client's
+    /// wire index; feedback from a slot this session does not hold is dropped.
+    fn pump_rumble(&mut self, mut rumble: impl FnMut(u16, u16, u16, u16, u16)) {
+        self.release_removed(std::time::Instant::now());
+        let slots = &self.slots;
+        let to_wire = |slot: u16, low, high, lt, rt| {
+            if let Some(wire) = u8::try_from(slot).ok().and_then(|s| slots.wire_of(s)) {
+                rumble(wire as u16, low, high, lt, rt);
+            }
+        };
+        match &mut self.dev {
+            PadDevices::Xusb(m) => m.pump_rumble(to_wire),
             #[cfg(target_os = "windows")]
-            SessionPads::Hid(m) => m.pump(rumble, |_| {}),
-            SessionPads::Usbridge(p) => p.pump_rumble(rumble),
+            PadDevices::Hid(m) => m.pump(to_wire, |_| {}),
         }
     }
 }
@@ -278,9 +377,10 @@ impl rusty_enet::Socket for OwnerFilteredSocket {
         &mut self,
         buffer: &mut [u8; rusty_enet::MTU_MAX],
     ) -> Result<Option<(Self::Address, rusty_enet::PacketReceived)>, std::io::Error> {
-        // Loop so a dropped non-owner datagram does not starve a following owner one.
+        // Keep reading past a dropped non-owner datagram so it cannot starve an owner one, but
+        // yield after `MAX_DROPS_PER_RECEIVE` so ENet's ACK and timeout pass still runs.
         // Timeout is `WouldBlock` on Unix and `TimedOut` on Windows; both map to `Ok(None)`.
-        loop {
+        for _ in 0..MAX_DROPS_PER_RECEIVE {
             match rusty_enet::Socket::receive(&mut self.inner, buffer) {
                 Ok(Some((addr, received))) => {
                     // Decide before rusty_enet allocates per-peer reassembly. No live
@@ -304,8 +404,14 @@ impl rusty_enet::Socket for OwnerFilteredSocket {
                 Err(e) => return Err(e),
             }
         }
+        Ok(None)
     }
 }
+
+/// Datagrams one [`OwnerFilteredSocket::receive`] reads and drops before it reports none.
+/// ENet sends ACKs, checks timeouts and dispatches only once `receive` returns none, and a
+/// flood from another host never leaves the 2 ms read timeout to expire.
+const MAX_DROPS_PER_RECEIVE: usize = 64;
 
 /// Admit a fresh ENet connect only behind a live `/launch` (Moonlight connects after
 /// RTSP, so there is no legitimate connect without one). When both sides captured the
@@ -466,7 +572,8 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
 }
 
 /// Each 2 ms tick: resolve on a new owner, fold a console edit (watch poll), and cut the
-/// session the tick the deadline passes. Events read the mask this leaves.
+/// session the tick the deadline passes or, within [`LOCK_EVERY`], once the owner's profile
+/// stops opening for its device. Events read the mask this leaves.
 fn tick_access(
     access: &mut Option<SessionAccess>,
     state: &AppState,
@@ -491,14 +598,19 @@ fn tick_access(
             peer.withdraw(lost, inj_tx);
         }
     }
+    if let Some(a) = access.as_mut() {
+        a.ask_lock(state);
+    }
     if let Some(a) = access
         .as_ref()
-        .filter(|a| a.expired(crate::clock::unix_secs()))
+        .filter(|a| a.locked_out || a.expired(crate::clock::unix_secs()))
     {
         // Expiry ends the session as a decision, not a network drop. `quit_session`
         // clears `launch`; the host-side-ended arm then sends TERMINATION + disconnect
         // (GameStream has no AccessUpdate).
-        let why = if a.revoked {
+        let why = if a.locked_out {
+            "the owner's profile no longer opens for this device"
+        } else if a.revoked {
             "gamestream access record removed"
         } else {
             "gamestream access expired"
@@ -520,11 +632,6 @@ struct ControlPeer {
     /// What the client last heard over HDR-mode (0x010e). A client starts in SDR.
     hdr_signalled: Option<HdrMeta>,
     pads: SessionPads,
-    /// Raw HID devices of a USBridge client, built by the agent's USB broker. Clients send
-    /// them only after seeing `SS_FF_USBRIDGE_RAW_HID` (rtsp.rs).
-    raw_hid: super::usbridge::RawHid,
-    /// The keyboard on the USB broker under the USBridge agent: keys and text typed there.
-    keyboard: super::usbridge::Keyboard,
     /// SS_PEN/SS_TOUCH → tablet / wire touch. Clients send these only after seeing
     /// `SS_FF_PEN_TOUCH_EVENTS` (rtsp.rs).
     pointer: super::pen::GsPointer,
@@ -551,8 +658,6 @@ impl ControlPeer {
             decrypt_fails: 0,
             hdr_signalled: None,
             pads: SessionPads::new(),
-            raw_hid: super::usbridge::RawHid::new(),
-            keyboard: super::usbridge::Keyboard::new(),
             pointer: super::pen::GsPointer::new(),
             held: Default::default(),
             repeat: super::input::KeyRepeat::for_this_host(),
@@ -569,7 +674,7 @@ impl ControlPeer {
     /// last sent, since tearing a live pad is churn.
     fn withdraw(&mut self, lost: u32, inj_tx: &Sender<InputEvent>) {
         let keys = lost & GRANT_KEYBOARD != 0;
-        for ev in self.keyboard.forward(self.held.release_classes(keys, lost & GRANT_POINTER != 0)) {
+        for ev in self.held.release_classes(keys, lost & GRANT_POINTER != 0) {
             let _ = inj_tx.send(ev);
         }
         if keys {
@@ -597,9 +702,7 @@ impl ControlPeer {
     fn pump_repeat(&mut self, inj_tx: &Sender<InputEvent>, grants: u32) {
         if let Some(ev) = self.repeat.due(std::time::Instant::now()) {
             if self.drops.permitted(grants, classify(ev.kind)) {
-                for ev in self.keyboard.forward(vec![ev]) {
-                    let _ = inj_tx.send(ev);
-                }
+                let _ = inj_tx.send(ev);
             }
         }
     }
@@ -619,15 +722,11 @@ impl ControlPeer {
         self.hdr_signalled = None;
         self.pads = SessionPads::new();
         self.pads_active = 0;
-        // Closing the broker connection unplugs the session's devices.
-        self.raw_hid = super::usbridge::RawHid::new();
         self.pointer = super::pen::GsPointer::new();
         self.repeat = super::input::KeyRepeat::for_this_host();
-        for ev in self.keyboard.forward(self.held.release()) {
+        for ev in self.held.release() {
             let _ = inj_tx.send(ev);
         }
-        // A new connection: the broker releases whatever the old one still held.
-        self.keyboard = super::usbridge::Keyboard::new();
         if let Some(totals) =
             std::mem::replace(&mut self.drops, GrantDrops::new(Plane::Gamestream)).summary()
         {
@@ -690,32 +789,15 @@ impl ControlPeer {
         // Handle motors only. `0x010B` has no trigger-rumble id on this plane, and uinput
         // `FF_RUMBLE` has two fields anyway.
         let seq = &mut self.host_seq;
-        // usbridge: the broker's pads send back lights, motion requests, adaptive triggers
-        // and their sound too; the sound goes unreliably on its own channel.
-        let mut unreliable: Vec<(u8, Vec<u8>)> = Vec::new();
-        if let Some(pads) = self.pads.usbridge() {
-            pads.pump(|o| {
-                let wire = encrypt_control(&key, &scheme, *seq, &o.plaintext);
-                *seq = seq.wrapping_add(1);
-                match o.channel {
-                    Some(channel) => unreliable.push((channel, wire)),
-                    None => out.push(wire),
-                }
-            });
-        } else {
-            self.pads.pump_rumble(|index, low, high, _lt, _rt| {
-                let pt = super::gamepad::rumble_plaintext(index, low, high);
-                out.push(encrypt_control(&key, &scheme, *seq, &pt));
-                *seq = seq.wrapping_add(1);
-            });
-        }
+        self.pads.pump_rumble(|index, low, high, _lt, _rt| {
+            let pt = super::gamepad::rumble_plaintext(index, low, high);
+            out.push(encrypt_control(&key, &scheme, *seq, &pt));
+            *seq = seq.wrapping_add(1);
+        });
         for wire in out {
             if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..])) {
                 tracing::warn!(error = ?e, "control send failed");
             }
-        }
-        for (channel, wire) in unreliable {
-            let _ = host.peer_mut(pid).send(channel, &Packet::unreliable(&wire[..]));
         }
     }
 
@@ -756,16 +838,6 @@ impl ControlPeer {
     /// Decodable input lifts the suspend veto whether or not it is granted; a keepalive is
     /// not input and lifts nothing.
     fn inject(&mut self, state: &AppState, pt: &[u8], inj_tx: &Sender<InputEvent>, grants: u32) {
-        // Under the USBridge agent the controller extensions go to the broker's pads.
-        if let Some(pads) = self.pads.usbridge() {
-            if let Some(frame) = super::usbridge::controller_frame(pt) {
-                crate::sleep_inhibit::note_input();
-                if self.drops.permitted(grants, GrantClass::Gamepad) {
-                    pads.extension(frame);
-                }
-                return;
-            }
-        }
         // Gate gamepad before the manager sees it: without GAMEPAD the creating event never
         // arrives, so no uinput node and no pad-audio streamer.
         if let Some(gp) = super::gamepad::decode(pt) {
@@ -776,16 +848,6 @@ impl ControlPeer {
                     self.pads_active = f.active_mask;
                 }
                 self.pads.handle(&gp);
-            }
-            return;
-        }
-        // A USBridge client's HID device (only after our feature flag): pointer-class, as the
-        // pen is -- what it sends is a tablet.
-        if let Some(frame) = super::usbridge::raw_hid_frame(pt) {
-            crate::sleep_inhibit::note_input();
-            if self.drops.permitted(grants, GrantClass::Pointer) {
-                state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
-                self.raw_hid.forward(frame);
             }
             return;
         }
@@ -812,17 +874,13 @@ impl ControlPeer {
         crate::sleep_inhibit::note_input();
         // One mask test, then the injector thread. A closed channel means the injector
         // died at startup; input is lossy, so drop silently.
-        let mut permitted = Vec::with_capacity(events.len());
         for ev in events {
             if self.drops.permitted(grants, classify(ev.kind)) {
                 state.counters.input_events.fetch_add(1, Ordering::Relaxed);
                 self.held.note(&ev);
                 self.repeat.note(&ev, std::time::Instant::now());
-                permitted.push(ev);
+                let _ = inj_tx.send(ev);
             }
-        }
-        for ev in self.keyboard.forward(permitted) {
-            let _ = inj_tx.send(ev);
         }
     }
 }
@@ -1031,6 +1089,36 @@ mod tests {
         // Address unknown on one side → launch-present only.
         assert!(super::accept_connect(launched(Some(owner)), None));
         assert!(super::accept_connect(launched(None), Some(other)));
+    }
+
+    /// A flood of non-owner datagrams makes `receive` report none after the drop cap, so ENet's
+    /// ACK and timeout pass runs; the datagrams behind the cap are read by the next call.
+    #[test]
+    fn a_non_owner_flood_does_not_hold_receive() {
+        use rusty_enet::Socket;
+        let inner = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        inner
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let to = inner.local_addr().unwrap();
+        let state = super::super::test_state();
+        let mut sock = super::OwnerFilteredSocket {
+            inner,
+            state: state.clone(),
+        };
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let other: std::net::IpAddr = "10.9.9.9".parse().unwrap();
+        *state.launch.lock().unwrap() = launched(Some(other));
+        for _ in 0..super::MAX_DROPS_PER_RECEIVE + 5 {
+            sender.send_to(&[1], to).unwrap();
+        }
+        let mut buf = [0u8; rusty_enet::MTU_MAX];
+        assert!(sock.receive(&mut buf).unwrap().is_none());
+        *state.launch.lock().unwrap() = launched(Some(sender.local_addr().unwrap().ip()));
+        assert!(
+            sock.receive(&mut buf).unwrap().is_some(),
+            "the datagrams behind the cap stay queued for the owner"
+        );
     }
 
     /// Wrong type table or reason endianness is ignored by the client (frozen stream or
@@ -1520,6 +1608,56 @@ mod tests {
         }
     }
 
+    /// A live session ends within a second once the owner's profile stops opening for its
+    /// device: a lock without it, or a sign-out. A listed device plays on.
+    #[test]
+    fn a_session_ends_when_the_owner_s_lock_shuts_its_device_out() {
+        let owner = [0xcd; 32];
+        let fp_hex = hex::encode(owner);
+        let dir = crate::test_support::scratch();
+        let path = dir.join("profiles.json");
+        let profiles = crate::profiles::Profiles::load_with(Some(path), None);
+        profiles.ensure_owner("box").unwrap();
+        let owner_id = profiles.owner_id().unwrap();
+        let profiles = std::sync::Arc::new(profiles);
+        let state = launched_state();
+        *state.launch.lock().unwrap() = launched(None).map(|l| super::LaunchSession {
+            gcm_key: KEY,
+            owner_fp: Some(owner),
+            ..l
+        });
+        assert!(state.profiles.set(profiles.clone()).is_ok());
+        let device = pf_seats::ipc::Device {
+            fingerprint: fp_hex.clone(),
+            name: "Moonlight".into(),
+        };
+        let locked = profiles.locks().edit(&owner_id, |lock, now| {
+            lock.locked = true;
+            lock.admit(&device, now, true)
+        });
+        assert!(locked.unwrap());
+        let mut access = None;
+        let mut peer = super::ControlPeer::new();
+        let (tx, _rx) = channel();
+        super::tick_access(&mut access, &state, &mut peer, &tx);
+        assert!(
+            state.launch.lock().unwrap().is_some(),
+            "on the list: it plays"
+        );
+
+        let signed_out = profiles.locks().edit(&owner_id, |lock, _| {
+            lock.list.sign_out(Some(&fp_hex));
+        });
+        signed_out.unwrap();
+        let deadline = std::time::Instant::now() + super::LOCK_EVERY * 3;
+        while state.launch.lock().unwrap().is_some() {
+            assert!(std::time::Instant::now() < deadline, "the session ended");
+            super::tick_access(&mut access, &state, &mut peer, &tx);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(access.is_none());
+    }
+
     /// A grant withdrawn mid-press lets go of what it covered: the key-up the client can no
     /// longer send goes out from here, the pads rest, and what the other grants hold stays.
     #[test]
@@ -1591,5 +1729,68 @@ mod tests {
         super::tick_access(&mut access, &state, &mut peer, &tx);
         assert!(rx.try_iter().next().is_none());
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A Moonlight pad takes a host-wide slot: alone, wire 0 is slot 0; beside a native
+    /// session that holds slot 0, it is made elsewhere and still answers to wire 0.
+    #[test]
+    fn moonlight_pads_take_host_wide_slots() {
+        use super::{GamepadEvent, GamepadFrame, SessionPads, PAD_RELEASE_GRACE};
+        use crate::inject::pad_pool::{PadSlotMap, PadSlotPool};
+        let pool = || -> &'static PadSlotPool { Box::leak(Box::new(PadSlotPool::new())) };
+        let frame = |index, active_mask| {
+            GamepadEvent::State(GamepadFrame {
+                index,
+                active_mask,
+                ..Default::default()
+            })
+        };
+        let os = |ev: Option<GamepadEvent>| match ev {
+            Some(GamepadEvent::State(f)) => Some((f.index, f.active_mask)),
+            Some(GamepadEvent::Arrival { index, .. }) => Some((i16::from(index), 0)),
+            None => None,
+        };
+        let now = std::time::Instant::now();
+
+        let mut lone = SessionPads::with_slots(PadSlotMap::with_pool(pool()));
+        assert_eq!(os(lone.in_slot_space(&frame(0, 0b1), now)), Some((0, 0b1)));
+
+        let shared = pool();
+        let mut native = PadSlotMap::with_pool(shared);
+        assert_eq!(native.claim_for(0), Some(0));
+        let mut gs = SessionPads::with_slots(PadSlotMap::with_pool(shared));
+        assert_eq!(os(gs.in_slot_space(&frame(0, 0b1), now)), Some((1, 0b10)));
+        let arrival = GamepadEvent::Arrival {
+            index: 1,
+            kind: 1,
+            capabilities: 0,
+            audio_caps: 0,
+        };
+        assert_eq!(os(gs.in_slot_space(&arrival, now)), Some((2, 0)));
+        assert_eq!(
+            gs.slots.wire_of(1),
+            Some(0),
+            "rumble on slot 1 is wire pad 0"
+        );
+        assert_eq!(native.wire_of(1), None);
+
+        // Wire 0 unplugs: the frame reaches its device, and the slot follows it out.
+        assert_eq!(os(gs.in_slot_space(&frame(0, 0b10), now)), Some((1, 0b100)));
+        gs.release_removed(now + PAD_RELEASE_GRACE - std::time::Duration::from_millis(1));
+        assert_eq!(
+            gs.slots.slot_of(0),
+            Some(1),
+            "held through the device's grace"
+        );
+        gs.release_removed(now + PAD_RELEASE_GRACE);
+        assert_eq!(gs.slots.slot_of(0), None);
+
+        assert_eq!(
+            os(gs.in_slot_space(&frame(3, 0), now)),
+            None,
+            "no slot, nothing to remove"
+        );
+        assert_eq!(os(gs.in_slot_space(&frame(-1, 0xffff), now)), None);
+        assert_eq!(os(gs.in_slot_space(&frame(16, 0xffff), now)), None);
     }
 }

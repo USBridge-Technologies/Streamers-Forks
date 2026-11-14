@@ -12,7 +12,7 @@ it is current; **Check for update** checks right away. Once a newer release exis
 card unfolds below it with the channel you follow, how the host was installed, and either an
 **Update now** button or the command that updates this install. The host checks a signed feed on
 `git.unom.io` while the console is open. The host also fires `update.available`
-and `update.applied` on the [event stream](/docs/automation).
+and `update.applied` on the [event stream](/docs/host-events#the-event-stream).
 
 The channel comes from the repository you installed from (on a Steam Deck, the branch
 `~/punktfunk` follows), and the card never switches it — see [Release Channels](/docs/channels).
@@ -61,8 +61,7 @@ apt, dnf, a NixOS switch, **Update now**, the Windows installer, `punktfunk-syse
 Steam Deck script. A service you stopped stays stopped. A live stream drops when the host restarts.
 A layered rpm-ostree install moves at the reboot instead.
 
-The apt and dnf commands above update only the host; name `punktfunk-web` and `punktfunk-scripting`
-too to move all three. A source build restarts by hand, console first:
+A source build restarts by hand, console first:
 
 ```bash
 systemctl --user restart punktfunk-web
@@ -84,8 +83,10 @@ A host left running on a replaced binary fails every new KDE desktop session wit
   sudo punktfunk-sysext install --from-file ~/punktfunk-known-good.raw   # to go back
   ```
 
-- After a Bazzite major rebase the old image refuses to load, and `punktfunk-sysext` goes with it.
-  Download the script again and update once to fetch the image for the new base:
+- After a Bazzite major rebase the old image refuses to load. A unit the install left in `/etc`
+  fetches the image for the new base once the network is up, so the host is back a minute or two
+  after the first boot. A host last updated before 0.47.0 has no such unit yet: download the
+  script again and update once:
 
   ```sh
   curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh
@@ -101,7 +102,7 @@ A host left running on a replaced binary fails every new KDE desktop session wit
 
 Turn off **Check for updates** under **Host → System** (`PUNKTFUNK_UPDATE_CHECK=0` in
 `host.env`). To keep the check but drop the button, turn off **Console updates** under
-**Show advanced** (`PUNKTFUNK_UPDATE_APPLY=0`). The check contacts `git.unom.io` and nothing else.
+**Show advanced** (`PUNKTFUNK_UPDATE_APPLY=0`). The check contacts `git.unom.io`, which hands the file over to Cloudflare R2.
 
 ## Troubleshooting
 

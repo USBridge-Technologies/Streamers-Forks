@@ -45,6 +45,8 @@
   libGL,
   vulkan-loader,
   libva,
+  # The seat daemon dlopens libpam.so.0 to check an adopted account's password.
+  linux-pam,
   # gbm lives in `libgbm` on recent nixpkgs, `mesa` on older ones.
   libgbm ? null,
   mesa,
@@ -89,6 +91,8 @@ let
       outputHashes = {
         "git+https://github.com/microsoft/windows-rs?rev=58217a690#58217a690d6256ee229044a174de67d72d28bc35" =
           "sha256-zarqTTlHYV0NYyBbVhe8UNHYpn8RFcfl8uBQF1T5Nqc=";
+        "git+https://github.com/microsoft/windows-rs?rev=d19f6bbc0#d19f6bbc0485cc4a9f63352d2948168707b84a9f" =
+          "sha256-yhfSwq3gPlZAv40+dxk45X++7rt24usxmEDpwrgYojc=";
         "git+https://github.com/unom-io/usbfs-iso?rev=ff5468ac68cea3de64ecc4a1e16b4dbdba2f8b39#ff5468ac68cea3de64ecc4a1e16b4dbdba2f8b39" =
           "sha256-4y84oeUPEXC3c/45X/sBIYjJwxID6XvZU283/dLgNKk=";
       };
@@ -192,6 +196,9 @@ in
 
         # udev: /dev/uinput + /dev/uhid (virtual gamepads) + the vhci sysfs perms for the virtual Deck.
         install -Dm0644 scripts/60-punktfunk.rules "$out/lib/udev/rules.d/60-punktfunk.rules"
+        # NetworkManager hook: a connected Steam Frame wireless adapter stays out of power save.
+        install -Dm0755 packaging/linux/90-punktfunk-frame-adapter \
+          "$out/lib/NetworkManager/dispatcher.d/90-punktfunk-frame-adapter"
         # WirePlumber: hold a DualSense's sound card open + keep it off the graph clock.
         install -Dm0644 scripts/60-punktfunk-dualsense.conf "$out/share/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf"
 
@@ -206,6 +213,11 @@ in
           "$out/share/applications/io.unom.punktfunk.starthost.desktop"
         substituteInPlace "$out/share/applications/io.unom.punktfunk.starthost.desktop" \
           --replace-fail "/usr/bin/punktfunk-tray" "$out/bin/punktfunk-tray"
+        # Opens the web console signed in: a person's own inside their seat, the operator's elsewhere.
+        install -Dm0644 packaging/linux/io.unom.punktfunk.webconsole.desktop \
+          "$out/share/applications/io.unom.punktfunk.webconsole.desktop"
+        substituteInPlace "$out/share/applications/io.unom.punktfunk.webconsole.desktop" \
+          --replace-fail "/usr/bin/punktfunk-host" "$out/bin/punktfunk-host"
         for sz in 22x22 48x48; do
           for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
             install -Dm0644 "$png" "$out/share/icons/hicolor/$sz/apps/$(basename "$png")"
@@ -272,6 +284,17 @@ in
         libxkbcommon # pf-inject's keymap
         bash
       ];
+
+      # Nothing links libpam, so a `buildInputs` entry never reaches RUNPATH: add it by hand, and
+      # assert the soname resolves. A miss refuses every adopt of an existing account.
+      postFixup = ''
+        patchelf --add-rpath "${linux-pam}/lib" "$out/libexec/punktfunk/punktfunk-seats"
+        ok=""
+        for d in $(patchelf --print-rpath "$out/libexec/punktfunk/punktfunk-seats" | tr : ' '); do
+          [ -e "$d/libpam.so.0" ] && ok=1
+        done
+        [ -n "$ok" ] || { echo "punktfunk-seats: libpam.so.0 unresolvable from RUNPATH"; exit 1; }
+      '';
 
       postInstall = ''
         install -d "$out/libexec/punktfunk"
@@ -461,7 +484,8 @@ in
     '';
 
     # Everything past the deps fetch is offline: codegen + the vite build take every input from the
-    # installed node_modules, the checked-in api/openapi.json, and web/project.inlang.
+    # installed node_modules, the checked-in api/openapi.json, web/project.inlang and the
+    # l10n/messages it names (`src` is the whole repo, so they are there).
     #
     # ⚠ "Offline" is load-bearing and NOT self-enforcing. inlang resolves the plugins in
     # web/project.inlang/settings.json `modules`, and a failed import is only a WARNING there:
@@ -575,8 +599,13 @@ in
       # The user unit every channel ships, sandbox included. NixOS has no /bin/mkdir.
       install -Dm0644 scripts/punktfunk-scripting.service \
         $out/lib/systemd/user/punktfunk-scripting.service
+      install -Dm0644 scripts/punktfunk-scripting-seat@.service \
+        $out/lib/systemd/user/punktfunk-scripting-seat@.service
+      for unit in punktfunk-scripting.service punktfunk-scripting-seat@.service; do
+        substituteInPlace $out/lib/systemd/user/$unit \
+          --replace-fail /usr/bin/punktfunk-scripting $out/bin/punktfunk-scripting
+      done
       substituteInPlace $out/lib/systemd/user/punktfunk-scripting.service \
-        --replace-fail /usr/bin/punktfunk-scripting $out/bin/punktfunk-scripting \
         --replace-fail =+/bin/mkdir =+${coreutils}/bin/mkdir
       runHook postInstall
     '';

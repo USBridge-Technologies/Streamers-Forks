@@ -20,8 +20,9 @@ No stream needs to be running.
 
 | Client | Where |
 | --- | --- |
-| Linux, Windows, Android | The host card's menu → **Send logs to host** |
-| iPhone, iPad, Mac, Apple TV | Long-press (or right-click) the host card → **Host Details…** → **Send Logs to Host** |
+| Linux, Windows | The host card's menu → **Send logs to host** |
+| iPhone, iPad, Mac, Apple TV | Long-press (or right-click) the host card → **Host details…** → **Send logs to host** |
+| Android | The info button on the host card → **Send logs to host** |
 | Console home (Steam Deck Gaming Mode, TV, controller) | The host's options → **Send logs to host** |
 
 The item shows only for a **paired** host that is **online** (Apple: paired is enough). It sends the
@@ -39,15 +40,14 @@ names.
 
 ## 4. File the report
 
-Post in the `bug-reports` forum on [Discord](https://discord.gg/wzEGg9y45z) and attach the export
-there. Not on Discord? Use the form on the
-[community page](https://punktfunk.unom.io/community#bugs): we confirm it by email, then you follow
-the report and reply through a private link. The form takes text only, so paste the parts of the
-export that matter.
+Report it on [improve unom](https://improve.unom.io/p/punktfunk/new?kind=bug), where you can also
+vote for bugs that hit you too and follow what happens to yours. You need a free unom account. It
+takes text only, so paste the parts of the export that matter. Or post in the `bug-reports` forum on
+[Discord](https://discord.gg/wzEGg9y45z) and attach the export there.
 
-The title and first post of every report go on our
-[public tracker](https://git.unom.io/unom/punktfunk/issues), so keep host names and addresses out of
-them. Replies and attachments stay in the Discord thread. Include:
+Either way the title and text of your report are public, on improve unom and on our
+[tracker](https://git.unom.io/unom/punktfunk/issues), so keep host names and addresses out of them.
+Include:
 
 - host and client versions (the console's **Host** page; the first line of each client log)
 - host OS and desktop, GPU, the client device, wired or Wi-Fi

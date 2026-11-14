@@ -3,13 +3,17 @@
   "pages": [
     "web-console",
     "virtual-displays",
+    "stream-a-monitor",
+    "play-together",
     "access-levels",
     "profiles",
+    "own-account",
     "windows-seats",
     "friends-over-the-internet",
     "wake-on-lan",
     "host-power",
     "plugins",
+    "plugin-setup",
     "automation"
   ]
 }

@@ -99,7 +99,7 @@ pub use routing::{
     claim_workspace, dedicated_game_exited, focus_streamed_output, gamescope_presenting,
     gamescope_xwayland_cursor_targets, held_managed_session, launch_into_gamescope_session,
     launch_is_nested, launch_is_steam, release_managed_session, steam_appid_from_launch,
-    watch_steam_game_exit, WorkspaceClaim,
+    watch_steam_game_exit, GamescopeHdrContent, WorkspaceClaim,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +148,15 @@ impl Compositor {
                 | Compositor::Wlroots
                 | Compositor::Niri
                 | Compositor::Umbriel
+        )
+    }
+
+    /// Makes the streamed screen the desktop's main one under `primary`. The tiling backends
+    /// only focus it, so there `primary` is `extend` (`exclusive_wanted`).
+    pub fn has_primary(self) -> bool {
+        matches!(
+            self,
+            Compositor::Kwin | Compositor::Mutter | Compositor::Windows
         )
     }
 
@@ -417,41 +426,71 @@ pub fn rebuild_probe_active() -> bool {
     REBUILD_PROBES.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
-/// Monitor to mirror instead of creating a virtual display, or `None`.
-///
-/// **`PUNKTFUNK_CAPTURE_MONITOR` wins over stored policy** — an appliance pin
-/// in `host.env` must not be overridden by a console click. Unset, the
-/// persisted picker applies (the env is snapshotted at startup, so a UI
-/// cannot write it). Read per `open`, not cached, so a console change takes
-/// effect on the next session.
+/// The host-wide monitor to mirror, or `None`: [`screen_target`] of a device with no row.
 pub fn capture_monitor() -> Option<String> {
-    if let Some(env) = pf_host_config::config().capture_monitor.as_deref() {
-        return Some(env.to_string());
-    }
-    policy::prefs().get().capture_monitor
+    screen_target(None, false).0.into_monitor()
 }
 
-/// Whether a session opened now streams the pinned monitor instead of a virtual display: a
-/// [`capture_monitor`] pin, and on Windows a desktop that can be captured (see [`open`]).
-pub fn mirrors_pinned() -> bool {
+/// What the device with pairing fingerprint `fp` (hex) is set to stream, and whether
+/// `PUNKTFUNK_CAPTURE_MONITOR` fixes it.
+///
+/// **The env pin wins over stored policy**: an appliance pin in `host.env` must not be
+/// overridden by a console click (the env is snapshotted at startup, so a UI cannot write
+/// it). Unset, the device's row (a pick it set itself only when it `may_choose`), then the
+/// host's screen, then its own screen. Read per call, not cached, so a console change takes
+/// effect on the next session.
+pub fn screen_target(fp: Option<&str>, may_choose: bool) -> (policy::DisplayTarget, bool) {
+    if let Some(env) = pf_host_config::config().capture_monitor.as_deref() {
+        return (policy::DisplayTarget::Monitor(env.to_string()), true);
+    }
+    let target = policy::prefs().get().screen_for(fp, may_choose);
+    (target.unwrap_or(policy::DisplayTarget::Own), false)
+}
+
+/// Heads a live mirror streams now, each with the device (fingerprint hex) it streams to.
+/// `None` is a session that named no device.
+pub fn streamed_monitors() -> Vec<(String, Option<String>)> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        mirror::streamed()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    Vec::new()
+}
+
+/// Whether a session opened now on `target` streams that monitor instead of a virtual display:
+/// a monitor, and on Windows a desktop that can be captured (see [`open_for`]).
+pub fn mirrors(target: &policy::DisplayTarget) -> bool {
+    let monitor = matches!(target, policy::DisplayTarget::Monitor(_));
     #[cfg(target_os = "windows")]
     {
-        capture_monitor().is_some() && mirror::desktop_capturable()
+        monitor && mirror::desktop_capturable()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        capture_monitor().is_some()
+        monitor
     }
 }
 
-/// Open the virtual-display driver for `compositor`.
-///
-/// A [`capture_monitor`] pin routes to the mirror backend (physical head, no
-/// virtual display). Resolved here — the one place every session opens a
-/// display — so the pin is host-wide. `design/per-monitor-portal-capture.md`.
+/// [`mirrors`] for a device with no row of its own: the host-wide screen.
+pub fn mirrors_pinned() -> bool {
+    mirrors(&screen_target(None, false).0)
+}
+
+/// [`open_for`] the host-wide screen: what a device with no row of its own streams.
 pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
+    open_for(compositor, screen_target(None, false).0)
+}
+
+/// Open the display `target` names on `compositor`: the mirror backend for a monitor
+/// (physical head, no virtual display), else the virtual-display driver.
+/// `design/per-monitor-portal-capture.md`.
+pub fn open_for(
+    compositor: Compositor,
+    target: policy::DisplayTarget,
+) -> Result<Box<dyn VirtualDisplay>> {
     #[cfg(target_os = "linux")]
-    if let Some(connector) = capture_monitor() {
+    if let policy::DisplayTarget::Monitor(connector) = target {
         // No desk (nested/headless, or only our own kept outputs) degrades to a
         // virtual display so a persisted pin cannot refuse to stream. A miss among
         // real heads stays a hard error; an enumeration error stays on the mirror path.
@@ -471,7 +510,7 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
         backend(compositor)
     }
     #[cfg(target_os = "windows")]
-    if let Some(connector) = capture_monitor() {
+    if let policy::DisplayTarget::Monitor(connector) = target {
         if mirror::desktop_capturable() {
             return Ok(Box::new(mirror::MirrorDisplay::new(compositor, connector)?));
         }
@@ -484,13 +523,8 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
     #[cfg(target_os = "windows")]
     {
+        // The IddCx driver, whatever `compositor` says.
         let _ = compositor;
-        // USBridge: MttVDD, the virtual monitor every USBridge streamer on Windows shares,
-        // when it is installed; pf-vdisplay only otherwise (see `windows_uses_mttvdd`).
-        if windows_uses_mttvdd() {
-            return Ok(Box::new(mttvdd::MttvddDisplay::new()));
-        }
-        // Otherwise the IddCx driver, whatever `compositor` says.
         // `ensure_available` waits out a D0 re-register (wake-from-sleep) and
         // reloads a hostless-zombie adapter (devnode present, interface gone).
         // `.context` appends; a replacement "not installed" hid mid-resume.
@@ -504,7 +538,7 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = compositor;
+        let _ = (compositor, target);
         anyhow::bail!("virtual displays require Linux or Windows")
     }
 }
@@ -579,9 +613,6 @@ pub fn probe(compositor: Compositor) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let _ = compositor;
-        if windows_uses_mttvdd() {
-            return Ok(());
-        }
         driver::probe()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -700,12 +731,12 @@ pub fn resolve_topology(t: policy::Topology) -> policy::Topology {
     }
 }
 
-/// Topology applied at create, for the client this display is being created for, and the
-/// one every readout names.
+/// Topology applied at create when the session carries none ([`create_topology`]), for the
+/// client this display is being created for, and the one every readout names.
 ///
 /// Precedence: configured console policy — that client's overlay over the host's
-/// (`design/web-console-overhaul.md` §6.1) — else `unconfigured_topology`, the platform's
-/// own rule. Always concrete.
+/// (`design/web-console-overhaul.md` §6.1), without a topology the device set itself — else
+/// `unconfigured_topology`, the platform's own rule. Always concrete.
 ///
 /// `None` for a client is the host policy, which is also what an unidentified session
 /// (shared identity, GameStream) gets.
@@ -714,6 +745,53 @@ pub fn effective_topology(client: Option<[u8; 32]>) -> policy::Topology {
         Some(p) => resolve_topology(p.effective_for(policy::fp_hex(client).as_deref()).topology),
         None => unconfigured_topology(),
     }
+}
+
+/// The topology a session of the device `fp` (hex) wants
+/// ([`policy::DisplayPolicy::topology_for`]), `auto` resolved. `None` on an unconfigured host or a contract seat, whose backends keep
+/// [`effective_topology`].
+pub fn wanted_topology(fp: Option<&str>, may_choose: bool) -> Option<policy::Topology> {
+    let p = policy::prefs().configured()?;
+    Some(resolve_topology(p.topology_for(fp, may_choose)))
+}
+
+/// The topology a backend's `create` applies: the one its session carries
+/// ([`VirtualDisplay::set_topology`]), else [`effective_topology`] for `client`.
+pub(crate) fn create_topology(
+    carried: Option<policy::Topology>,
+    client: Option<[u8; 32]>,
+) -> policy::Topology {
+    carried.unwrap_or_else(|| effective_topology(client))
+}
+
+/// The devices (fingerprint hex) holding a live or kept screen on this host or mirroring one
+/// of its monitors, for [`policy::first_session_rule`]. `None` is one whose device is not
+/// known: a shared identity slot, or a session that named no device.
+pub fn screen_holders() -> Vec<Option<String>> {
+    registry::snapshot()
+        .displays
+        .into_iter()
+        .map(|d| identity::slot_owner(d.identity_slot))
+        .chain(streamed_monitors().into_iter().map(|(_, device)| device))
+        .collect()
+}
+
+/// The devices (fingerprint hex) whose screen here, live or kept, sits in a group that keeps the
+/// host's monitors off: one of its members was made `exclusive`. `None` is a device not known.
+/// Linux reads the pool, Windows the group its first monitor isolated.
+pub fn monitors_off_by() -> Vec<Option<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let slots = registry::dark_slots().into_iter();
+        slots.map(identity::slot_owner).collect()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let devices = manager::dark_devices().into_iter();
+        devices.map(policy::fp_hex).collect()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    Vec::new()
 }
 
 // The Windows manager applies its own unconfigured rule (`PUNKTFUNK_NO_ISOLATE`).
@@ -995,29 +1073,6 @@ mod mutter;
 #[path = "vdisplay/windows/pf_vdisplay.rs"]
 pub mod driver;
 
-// USBridge: the shared MttVDD virtual monitor (DXGI-duplicated by the host) instead of
-// pf-vdisplay. `vdisplay/windows/mttvdd.rs`.
-#[cfg(target_os = "windows")]
-#[path = "vdisplay/windows/mttvdd.rs"]
-pub mod mttvdd;
-
-/// USBridge: whether Windows sessions use the MttVDD monitor (captured with DXGI Desktop
-/// Duplication) rather than pf-vdisplay's IDD push. Yes whenever MttVDD is installed, so
-/// every USBridge streamer shares one virtual display driver; `USBRIDGE_VDISPLAY=pf` forces
-/// pf-vdisplay.
-#[cfg(target_os = "windows")]
-pub fn windows_uses_mttvdd() -> bool {
-    if std::env::var("USBRIDGE_VDISPLAY").is_ok_and(|v| v.eq_ignore_ascii_case("pf")) {
-        return false;
-    }
-    mttvdd::is_installed()
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn windows_uses_mttvdd() -> bool {
-    false
-}
-
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/wlroots.rs"]
 mod wlroots;
@@ -1204,5 +1259,53 @@ mod tests {
         ) {
             assert!(a.env.wayland_display.is_none());
         }
+    }
+
+    /// A create applies the topology its session carries over the one stored for its device;
+    /// the session wants the device's own only while it may choose. Unconfigured, it carries none.
+    #[test]
+    fn a_create_takes_the_carried_topology_over_the_store() {
+        let name = "a_create_takes_the_carried_topology_over_the_store";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            use policy::{ClientOverlay, DisplayPolicy, DisplayTarget, Preset, Topology};
+            let fp = [9; 32];
+            let hex = policy::fp_hex(Some(fp)).unwrap();
+            assert_eq!(wanted_topology(Some(&hex), true), None, "unconfigured");
+            let mut row = ClientOverlay::default();
+            row.set_device_pick(Some(DisplayTarget::Own), Some(Topology::Extend));
+            let mut p = DisplayPolicy {
+                preset: Preset::Custom,
+                topology: Topology::Exclusive,
+                ..DisplayPolicy::default()
+            };
+            p.clients.insert(hex.clone(), row);
+            policy::prefs().set(p).unwrap();
+
+            assert_eq!(wanted_topology(Some(&hex), true), Some(Topology::Extend));
+            assert_eq!(
+                wanted_topology(Some(&hex), false),
+                Some(Topology::Exclusive)
+            );
+            assert_eq!(create_topology(None, Some(fp)), Topology::Exclusive);
+            let carried = Some(Topology::Extend);
+            assert_eq!(create_topology(carried, Some(fp)), Topology::Extend);
+            assert!(backend::exclusive_wanted("test", None, Some(fp)));
+            assert!(!backend::exclusive_wanted("test", carried, Some(fp)));
+        });
+    }
+
+    /// Only the backends that can make the streamed screen the main one offer `primary`.
+    #[test]
+    fn primary_is_real_where_the_desktop_has_a_main_screen() {
+        let with: Vec<_> = Compositor::all()
+            .iter()
+            .copied()
+            .chain([Compositor::Windows])
+            .filter(|c| c.has_primary())
+            .collect();
+        assert_eq!(
+            with,
+            [Compositor::Kwin, Compositor::Mutter, Compositor::Windows]
+        );
     }
 }

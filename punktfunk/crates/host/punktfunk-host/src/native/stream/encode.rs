@@ -425,14 +425,19 @@ impl StreamState {
             t_submit + self.live.interval
         };
         let owed = crate::send_pacing::owed_aus(&self.live.frame, &mut *self.live.enc, au_wait);
-        // Every backend gets the floor, the pixel-less driver encoder too: without it the
-        // driver's AMF/QSV/NVENC keep referencing frames the client never confirmed.
+        // Every backend gets the floor and the confirmations, the pixel-less driver encoder
+        // too: without the floor the driver's AMF/QSV/NVENC keep referencing frames the client
+        // never confirmed, and without the confirmations a late loss report finds no anchor.
+        let acked = self.shared.acked.load(Ordering::Relaxed);
         let floor = self.loss_mode.floor(
             self.shared.lossy_window.swap(false, Ordering::Relaxed),
-            self.shared.acked.load(Ordering::Relaxed),
+            acked,
             wire_index,
             t_submit,
         );
+        self.live
+            .enc
+            .note_confirmed(super::recovery::confirmed(acked));
         self.live.enc.set_reference_floor(floor);
         let submitted = match owed {
             Some(_) => Ok(()),
@@ -477,11 +482,18 @@ impl StreamState {
             measure,
             owed: owed.is_some(),
         };
+        self.tick_stamps = Some(stamps);
+        self.drain_ready(&stamps)
+    }
+
+    /// Poll every ready AU into the send thread, then watch for a stall. `Break` = the send
+    /// thread is gone.
+    fn drain_ready(&mut self, stamps: &Stamps) -> Result<Flow> {
         let mut send_gone = false;
         let mut poll_err: Option<anyhow::Error> = None;
         while !self.clock.inflight.is_empty() {
             if self.facts.streamed_wire && self.live.enc.supports_chunked_poll() {
-                match self.poll_chunked(&stamps) {
+                match self.poll_chunked(stamps) {
                     Polled::Au => continue,
                     Polled::Nothing => break,
                     Polled::SendGone => {
@@ -494,7 +506,7 @@ impl StreamState {
                     }
                 }
             }
-            match self.poll_whole(&stamps) {
+            match self.poll_whole(stamps) {
                 Polled::Au => {}
                 Polled::Nothing => break,
                 Polled::SendGone => {
@@ -904,10 +916,19 @@ impl StreamState {
         }
     }
 
-    /// Wait for the next tick ([`crate::send_pacing::wait_next_tick`]) on this session's
-    /// measured source cadence.
-    pub(super) fn sleep_to_next(&mut self, t_cap: std::time::Instant, repeat: bool) {
-        crate::send_pacing::wait_next_tick(
+    /// Wait for the next tick ([`crate::send_pacing::wait_tick_or_au`]) on this session's
+    /// measured source cadence. An access unit the encoder finishes first goes to the send
+    /// thread at once, under this tick's stamps and with no submit, and the wait goes on.
+    /// While the encoder owes one that will ring, the keep-alive repeat holds off.
+    /// `Break` = the send thread is gone.
+    pub(super) fn sleep_to_next(
+        &mut self,
+        t_cap: std::time::Instant,
+        repeat: bool,
+    ) -> Result<Flow> {
+        use crate::send_pacing::Waited;
+        let owed = self.au_owed();
+        let mut waited = crate::send_pacing::wait_tick_or_au(
             &mut *self.live.capturer,
             &mut *self.live.enc,
             &self.live.frame,
@@ -916,7 +937,25 @@ impl StreamState {
             (!repeat).then_some(t_cap),
             self.live.interval,
             self.src_period_ns,
+            owed,
         );
+        while let Waited::AuReady(gate) = waited {
+            self.au_rings = true;
+            if let Some(stamps) = self.tick_stamps {
+                if let Flow::Break = self.drain_ready(&stamps)? {
+                    return Ok(Flow::Break);
+                }
+            }
+            let owed = self.au_owed();
+            waited = gate.resume(&mut *self.live.capturer, &self.pace, &mut self.next, owed);
+        }
+        Ok(Flow::Next)
+    }
+
+    /// The encoder holds an access unit and rings the loop when it is done
+    /// ([`crate::send_pacing::wait_tick_or_au`]'s `owed`).
+    fn au_owed(&self) -> bool {
+        self.au_rings && !self.clock.inflight.is_empty()
     }
 
     /// After the loop: poll what the encoder still owes into the send thread.
@@ -1002,7 +1041,8 @@ fn driver_stages(enc: &dyn crate::encode::Encoder) -> AuStages {
 }
 
 /// This tick's stage timings, stamped onto every AU it produces.
-struct Stamps {
+#[derive(Clone, Copy)]
+pub(super) struct Stamps {
     queue_us: u32,
     cap_us: u32,
     submit_us: u32,
@@ -1249,3 +1289,7 @@ mod tests {
         assert!(mark_recovery_boundary(&mut pos, false, period));
     }
 }
+
+#[cfg(test)]
+#[path = "au_wake_tests.rs"]
+mod au_wake_tests;

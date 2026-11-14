@@ -32,12 +32,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.DialogProperties
+import io.unom.punktfunk.kit.R
+import io.unom.punktfunk.kit.wakingLine
 
 /**
  * Which phase of the connect flow to draw — the pure view model [ConnectOverlay] resolves from the
@@ -49,6 +52,9 @@ internal sealed interface ConnectPhase {
 
     /** The dial is in flight (shown the instant a host is picked). */
     data class Connecting(override val hostName: String) : ConnectPhase
+
+    /** A dial's unlock is starting [profile]'s desktop, which can take a minute. */
+    data class Starting(override val hostName: String, val profile: String) : ConnectPhase
 
     /** A sleeping host is being Wake-on-LAN'd and we're waiting for it to advertise again. */
     data class Waking(override val hostName: String, val seconds: Int, val connectsAfter: Boolean) : ConnectPhase
@@ -66,22 +72,32 @@ private data class ConnectCopy(
     val cancelLabel: String,
 )
 
+@Composable
 private fun connectCopy(phase: ConnectPhase): ConnectCopy = when (phase) {
     is ConnectPhase.Connecting -> ConnectCopy(
-        "Connecting to ${phase.hostName}", "Establishing a secure connection…", false, "Cancel",
+        stringResource(R.string.dial_connecting_to, phase.hostName),
+        stringResource(R.string.dial_connecting_detail),
+        false,
+        stringResource(R.string.common_cancel),
+    )
+    is ConnectPhase.Starting -> ConnectCopy(
+        wakingLine(phase.profile).asString(),
+        stringResource(R.string.android_profile_starting_hint),
+        false,
+        stringResource(R.string.common_cancel),
     )
     is ConnectPhase.Waking -> ConnectCopy(
-        "Waking ${phase.hostName}…",
-        "Waiting for it to come online · ${phase.seconds}s",
+        stringResource(R.string.dial_waking, phase.hostName),
+        stringResource(R.string.dial_waking_progress, phase.seconds),
         true,
-        // A wake-only wait (no dial after) says "Stop Waiting"; a wake that will connect says "Cancel".
-        if (!phase.connectsAfter) "Stop Waiting" else "Cancel",
+        // A wake-only wait (no dial after) says "Stop waiting"; a wake that will connect says "Cancel".
+        stringResource(if (!phase.connectsAfter) R.string.dial_stop_waiting else R.string.common_cancel),
     )
     is ConnectPhase.WakeTimedOut -> ConnectCopy(
-        "${phase.hostName} didn't wake",
-        "It may still be booting, or it's powered off / off this network.",
+        stringResource(R.string.dial_wake_parked, phase.hostName),
+        stringResource(R.string.dial_wake_parked_hint),
         false,
-        "Cancel",
+        stringResource(R.string.common_cancel),
     )
 }
 
@@ -91,7 +107,8 @@ private fun connectCopy(phase: ConnectPhase): ConnectCopy = when (phase) {
  * out to be asleep:
  *
  *  - **Connecting** ([connectingHostName] non-null): the dial is in flight. Shown immediately on tap,
- *    so a host that takes a beat to answer no longer looks like nothing happened.
+ *    so a host that takes a beat to answer no longer looks like nothing happened. With
+ *    [startingProfile], the dial's unlock is starting that profile's desktop.
  *  - **Waking** ([WakeController.waking] non-null): the dial failed on a sleeping host, so we're firing
  *    Wake-on-LAN and waiting for it to advertise again, escalating to a retry/cancel prompt on timeout.
  *
@@ -105,6 +122,7 @@ fun ConnectOverlay(
     connectingHostName: String?,
     waker: WakeController,
     onCancelConnect: () -> Unit,
+    startingProfile: String? = null,
 ) {
     val waking = waker.waking
     // Waking takes precedence (it only exists after a dial has failed) so a stray overlap can't strand
@@ -112,6 +130,8 @@ fun ConnectOverlay(
     val phase = when {
         waking != null && waking.timedOut -> ConnectPhase.WakeTimedOut(waking.hostName)
         waking != null -> ConnectPhase.Waking(waking.hostName, waking.seconds, waking.connectsAfter)
+        connectingHostName != null && startingProfile != null ->
+            ConnectPhase.Starting(connectingHostName, startingProfile)
         connectingHostName != null -> ConnectPhase.Connecting(connectingHostName)
         else -> return
     }
@@ -154,9 +174,9 @@ internal fun ConnectModal(
                 fontFamily = if (copy.monoSubtitle) FontFamily.Monospace else FontFamily.Default,
             )
         },
-        // No confirm action until the wake times out; then "Try Again" is the primary button.
+        // No confirm action until the wake times out; then "Try again" is the primary button.
         confirmButton = {
-            if (timedOut) TextButton(onClick = onRetry) { Text("Try Again") }
+            if (timedOut) TextButton(onClick = onRetry) { Text(stringResource(R.string.common_retry)) }
         },
         dismissButton = {
             TextButton(onClick = onCancel) { Text(copy.cancelLabel) }

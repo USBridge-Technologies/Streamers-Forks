@@ -125,8 +125,20 @@ async fn pending_devices_approve_and_deny() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b.as_array().unwrap().len(), 0);
 
-    np.note_pending("Enrico's MacBook", "aa11", Some(LAN_KNOCK), None, None);
-    np.note_pending("device bb22cc33", "bb22", Some(LAN_KNOCK), None, None);
+    np.note_pending(
+        "Enrico's MacBook",
+        "aa11",
+        Some(LAN_KNOCK),
+        &Via::DIRECT,
+        None,
+    );
+    np.note_pending(
+        "device bb22cc33",
+        "bb22",
+        Some(LAN_KNOCK),
+        &Via::DIRECT,
+        None,
+    );
     let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
     assert_eq!(b.as_array().unwrap().len(), 2);
     assert_eq!(b[0]["name"], "Enrico's MacBook");
@@ -364,6 +376,72 @@ async fn patch_native_access_validates_and_404s() {
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
 }
 
+/// An access write marks the record, so "all but the screen choice" survives a reload. An
+/// older host's `0xFF` lists as Full, and an expiry-only PATCH keeps it Full.
+#[tokio::test]
+async fn an_access_write_keeps_all_but_the_screen_choice() {
+    use punktfunk_core::quic::{GRANT_ALL, GRANT_ALL_PRE_DISPLAY, GRANT_DISPLAY};
+    let path = crate::test_support::scratch().join("pf-mgmt-grants-rev.json");
+    std::fs::write(
+        &path,
+        br#"{ "clients": [ { "name": "Old", "fingerprint": "aa11", "grants": 255 },
+                           { "name": "New", "fingerprint": "bb22" } ] }"#,
+    )
+    .unwrap();
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(Some(path.clone()), None, false).unwrap(),
+    );
+    let app = test_app_native(test_state(), np.clone());
+    let patch = |fp: &str, body: serde_json::Value| {
+        json_req(Method::PATCH, &format!("/api/v1/native/clients/{fp}"), body)
+    };
+
+    let (_, list) = send(&app, get_req("/api/v1/native/clients")).await;
+    let old = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["fingerprint"] == "aa11")
+        .unwrap();
+    assert_eq!(old["grants"], GRANT_ALL, "an older host's Full: {old}");
+    assert_eq!(old["access_level"], "full");
+
+    let (s, b) = send(
+        &app,
+        patch("bb22", serde_json::json!({"grants": GRANT_DISPLAY})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "the screen grant is a known bit: {b}");
+    let (s, b) = send(
+        &app,
+        patch("bb22", serde_json::json!({"grants": GRANT_ALL_PRE_DISPLAY})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["grants"], GRANT_ALL_PRE_DISPLAY);
+    assert_eq!(b["access_level"], "custom");
+    let (s, b) = send(
+        &app,
+        patch("aa11", serde_json::json!({"expires_in_secs": 3600})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        b["grants"], GRANT_ALL,
+        "an expiry edit re-stores what is in force"
+    );
+
+    let reloaded =
+        crate::native_pairing::NativePairing::load_with(Some(path), None, false).unwrap();
+    let now = wall_now();
+    assert_eq!(reloaded.effective("bb22", now), Some(GRANT_ALL_PRE_DISPLAY));
+    assert_eq!(reloaded.effective("aa11", now), Some(GRANT_ALL));
+    assert!(reloaded
+        .list()
+        .iter()
+        .all(|c| c.grants_rev == Some(crate::native_pairing::GRANTS_REV)));
+}
+
 /// `until_disconnect` replaces nothing on its own. Honouring it alone would hand a re-pairing
 /// device full permanent control, because `Access` replaces the whole record.
 #[tokio::test]
@@ -377,7 +455,7 @@ async fn until_disconnect_alone_is_refused_rather_than_widening_access() {
         .unwrap(),
     );
     let app = test_app_native(test_state(), np.clone());
-    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), None, None);
+    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), &Via::DIRECT, None);
     let id = np.pending()[0].id;
 
     let (s, _) = send(
@@ -435,8 +513,8 @@ async fn a_wan_knock_is_listed_as_wan_and_refused_by_approve() {
     );
     let app = test_app_native(test_state(), np.clone());
     let wan = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5));
-    np.note_pending("Friend's Deck", "dd88", Some(wan), None, None);
-    np.note_pending("Living Room", "ee99", Some(LAN_KNOCK), None, None);
+    np.note_pending("Friend's Deck", "dd88", Some(wan), &Via::DIRECT, None);
+    np.note_pending("Living Room", "ee99", Some(LAN_KNOCK), &Via::DIRECT, None);
 
     let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
     let rows = b.as_array().unwrap();
@@ -482,6 +560,85 @@ async fn a_wan_knock_is_listed_as_wan_and_refused_by_approve() {
     assert!(np.is_paired("ee99"));
 }
 
+/// A knock through a page server is listed as relayed, keeps `source: "wan"` so an older console
+/// hides Approve too, and a bare approve is refused in the web client's words.
+#[tokio::test]
+async fn a_relayed_knock_is_listed_as_relayed_and_refused_by_approve() {
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(crate::test_support::scratch().join("pf-mgmt-relayed-knock.json")),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let app = test_app_native(test_state(), np.clone());
+    let lan = Via {
+        relay: Relay::For("10.0.0.9".parse().unwrap()),
+        ..Via::DIRECT
+    };
+    np.note_pending("Office browser", "ab12", Some(LAN_KNOCK), &lan, None);
+    np.note_pending("Living Room", "ee99", Some(LAN_KNOCK), &Via::DIRECT, None);
+
+    let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
+    let rows = b.as_array().unwrap();
+    let relayed = rows.iter().find(|r| r["fingerprint"] == "ab12").unwrap();
+    let direct = rows.iter().find(|r| r["fingerprint"] == "ee99").unwrap();
+    assert_eq!(relayed["source"], "wan");
+    assert_eq!(relayed["relayed"], true);
+    assert_eq!(direct["relayed"], false);
+
+    let id = relayed["id"].as_u64().unwrap();
+    let path = format!("/api/v1/native/pending/{id}/approve");
+    let (s, b) = send(&app, json_req(Method::POST, &path, serde_json::json!({}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert!(b["error"].as_str().unwrap().contains("web client"), "{b}");
+    assert!(!np.is_paired("ab12"));
+}
+
+/// A knock from a page the host does not know names the page, keeps `source: "wan"`, and a bare
+/// approve is refused in those words. An access PATCH keeps the page a paired record carries.
+#[tokio::test]
+async fn an_unfamiliar_page_is_listed_and_refused_and_a_patch_keeps_a_page() {
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(crate::test_support::scratch().join("pf-mgmt-page-knock.json")),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let app = test_app_native(test_state(), np.clone());
+    let evil = Via {
+        origin: Some("https://evil.example".into()),
+        unfamiliar_origin: true,
+        ..Via::DIRECT
+    };
+    np.note_pending("Chrome on Mac", "ab12", Some(LAN_KNOCK), &evil, None);
+
+    let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
+    let row = &b.as_array().unwrap()[0];
+    assert_eq!(row["source"], "wan");
+    assert_eq!(row["origin"], "https://evil.example");
+    assert_eq!(row["unfamiliar_origin"], true);
+    assert_eq!(row["relayed"], false);
+    let path = format!("/api/v1/native/pending/{}/approve", row["id"]);
+    let (s, b) = send(&app, json_req(Method::POST, &path, serde_json::json!({}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert!(b["error"].as_str().unwrap().contains("page"), "{b}");
+
+    np.add("Enrico's browser", "cd34").unwrap();
+    np.remember_origin("cd34", "https://play.example.com");
+    let body = serde_json::json!({"grants": punktfunk_core::quic::GRANT_GAMEPAD});
+    let (s, _) = send(
+        &app,
+        json_req(Method::PATCH, "/api/v1/native/clients/cd34", body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(np.knows_origin("https://play.example.com"));
+}
+
 /// Approve pins the chosen mask. Reserved bits 400 without consuming the pending entry.
 /// A later re-knock surfaces the stored access.
 #[tokio::test]
@@ -497,7 +654,7 @@ async fn approve_with_access_pins_the_chosen_mask() {
     );
     let app = test_app_native(test_state(), np.clone());
 
-    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), None, None);
+    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), &Via::DIRECT, None);
     let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
     assert!(pend[0]["grants"].is_null());
     assert!(pend[0]["access_level"].is_null());
@@ -539,7 +696,7 @@ async fn approve_with_access_pins_the_chosen_mask() {
     assert_eq!(np.effective("cc33", now), Some(GRANT_GAMEPAD));
 
     // Re-knock surfaces the stored access for the approve dialog.
-    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), None, None);
+    np.note_pending("Guest Phone", "cc33", Some(LAN_KNOCK), &Via::DIRECT, None);
     let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
     assert_eq!(pend[0]["grants"], GRANT_GAMEPAD);
     assert_eq!(pend[0]["access_level"], "controller");
@@ -624,7 +781,7 @@ async fn approve_and_arm_without_access_fields_keep_todays_behavior() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(np.armed_access(), None, "no fields = no choice");
 
-    np.note_pending("Old Laptop", "ee55", Some(LAN_KNOCK), None, None);
+    np.note_pending("Old Laptop", "ee55", Some(LAN_KNOCK), &Via::DIRECT, None);
     let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
     let id = pend[0]["id"].as_u64().unwrap();
     let (s, b) = send(

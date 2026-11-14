@@ -2,9 +2,8 @@
 //! Settings).
 
 use super::style::*;
-use super::{AppCtx, AsyncSetState, Screen};
 use pf_fluent::{Palette, Token};
-use std::sync::Arc;
+use pf_l10n::{client, desktop};
 use windows_reactor::*;
 
 /// punktfunk's own license (MIT OR Apache-2.0).
@@ -22,29 +21,13 @@ const APP_LICENSE: &str = concat!(
 /// — a false statement to the user's face, three lines under a card saying otherwise.
 const THIRD_PARTY_NOTICES: &str = include_str!("../../THIRD-PARTY-NOTICES.txt");
 
-pub(crate) fn licenses_page(
-    pal: &Palette,
-    ctx: &Arc<AppCtx>,
-    set_screen: &AsyncSetState<Screen>,
-) -> View {
-    let back_btn = icon_button("arrow-left", "Back")
-        .style(ButtonStyle::Accent)
-        .on_click({
-            let (c, ss) = (ctx.clone(), set_screen.clone());
-            move || {
-                // Back RE-ENTERS the settings page — re-base its snapshot on the file, same
-                // as the hosts page's Settings button (see settings::refresh_snapshot).
-                super::settings::refresh_snapshot(&c);
-                ss.call(Screen::Settings)
-            }
-        });
-
+pub(crate) fn licenses_page(pal: &Palette) -> View {
     let app_card = card(
         vstack((
             text("Punktfunk")
                 .font_size(15.0)
                 .font_weight(FontWeight::SEMI_BOLD),
-            text("Licensed under MIT OR Apache-2.0, at your option.")
+            text(client::about_license_statement())
                 .font_size(12.0)
                 .text_wrapping(TextWrapping::Wrap)
                 .foreground(pal.get(Token::SecondaryText)),
@@ -58,25 +41,20 @@ pub(crate) fn licenses_page(
 
     let natives_card = card(
         vstack((
-            text("Bundled components")
+            text(desktop::desktop_licenses_bundled_components())
                 .font_size(15.0)
                 .font_weight(FontWeight::SEMI_BOLD),
-            text(
-                "SDL 3 (Zlib) and the Windows App SDK (Microsoft) are linked; their notices ship \
-                 in the installed licenses\\ folder. Video decoding uses Windows' own DXVA and \
-                 Vulkan Video, with OpenH264 and rav1d (both BSD-2-Clause) as the CPU fallback — \
-                 no FFmpeg is bundled.",
-            )
-            .font_size(12.0)
-            .text_wrapping(TextWrapping::Wrap)
-            .foreground(pal.get(Token::SecondaryText)),
+            text(desktop::desktop_licenses_bundled_body())
+                .font_size(12.0)
+                .text_wrapping(TextWrapping::Wrap)
+                .foreground(pal.get(Token::SecondaryText)),
         ))
         .spacing(8.0),
     );
 
     let notices_card = card(
         vstack((
-            text("Rust crates")
+            text(desktop::desktop_licenses_rust_crates())
                 .font_size(15.0)
                 .font_weight(FontWeight::SEMI_BOLD),
             text(THIRD_PARTY_NOTICES)
@@ -88,12 +66,12 @@ pub(crate) fn licenses_page(
     );
 
     page(vec![
-        page_header("Third-party licenses", back_btn),
-        section(pal, "PUNKTFUNK"),
+        page_header(client::about_licenses_title(), Vec::new()),
+        section(pal, "Punktfunk"),
         app_card.into(),
-        section(pal, "BUNDLED"),
+        section(pal, desktop::desktop_licenses_section_bundled()),
         natives_card.into(),
-        section(pal, "OPEN SOURCE"),
+        section(pal, desktop::desktop_licenses_section_open_source()),
         notices_card.into(),
     ])
 }

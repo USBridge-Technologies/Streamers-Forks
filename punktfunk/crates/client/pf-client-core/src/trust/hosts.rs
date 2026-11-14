@@ -1,7 +1,7 @@
 //! The known-hosts store: pinned records, the trust decisions that write them, and what
 //! adverts and connects teach them.
 
-use super::{config_dir, load_json_or_default, write_atomic};
+use super::{config_dir, load_json_or_default, read_json, write_atomic};
 use crate::presets::{PresetsFile, StreamPreset};
 use anyhow::Result;
 use punktfunk_core::discovery::DiscoveredHost;
@@ -336,13 +336,10 @@ impl HostEdit {
     pub fn parse_address(text: &str) -> Result<(String, Option<u16>), String> {
         let addr = text.trim();
         if addr.is_empty() {
-            return Err("Enter the host's address.".into());
+            return Err(pf_l10n::client::hosts_error_address_empty().into());
         }
-        crate::deeplink::split_host_port(addr).ok_or_else(|| {
-            format!(
-                "\u{201c}{addr}\u{201d} isn't an address. Use a name or an IP, like 192.168.1.20."
-            )
-        })
+        crate::deeplink::split_host_port(addr)
+            .ok_or_else(|| pf_l10n::client::hosts_error_address_invalid(addr))
     }
 
     /// The port field; blank is the default 9777.
@@ -351,18 +348,15 @@ impl HostEdit {
         if text.is_empty() {
             return Ok(crate::deeplink::DEFAULT_PORT);
         }
-        text.parse::<u16>().ok().filter(|&p| p != 0).ok_or_else(|| {
-            format!("\u{201c}{text}\u{201d} isn't a port. Use a number from 1 to 65535.")
-        })
+        text.parse::<u16>()
+            .ok()
+            .filter(|&p| p != 0)
+            .ok_or_else(|| pf_l10n::client::hosts_error_port_invalid(text))
     }
 
     /// The Wake-on-LAN field: a list, or empty to clear it.
     pub fn parse_macs(text: &str) -> Result<Vec<String>, String> {
-        crate::wol::parse_mac_list(text).map_err(|bad| {
-            format!(
-                "\u{201c}{bad}\u{201d} isn't a MAC address. Use six pairs, like aa:bb:cc:dd:ee:ff."
-            )
-        })
+        crate::wol::parse_mac_list(text).map_err(pf_l10n::client::hosts_error_mac_invalid)
     }
 }
 
@@ -379,6 +373,8 @@ thread_local! {
     /// Set while this thread holds a store lock. A second lock on the sidecar would wait on
     /// the first for ever, so a nested edit runs under the outer one. One flag for every
     /// store: a thread holding one lock takes no other, so two processes never wait in a ring.
+    // Already `const`; clippy flags it anyway on an Android target.
+    #[allow(clippy::missing_const_for_thread_local)]
     static LOCK_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -521,10 +517,11 @@ impl KnownHosts {
 
     /// One edit of the store at `path`, alone: under the lock, re-read, run `f`, and write
     /// when it returns `true` beside its result. Another process's edit lands before or
-    /// after this one, never in between.
+    /// after this one, never in between. A store that exists but can't be read refuses the
+    /// edit, so no save replaces it.
     fn locked_at<R>(path: &Path, f: impl FnOnce(&mut KnownHosts) -> (bool, R)) -> Result<R> {
         let _lock = StoreLock::take(path);
-        let mut known: KnownHosts = load_json_or_default(path);
+        let mut known: KnownHosts = read_json(path)?.unwrap_or_default();
         let (write, r) = f(&mut known);
         if write {
             known.save_at(path)?;
@@ -1104,6 +1101,44 @@ mod tests {
         let stored: KnownHosts = load_json_or_default(&path);
         let names: Vec<&str> = stored.hosts.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["first", "second"]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A store that exists but does not parse is set aside as `.bad` before the edit
+    /// saves over it, and the saved store is valid.
+    #[test]
+    fn an_edit_keeps_an_unparsable_store_beside_the_new_one() {
+        let _guard = crate::trust::store_health_lock();
+        let path = scratch_store("hosts-unparsable");
+        // UTF-16 with a BOM: how Notepad re-saves a UTF-8 file.
+        let utf16: Vec<u8> = "\u{feff}{\"hosts\":[]}"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        for bad in [utf16, b"{\"hosts\":[{".to_vec()] {
+            let _ = std::fs::remove_file(path.with_extension("json.bad"));
+            std::fs::write(&path, &bad).unwrap();
+            KnownHosts::locked_at(&path, |k| (true, k.hosts.push(named("fresh")))).unwrap();
+            assert_eq!(std::fs::read(path.with_extension("json.bad")).unwrap(), bad);
+            let stored: KnownHosts = load_json_or_default(&path);
+            assert_eq!(stored.hosts.len(), 1);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A store that exists but can't be read refuses the edit before it runs, so no save
+    /// replaces every pairing with the one edit.
+    #[test]
+    fn an_unreadable_store_refuses_the_edit() {
+        let _guard = crate::trust::store_health_lock();
+        let path = scratch_store("hosts-unreadable");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut ran = false;
+        let edit = KnownHosts::locked_at(&path, |k| {
+            ran = true;
+            (true, k.hosts.push(named("fresh")))
+        });
+        assert!(edit.is_err() && !ran);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

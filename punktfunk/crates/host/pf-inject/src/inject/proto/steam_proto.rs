@@ -289,7 +289,7 @@ impl SteamState {
                 self.rpad_y = (32768 - (y as i32)).min(32767) as i16;
             }
             RichInput::Motion { gyro, accel, .. } => {
-                // Wire is DualSense units; hid-steam wants 16 LSB/°·s and 16384 LSB/g.
+                // Wire is DualSense units and axes; the pad's raw IMU has its own.
                 let (g, a) = super::steam_remap::motion_wire_to_deck(gyro, accel);
                 self.gyro = g;
                 self.accel = a;
@@ -554,7 +554,8 @@ pub struct ScState {
     pub typed: SteamState,
     /// The pad's last state report; `None` until the first.
     raw: Option<[u8; STEAM_REPORT_LEN]>,
-    /// When the client last sent anything for this pad: a report or a typed frame.
+    /// When the client last sent anything for this pad: a report, a typed frame or an
+    /// unchanged refresh ([`Self::hear`]).
     heard: Option<std::time::Instant>,
 }
 
@@ -575,6 +576,11 @@ impl ScState {
     /// A typed frame arrived: the fallback state, and proof the client is alive.
     pub fn typed_frame(&mut self, typed: SteamState, now: std::time::Instant) {
         self.typed = typed;
+        self.heard = Some(now);
+    }
+
+    /// The client refreshed this pad and the state did not change: proof of life, nothing else.
+    pub fn hear(&mut self, now: std::time::Instant) {
         self.heard = Some(now);
     }
 
@@ -891,14 +897,14 @@ mod tests {
         assert_ne!(s.buttons & btn::RPAD_TOUCH, 0);
         assert_eq!(s.rpad_x, 32767); // 65535-32768
         assert_eq!(s.rpad_y, 32767); // wire y=0 top (screen) → Deck +up
-                                     // DualSense → Deck: gyro ×16/20, accel ×16384/10000.
+                                     // DualSense → Deck: gyro ×16/20, accel ×16384/10000, wire y on raw z.
         s.apply_rich(RichInput::Motion {
             pad: 0,
             gyro: [1000, -2000, 0],
             accel: [10000, -5000, 0],
         });
-        assert_eq!(s.gyro, [800, -1600, 0]);
-        assert_eq!(s.accel, [16384, -8192, 0]);
+        assert_eq!(s.gyro, [800, 0, -1600]);
+        assert_eq!(s.accel, [16384, 0, -8192]);
     }
 
     /// Empty serial must not panic. `clamp(1, 21)` then `bytes[..len]`
@@ -1184,6 +1190,27 @@ mod tests {
 
         st.clear_rich();
         assert!(!st.mirrors());
+    }
+
+    /// An unchanged refresh carries no frame, only [`ScState::hear`]: a mirrored pad holds its
+    /// button past [`RAW_STALE`] while they keep coming, and reads neutral once they stop.
+    #[test]
+    fn a_heard_client_holds_a_mirrored_sc_past_the_stale_window() {
+        let t0 = std::time::Instant::now();
+        let mut st = ScState::neutral();
+        let mut seq = 0;
+        let frame = [0x01, 0x00, 0x01, 0x3C, 0x2A, 0, 0, 0, 0x80];
+        st.apply_rich(raw_report(&frame), t0);
+
+        let mut at = t0;
+        for _ in 0..30 {
+            at += std::time::Duration::from_millis(100);
+            st.hear(at);
+            let r = st.report(&mut seq, at + std::time::Duration::from_millis(8));
+            assert_eq!((&r[..9], seq), (&frame[..], 0), "released at {at:?}");
+        }
+        let stalled = st.report(&mut seq, at + RAW_STALE);
+        assert_eq!(stalled[8..11], [0, 0, 0]);
     }
 
     /// Settings and haptics reach the physical pad; lizard mode, calibration and firmware

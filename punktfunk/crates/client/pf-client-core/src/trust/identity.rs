@@ -1,10 +1,8 @@
 //! This client's mTLS identity: the key pair it presents, the owner-only key file, the
 //! label hosts file it under, and the SPAKE2 PIN ceremony that pins a host.
 
-use super::{config_dir, save_paired, Paired};
-#[cfg(windows)]
-use anyhow::Context as _;
-use anyhow::{anyhow, Result};
+use super::{config_dir, save_paired, Paired, StoreLock};
+use anyhow::{anyhow, Context as _, Result};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::quic::endpoint;
 
@@ -13,30 +11,52 @@ use punktfunk_core::quic::endpoint;
 /// The private key is owner-only wherever the directory is. Unix uses mode 0600.
 /// Windows drops inherited ACEs and grants the owner, including when
 /// `PUNKTFUNK_CONFIG_DIR` points outside `%APPDATA%`.
+///
+/// A missing pair, or one whose cert does not parse or whose key PEM has no END line (a
+/// write cut short by a crash or a full disk), is replaced: it could never have connected.
+/// A file that exists but can't be read is an error, and the pair stays. One process at a
+/// time reads or writes the pair, so none sees another's half-written key.
 pub fn load_or_create_identity() -> Result<(String, String)> {
-    let dir = config_dir()?;
+    identity_in(&config_dir()?)
+}
+
+fn identity_in(dir: &std::path::Path) -> Result<(String, String)> {
     let (cp, kp) = (dir.join("client-cert.pem"), dir.join("client-key.pem"));
-    if let (Ok(c), Ok(k)) = (std::fs::read_to_string(&cp), std::fs::read_to_string(&kp)) {
-        // Older Unix builds left the key world-readable. Re-lock on load. Best-effort:
-        // a read-only store still returns the key it already has. Windows keys only
-        // ever lived in the per-user `%APPDATA%`, so nothing there needs a re-lock.
-        #[cfg(unix)]
-        lock_identity_perms(&dir, &kp);
-        return Ok((c, k));
+    std::fs::create_dir_all(dir)?;
+    let _lock = StoreLock::take(&kp);
+    if let (Some(c), Some(k)) = (read_pem(&cp)?, read_pem(&kp)?) {
+        if endpoint::fingerprint_of_pem(&c).is_ok() && k.contains("-----END ") {
+            // Older Unix builds left the key world-readable. Re-lock on load. Best-effort:
+            // a read-only store still returns the key it already has. Windows keys only
+            // ever lived in the per-user `%APPDATA%`, so nothing there needs a re-lock.
+            #[cfg(unix)]
+            lock_identity_perms(dir, &kp);
+            return Ok((c, k));
+        }
+        tracing::warn!(cert = %cp.display(), "client identity is incomplete — generating a new one");
     }
     let (c, k) = endpoint::generate_identity().map_err(|e| anyhow!("generate identity: {e}"))?;
-    std::fs::create_dir_all(&dir)?;
     // Unix: the directory is 0700 before the key is written. Windows locks the key
     // file alone in `write_private_key`; the directory keeps the ACL it came with.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     std::fs::write(&cp, &c)?;
     write_private_key(&kp, k.as_bytes())?;
     tracing::info!(cert = %cp.display(), "generated client identity");
     Ok((c, k))
+}
+
+/// A PEM file's text, or `None` when it is missing or not text: a pair that can't connect.
+fn read_pem(path: &std::path::Path) -> Result<Option<String>> {
+    use std::io::ErrorKind::{InvalidData, NotFound};
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if matches!(e.kind(), NotFound | InvalidData) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 /// Write the mTLS private key owner-only.
@@ -155,14 +175,22 @@ pub fn pair_and_save(
 /// the host's own timeout.
 pub const REQUEST_ACCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(185);
 
+/// The code this device shows while it waits for approval, or `None` for a certificate that
+/// does not parse.
+pub fn device_code(identity: &(String, String)) -> Option<String> {
+    let fp = endpoint::fingerprint_of_pem(&identity.0).ok()?;
+    Some(punktfunk_core::fp::device_code(&fp))
+}
+
 /// Request access without a PIN: blocks until the host's operator approves this device or
-/// refuses it. `pin` is the advertised fingerprint (`None` trusts on first use); setting
-/// `cancel` withdraws the request. Returns the host certificate fingerprint. Never streams.
+/// refuses it. `pin` is the fingerprint the host must show: a host that advertised none pairs
+/// by PIN. Setting `cancel` withdraws the request. Returns the host certificate fingerprint.
+/// Never streams.
 pub fn request_access_to_host(
     addr: &str,
     port: u16,
     identity: &(String, String),
-    pin: Option<[u8; 32]>,
+    pin: [u8; 32],
     device_name: &str,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::result::Result<[u8; 32], punktfunk_core::PunktfunkError> {
@@ -180,6 +208,38 @@ pub fn request_access_to_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An identity is generated once and kept. A key cut short by a crash is replaced by
+    /// a whole pair instead of being returned for every connect to fail on.
+    #[test]
+    fn a_torn_key_is_replaced_not_returned() {
+        let dir = std::env::temp_dir().join(format!("pf-client-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = identity_in(&dir).unwrap();
+        assert_eq!(identity_in(&dir).unwrap(), first, "a whole pair is kept");
+        std::fs::write(dir.join("client-key.pem"), "").unwrap();
+        let second = identity_in(&dir).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(
+            identity_in(&dir).unwrap(),
+            second,
+            "and the new pair is whole"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key that exists but can't be read is an error, and the cert beside it stays: a new
+    /// pair would need pairing again on every host.
+    #[test]
+    fn an_unreadable_key_keeps_the_pair() {
+        let dir = crate::presets::tests::scratch_dir("identity-unreadable");
+        std::fs::create_dir_all(dir.join("client-key.pem")).unwrap();
+        std::fs::write(dir.join("client-cert.pem"), "cert").unwrap();
+        assert!(identity_in(&dir).is_err());
+        let cert = std::fs::read_to_string(dir.join("client-cert.pem")).unwrap();
+        assert_eq!(cert, "cert");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The key file is owner-only on create. Unix is mode 0600. Windows is an
     /// owner ACE with inherited access removed.

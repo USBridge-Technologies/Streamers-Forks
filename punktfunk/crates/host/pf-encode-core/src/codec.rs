@@ -276,9 +276,15 @@ pub trait Encoder: Send {
     /// `recovery_anchor`. With none resident the backend keeps its chain, never an IDR. Set
     /// before each submit. Default: no-op.
     fn set_reference_floor(&mut self, _acked: Option<Acked>) {}
+    /// What the client confirmed it decoded clean, before each submit whatever the link: the
+    /// backend keeps the newest confirmed picture resident ([`super::rfi::Kept`]), so the next
+    /// loss finds an anchor however long its report took. `None` before the first
+    /// confirmation. Default: no-op.
+    fn note_confirmed(&mut self, _acked: Option<Acked>) {}
     /// Escalate to pipelined retrieve under GPU contention: `poll` stops waiting
     /// on the newest in-flight AU (a retrieve thread on NVENC, a completion probe
-    /// on Vulkan/VA-API), so AUs may ride ~one loop tick behind their submit.
+    /// on Vulkan/VA-API). An AU reaches the loop when [`set_au_wake`](Self::set_au_wake)'s
+    /// wake rings, or ~one loop tick behind its submit on a backend that rings none.
     /// Returns whether pipelined retrieve is now active; the switch may defer.
     /// `true` returning `false` (the default) = unsupported — the session loop
     /// stops asking.
@@ -289,6 +295,10 @@ pub trait Encoder: Send {
     fn set_pipelined(&mut self, _on: bool) -> bool {
         false
     }
+    /// The loop's wake for a pipelined access unit: the backend calls it, from any thread,
+    /// once [`poll`](Self::poll) would return that AU, so the loop collects it between ticks.
+    /// Kept across rebuilds; `None` clears it. Default: ignored, the AU waits for the next tick.
+    fn set_au_wake(&mut self, _wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {}
     fn poll(&mut self) -> Result<Option<EncodedFrame>>;
     /// Raw OS handle, signalled while [`poll`](Self::poll) / [`poll_chunk`](Self::poll_chunk)
     /// would return without blocking, so a caller can park on it instead of sampling. Auto-reset:

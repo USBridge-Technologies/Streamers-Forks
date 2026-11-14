@@ -128,20 +128,22 @@ pub fn offered(id: &str) -> hermir::Result<bool> {
 /// Installs (or reinstalls) `id` and makes its folder exist, so the grant that follows has a
 /// directory to land on even when the copy itself is a Flatpak. On a Linux box with seats a
 /// Flatpak goes in box-wide ([`install_box_wide`]); an AppImage or archive stays this account's.
+/// Players may write in [`home_of`] only, set before hermir writes its manifests beside it.
 pub fn install(id: &str) -> hermir::Result<Installed> {
     let h = open()?;
     let emulator = h.emulator(id)?;
+    let home = home_of(id);
+    crate::plugins::open_for_players(&home);
     let row = match box_flatpak(emulator.entry()).filter(|_| box_wide()) {
         Some(app) => install_box_wide(&h, id, app)?,
         None => emulator.install(&Quiet)?,
     };
-    let home = home_of(id);
     std::fs::create_dir_all(&home).map_err(|e| hermir::Error::Io {
         op: "create",
         path: home.clone(),
         source: e,
     })?;
-    crate::plugins::open_for_players(&prefix().join(id));
+    crate::plugins::open_for_players(&home);
     Ok(row)
 }
 
@@ -234,11 +236,33 @@ pub fn install_core(core: &str) -> hermir::Result<PathBuf> {
 
 /// Whether RetroArch's cores folder `dir` already holds `core`, under the name hermir gives it.
 pub fn has_core(dir: &Path, core: &str) -> bool {
+    core_file(dir, core).is_file()
+}
+
+fn core_file(dir: &Path, core: &str) -> PathBuf {
     dir.join(format!(
         "{core}_libretro.{}",
         std::env::consts::DLL_EXTENSION
     ))
-    .is_file()
+}
+
+/// A core moved in from an admin-only folder keeps that folder's ACL, and the player's RetroArch
+/// can't load it. The cores folder is the player's, so the core gets the player's read and
+/// execute ACE through one handle that refuses a link on the way, never a copy by path.
+#[cfg(windows)]
+fn open_core(dir: &Path, core: &str) {
+    use pf_paths_win::player::{grant_on_file, READ_EXECUTE};
+    let path = core_file(dir, core);
+    if !path.is_file() || !pf_paths_win::admin_only_acl(&path) {
+        return;
+    }
+    let Some(sid) = crate::windows::theme::session_sid() else {
+        return;
+    };
+    match grant_on_file(&path, &sid, READ_EXECUTE) {
+        Ok(()) => tracing::debug!(core, path = %path.display(), "core opened to the player"),
+        Err(error) => tracing::warn!(core, %error, "core left unreadable to the player"),
+    }
 }
 
 /// How long a launch waits for the client's first pad, and for every pad it claimed to be
@@ -516,12 +540,58 @@ fn virtual_pads(text: &str, sys: &Path) -> Vec<hermir::PadRef> {
         .collect()
 }
 
-/// Puts every emulator's own bindings back after a game: what `prepare` wrote for the
-/// session's pads is gone again, file by file. Forced: an emulator rewrites its config on
-/// exit, and that is no edit of the player's. Nothing outstanding is a quiet no-op.
-pub fn revert_players() {
+/// Whose session bindings are out: `prepared` counts the prepares, `owner` is the library id of
+/// the launch whose prepare was last. `None` for a prepare outside a launch, and once reverted.
+struct Bindings {
+    prepared: u64,
+    owner: Option<String>,
+}
+
+impl Bindings {
+    /// What a launch of `library_id` holds: the last prepare, when it was that launch's.
+    fn of(&self, library_id: Option<&str>) -> Option<u64> {
+        (self.owner.is_some() && self.owner.as_deref() == library_id).then_some(self.prepared)
+    }
+
+    /// Whether an exit holding `held` ([`Self::of`]) puts the bindings back: its own, or ones
+    /// no launch owns.
+    fn reverts_for(&self, held: Option<u64>) -> bool {
+        self.owner.is_none() || held == Some(self.prepared)
+    }
+
+    fn prepared_for(&mut self, owner: Option<&str>) {
+        self.prepared += 1;
+        self.owner = owner.map(str::to_string);
+    }
+}
+
+static BINDINGS: std::sync::Mutex<Bindings> = std::sync::Mutex::new(Bindings {
+    prepared: 0,
+    owner: None,
+});
+
+fn bindings() -> std::sync::MutexGuard<'static, Bindings> {
+    BINDINGS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The bindings a launch of `library_id` holds, for [`revert_players`]: `Some` while the last
+/// [`prepare`] was that launch's.
+pub fn bindings_of(library_id: Option<&str>) -> Option<u64> {
+    bindings().of(library_id)
+}
+
+/// Puts the emulators' own bindings back after a game, file by file, when they are the exiting
+/// launch's (`held`, from [`bindings_of`]) or no launch's: a later launch's prepare already put
+/// this one's back and wrote its own. Forced: an emulator rewrites its config on exit, and that
+/// is no edit of the player's. Nothing outstanding is a quiet no-op.
+pub fn revert_players(held: Option<u64>) {
     let Ok(h) = open() else { return };
+    let mut out = bindings();
+    if !out.reverts_for(held) {
+        return;
+    }
     revert_with(&h);
+    out.owner = None;
 }
 
 fn revert_with(h: &Hermir) {
@@ -540,11 +610,25 @@ fn revert_with(h: &Hermir) {
 }
 
 /// Every copy of `id` answers its first-run questions, gets `platform`'s firmware from
-/// `firmware_dir` (the regular files in it, not below), and has the session's pads written
-/// in seat order (steps of kind `players`; reverted after the game): see [`session_players`]
-/// for `pad` and `slots`. `platform` is a catalog id or any of its aliases (RomM slug, ES-DE
-/// folder, libretro name). Blocking: an installer may run.
+/// `firmware_dir` (the regular files in it, not below, which a Windows player may then read,
+/// `let_player_read`), and has the session's pads written in seat order (steps of kind
+/// `players`; reverted after the game): see [`session_players`] for `pad` and `slots`.
+/// `platform` is a catalog id or any of its aliases (RomM slug, ES-DE folder, libretro name).
+/// Blocking: an installer may run. The bindings belong to no launch: any game's exit reverts
+/// them.
 pub fn prepare(
+    id: &str,
+    platform: Option<&str>,
+    firmware_dir: Option<&Path>,
+    pad: GamepadPref,
+    slots: Option<&AtomicU16>,
+) -> hermir::Result<Vec<(String, hermir::Prepared)>> {
+    prepare_as(None, id, platform, firmware_dir, pad, slots)
+}
+
+/// [`prepare`], its bindings `owner`'s: the library id of the launch they are for.
+fn prepare_as(
+    owner: Option<&str>,
     id: &str,
     platform: Option<&str>,
     firmware_dir: Option<&Path>,
@@ -554,7 +638,11 @@ pub fn prepare(
     let h = open()?;
     // A game that ended without a lease reporting it (its session took the nested gamescope
     // down with it) still has its bindings out; the next launch is the latest they go back.
-    revert_with(&h);
+    {
+        let mut out = bindings();
+        revert_with(&h);
+        out.prepared_for(owner);
+    }
     let emulator = h.emulator(id)?;
     let platform = platform.map(|p| {
         h.catalog()
@@ -577,6 +665,8 @@ pub fn prepare(
             .map(|e| e.path())
             .collect(),
     };
+    #[cfg(windows)]
+    let_player_read(&firmware);
     let players = hermir::Patch {
         players: Some(session_players(pad, slots)),
         ..Default::default()
@@ -590,6 +680,35 @@ pub fn prepare(
             Ok((copy.exe.to_string(), prepared))
         })
         .collect()
+}
+
+/// The emulator opens what a plugin hands it as the session's player, and a plugin's state is
+/// the runner's alone. Each such file gets that player's read ACE, on the file itself and only
+/// while it is the plugin's own; a file outside every plugin's state is left as it is.
+#[cfg(windows)]
+fn let_player_read(files: &[PathBuf]) {
+    let Some(sid) = crate::windows::theme::session_sid() else {
+        return;
+    };
+    let mut roots: Vec<PathBuf> = [pf_paths::config_dir(), pf_paths::seat::library_dir()]
+        .iter()
+        .filter_map(|d| d.join("plugin-state").canonicalize().ok())
+        .collect();
+    roots.dedup();
+    for file in files {
+        let Ok(real) = file.canonicalize() else {
+            continue;
+        };
+        let Some(own) = roots.iter().find_map(|root| {
+            let plugin = real.strip_prefix(root).ok()?.components().next()?;
+            Some(root.join(plugin))
+        }) else {
+            continue;
+        };
+        if let Err(error) = pf_paths_win::grant_read_inside(&real, &own, &sid) {
+            tracing::warn!(file = %real.display(), %error, "plugin file not opened to the player");
+        }
+    }
 }
 
 /// `platform` as the catalog spells it, from its id or any alias; as given when unknown.
@@ -694,13 +813,16 @@ pub fn import_unit(
     })
 }
 
-/// A game's update or DLC files, installed the way the emulator takes them.
+/// A game's update or DLC files, installed the way the emulator takes them. On Windows the
+/// player may then read the ones a plugin keeps (`let_player_read`).
 pub fn install_content(
     id: &str,
     platform: &str,
     kind: &str,
     files: &[PathBuf],
 ) -> hermir::Result<Vec<hermir::ContentStep>> {
+    #[cfg(windows)]
+    let_player_read(files);
     on_best(id, |h, e, i| {
         e.install_content(i, &platform_id(h, platform), kind, files)
     })
@@ -717,14 +839,15 @@ pub fn firmware_status(
     })
 }
 
-/// The command that starts `file` in the best copy of `id`, fullscreen.
+/// The command that starts `file` in the best copy of `id`, fullscreen. On Windows without
+/// hermir's per-user variables ([`drop_home_vars`]).
 pub fn launch_spec(
     id: &str,
     platform: &str,
     file: &Path,
     core: Option<&str>,
 ) -> hermir::Result<hermir::LaunchSpec> {
-    on_best(id, |h, e, i| {
+    let mut spec = on_best(id, |h, e, i| {
         e.launch(
             i,
             &hermir::LaunchRequest {
@@ -735,7 +858,22 @@ pub fn launch_spec(
                 ..Default::default()
             },
         )
-    })
+    })?;
+    if cfg!(windows) {
+        drop_home_vars(&mut spec);
+    }
+    Ok(spec)
+}
+
+/// `%USERPROFILE%`, `%APPDATA%` and `%LOCALAPPDATA%` out of `spec`. hermir adds them for the
+/// home [`open`] gave it, the session player's, and a Windows launch starts as that player
+/// with their own environment block.
+fn drop_home_vars(spec: &mut hermir::LaunchSpec) {
+    // Only the names: the home is the player's either way.
+    let names = hermir::RealEnv::with_home(hermir::Os::Windows, PathBuf::new()).home_vars();
+    for (name, _) in names {
+        spec.env.remove(name);
+    }
 }
 
 /// Points hermir at the operator's own copy of `id`; `keep: false` forgets it.
@@ -762,8 +900,9 @@ pub fn in_catalog(id: &str) -> bool {
 }
 
 /// Before an `emulator` entry starts: the RetroArch core it names when this host's RetroArch
-/// lacks it, every copy past its first-run questions, the platform's firmware from the plugin's
-/// `firmware/<platform>` when it staged some, the session's pads. What it did goes to the log. A
+/// lacks it, and on Windows readable by the player, every copy past its first-run questions, the
+/// platform's firmware from the plugin's `firmware/<platform>` when it staged some, the session's
+/// pads, which only this launch's exit reverts ([`bindings_of`]). What it did goes to the log. A
 /// launch waits for the client's pads, at most [`SETTLE_ALL`], and never on the rest to succeed.
 pub fn prepare_launch(library_id: &str, pad: GamepadPref, slots: Option<&AtomicU16>) {
     let Some(entry) = crate::library::entry_for_library_id(library_id) else {
@@ -781,24 +920,32 @@ pub fn prepare_launch(library_id: &str, pad: GamepadPref, slots: Option<&AtomicU
     };
     let platform = arg("platform");
     if let Some(core) = arg("core").filter(|c| valid_core(c))
-        && cores_dir()
-            .ok()
-            .flatten()
-            .is_some_and(|d| !has_core(&d, core))
+        && let Some(dir) = cores_dir().ok().flatten()
     {
-        match install_core(core) {
-            Ok(path) => {
-                tracing::info!(core, path = %path.display(), "core installed for the launch")
+        if !has_core(&dir, core) {
+            match install_core(core) {
+                Ok(path) => {
+                    tracing::info!(core, path = %path.display(), "core installed for the launch")
+                }
+                Err(error) => tracing::warn!(core, %error, "core not installed for the launch"),
             }
-            Err(error) => tracing::warn!(core, %error, "core not installed for the launch"),
         }
+        #[cfg(windows)]
+        open_core(&dir, core);
     }
     let staged = entry
         .provider
         .as_deref()
         .zip(platform)
         .and_then(|(provider, platform)| staged_firmware(provider, platform));
-    match prepare(&spec.value, platform, staged.as_deref(), pad, slots) {
+    match prepare_as(
+        Some(library_id),
+        &spec.value,
+        platform,
+        staged.as_deref(),
+        pad,
+        slots,
+    ) {
         Ok(copies) => {
             for (exe, prepared) in copies {
                 for s in prepared.steps {
@@ -844,6 +991,40 @@ pub fn grant_target(id: &str) -> (PathBuf, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Windows launch can't set variables, and in the player's home it needs none.
+    #[test]
+    fn a_windows_launch_in_the_players_home_carries_no_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Hermir::open(Options {
+            prefix: Some(dir.path().join("emulators")),
+            os: Some(hermir::Os::Windows),
+            home: Some(dir.path().join("Users").join("player")),
+            ..Options::default()
+        })
+        .unwrap();
+        let copy = hermir::Install {
+            emulator: "ryujinx".into(),
+            kind: hermir::InstallKind::Native,
+            exe: hermir::Exe::Path(r"E:\Ryubing\Ryujinx.exe".into()),
+            version: None,
+            config_root: None,
+        };
+        let request = hermir::LaunchRequest {
+            file: Some(r"D:\Switch\Animal Crossing New Horizons.nsp".into()),
+            platform: Some("switch".into()),
+            fullscreen: Some(true),
+            ..Default::default()
+        };
+        let mut spec = h
+            .emulator("ryujinx")
+            .unwrap()
+            .launch(&copy, &request)
+            .unwrap();
+        assert!(spec.env.contains_key("APPDATA"));
+        drop_home_vars(&mut spec);
+        assert!(spec.env.is_empty(), "{:?}", spec.env);
+    }
 
     #[test]
     fn the_hosts_pads_come_in_event_order_and_nothing_else_does() {
@@ -982,6 +1163,31 @@ I: Bus=0011 Vendor=0001 Product=0001 Version=ab41\nN: Name=\"AT Translated Set 2
             std::os::unix::fs::symlink(outside.path(), firmware.join("psx")).unwrap();
             assert_eq!(staged_firmware_in(base.path(), "rom-manager", "psx"), None);
         }
+    }
+
+    #[test]
+    fn an_exit_reverts_only_the_bindings_its_own_launch_still_holds() {
+        let mut out = Bindings {
+            prepared: 0,
+            owner: None,
+        };
+        out.prepared_for(Some("emu-a"));
+        let a = out.of(Some("emu-a"));
+        let native = out.of(Some("native-game"));
+        out.prepared_for(Some("emu-b"));
+        let b = out.of(Some("emu-b"));
+        assert!(!out.reverts_for(a), "A's exit leaves B's bindings");
+        assert!(
+            !out.reverts_for(native),
+            "a launch that prepared nothing leaves them"
+        );
+        assert!(out.reverts_for(b));
+        // The same title launched again: the first launch's exit leaves the second's.
+        out.prepared_for(Some("emu-b"));
+        assert!(!out.reverts_for(b));
+        // A prepare outside a launch is any exit's to revert.
+        out.prepared_for(None);
+        assert!(out.reverts_for(None) && out.reverts_for(a));
     }
 
     #[test]

@@ -2094,10 +2094,10 @@
     hash = "sha512-M45nihK+LGyxwy2mmHYRKggaocTt+EKNVFNaMpTvTaIUpozi7bmKIkbM2/enMYS0/UYTaZrBSZs/a0nPXqkAKw==";
     name = "style-0.4.4.tgz";
   };
-  "@unom/ui@0.10.0" = fetchurl {
-    url = "https://git.unom.io/api/packages/unom/npm/%40unom%2Fui/-/0.10.0/ui-0.10.0.tgz";
-    hash = "sha512-3FxP1+4fW7rXFTMUvCwS9YNauADSH6MbrGAtlfnzQfvzi8OPXAnSnsOk6Yo2YJcnZLz+SynaQfEZ5jUg9MqG+Q==";
-    name = "ui-0.10.0.tgz";
+  "@unom/ui@0.11.0" = fetchurl {
+    url = "https://git.unom.io/api/packages/unom/npm/@unom/ui/-/ui-0.11.0.tgz";
+    hash = "sha512-4qsEBLVkC6kzOHR8X3vHL7/mvxO5ZQ+HPLkvPgAg7acuHp9piK4mc/7IHSEEAyqBFyJEtIaifRooEdr1pNug7g==";
+    name = "ui-0.11.0.tgz";
   };
   "@vercel/nft@1.11.0" = fetchurl {
     url = "https://registry.npmjs.org/@vercel/nft/-/nft-1.11.0.tgz";
@@ -3811,9 +3811,9 @@
     url = "https://registry.npmjs.org/node-fetch/-/node-fetch-2.7.0.tgz";
     hash = "sha512-c4FRfUm/dbcWZ7U+1Wq0AwCyFL+3nt2bEw05wfxSz+DWpWsitgmSgYmy2dQdWyKC1694ELPqMs/YzUSNozLt8A==";
   };
-  "node-forge@1.4.1" = fetchurl {
-    url = "https://registry.npmjs.org/node-forge/-/node-forge-1.4.1.tgz";
-    hash = "sha512-w5/MfWaeMrpR/5ba6fZyAUTLSuE6aYz7H/3cYrqwZEmf5eQS3IaaLgJt4MBv7HglGFWmV22K8h4U18RJQmw/ow==";
+  "node-forge@1.4.3" = fetchurl {
+    url = "https://registry.npmjs.org/node-forge/-/node-forge-1.4.3.tgz";
+    hash = "sha512-P6wzfh6t70avmV8FrVEAd/36sOPJQ+hkaJVX1Laap9J/77m7M0eyozDvc8SwnDf4P7MP94gwbAAo0rg3YVXT+g==";
   };
   "node-gyp-build@4.8.4" = fetchurl {
     url = "https://registry.npmjs.org/node-gyp-build/-/node-gyp-build-4.8.4.tgz";
