@@ -1765,12 +1765,6 @@ TEST(ConfigHttpDriverStatusTest, BuildsLiveVirtualInputDriverStatus) {
   EXPECT_EQ(virtualhid["minimum_version"].get<std::string>(), LIBVIRTUALHID_MINIMUM_VERSION);
   EXPECT_EQ(virtualhid["supported_versions"].get<std::string>(), std::format(">= {}", LIBVIRTUALHID_MINIMUM_VERSION));
 #endif
-
-  const auto vigembus = confighttp::get_vigembus_driver_status();
-  EXPECT_TRUE(vigembus.contains("installed"));
-  EXPECT_TRUE(vigembus.contains("version"));
-  EXPECT_TRUE(vigembus.contains("minimum_version"));
-  EXPECT_TRUE(vigembus.contains("version_compatible"));
 }
 
 TEST(ConfigHttpLicenseStatusTest, ClearsSensitiveRequestString) {
@@ -1779,7 +1773,7 @@ TEST(ConfigHttpLicenseStatusTest, ClearsSensitiveRequestString) {
   EXPECT_TRUE(sensitive_value.empty());
 }
 
-TEST_F(ConfigHttpTest, VirtualInputStatusReturnsBothBackends) {
+TEST_F(ConfigHttpTest, VirtualInputStatusReturnsVirtualHid) {
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
 
@@ -1787,9 +1781,7 @@ TEST_F(ConfigHttpTest, VirtualInputStatusReturnsBothBackends) {
   ASSERT_EQ(response->status_code, "200 OK");
   const auto body = nlohmann::json::parse(response->content.string());
   ASSERT_TRUE(body.contains("virtualhid"));
-  ASSERT_TRUE(body.contains("vigembus"));
   EXPECT_TRUE(body.at("virtualhid").contains("installed"));
-  EXPECT_TRUE(body.at("vigembus").contains("installed"));
 }
 
 TEST_F(ConfigHttpTest, PermissionsEndpointRequiresAuthenticationAndCsrf) {

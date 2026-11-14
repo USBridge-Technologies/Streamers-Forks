@@ -936,8 +936,21 @@ namespace display_device {
       return output_name;
     }
 
-    const auto mapped_name {DD_DATA.sm_instance->execute([&output_name](auto &settings_iface) {
-      return settings_iface.getDisplayName(output_name);
+    const auto mapped_name {DD_DATA.sm_instance->execute([&output_name](auto &settings_iface) -> std::string {
+      auto name {settings_iface.getDisplayName(output_name)};
+      if (!name.empty() || output_name.empty()) {
+        return name;
+      }
+      // usbridge: a monitor's friendly name ("VDD by MTT", the shared virtual monitor the
+      // agent attaches) or its display name ("\\.\DISPLAY5") names it too, as on Vibepollo.
+      // The device_id is derived from EDID and instance path, which the agent cannot compute.
+      for (const auto &device : settings_iface.enumAvailableDevices()) {
+        if (!device.m_display_name.empty() &&
+            (boost::iequals(device.m_friendly_name, output_name) || boost::iequals(device.m_display_name, output_name))) {
+          return device.m_display_name;
+        }
+      }
+      return name;
     })};
 
 #ifdef __APPLE__

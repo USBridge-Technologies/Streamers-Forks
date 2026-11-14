@@ -176,10 +176,10 @@ TEST_F(ConfigPersistenceTest, AppendsMissingOptionWithoutReplacingExistingText) 
 }
 
 TEST_F(ConfigPersistenceTest, DoesNotReplaceAnExistingOption) {
-  ASSERT_EQ(file_handler::write_file(config_file().string().c_str(), "gamepad_driver = vigembus\n"), 0);
+  ASSERT_EQ(file_handler::write_file(config_file().string().c_str(), "gamepad_driver = none\n"), 0);
 
   EXPECT_FALSE(config::persist_config_option_if_missing("gamepad_driver", "all"));
-  EXPECT_EQ(file_handler::read_file(config_file().string().c_str()), "gamepad_driver = vigembus\n");
+  EXPECT_EQ(file_handler::read_file(config_file().string().c_str()), "gamepad_driver = none\n");
 }
 
 TEST_F(ConfigPersistenceTest, SelectsAllDriversOnlyForLicensedUsersWithoutAPreference) {

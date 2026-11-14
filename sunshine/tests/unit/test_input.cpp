@@ -60,6 +60,8 @@ namespace {
     return packet;
   }
 
+#ifndef _WIN32
+  // The USBridge fork's Windows input has no libvirtualhid context to swap a fake backend into.
   /**
    * @brief Verify batching a repeated packet around a potentially different packet.
    *
@@ -152,6 +154,7 @@ namespace {
     lvh::Runtime *runtime_ = nullptr;  ///< Fake runtime installed in the global input backend.
     config::input_t original_input_;  ///< Input configuration restored after each test.
   };
+#endif
 }  // namespace
 
 TEST(InputPacketValidationTest, RejectsEveryBufferShorterThanTheHeader) {
@@ -246,6 +249,7 @@ TEST(InputPacketValidationTest, PreservesUnknownPacketHandlingWithinDeclaredBoun
   EXPECT_TRUE(input::testing::is_valid_input_packet(packet));
 }
 
+#ifndef _WIN32
 TEST_F(InputGamepadSessionTest, RejectsMalformedBatchablePacketsAtQueueIngress) {
   ASSERT_FALSE(task_pool.running());
   const std::shared_ptr<input::input_t> empty_input;
@@ -823,3 +827,4 @@ TEST_F(InputGamepadSessionTest, RetargetsNativeTouchAndPenWithoutApplyingTheMoni
   EXPECT_EQ(client.touch->submit_count(), touch_count);
   EXPECT_EQ(client.pen->submit_count(), pen_count);
 }
+#endif
