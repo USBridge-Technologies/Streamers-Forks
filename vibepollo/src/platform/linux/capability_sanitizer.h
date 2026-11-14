@@ -123,7 +123,35 @@ namespace platf::linux_security {
     if (retained_count != static_cast<int>(sizeof(allowed) / sizeof(allowed[0]))) {
       return fail(EPERM, "verifying both required permitted capabilities");
     }
-    const int entry_comparison = cap_compare(original, sanitized);
+    int entry_comparison = cap_compare(original, sanitized);
+    if (entry_comparison > 0) {
+      // usbridge: the USBridge agent's root-owned usbridge-streamer-launch
+      // hands both capabilities over as ambient ones, because file
+      // capabilities on this binary would put glibc in secure-execution mode
+      // and drop the bundle's $ORIGIN/../lib RUNPATH. An ambient exec enters
+      // with P = E = {CAP_SYS_ADMIN, CAP_SYS_NICE}, and I holding them plus
+      // whatever the parent passed down. Accept exactly that permitted and
+      // effective pair; inheritable and ambient bits are cleared below and
+      // no_new_privs is set, so the result equals the packaged file-cap entry.
+      cap_t launcher_entry = cap_dup(original);
+      cap_t expected = cap_dup(sanitized);
+      if (!launcher_entry || !expected ||
+          cap_clear_flag(launcher_entry, CAP_INHERITABLE) != 0 ||
+          cap_set_flag(expected, CAP_EFFECTIVE, retained_count, retained, CAP_SET) != 0) {
+        if (launcher_entry) {
+          cap_free(launcher_entry);
+        }
+        if (expected) {
+          cap_free(expected);
+        }
+        return fail(errno, "checking the launcher entry capability set");
+      }
+      entry_comparison = cap_compare(launcher_entry, expected);
+      const int saved_errno = errno;
+      cap_free(launcher_entry);
+      cap_free(expected);
+      errno = saved_errno;
+    }
     if (entry_comparison != 0) {
       return fail(entry_comparison < 0 ? errno : EPERM, "verifying the exact entry capability set");
     }
