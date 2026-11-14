@@ -8,11 +8,9 @@
 #include <bitset>
 #include <filesystem>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <vector>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -22,7 +20,7 @@
 
 // local includes
 #ifndef _WIN32
-  #include "src/boost_process_compat.h"
+  #include "src/compat/boost_process.h"
 #endif
 #include "src/config.h"
 #include "src/logging.h"
@@ -124,7 +122,6 @@ namespace platf {
     set_rgb_led,  ///< Set RGB LED
     set_player_leds,  ///< Set player indicator LEDs
     set_adaptive_triggers,  ///< Set adaptive triggers
-    usbridge_packet,  ///< usbridge: a ready control packet of a pad's sound (see src/usbridge.h)
   };
 
   /**
@@ -232,27 +229,8 @@ namespace platf {
       return msg;
     }
 
-    /**
-     * @brief usbridge: a control packet the USB broker made of a pad's sound, sent unreliably.
-     *
-     * @param id Controller number.
-     * @param channel ENet channel to send it on.
-     * @param packet_type Control packet type.
-     * @param payload The packet's payload, after its type and length.
-     * @return Constructed message.
-     */
-    static gamepad_feedback_msg_t make_usbridge_packet(std::uint16_t id, std::uint8_t channel, std::uint16_t packet_type, std::vector<std::uint8_t> payload) {
-      gamepad_feedback_msg_t msg;
-      msg.type = gamepad_feedback_e::usbridge_packet;
-      msg.id = id;
-      msg.data.usbridge_packet = {channel, packet_type};
-      msg.usbridge_payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(payload));
-      return msg;
-    }
-
     gamepad_feedback_e type;  ///< Feedback command type stored in the union payload.
     std::uint16_t id;  ///< Controller identifier associated with this message.
-    std::shared_ptr<const std::vector<std::uint8_t>> usbridge_payload;  ///< usbridge_packet's payload.
 
     union {
       struct {
@@ -288,11 +266,6 @@ namespace platf {
         std::array<uint8_t, 10> left;  ///< Left adaptive-trigger effect parameters.
         std::array<uint8_t, 10> right;  ///< Right adaptive-trigger effect parameters.
       } adaptive_triggers;  ///< Adaptive-trigger effect payload.
-
-      struct {
-        std::uint8_t channel;  ///< ENet channel.
-        std::uint16_t packet_type;  ///< Control packet type.
-      } usbridge_packet;  ///< usbridge_packet's header.
     } data;  ///< Controller feedback payload for the selected feedback type.
   };
 
@@ -422,6 +395,7 @@ namespace platf {
     int logical_height;  ///< Logical height after display scaling.
     int env_offset_x {};  ///< Horizontal origin of the full input environment in native desktop coordinates.
     int env_offset_y {};  ///< Vertical origin of the full input environment in native desktop coordinates.
+    std::string output_name {};  ///< Native connector name used to assign compositor-managed touch and pen devices.
   };
 
   // These values must match Limelight-internal.h's SS_FF_* constants!
@@ -712,6 +686,38 @@ namespace platf {
   };
 
   /**
+   * @brief A single encoded frame produced by a native VideoToolbox encoder.
+   */
+  struct vt_encoded_frame {
+    std::vector<uint8_t> data;  ///< Annex-B elementary stream for exactly one frame.
+    uint64_t frame_index = 0;  ///< Frame index the data corresponds to.
+    bool idr = false;  ///< Whether the frame is an IDR frame.
+  };
+
+  /**
+   * @brief Native VideoToolbox-backed encode device state.
+   */
+  struct vt_encode_device_t: encode_device_t {
+    /**
+     * @brief Initialize the platform encoder for the client stream configuration.
+     *
+     * @param client_config Client stream configuration negotiated for this session.
+     * @param colorspace Colorimetry information used for conversion or encoding.
+     * @return True when the backend successfully completes the requested action.
+     */
+    virtual bool init_encoder(const video::config_t &client_config, const video::sunshine_colorspace_t &colorspace) = 0;
+
+    /**
+     * @brief Encode the frame most recently supplied via convert().
+     *
+     * @param frame_index Frame index to associate with the encoded output.
+     * @param force_idr Whether the frame must be encoded as an IDR frame.
+     * @return Encoded frame, or one with empty data on failure.
+     */
+    virtual vt_encoded_frame encode_frame(uint64_t frame_index, bool force_idr) = 0;
+  };
+
+  /**
    * @brief Enumerates supported capture options.
    */
   enum class capture_e : int {
@@ -797,6 +803,16 @@ namespace platf {
     }
 
     /**
+     * @brief Create a native VideoToolbox encode device.
+     *
+     * @param pix_fmt Sunshine pixel format to convert or allocate for.
+     * @return Constructed VideoToolbox encode device object.
+     */
+    virtual std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt) {
+      return nullptr;
+    }
+
+    /**
      * @brief Report whether the active display mode is HDR.
      *
      * @return True when the active display mode is HDR.
@@ -829,6 +845,7 @@ namespace platf {
     virtual ~display_t() = default;
 
     // Offsets for when streaming a specific monitor. By default, they are 0.
+    std::string output_name;  ///< Native connector name of the captured display for absolute input assignment.
     int offset_x {0};  ///< Horizontal capture offset in physical pixels.
     int offset_y {0};  ///< Vertical capture offset in physical pixels.
     int env_offset_x {0};  ///< Horizontal origin of the full capture environment in native desktop coordinates.

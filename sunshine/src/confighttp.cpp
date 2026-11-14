@@ -226,6 +226,7 @@ namespace confighttp {
 #ifdef __APPLE__
   constexpr std::string_view libvirtualhid_macos_minimum_version = LIBVIRTUALHID_MACOS_MINIMUM_VERSION;  ///< Minimum supported macOS broker bundle version.
 #endif
+  constexpr auto VIGEMBUS_MINIMUM_VERSION = "1.17.0.0"sv;  ///< Minimum supported ViGEmBus fallback driver version.  // NOSONAR(cpp:S1313): not an IP address
 
   /**
    * @brief Parse one dotted driver-version component.
@@ -1134,6 +1135,103 @@ namespace confighttp {
   }
 
   /**
+   * @brief Remove object members whose values are JSON null.
+   *
+   * @param object JSON object to mutate.
+   * @param members Member names to inspect.
+   */
+  void erase_null_members(nlohmann::json &object, std::initializer_list<const char *> members) {
+    for (const char *member : members) {
+      if (object.contains(member) && object[member].is_null()) {
+        object.erase(member);
+      }
+    }
+  }
+
+  /**
+   * @brief Drop empty or invalid prep-cmd arrays and null prep-command members.
+   *
+   * @param input_tree Application JSON from the save request, mutated in place.
+   */
+  void normalize_prep_cmd_field(nlohmann::json &input_tree) {
+    if (!input_tree.contains("prep-cmd")) {
+      return;
+    }
+    if (!input_tree["prep-cmd"].is_array() || input_tree["prep-cmd"].empty()) {
+      input_tree.erase("prep-cmd");
+      return;
+    }
+
+    for (auto &cmd : input_tree["prep-cmd"]) {
+      if (!cmd.is_object()) {
+        continue;
+      }
+      erase_null_members(cmd, {"do", "undo", "elevated"});
+    }
+  }
+
+  /**
+   * @brief Drop empty or invalid detached command arrays.
+   *
+   * @param input_tree Application JSON from the save request, mutated in place.
+   */
+  void normalize_detached_field(nlohmann::json &input_tree) {
+    if (!input_tree.contains("detached")) {
+      return;
+    }
+    if (!input_tree["detached"].is_array() || input_tree["detached"].empty()) {
+      input_tree.erase("detached");
+    }
+  }
+
+  /**
+   * @brief Trim cover paths and omit missing, non-string, empty, or whitespace-only values.
+   *
+   * @param input_tree Application JSON from the save request, mutated in place.
+   */
+  void normalize_image_path_field(nlohmann::json &input_tree) {
+    std::string image_path;
+    if (input_tree.contains("image-path") && input_tree["image-path"].is_string()) {
+      image_path = input_tree["image-path"].get<std::string>();
+    }
+    boost::trim(image_path);
+    if (image_path.empty()) {
+      input_tree.erase("image-path");
+      return;
+    }
+    input_tree["image-path"] = image_path;
+  }
+
+  /**
+   * @brief Omit null optional application fields and normalize empty collections and cover paths.
+   *
+   * Required `name`/`index` handling stays with the caller. Explicit `false` and `0` values are kept.
+   * Null `do`, `undo`, and `elevated` members are removed from preparation-command objects.
+   * Missing, non-string, empty, or whitespace-only image-path values are omitted from the saved
+   * application. Nonempty string values are trimmed before saving.
+   *
+   * @param input_tree Application JSON from the save request, mutated in place.
+   */
+  void normalize_optional_app_fields(nlohmann::json &input_tree) {
+    erase_null_members(input_tree, {
+                                     "prep-cmd",
+                                     "detached",
+                                     "exclude-global-prep-cmd",
+                                     "elevated",
+                                     "auto-detach",
+                                     "wait-all",
+                                     "exit-timeout",
+                                     "cmd",
+                                     "output",
+                                     "working-dir",
+                                     "image-path",
+                                   });
+    normalize_prep_cmd_field(input_tree);
+    normalize_detached_field(input_tree);
+    normalize_image_path_field(input_tree);
+  }
+
+  /**
    * @brief Save an application. To save a new application, the index must be `-1`. To update an existing application, you must provide the current index of the application.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -1163,6 +1261,10 @@ namespace confighttp {
    * }
    * @endcode
    *
+   * Missing, non-string, empty, or whitespace-only image-path values are omitted
+   * from the saved application. Nonempty string values are trimmed before saving.
+   * Null optional fields are omitted before persistence; explicit `false` and `0` are preserved.
+   *
    * @api_examples{/api/apps|:| POST|:| {"name":"Hello, World!","index":-1}}
    */
   void saveApp(const resp_https_t &response, const req_https_t &request) {
@@ -1190,13 +1292,7 @@ namespace confighttp {
       BOOST_LOG(info) << file;
       nlohmann::json file_tree = nlohmann::json::parse(file);
 
-      if (input_tree["prep-cmd"].empty()) {
-        input_tree.erase("prep-cmd");
-      }
-
-      if (input_tree["detached"].empty()) {
-        input_tree.erase("detached");
-      }
+      normalize_optional_app_fields(input_tree);
 
       auto &apps_node = file_tree["apps"];
       int index = input_tree["index"].get<int>();  // this will intentionally cause an exception if the provided value is the wrong type
@@ -2134,6 +2230,35 @@ namespace confighttp {
   }
 
   /**
+   * @brief Build ViGEmBus fallback driver version and installation status.
+   *
+   * @return ViGEmBus fallback driver status JSON.
+   */
+  nlohmann::json get_vigembus_driver_status() {
+#ifdef _WIN32
+    std::string version_str;
+
+    // Check if ViGEmBus driver exists
+    std::string system_root;
+    if (!lizardbyte::common::get_env("SystemRoot", system_root)) {
+      system_root = "C:\\Windows";
+    }
+    const std::filesystem::path driver_path = std::filesystem::path(system_root) / "System32" / "drivers" / "ViGEmBus.sys";
+    const auto installed = std::filesystem::exists(driver_path);
+    if (installed) {
+      platf::getFileVersionInfo(driver_path, version_str);
+    }
+
+    auto output_tree = build_driver_status(installed, version_str, VIGEMBUS_MINIMUM_VERSION);
+#else
+    auto output_tree = build_driver_status(false, "", VIGEMBUS_MINIMUM_VERSION);
+    output_tree["error"] = "ViGEmBus is only available on Windows";
+#endif
+
+    return output_tree;
+  }
+
+  /**
    * @brief Get virtual input driver version and installation status.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -2149,6 +2274,7 @@ namespace confighttp {
 
     nlohmann::json output_tree;
     output_tree["virtualhid"] = get_virtualhid_driver_status();
+    output_tree["vigembus"] = get_vigembus_driver_status();
     send_response(response, output_tree);
   }
 
@@ -2487,16 +2613,10 @@ namespace confighttp {
     server.resource["^/assets\\/.+$"]["GET"] = getAsset;
 
     server.config.reuse_address = true;
-    // web_bind_address overrides bind_address for the admin UI only (e.g. "127.0.0.1" to keep it localhost-only)
-    server.config.address = config::sunshine.web_bind_address.empty()
-      ? net::get_bind_address(address_family)
-      : config::sunshine.web_bind_address;
+    server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
 
-    // web_bind_address is shown as-is (IPv6 literals bracketed); otherwise fall back to upstream's bind_address-derived host.
-    const std::string display_addr = config::sunshine.web_bind_address.empty()
-      ? net::get_bind_address_url_host()
-      : (config::sunshine.web_bind_address.find(':') != std::string::npos ? "[" + config::sunshine.web_bind_address + "]" : config::sunshine.web_bind_address);
+    const auto display_addr = net::get_bind_address_url_host();
 
     auto accept_and_run = [&](auto *https_server) {
       try {

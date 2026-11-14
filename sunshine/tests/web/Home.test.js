@@ -19,6 +19,7 @@ async function mountHome(platform, { developmentVersion = true, licensed = true,
       return {
         json: async () => ({
           virtualhid: { installed: true, development_version: developmentVersion, version_compatible: true },
+          vigembus: { installed: false, version_compatible: false },
         }),
       }
     }
@@ -31,10 +32,10 @@ async function mountHome(platform, { developmentVersion = true, licensed = true,
     if (url === './api/logs') {
       return { text: async () => '' }
     }
-    if (url === 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest') {
+    if (url === 'https://api.github.com/repos/SunshineStream/Sunshine/releases/latest') {
       return { json: async () => ({ tag_name: 'v2026.927.1200' }) }
     }
-    if (url === 'https://api.github.com/repos/LizardByte/Sunshine/releases') {
+    if (url === 'https://api.github.com/repos/SunshineStream/Sunshine/releases') {
       return { json: async () => [{ tag_name: 'v2026.927.1200', prerelease: true }] }
     }
     throw new Error(`Unexpected fetch: ${url}`)
@@ -74,7 +75,7 @@ describe('development broker home notice', () => {
     wrapper.unmount()
   })
 
-  it.each(['macos'])('shows the development card on %s', async platform => {
+  it.each(['windows', 'macos'])('shows the development card on %s', async platform => {
     const wrapper = await mountHome(platform)
 
     expect(fetch).toHaveBeenCalledWith('./api/virtual-input/status')

@@ -41,6 +41,7 @@ namespace config {
 
   inline constexpr std::string_view GAMEPAD_DRIVER_ALL = "all";  ///< Allow every available Windows virtual gamepad driver.
   inline constexpr std::string_view GAMEPAD_DRIVER_VIRTUALHID = "virtualhid";  ///< Use Virtual HID Broker for gamepads on Windows or macOS.
+  inline constexpr std::string_view GAMEPAD_DRIVER_VIGEMBUS = "vigembus";  ///< Allow only ViGEmBus for Windows gamepads.
   inline constexpr std::string_view GAMEPAD_DRIVER_NONE = "none";  ///< Disable virtual gamepads on Windows and macOS.
 
   // track modified config options
@@ -120,8 +121,6 @@ namespace config {
     } amd;  ///< AMD AMF encoder options.
 
     struct {
-      int vt_allow_sw;  ///< Whether VideoToolbox may use software encoding.
-      int vt_require_sw;  ///< Whether VideoToolbox must use software encoding.
       int vt_realtime;  ///< Whether VideoToolbox uses realtime encoding mode.
       int vt_coder;  ///< VideoToolbox entropy-coding mode.
     } vt;  ///< VideoToolbox encoder options.
@@ -271,6 +270,8 @@ namespace config {
 
     // Limit the packetsize to avoid fragmentation on a low MTU link
     int packetsize;  ///< Maximum payload size for network packets.
+
+    bool dscp_tagging;  ///< Allow DSCP tagging of audio and video traffic when requested by the client.
   };
 
   /**
@@ -395,7 +396,6 @@ namespace config {
     std::uint16_t port;  ///< TCP port used by Sunshine services.
     std::string address_family;  ///< Address family requested for listening sockets.
     std::string bind_address;  ///< Local address Sunshine should bind to.
-    std::string web_bind_address;  ///< Override bind address for the web admin UI (defaults to bind_address).
 
     std::string log_file;  ///< Path to the configured log file.
     bool notify_pre_releases;  ///< Notify users about pre-release updates.

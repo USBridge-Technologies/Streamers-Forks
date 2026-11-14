@@ -17,11 +17,8 @@
 #include <openssl/err.h>
 #include <rs.h>
 
-extern "C" {
-  // clang-format off
-#include <moonlight-common-c/src/Limelight-internal.h>
-  // clang-format on
-}
+// Keep this separate so clang-format preserves the include order.
+#include "compat/moonlight.h"
 
 // local includes
 #include "config.h"
@@ -36,7 +33,6 @@ extern "C" {
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
-#include "usbridge.h"
 #include "utility.h"
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
@@ -451,22 +447,6 @@ namespace stream {
      */
     int send(const std::string_view &payload, net::peer_t peer) {
       if (auto packet = enet_packet_create(payload.data(), payload.size(), ENET_PACKET_FLAG_RELIABLE); enet_peer_send(peer, 0, packet)) {
-        enet_packet_destroy(packet);
-
-        return -1;
-      }
-
-      return 0;
-    }
-
-    /**
-     * @brief usbridge: send a packet unreliably on `channel` (a pad's sound: late is worse than lost).
-     */
-    int send_unreliable(const std::string_view &payload, net::peer_t peer, std::uint8_t channel) {
-      if (channel >= peer->channelCount) {
-        return 0;
-      }
-      if (auto packet = enet_packet_create(payload.data(), payload.size(), 0); enet_peer_send(peer, channel, packet)) {
         enet_packet_destroy(packet);
 
         return -1;
@@ -1153,25 +1133,6 @@ namespace stream {
         encrypted_payload;
 
       payload = encode_control(session, util::view(plaintext), encrypted_payload);
-    } else if (msg.type == platf::gamepad_feedback_e::usbridge_packet) {
-      // usbridge: the USB broker's ready packet of a pad's sound (haptics, speaker).
-      constexpr std::size_t max_payload = 1024;
-      if (!msg.usbridge_payload || msg.usbridge_payload->size() > max_payload) {
-        return -1;
-      }
-      std::array<std::uint8_t, sizeof(control_header_v2) + max_payload> plaintext;
-      const auto size = msg.usbridge_payload->size();
-      auto header = (control_header_v2 *) plaintext.data();
-      header->type = util::endian::little(msg.data.usbridge_packet.packet_type);
-      header->payloadLength = util::endian::little(static_cast<std::uint16_t>(size));
-      std::copy_n(msg.usbridge_payload->data(), size, plaintext.data() + sizeof(control_header_v2));
-      std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
-        encrypted_payload;
-      auto packet = encode_control(session, std::string_view((const char *) plaintext.data(), sizeof(control_header_v2) + size), encrypted_payload);
-      if (session->broadcast_ref->control_server.send_unreliable(packet, session->control.peer, msg.data.usbridge_packet.channel)) {
-        return -1;
-      }
-      return 0;
     } else {
       BOOST_LOG(error) << "Unknown gamepad feedback message type"sv;
       return -1;
@@ -1287,17 +1248,11 @@ namespace stream {
       auto &cipher = session->control.cipher;
       auto &iv = session->control.legacy_input_enc_iv;
       if (cipher.decrypt(tagged_cipher, plaintext, &iv)) {
-        // A tag failure here almost always means this is a stray/reordered
-        // UDP packet from a *previous* session's control stream, encrypted
-        // with that session's key, arriving just after a fast reconnect
-        // (e.g. a client-initiated codec switch) -- not an attack against
-        // this session, which is already authenticated via the paired RTSP
-        // launch flow. Ending the whole session (and, downstream, the video
-        // pipeline that hasn't even started encoding yet) over one
-        // undecryptable control packet is disproportionate: drop it and
-        // keep going, the same way a single lost/corrupt packet on any
-        // other channel wouldn't take down the stream.
-        BOOST_LOG(warning) << "Failed to verify tag on legacy input packet, dropping it"sv;
+        // something went wrong :(
+
+        BOOST_LOG(error) << "Failed to verify tag"sv;
+
+        session::stop(*session);
         return;
       }
 
@@ -1348,16 +1303,11 @@ namespace stream {
 
       std::vector<uint8_t> plaintext;
       if (cipher.decrypt(tagged_cipher, plaintext, &iv)) {
-        // See the identical comment in the IDX_INPUT_DATA handler above --
-        // this fires reliably on a fast client-initiated reconnect (e.g.
-        // switching codec) when a control packet from the just-torn-down
-        // previous session's ENet stream is still in flight and lands here
-        // encrypted with the old session's key. Previously this killed the
-        // brand new session via session::stop() before its video pipeline
-        // had even created an encoder, turning a single stray packet into a
-        // full "video never starts" outage. Drop it and keep the session
-        // alive instead.
-        BOOST_LOG(warning) << "Failed to verify tag on control packet, dropping it"sv;
+        // something went wrong :(
+
+        BOOST_LOG(error) << "Failed to verify tag"sv;
+
+        session::stop(*session);
         return;
       }
 
@@ -1457,8 +1407,7 @@ namespace stream {
         break;
       }
 
-      // usbridge: a pad's sound goes out as it comes, not in 150 ms bursts.
-      server->iterate(usbridge::sound_active() ? 5ms : 150ms);
+      server->iterate(150ms);
     }
 
     // Let all remaining connections know the server is shutting down
@@ -2275,7 +2224,7 @@ namespace stream {
 
     // Enable local prioritization and QoS tagging on video traffic if requested by the client
     auto address = session->video.peer.address();
-    session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
+    session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, config::stream.dscp_tagging && session->config.videoQosType != 0);
 
     BOOST_LOG(debug) << "Start capturing Video"sv;
     video::capture(session->mail, session->config.monitor, session);
@@ -2302,7 +2251,7 @@ namespace stream {
 
     // Enable local prioritization and QoS tagging on audio traffic if requested by the client
     auto address = session->audio.peer.address();
-    session->audio.qos = platf::enable_socket_qos(ref->audio_sock.native_handle(), address, session->audio.peer.port(), platf::qos_data_type_e::audio, session->config.audioQosType != 0);
+    session->audio.qos = platf::enable_socket_qos(ref->audio_sock.native_handle(), address, session->audio.peer.port(), platf::qos_data_type_e::audio, config::stream.dscp_tagging && session->config.audioQosType != 0);
 
     BOOST_LOG(debug) << "Start capturing Audio"sv;
     audio::capture(session->mail, session->config.audio, session);

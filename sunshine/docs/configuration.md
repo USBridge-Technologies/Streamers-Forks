@@ -331,9 +331,12 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Description</td>
         <td colspan="2">
-            Controls which virtual gamepad backend Sunshine may use on macOS. An unset value uses Virtual HID Broker.
-            @note{USBridge fork: on Windows there is no gamepad backend to choose. Gamepads are the USBridge USB
-            broker's, Xbox 360 controllers on usbip-win2; ViGEmBus and Virtual HID Broker are not used.}
+            Controls which virtual gamepad backend Sunshine may use on Windows and macOS. On Windows, the Web UI and
+            startup notification request a choice while this option is not set. If Sunshine detects an active Virtual
+            HID Broker license on Windows, it automatically sets this option to `all` when it is missing.
+            @warning{ViGEmBus has limited gamepad features, supports only Xbox 360 and DualShock 4 emulation, and has
+            reached end of life. Selecting `vigembus` also suppresses Virtual HID Broker startup notifications.}
+            @note{`all` and `vigembus` apply only to Windows. On macOS, an unset value uses Virtual HID Broker.}
         </td>
     </tr>
     <tr>
@@ -345,17 +348,25 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            gamepad_driver = virtualhid
+            gamepad_driver = all
             @endcode</td>
     </tr>
     <tr>
-        <td rowspan="2">Choices</td>
+        <td rowspan="4">Choices</td>
+        <td>all</td>
+        <td>Windows only: prefer Virtual HID Broker when it is available and licensed, with ViGEmBus as a limited fallback.</td>
+    </tr>
+    <tr>
         <td>virtualhid</td>
-        <td>Use Virtual HID Broker for gamepads. An active paid license is required.</td>
+        <td>Use Virtual HID Broker for gamepads. An active paid license is required; Windows ViGEmBus fallback is disabled.</td>
+    </tr>
+    <tr>
+        <td>vigembus</td>
+        <td>Windows only: use ViGEmBus for gamepads and hide Virtual HID Broker status and licensing details.</td>
     </tr>
     <tr>
         <td>none</td>
-        <td>Disable virtual gamepads on macOS without changing keyboard or mouse input. Suppress broker and driver choice notices.</td>
+        <td>Disable virtual gamepads on Windows and macOS without changing keyboard or mouse input. Suppress broker and driver choice notices.</td>
     </tr>
 </table>
 
@@ -368,6 +379,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             The type of gamepad to emulate on the host. Automatic selection uses the controller type
             reported by the client. If the type is unknown, Sunshine can select a PlayStation-style
             controller from reported motion or touchpad support; otherwise it uses an Xbox-style controller.
+            @note{When gamepad_driver is `vigembus` on Windows, only auto, x360, and ds4 are available.}
         </td>
     </tr>
     <tr>
@@ -1902,6 +1914,32 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### dscp_tagging
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Mark audio and video packets with DSCP priority tags when requested by the client.
+            @tip{Disabling this may help if audio crackles or stutters on Wi-Fi while the network otherwise appears
+            healthy. Some routers handle tagged traffic poorly.}
+            @note{On Windows, disabling this also removes local traffic prioritization.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dscp_tagging = disabled
+            @endcode</td>
+    </tr>
+</table>
+
 ## Config Files
 
 ### file_apps
@@ -2332,7 +2370,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             @endcode</td>
     </tr>
     <tr>
-        <td rowspan="5">Choices</td>
+        <td rowspan="7">Choices</td>
         <td>nvenc</td>
         <td>For NVIDIA graphics cards</td>
     </tr>
@@ -2352,6 +2390,11 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>vulkan</td>
         <td>Use Vulkan encoder (AMD, Intel, NVIDIA).
             @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>videotoolbox</td>
+        <td>Use VideoToolbox.
+            @note{Applies to macOS only.}</td>
     </tr>
     <tr>
         <td>software</td>
@@ -3068,7 +3111,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Description</td>
         <td colspan="2">
-            The entropy encoding to use.
+            The entropy encoding to use for H.264.
             @note{This option only applies when using macOS.}
         </td>
     </tr>
@@ -3087,56 +3130,15 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td rowspan="3">Choices</td>
         <td>auto</td>
-        <td>let ffmpeg decide</td>
+        <td>let VideoToolbox decide</td>
     </tr>
     <tr>
         <td>cabac</td>
-        <td>context adaptive binary arithmetic coding - faster decode</td>
+        <td>context adaptive binary arithmetic coding - higher quality</td>
     </tr>
     <tr>
         <td>cavlc</td>
-        <td>context adaptive variable-length coding - higher quality</td>
-    </tr>
-</table>
-
-### vt_software
-
-<table>
-    <tr>
-        <td>Description</td>
-        <td colspan="2">
-            Force Video Toolbox to use software encoding.
-            @note{This option only applies when using macOS.}
-        </td>
-    </tr>
-    <tr>
-        <td>Default</td>
-        <td colspan="2">@code{}
-            auto
-            @endcode</td>
-    </tr>
-    <tr>
-        <td>Example</td>
-        <td colspan="2">@code{}
-            vt_software = auto
-            @endcode</td>
-    </tr>
-    <tr>
-        <td rowspan="4">Choices</td>
-        <td>auto</td>
-        <td>let ffmpeg decide</td>
-    </tr>
-    <tr>
-        <td>disabled</td>
-        <td>disable software encoding</td>
-    </tr>
-    <tr>
-        <td>allowed</td>
-        <td>allow software encoding</td>
-    </tr>
-    <tr>
-        <td>forced</td>
-        <td>force software encoding</td>
+        <td>context adaptive variable-length coding - faster decode</td>
     </tr>
 </table>
 

@@ -533,34 +533,6 @@ namespace config {
     }
 
     /**
-     * @brief Parse whether VideoToolbox software encoding is allowed.
-     *
-     * @param software Whether the software encoder path is being configured.
-     * @return Parsed enum value, or the setting-specific default when the text is unknown.
-     */
-    int allow_software_from_view(const std::string_view &software) {
-      if (software == "allowed"sv || software == "forced") {
-        return 1;
-      }
-
-      return 0;
-    }
-
-    /**
-     * @brief Parse whether VideoToolbox software encoding is forced.
-     *
-     * @param software Whether the software encoder path is being configured.
-     * @return Parsed enum value, or the setting-specific default when the text is unknown.
-     */
-    int force_software_from_view(const std::string_view &software) {
-      if (software == "forced") {
-        return 1;
-      }
-
-      return 0;
-    }
-
-    /**
      * @brief Parse the VideoToolbox realtime encoder flag.
      *
      * @param rt Real-time encoder usage selector.
@@ -777,8 +749,6 @@ namespace config {
     },  // amd
 
     {
-      0,
-      0,
       1,
       -1,
     },  // vt
@@ -844,6 +814,7 @@ namespace config {
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
     0,  // packetsize
+    true,  // dscp_tagging
   };
 
   /**
@@ -905,7 +876,6 @@ namespace config {
     47989,  // Base port number
     "ipv4",  // Address family
     {},  // Bind address
-    {},  // Web bind address (admin UI override)
     platf::appdata().string() + "/sunshine.log",  // log file
     false,  // notify_pre_releases
     true,  // system_tray
@@ -1698,8 +1668,6 @@ namespace config {
     }
 
     int_f(vars, "vt_coder", video.vt.vt_coder, vt::coder_from_view);
-    int_f(vars, "vt_software", video.vt.vt_allow_sw, vt::allow_software_from_view);
-    int_f(vars, "vt_software", video.vt.vt_require_sw, vt::force_software_from_view);
     int_f(vars, "vt_realtime", video.vt.vt_realtime, vt::rt_from_view);
 
     std::string vaapi_quality;
@@ -1812,6 +1780,7 @@ namespace config {
     int_between_f(vars, "lan_encryption_mode", stream.lan_encryption_mode, {0, 2});
     int_between_f(vars, "wan_encryption_mode", stream.wan_encryption_mode, {0, 2});
     int_between_f(vars, "packetsize", stream.packetsize, {0, PACKETSIZE_MAX});
+    bool_f(vars, "dscp_tagging", stream.dscp_tagging);
 
     path_f(vars, "file_apps", stream.file_apps);
 #ifndef __ANDROID__
@@ -1862,9 +1831,16 @@ namespace config {
     string_restricted_f(vars, "gamepad_driver", input.gamepad_driver, {
                                                                         GAMEPAD_DRIVER_ALL,
                                                                         GAMEPAD_DRIVER_VIRTUALHID,
+                                                                        GAMEPAD_DRIVER_VIGEMBUS,
                                                                         GAMEPAD_DRIVER_NONE,
                                                                       });
     string_restricted_f(vars, "gamepad"s, input.gamepad, get_supported_gamepad_options());
+#ifdef _WIN32
+    if (input.gamepad_driver == GAMEPAD_DRIVER_VIGEMBUS && input.gamepad != "auto"sv && input.gamepad != "x360"sv && input.gamepad != "ds4"sv) {
+      BOOST_LOG(warning) << "Gamepad type '"sv << input.gamepad << "' is not supported by ViGEmBus; using automatic selection"sv;
+      input.gamepad = "auto";
+    }
+#endif
     bool_f(vars, "ds4_back_as_touchpad_click", input.ds4_back_as_touchpad_click);
     bool_f(vars, "motion_as_ds4", input.motion_as_ds4);
     bool_f(vars, "touchpad_as_ds4", input.touchpad_as_ds4);
@@ -1895,7 +1871,6 @@ namespace config {
 
     string_restricted_f(vars, "address_family", sunshine.address_family, {"ipv4"sv, "both"sv});
     string_f(vars, "bind_address", sunshine.bind_address);
-    string_f(vars, "web_bind_address", sunshine.web_bind_address);
 
     bool upnp = false;
     bool_f(vars, "upnp"s, upnp);

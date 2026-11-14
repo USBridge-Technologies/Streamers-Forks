@@ -165,6 +165,13 @@ namespace confighttp {
    */
   nlohmann::json get_virtualhid_driver_status();
 
+  /**
+   * @brief Build ViGEmBus fallback driver version and installation status.
+   *
+   * @return ViGEmBus fallback driver status JSON.
+   */
+  nlohmann::json get_vigembus_driver_status();
+
   void getVirtualInputStatus(const resp_https_t &response, const req_https_t &request);
 
   /**
@@ -188,6 +195,11 @@ namespace confighttp {
   void updateVirtualInputLicense(const resp_https_t &response, const req_https_t &request);
 
   void resetPortalToken(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Save an application with optional fields normalized before persistence.
+   */
+  void saveApp(const resp_https_t &response, const req_https_t &request);
 
 #ifdef SUNSHINE_TESTS
   /**
