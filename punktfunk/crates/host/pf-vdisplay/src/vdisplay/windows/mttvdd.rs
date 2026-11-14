@@ -47,7 +47,7 @@ use windows::Win32::Graphics::Gdi::{
     DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_DISPLAY_SETTINGS_MODE,
 };
 
-use crate::backend::{DisplayOwnership, VirtualDisplay, VirtualOutput};
+use crate::backend::{VirtualDisplay, VirtualOutput};
 use crate::Mode;
 
 /// The device node's hardware id (`install-mttvdd.ps1`), which `EnumDisplayDevicesW` also
@@ -102,13 +102,15 @@ impl VirtualDisplay for MttvddDisplay {
             *busy = true;
         }
         match attach(mode) {
-            Ok((got, target)) => Ok(VirtualOutput {
-                node_id: 0,
-                preferred_mode: Some((got.width, got.height, got.refresh_hz)),
-                win_capture: Some(target),
-                keepalive: Box::new(Lease),
-                ownership: DisplayOwnership::Owned,
-            }),
+            Ok((got, target)) => {
+                let mut out = VirtualOutput::owned(
+                    0,
+                    Some((got.width, got.height, got.refresh_hz)),
+                    Box::new(Lease),
+                );
+                out.win_capture = Some(target);
+                Ok(out)
+            }
             Err(e) => {
                 *IN_USE.lock().unwrap() = false;
                 Err(e)
