@@ -48,7 +48,7 @@ restart*.
 | Display refresh multiple (Linux, Windows) | `PUNKTFUNK_VDISPLAY_HZ_MULT` | 0–4 × | `0` | next session |
 | Extra resolutions (Windows) | `PUNKTFUNK_VDISPLAY_RESOLUTIONS` | comma list | `3840x2160`, `3440x1440`, `2560x1600`, `2560x1440`, `2560x1080`, `1920x1200`, `1920x1080`, `1680x1050`, `1600x900`, `1440x900`, `1366x768`, `1280x800`, `1280x720` | next session |
 | Cursor capture (Linux) | `PUNKTFUNK_PORTAL_CURSOR_MODE` | `auto` · `embedded` · `metadata` · `hidden` | `auto` | next session |
-| Vulkan encoding (Linux) | `PUNKTFUNK_VULKAN_ENCODE` | `on` · `off` | `on` | next session |
+| Vulkan encoding (Linux) | `PUNKTFUNK_VULKAN_ENCODE` | `on` · `off` | `off` | next session |
 | Direct capture (Linux) | `PUNKTFUNK_DIRECT_CAPTURE` | `on` · `off` | `on` | next session |
 | On-demand capture (Linux) | `PUNKTFUNK_LAZY_CAPTURE` | `on` · `off` | `on` | next session |
 | KWin capture pacing (Linux) | `PUNKTFUNK_KWIN_PACED` | `on` · `off` | `off` | next session |

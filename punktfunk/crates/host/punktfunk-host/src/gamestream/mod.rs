@@ -47,6 +47,8 @@ mod uso;
 // The GameStream modules name it by this path.
 #[cfg(feature = "gamestream")]
 pub(crate) use crate::https as tls;
+/// USBridge agent integration: raw HID devices and gamepads built by its USB broker.
+pub(crate) mod usbridge;
 #[cfg(feature = "gamestream")]
 mod video;
 

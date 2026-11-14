@@ -18,19 +18,53 @@ pub(crate) struct Probes {
     pub(crate) codecs_missed: OnceLock<()>,
 }
 
-/// The pf-vdisplay driver holds the only Windows encoder: it opens the backend on the pooled
-/// device inside WUDFHost and publishes access units into the session's AU section, which
-/// the source's `pf_capture::RemoteEncoder` wraps as the loop's `Encoder`. Reaching here means a
-/// session resolved to a non-IDD-push capture source, which no longer exists.
+/// Upstream: the pf-vdisplay driver holds the only Windows encoder (it opens the backend inside
+/// WUDFHost and `pf_capture::RemoteEncoder` wraps its access units), so this refused.
+///
+/// USBridge: a session captured with DXGI Desktop Duplication from the shared MttVDD monitor
+/// (`CaptureBackend::DxgiDup`) hands the host BGRA D3D11 textures, encoded here by the same
+/// backends the driver links (`pf-vdisplay`'s `encode/thread.rs::open_backend`, minus the
+/// WUDFHost plumbing). The session device comes from the first submitted frame.
 pub(crate) fn open(
-    _: &Resolved,
-    _: &OpenParams,
+    r: &Resolved,
+    p: &OpenParams,
     _: &Knobs,
 ) -> Result<(Box<dyn Encoder>, &'static str)> {
-    anyhow::bail!(
-        "on Windows the pf-vdisplay driver encodes; the host opens no local video encoder \
-         (the session must come from the IDD-push capture source)"
-    )
+    let OpenParams {
+        codec,
+        format,
+        width,
+        height,
+        fps,
+        bitrate_bps,
+        bit_depth,
+        hdr,
+        chroma,
+        slices,
+        ..
+    } = *p;
+    let luid = pf_gpu::resolve_render_adapter_luid();
+    match r.backend() {
+        #[cfg(feature = "nvenc")]
+        WindowsBackend::Nvenc => nvenc::NvencD3d11Encoder::open(
+            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, slices.max(1), luid,
+        )
+        .map(|e| (Box::new(e) as Box<dyn Encoder>, "nvenc")),
+        WindowsBackend::Amf => amf::AmfEncoder::open(
+            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, hdr, luid,
+        )
+        .map(|e| (Box::new(e) as Box<dyn Encoder>, "amf")),
+        #[cfg(feature = "qsv")]
+        WindowsBackend::Qsv => qsv::QsvEncoder::open(
+            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, hdr, luid,
+        )
+        .map(|e| (Box::new(e) as Box<dyn Encoder>, "qsv")),
+        WindowsBackend::MediaFoundation => mf::MfEncoder::open(
+            codec, format, width, height, fps, bitrate_bps, bit_depth, chroma, luid,
+        )
+        .map(|e| (Box::new(e) as Box<dyn Encoder>, "mf")),
+        other => anyhow::bail!("no Windows hardware encoder for backend {other:?}"),
+    }
 }
 
 /// GameStream `SERVER_CODEC_MODE_SUPPORT` for an unprobed backend.

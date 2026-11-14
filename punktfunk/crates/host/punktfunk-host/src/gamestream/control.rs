@@ -179,6 +179,10 @@ enum PadDevices {
     /// Windows UMDF HID Xbox pad — the native plane's default.
     #[cfg(target_os = "windows")]
     Hid(crate::inject::xbox_windows::XboxWindowsManager),
+    /// usbridge: under the USBridge agent, virtual pads on its USB broker's USB/IP ports.
+    /// They are this session's own devices, not in the host's OS slot space: their events and
+    /// rumble keep the client's wire index.
+    Usbridge(super::usbridge::Pads),
 }
 
 /// This session's pads, made under host-wide OS slots ([`crate::inject::pad_pool`]). Every
@@ -201,6 +205,13 @@ impl SessionPads {
     }
 
     fn with_slots(slots: crate::inject::pad_pool::PadSlotMap<'static>) -> SessionPads {
+        if super::usbridge::pads_via_broker() {
+            return SessionPads {
+                dev: PadDevices::Usbridge(super::usbridge::Pads::new()),
+                slots,
+                removed_at: [None; MAX_PADS],
+            };
+        }
         #[cfg(target_os = "windows")]
         let dev = if crate::native::gamepad::windows_xbox_hid() {
             PadDevices::Hid(crate::inject::xbox_windows::XboxWindowsManager::new())
@@ -218,6 +229,10 @@ impl SessionPads {
 
     /// Apply one decoded controller event (create/destroy by mask, then state) in OS-slot space.
     fn handle(&mut self, ev: &GamepadEvent) {
+        if let PadDevices::Usbridge(p) = &mut self.dev {
+            p.handle(ev);
+            return;
+        }
         let Some(ev) = self.in_slot_space(ev, std::time::Instant::now()) else {
             return;
         };
@@ -225,6 +240,15 @@ impl SessionPads {
             PadDevices::Xusb(m) => m.handle(&ev),
             #[cfg(target_os = "windows")]
             PadDevices::Hid(m) => m.handle(&ev),
+            PadDevices::Usbridge(p) => p.handle(&ev),
+        }
+    }
+
+    /// The USB broker's pads, when they are this session's.
+    fn usbridge(&mut self) -> Option<&mut super::usbridge::Pads> {
+        match &mut self.dev {
+            PadDevices::Usbridge(p) => Some(p),
+            _ => None,
         }
     }
 
@@ -287,6 +311,10 @@ impl SessionPads {
     /// motors only, so trigger levels are dropped at the call site. `rumble` gets the client's
     /// wire index; feedback from a slot this session does not hold is dropped.
     fn pump_rumble(&mut self, mut rumble: impl FnMut(u16, u16, u16, u16, u16)) {
+        if let PadDevices::Usbridge(p) = &mut self.dev {
+            p.pump_rumble(rumble);
+            return;
+        }
         self.release_removed(std::time::Instant::now());
         let slots = &self.slots;
         let to_wire = |slot: u16, low, high, lt, rt| {
@@ -298,6 +326,7 @@ impl SessionPads {
             PadDevices::Xusb(m) => m.pump_rumble(to_wire),
             #[cfg(target_os = "windows")]
             PadDevices::Hid(m) => m.pump(to_wire, |_| {}),
+            PadDevices::Usbridge(_) => {}
         }
     }
 }
@@ -632,6 +661,11 @@ struct ControlPeer {
     /// What the client last heard over HDR-mode (0x010e). A client starts in SDR.
     hdr_signalled: Option<HdrMeta>,
     pads: SessionPads,
+    /// Raw HID devices of a USBridge client, built by the agent's USB broker. Clients send
+    /// them only after seeing `SS_FF_USBRIDGE_RAW_HID` (rtsp.rs).
+    raw_hid: super::usbridge::RawHid,
+    /// The keyboard on the USB broker under the USBridge agent: keys and text typed there.
+    keyboard: super::usbridge::Keyboard,
     /// SS_PEN/SS_TOUCH → tablet / wire touch. Clients send these only after seeing
     /// `SS_FF_PEN_TOUCH_EVENTS` (rtsp.rs).
     pointer: super::pen::GsPointer,
@@ -658,6 +692,8 @@ impl ControlPeer {
             decrypt_fails: 0,
             hdr_signalled: None,
             pads: SessionPads::new(),
+            raw_hid: super::usbridge::RawHid::new(),
+            keyboard: super::usbridge::Keyboard::new(),
             pointer: super::pen::GsPointer::new(),
             held: Default::default(),
             repeat: super::input::KeyRepeat::for_this_host(),
@@ -674,7 +710,10 @@ impl ControlPeer {
     /// last sent, since tearing a live pad is churn.
     fn withdraw(&mut self, lost: u32, inj_tx: &Sender<InputEvent>) {
         let keys = lost & GRANT_KEYBOARD != 0;
-        for ev in self.held.release_classes(keys, lost & GRANT_POINTER != 0) {
+        for ev in self
+            .keyboard
+            .forward(self.held.release_classes(keys, lost & GRANT_POINTER != 0))
+        {
             let _ = inj_tx.send(ev);
         }
         if keys {
@@ -702,7 +741,9 @@ impl ControlPeer {
     fn pump_repeat(&mut self, inj_tx: &Sender<InputEvent>, grants: u32) {
         if let Some(ev) = self.repeat.due(std::time::Instant::now()) {
             if self.drops.permitted(grants, classify(ev.kind)) {
-                let _ = inj_tx.send(ev);
+                for ev in self.keyboard.forward(vec![ev]) {
+                    let _ = inj_tx.send(ev);
+                }
             }
         }
     }
@@ -722,11 +763,15 @@ impl ControlPeer {
         self.hdr_signalled = None;
         self.pads = SessionPads::new();
         self.pads_active = 0;
+        // Closing the broker connection unplugs the session's devices.
+        self.raw_hid = super::usbridge::RawHid::new();
         self.pointer = super::pen::GsPointer::new();
         self.repeat = super::input::KeyRepeat::for_this_host();
-        for ev in self.held.release() {
+        for ev in self.keyboard.forward(self.held.release()) {
             let _ = inj_tx.send(ev);
         }
+        // A new connection: the broker releases whatever the old one still held.
+        self.keyboard = super::usbridge::Keyboard::new();
         if let Some(totals) =
             std::mem::replace(&mut self.drops, GrantDrops::new(Plane::Gamestream)).summary()
         {
@@ -789,15 +834,34 @@ impl ControlPeer {
         // Handle motors only. `0x010B` has no trigger-rumble id on this plane, and uinput
         // `FF_RUMBLE` has two fields anyway.
         let seq = &mut self.host_seq;
-        self.pads.pump_rumble(|index, low, high, _lt, _rt| {
-            let pt = super::gamepad::rumble_plaintext(index, low, high);
-            out.push(encrypt_control(&key, &scheme, *seq, &pt));
-            *seq = seq.wrapping_add(1);
-        });
+        // usbridge: the broker's pads send back lights, motion requests, adaptive triggers
+        // and their sound too; the sound goes unreliably on its own channel.
+        let mut unreliable: Vec<(u8, Vec<u8>)> = Vec::new();
+        if let Some(pads) = self.pads.usbridge() {
+            pads.pump(|o| {
+                let wire = encrypt_control(&key, &scheme, *seq, &o.plaintext);
+                *seq = seq.wrapping_add(1);
+                match o.channel {
+                    Some(channel) => unreliable.push((channel, wire)),
+                    None => out.push(wire),
+                }
+            });
+        } else {
+            self.pads.pump_rumble(|index, low, high, _lt, _rt| {
+                let pt = super::gamepad::rumble_plaintext(index, low, high);
+                out.push(encrypt_control(&key, &scheme, *seq, &pt));
+                *seq = seq.wrapping_add(1);
+            });
+        }
         for wire in out {
             if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..])) {
                 tracing::warn!(error = ?e, "control send failed");
             }
+        }
+        for (channel, wire) in unreliable {
+            let _ = host
+                .peer_mut(pid)
+                .send(channel, &Packet::unreliable(&wire[..]));
         }
     }
 
@@ -838,6 +902,16 @@ impl ControlPeer {
     /// Decodable input lifts the suspend veto whether or not it is granted; a keepalive is
     /// not input and lifts nothing.
     fn inject(&mut self, state: &AppState, pt: &[u8], inj_tx: &Sender<InputEvent>, grants: u32) {
+        // Under the USBridge agent the controller extensions go to the broker's pads.
+        if let Some(pads) = self.pads.usbridge() {
+            if let Some(frame) = super::usbridge::controller_frame(pt) {
+                crate::sleep_inhibit::note_input();
+                if self.drops.permitted(grants, GrantClass::Gamepad) {
+                    pads.extension(frame);
+                }
+                return;
+            }
+        }
         // Gate gamepad before the manager sees it: without GAMEPAD the creating event never
         // arrives, so no uinput node and no pad-audio streamer.
         if let Some(gp) = super::gamepad::decode(pt) {
@@ -848,6 +922,16 @@ impl ControlPeer {
                     self.pads_active = f.active_mask;
                 }
                 self.pads.handle(&gp);
+            }
+            return;
+        }
+        // A USBridge client's HID device (only after our feature flag): pointer-class, as the
+        // pen is -- what it sends is a tablet.
+        if let Some(frame) = super::usbridge::raw_hid_frame(pt) {
+            crate::sleep_inhibit::note_input();
+            if self.drops.permitted(grants, GrantClass::Pointer) {
+                state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
+                self.raw_hid.forward(frame);
             }
             return;
         }
@@ -874,13 +958,17 @@ impl ControlPeer {
         crate::sleep_inhibit::note_input();
         // One mask test, then the injector thread. A closed channel means the injector
         // died at startup; input is lossy, so drop silently.
+        let mut permitted = Vec::with_capacity(events.len());
         for ev in events {
             if self.drops.permitted(grants, classify(ev.kind)) {
                 state.counters.input_events.fetch_add(1, Ordering::Relaxed);
                 self.held.note(&ev);
                 self.repeat.note(&ev, std::time::Instant::now());
-                let _ = inj_tx.send(ev);
+                permitted.push(ev);
             }
+        }
+        for ev in self.keyboard.forward(permitted) {
+            let _ = inj_tx.send(ev);
         }
     }
 }
